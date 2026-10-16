@@ -554,6 +554,36 @@ describe("ssh env-lab fixture", () => {
     expect(result.stdout).not.toContain("appledouble-present");
   }, SSH_FIXTURE_TEST_TIMEOUT_MS);
 
+  it("removes stale remote entries when it replaces the remote directory", async () => {
+    const rootDir = await createFixtureRootDir();
+    const statePath = path.join(rootDir, "state.json");
+    const firstDir = path.join(rootDir, "first");
+    const secondDir = path.join(rootDir, "second");
+
+    await mkdir(path.join(firstDir, "removed-skill"), { recursive: true });
+    await writeFile(path.join(firstDir, "removed-skill", "SKILL.md"), "old\n", "utf8");
+    await writeFile(path.join(firstDir, "kept.md"), "v1\n", "utf8");
+    await mkdir(secondDir, { recursive: true });
+    await writeFile(path.join(secondDir, "kept.md"), "v2\n", "utf8");
+
+    const started = await startSshEnvLabFixtureOrSkip(statePath, "SSH env-lab fixture test");
+    if (!started) return;
+    const config = await buildSshEnvLabFixtureConfig(started);
+    const spec = { ...config, remoteCwd: started.workspaceDir };
+    const remoteDir = path.posix.join(started.workspaceDir, "assets");
+
+    await syncDirectoryToSsh({ spec, localDir: firstDir, remoteDir });
+    await syncDirectoryToSsh({ spec, localDir: secondDir, remoteDir, replaceRemoteDir: true });
+
+    const result = await runSshCommand(
+      config,
+      `cat ${JSON.stringify(path.posix.join(remoteDir, "kept.md"))} && if [ -e ${JSON.stringify(path.posix.join(remoteDir, "removed-skill"))} ]; then echo stale-present; fi`,
+    );
+
+    expect(result.stdout).toContain("v2");
+    expect(result.stdout).not.toContain("stale-present");
+  }, SSH_FIXTURE_TEST_TIMEOUT_MS);
+
   it("reports throttled upload progress with a clamped percent and terminal 100% line", async () => {
     const rootDir = await createFixtureRootDir();
     const statePath = path.join(rootDir, "state.json");

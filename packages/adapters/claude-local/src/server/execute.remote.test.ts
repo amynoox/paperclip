@@ -280,13 +280,14 @@ describe("claude remote execution", () => {
 
     expect(prepareWorkspaceForSshExecution).not.toHaveBeenCalled();
     expect(restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
-    // Only the runtime assets are staged, under the authoritative root.
     expect(syncDirectoryToSsh).toHaveBeenCalledTimes(2);
     expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
       remoteDir: "/app/.paperclip-runtime/claude/skills",
+      replaceRemoteDir: true,
     }));
     expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
       remoteDir: "/app/.paperclip-runtime/claude/mcp-config",
+      replaceRemoteDir: true,
     }));
     const call = runChildProcess.mock.calls.find((c) => !(c[2] as string[]).includes("--version")) as unknown as
       | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]

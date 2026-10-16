@@ -1424,6 +1424,7 @@ export async function syncDirectoryToSsh(input: {
   remoteDir: string;
   exclude?: string[];
   followSymlinks?: boolean;
+  replaceRemoteDir?: boolean;
   onProgress?: RuntimeProgressSink;
   progressLabel?: string;
 }): Promise<void> {
@@ -1433,7 +1434,13 @@ export async function syncDirectoryToSsh(input: {
     "-p",
     String(input.spec.port),
     `${input.spec.username}@${input.spec.host}`,
-    `sh -c ${shellQuote(`mkdir -p ${shellQuote(input.remoteDir)} && tar -xf - -C ${shellQuote(input.remoteDir)}`)}`,
+    `sh -c ${shellQuote([
+      `mkdir -p ${shellQuote(input.remoteDir)}`,
+      ...(input.replaceRemoteDir
+        ? [`find ${shellQuote(input.remoteDir)} -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +`]
+        : []),
+      `tar -xf - -C ${shellQuote(input.remoteDir)}`,
+    ].join(" && "))}`,
   ];
 
   // tar's archive size isn't known until tar finishes, so estimate it from the

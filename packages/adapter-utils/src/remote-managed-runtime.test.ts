@@ -109,6 +109,7 @@ describe("remote managed runtime", () => {
     expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
       localDir: homeDir,
       remoteDir: "/app/.paperclip-runtime/codex/home",
+      replaceRemoteDir: true,
     }));
 
     await prepared.restoreWorkspace();

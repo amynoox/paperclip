@@ -178,6 +178,7 @@ export async function prepareRemoteManagedRuntime(input: {
         remoteDir,
         followSymlinks: asset.followSymlinks,
         exclude: asset.exclude,
+        replaceRemoteDir: !syncWorkspace,
         onProgress: input.onProgress,
         progressLabel: asset.key,
       });
