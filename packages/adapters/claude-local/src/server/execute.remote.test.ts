@@ -231,6 +231,72 @@ describe("claude remote execution", () => {
     }));
   });
 
+  it("runs in place at the authoritative root without archive prepare or restore", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-in-place-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    await mkdir(workspaceDir, { recursive: true });
+
+    await execute({
+      runId: "run-in-place",
+      agent: {
+        id: "agent-1",
+        companyId: "company-1",
+        name: "Claude Coder",
+        adapterType: "claude_local",
+        adapterConfig: {},
+      },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { engine: "cli", command: "claude" },
+      context: {
+        paperclipWorkspace: {
+          cwd: workspaceDir,
+          source: "task_session",
+        },
+      },
+      executionTarget: {
+        kind: "remote",
+        transport: "ssh",
+        remoteCwd: "/copied/workspace",
+        workspaceRealization: {
+          mode: "in_place",
+          authoritativeRoot: "/app",
+          pathAliases: [],
+          outboundRestorePaths: [],
+        },
+        spec: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/app",
+          remoteCwd: "/app",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      onLog: async () => {},
+    });
+
+    expect(prepareWorkspaceForSshExecution).not.toHaveBeenCalled();
+    expect(restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
+    // Only the runtime assets are staged, under the authoritative root.
+    expect(syncDirectoryToSsh).toHaveBeenCalledTimes(2);
+    expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: "/app/.paperclip-runtime/claude/skills",
+    }));
+    expect(syncDirectoryToSsh).toHaveBeenCalledWith(expect.objectContaining({
+      remoteDir: "/app/.paperclip-runtime/claude/mcp-config",
+    }));
+    const call = runChildProcess.mock.calls.find((c) => !(c[2] as string[]).includes("--version")) as unknown as
+      | [string, string, string[], { env: Record<string, string>; remoteExecution?: { remoteCwd: string } | null }]
+      | undefined;
+    expect(call?.[3].env.PAPERCLIP_WORKSPACE_CWD).toBe("/app");
+    expect(call?.[3].env.PAPERCLIP_WORKSPACE_REALIZATION_MODE).toBe("in_place");
+    expect(call?.[3].env.PAPERCLIP_WORKSPACE_AUTHORITATIVE_ROOT).toBe("/app");
+    expect(call?.[3].remoteExecution?.remoteCwd).toBe("/app");
+  });
+
   it("does not resume saved Claude sessions for remote SSH execution without a matching remote identity", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-claude-remote-resume-"));
     cleanupDirs.push(rootDir);
