@@ -27,10 +27,6 @@ import type { RunProcessResult } from "./server-utils.js";
 
 const DEFAULT_BRIDGE_TOKEN_BYTES = 24;
 const DEFAULT_BRIDGE_POLL_INTERVAL_MS = 100;
-// The longest an idle poll waits inside the sandbox for a request file. The
-// sandbox checks every poll interval, so a request is still picked up within
-// one interval, while an idle run costs one remote exec per wait instead of
-// ten per second. It stays well under the in-sandbox 30s response deadline.
 const DEFAULT_BRIDGE_LIST_WAIT_MS = 5_000;
 const DEFAULT_BRIDGE_RESPONSE_TIMEOUT_MS = 30_000;
 const MAX_BRIDGE_CONTROL_COMMAND_TIMEOUT_MS = 30_000;
@@ -289,9 +285,7 @@ export interface SandboxCallbackBridgeDirectories {
 }
 
 export interface SandboxCallbackBridgeListOptions {
-  // The longest time to wait for a request file. Zero or absent returns at once.
   waitMs?: number;
-  // How often the wait checks the directory.
   pollIntervalMs?: number;
 }
 
@@ -302,13 +296,6 @@ export interface SandboxCallbackBridgeQueueClient {
   // omits it; the worker falls back to sequential `makeDir` calls, so an
   // external implementation stays compatible without a change.
   makeDirs?(remotePaths: string[]): Promise<void>;
-  // `options.waitMs` lets a client wait inside the sandbox for the first
-  // request file, for at most that long, before it returns an empty listing.
-  // Each remote exec is a process spawn on the host, so a client whose call is
-  // a remote exec should wait: an idle run then costs one exec per wait instead
-  // of one exec per poll interval. The worker passes a wait only to a client
-  // that sets `supportsListWait`; any other client keeps the earlier contract:
-  // it returns at once, and the worker sleeps one poll interval.
   listJsonFiles(remotePath: string, options?: SandboxCallbackBridgeListOptions): Promise<string[]>;
   supportsListWait?: boolean;
   fileSize?(remotePath: string): Promise<number>;
@@ -691,11 +678,6 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
       const waitMs = typeof options.waitMs === "number" && Number.isFinite(options.waitMs) && options.waitMs > 0
         ? Math.trunc(options.waitMs)
         : 0;
-      // Wait inside the sandbox, so an idle poll is one remote exec. The wait
-      // counts sleeps instead of reading a clock, so it never runs past
-      // `waitMs`. A `sleep` that rejects a fraction falls back to whole
-      // seconds, and a wait shorter than one second then lists once and
-      // returns at once rather than sleeping a whole second.
       const pollMs = normalizeTimeoutMs(options.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
       const script = waitMs === 0
         ? listScript
@@ -869,9 +851,6 @@ export async function startSandboxCallbackBridgeWorker(input: {
   client: SandboxCallbackBridgeQueueClient;
   queueDir: string;
   pollIntervalMs?: number | null;
-  // The longest an idle poll waits inside the sandbox for a request file (see
-  // `SandboxCallbackBridgeListOptions`). Zero turns the wait off. Defaults to
-  // DEFAULT_BRIDGE_LIST_WAIT_MS.
   listWaitMs?: number | null;
   // Per-iteration timeout for one poll-loop client call (the `listJsonFiles`
   // poll and one `processRequestFile`). On timeout the loop `catch` runs
@@ -918,9 +897,6 @@ export async function startSandboxCallbackBridgeWorker(input: {
   const pollIntervalMs = normalizeTimeoutMs(input.pollIntervalMs, DEFAULT_BRIDGE_POLL_INTERVAL_MS);
   const iterationTimeoutMs = normalizeTimeoutMs(input.iterationTimeoutMs, DEFAULT_BRIDGE_ITERATION_TIMEOUT_MS);
   const watchdogTimeoutMs = normalizeTimeoutMs(input.watchdogTimeoutMs, DEFAULT_BRIDGE_WATCHDOG_TIMEOUT_MS);
-  // A waiting poll makes no successful iteration until it returns, so keep the
-  // wait under half the watchdog threshold; the watchdog then never mistakes a
-  // healthy wait for a hung channel.
   const listWaitMs = !input.client.supportsListWait || input.listWaitMs === 0
     ? 0
     : Math.min(
@@ -954,7 +930,6 @@ export async function startSandboxCallbackBridgeWorker(input: {
   }
 
   let stopping = false;
-  // True while the loop waits inside the sandbox with nothing listed or in flight.
   let listWaitActive = false;
   let inFlight = 0;
   let settled = false;
@@ -1588,8 +1563,6 @@ export async function startSandboxCallbackBridgeWorker(input: {
       let consecutivePollFailures = 0;
       while (true) {
         let fileNames: string[];
-        // Wait inside the sandbox only when nothing is in flight. A guarded file
-        // stays listed, so a wait would return at once and save nothing.
         const waitMs = !stopping && inFlightRequestGuards.size === 0 ? listWaitMs : 0;
         try {
           listWaitActive = waitMs > 0;
@@ -1715,10 +1688,6 @@ export async function startSandboxCallbackBridgeWorker(input: {
       const drainMs = normalizeTimeoutMs(options.drainTimeoutMs, DEFAULT_BRIDGE_STOP_TIMEOUT_MS);
       stopDeadline = Date.now() + drainMs;
       if (listWaitActive) {
-        // The loop is waiting inside the sandbox with nothing listed and nothing
-        // in flight, so there is nothing to drain. Do not hold the stop for the
-        // rest of the wait: end the drain now, and the pass below answers any
-        // request that arrived during the wait with a retryable 503.
         stopDeadline = Date.now();
       } else if (!settled) {
         await Promise.race([

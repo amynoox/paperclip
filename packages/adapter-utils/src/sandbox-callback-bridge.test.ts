@@ -1122,7 +1122,6 @@ describe("sandbox callback bridge", () => {
     await expect(client.listJsonFiles(requestsDir, { waitMs: 1_000, pollIntervalMs: 50 })).resolves.toEqual([]);
     expect(Date.now() - startedAt).toBeLessThan(3_000);
     expect(runner.execute).toHaveBeenCalledTimes(1);
-    // Without a wait the client keeps the single immediate listing.
     await expect(client.listJsonFiles(path.join(rootDir, "missing"))).resolves.toEqual([]);
     expect(runner.execute).toHaveBeenCalledTimes(2);
   });
@@ -1136,7 +1135,6 @@ describe("sandbox callback bridge", () => {
     const runner = { execute: vi.fn((input: Parameters<typeof inner.execute>[0]) => inner.execute(input)) };
     const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: rootDir, timeoutMs: 30_000 });
 
-    // A 200 ms limit must not stretch to the next whole second.
     const startedAt = Date.now();
     await expect(client.listJsonFiles(requestsDir, { waitMs: 200, pollIntervalMs: 50 })).resolves.toEqual([]);
     expect(Date.now() - startedAt).toBeLessThan(800);
@@ -1150,7 +1148,6 @@ describe("sandbox callback bridge", () => {
     const sleepLog = path.join(rootDir, "sleeps.log");
     await mkdir(requestsDir, { recursive: true });
     await mkdir(binDir, { recursive: true });
-    // A `sleep` like the ones on minimal images: whole seconds only.
     await writeFile(
       path.join(binDir, "sleep"),
       [
@@ -1169,13 +1166,11 @@ describe("sandbox callback bridge", () => {
     };
     const client = createCommandManagedSandboxCallbackBridgeQueueClient({ runner, remoteCwd: rootDir, timeoutMs: 30_000 });
 
-    // Under one second there is no whole-second sleep that fits, so the call lists once and returns.
     const startedAt = Date.now();
     await expect(client.listJsonFiles(requestsDir, { waitMs: 900, pollIntervalMs: 50 })).resolves.toEqual([]);
     expect(Date.now() - startedAt).toBeLessThan(700);
     await expect(readFile(sleepLog, "utf8")).rejects.toThrow();
 
-    // Two seconds fit two whole-second sleeps and no more.
     await expect(client.listJsonFiles(requestsDir, { waitMs: 2_100, pollIntervalMs: 50 })).resolves.toEqual([]);
     expect((await readFile(sleepLog, "utf8")).trim().split("\n")).toEqual(["1", "1"]);
   });
@@ -1208,7 +1203,6 @@ describe("sandbox callback bridge", () => {
     expect(listCalls).toHaveLength(1);
     expect(listCalls[0]).toEqual({ waitMs: 5_000, pollIntervalMs: 100 });
 
-    // A stop during the idle wait has nothing to drain, so it does not hold for the rest of the wait.
     const stopStartedAt = Date.now();
     await worker.stop();
     expect(Date.now() - stopStartedAt).toBeLessThan(1_000);
