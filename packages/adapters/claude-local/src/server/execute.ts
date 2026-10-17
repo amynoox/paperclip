@@ -175,6 +175,29 @@ function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscri
   return hasNonEmptyEnvValue(env, "ANTHROPIC_API_KEY") ? "api" : "subscription";
 }
 
+export function resolveClaudeRunScopedRuntimeRoot(
+  executionTarget: ReturnType<typeof readAdapterExecutionTarget>,
+  runId: string,
+): { runtimeRootDir: string; removeRuntimeRootOnRestore: true } | Record<string, never> {
+  if (
+    executionTarget?.kind !== "remote" ||
+    executionTarget.transport !== "ssh" ||
+    executionTarget.workspaceRealization?.mode !== "in_place"
+  ) {
+    return {};
+  }
+  return {
+    runtimeRootDir: path.posix.join(
+      executionTarget.workspaceRealization.authoritativeRoot,
+      ".paperclip-runtime",
+      "runs",
+      runId,
+      "claude",
+    ),
+    removeRuntimeRootOnRestore: true,
+  };
+}
+
 async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<ClaudeRuntimeConfig> {
   const { runId, agent, config, context, runtimeCommandSpec, executionTarget, authToken } = input;
   const onLog = input.onLog ?? (async () => {});
@@ -651,18 +674,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             targetWorkspaceRealization?.mode === "in_place"
               ? targetWorkspaceRealization.authoritativeRoot
               : undefined,
-          ...(targetWorkspaceRealization?.mode === "in_place"
-            ? {
-                runtimeRootDir: path.posix.join(
-                  targetWorkspaceRealization.authoritativeRoot,
-                  ".paperclip-runtime",
-                  "runs",
-                  runId,
-                  "claude",
-                ),
-                removeRuntimeRootOnRestore: true,
-              }
-            : {}),
+          ...resolveClaudeRunScopedRuntimeRoot(executionTarget, runId),
           syncWorkspace: targetWorkspaceRealization?.mode !== "in_place",
           installCommand: SANDBOX_INSTALL_COMMAND,
           detectCommand: command,

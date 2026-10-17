@@ -81,7 +81,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 });
 
 import { createPromptContextFixture } from "@paperclipai/adapter-utils/test-fixtures/prompt-context";
-import { execute } from "./execute.js";
+import { execute, resolveClaudeRunScopedRuntimeRoot } from "./execute.js";
 import { resetClaudeCliCapabilitiesCacheForTests } from "./cli-capabilities.js";
 
 describe("claude remote execution", () => {
@@ -301,6 +301,27 @@ describe("claude remote execution", () => {
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_REALIZATION_MODE).toBe("in_place");
     expect(call?.[3].env.PAPERCLIP_WORKSPACE_AUTHORITATIVE_ROOT).toBe("/app");
     expect(call?.[3].remoteExecution?.remoteCwd).toBe("/app");
+  });
+
+  it("scopes the runtime root per run only for in-place SSH targets", () => {
+    const realization = {
+      mode: "in_place" as const,
+      authoritativeRoot: "/app",
+      pathAliases: [],
+      outboundRestorePaths: [],
+    };
+    type Target = Parameters<typeof resolveClaudeRunScopedRuntimeRoot>[0];
+    const sshInPlace = { kind: "remote", transport: "ssh", remoteCwd: "/app", workspaceRealization: realization } as unknown as Target;
+    const sshCopy = { kind: "remote", transport: "ssh", remoteCwd: "/app" } as unknown as Target;
+    const sandboxInPlace = { kind: "remote", transport: "sandbox", remoteCwd: "/app", workspaceRealization: realization } as unknown as Target;
+
+    expect(resolveClaudeRunScopedRuntimeRoot(sshInPlace, "run-a")).toEqual({
+      runtimeRootDir: "/app/.paperclip-runtime/runs/run-a/claude",
+      removeRuntimeRootOnRestore: true,
+    });
+    expect(resolveClaudeRunScopedRuntimeRoot(sshCopy, "run-a")).toEqual({});
+    expect(resolveClaudeRunScopedRuntimeRoot(sandboxInPlace, "run-a")).toEqual({});
+    expect(resolveClaudeRunScopedRuntimeRoot(null, "run-a")).toEqual({});
   });
 
   it("creates a missing local workspace before it copies the workspace to the SSH host", async () => {
