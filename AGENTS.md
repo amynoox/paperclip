@@ -5,6 +5,15 @@ Guidance for human and AI contributors working in this repository.
 ## Studio fork maintenance
 
 For this downstream fork, also follow [studio/README.md](studio/README.md).
+Before changing Paperclip behavior, isolate the problem and search current
+`paperclipai/paperclip` pull requests, including open, draft, merged and closed
+work. Prefer a suitable existing PR over reimplementation; review its actual
+diff and compatibility, and preserve its source URL and commit provenance.
+Only start a custom downstream fix after a documented search finds no suitable
+upstream PR and the user explicitly approves that specific fix. An incomplete
+or unavailable search is not evidence that no PR exists. General permission to
+maintain this fork does not replace this approval. See the upstream-first policy
+in `studio/README.md` for the required evidence and integration boundaries.
 Every downstream behavior change needs a stable patch record in
 `studio/patches.json`, its reason, relevant tests and limits, and a condition for
 retirement when upstream provides an equivalent fix. Preserve the pinned
