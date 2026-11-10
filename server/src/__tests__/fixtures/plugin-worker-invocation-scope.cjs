@@ -23,7 +23,13 @@ function sendNestedHostRequest(originalRequest, invocationId) {
         configPath: params.configPath || "apiKeyRef",
       }
     : hostMethod === "state.get"
-    ? {
+    ? params.nestedScopeKind === "instance"
+      ? {
+          scopeKind: "instance",
+          namespace: params.namespace || "ns",
+          stateKey: params.stateKey || "key",
+        }
+      : {
         // Company-scoped state key — the shape a proactive gateway loop uses
         // (ctx.state.get with scopeKind "company"). The host derives the
         // requested company from scopeId, not companyId.
@@ -98,13 +104,24 @@ rl.on("line", (line) => {
       id: message.id,
       result: {
         ok: true,
-        supportedMethods: ["getData", "performAction", "resourceLifecycle", "workspaceOperation", "executeTool"],
+        supportedMethods: ["getData", "performAction", "resourceLifecycle", "workspaceOperation", "executeTool", "runJob"],
       },
     });
     return;
   }
 
-  if (["getData", "performAction", "resourceLifecycle", "workspaceOperation", "executeTool"].includes(method)) {
+  if (method === "onEvent" && !message.id) {
+    if (message.paperclipInvocation?.id) {
+      send({
+        jsonrpc: "2.0",
+        method: "paperclip.invocationSettled",
+        params: { invocationId: message.paperclipInvocation.id },
+      });
+    }
+    return;
+  }
+
+  if (["getData", "performAction", "resourceLifecycle", "workspaceOperation", "executeTool", "runJob"].includes(method)) {
     sendNestedHostRequest(message, message.paperclipInvocation?.id);
     return;
   }

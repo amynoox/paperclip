@@ -62,6 +62,47 @@
       "retireWhen": "Upstream exact-version service verification works for authenticated instances and passes the same isolation and mismatch cases.",
       "upstreamContribution": null,
       "upgradeDecisions": []
+    },
+    {
+      "id": "STUDIO-0003",
+      "title": "Settle notification invocations and scope global plugin jobs",
+      "status": "implemented",
+      "problem": "Completed event scopes retain a15-minute denial window; globaljobs receive no nativeinvocation.",
+      "reason": "The host and SDK must agree on lifecycle; pluginconfiguration or SDK-onlyupgrade cannot fix host registration.",
+      "observedOnUpstream": "2026.1110.0-nightly.0",
+      "owner": "Plugin worker host and SDK invocation lifecycle",
+      "paths": [
+        "server/src/services/plugin-worker-manager.ts",
+        "packages/plugins/sdk/src/worker-rpc-host.ts",
+        "server/src/__tests__/plugin-worker-manager.test.ts",
+        "packages/plugins/sdk/tests/worker-rpc-host.test.ts",
+        "studio/scope-tests",
+        "studio/build-invocation-overlay.mjs"
+      ],
+      "proposal": "Reuse official PR15925 and PR9368 with the explicitly approved host-owned notification-only settlement guard.",
+      "upstreamSearch": {
+        "date": "2026-11-10",
+        "repository": "paperclipai/paperclip",
+        "details": "studio/plugin-invocation-scopes.md",
+        "pullRequests": [
+          {
+            "number": 15925,
+            "head": "59cf44a3ac2a479ef6e9795acd16b8e85954e974"
+          },
+          {
+            "number": 9368,
+            "head": "4558c6fc38cd08b2d977b740ce61aea1d03e7dbb"
+          }
+        ]
+      },
+      "customApproval": "2026-11-10: owner explicitly approved notification-only settlement hardening after upstream search and failing adversarial regression.",
+      "commits": [],
+      "validation": "14/14 focused local protocol tests pass on source and compiled overlays. Full workspace/DB suites and real workload tests not run. Test and artifact limits are documented.",
+      "migration": "No database migration or new permissions. Deploy host and SDK together.",
+      "rollback": "Restore the previous managed payload and plugin via native lifecycle only while drained. Verify authenticated health and versions; preserve database and evidence.",
+      "retireWhen": "Upstream host and SDK implement equivalent lifecycle and pass the same negative authorization tests.",
+      "pullRequest": "https://github.com/amynoox/paperclip/pull/1",
+      "upgradeDecisions": []
     }
   ]
 }

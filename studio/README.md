@@ -93,6 +93,12 @@ old and new release tags so any future operator can reconstruct the comparison.
 
 ## Initial backlog
 
+`STUDIO-0003` reuses upstream event-settlement and global-job invocation fixes
+with an explicitly approved notification-only guard. See
+[plugin-invocation-scopes.md](plugin-invocation-scopes.md) for source provenance,
+the security regression, the isolated local suite and the two-module overlay.
+It does not change permissions or provide end-to-end worker qualification.
+
 `STUDIO-0001` implements a four-day default for new run MCP credentials after
 review of the installed nightly's issuing and public API contracts. See
 [runtime-mcp-lifetime.md](runtime-mcp-lifetime.md) for authority, test scope,
