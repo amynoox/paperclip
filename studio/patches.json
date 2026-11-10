@@ -17,20 +17,24 @@
         "studio/build-runtime-overlay.mjs"
       ],
       "proposal": "Issue assigned and managed run MCP gateway tokens with a 96-hour expiry. Preserve all existing per-call checks and terminal revocation. No renewal mechanism or permission expansion.",
-      "commits": [],
+      "commits": [
+        "8c12f1c70031823308e4b8bcb1ff60de88544f0e"
+      ],
       "testsRequired": [
         "Both runtime issuing paths use 96 hours and retain authority",
         "Missing or changed assignments do not mint credentials",
         "Native terminal revocation remains company/run-scoped",
         "Gateway authentication refuses revoked credentials"
       ],
-      "validation": "Six focused offline source-function tests passed. PostgreSQL integration coverage has been updated but not yet run in this sparse checkout. No live task test has been run.",
+      "validation": "Six focused offline source-function tests and the same six tests against the generated runtime passed. PostgreSQL integration coverage was updated but not run in the sparse checkout. The deployed runtime hash, exact version and commit were read back through authenticated health. No real task test was run.",
       "migration": "No schema or data migration. Existing credentials retain their stored expiry and revocation.",
       "rollback": "Activate the retained upstream payload; do not roll back the database or task evidence. Future minting uses upstream expiry; existing tokens still use native revocation.",
       "retireWhen": "An upstream version provides equivalent active-run continuity, authority boundaries and terminal revocation, confirmed by the same regression cases.",
       "upstreamContribution": null,
       "upgradeDecisions": [],
-      "newBaselineObservation": "Reviewed the installed run-preparation, adapter interface, gateway routes and public validator on 2026-11-10. getServers has no refresh; public heartbeat_run minting is still rejected."
+      "newBaselineObservation": "Reviewed the installed run-preparation, adapter interface, gateway routes and public validator on 2026-11-10. getServers has no refresh; public heartbeat_run minting is still rejected.",
+      "pullRequest": "https://github.com/amynoox/paperclip/pull/1",
+      "releaseTag": "studio/v2026.1110.0-studio.1"
     },
     {
       "id": "STUDIO-0002",
