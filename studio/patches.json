@@ -30,6 +30,34 @@
       "rollback": "To be specified with the implementation; do not release task reservations or discard collection obligations.",
       "retireWhen": "An upstream version provides equivalent active-run continuity, authority boundaries and terminal revocation, confirmed by the same regression cases.",
       "upstreamContribution": null,
+      "upgradeDecisions": [],
+      "newBaselineObservation": "The installed 2026.1110.0-nightly.0 run-preparation source still creates an automatic token with a one-hour expiry. Full lifecycle and API review is still required before implementation."
+    },
+    {
+      "id": "STUDIO-0002",
+      "title": "Make managed-update health verification compatible with authenticated instances",
+      "status": "proposed",
+      "problem": "The CLI probes health without authentication but requires an exact version. Authenticated deployments intentionally omit version fields from anonymous healthy responses, causing a false rollback and false rollback-restart failure.",
+      "reason": "Liveness alone cannot prove the intended binary is active; protected details must not be made public to satisfy the updater.",
+      "observedOnUpstream": "2026.1110.0-nightly.0",
+      "owner": "Managed CLI service verification and authenticated health response contract",
+      "paths": [
+        "cli/src/commands/service.ts",
+        "cli/src/commands/update.ts",
+        "server/src/routes/health.ts"
+      ],
+      "proposal": "Use an authorized local/admin health context for exact installed-version verification, retaining identity checks and redacted public liveness.",
+      "commits": [],
+      "testsRequired": [
+        "Authenticated healthy expected version succeeds without exposing protected fields",
+        "Wrong version, unavailable or unhealthy service still fails verification",
+        "Rollback verification uses the same authenticated contract"
+      ],
+      "validation": "Source and deployment readback establish the mismatch; no source fix implemented. An idle-service native stop/update/start procedure with verified backups and authenticated version+commit readback was used separately.",
+      "migration": "No database change proposed; implementation remains to be designed.",
+      "rollback": "No implementation to roll back. Retain previous payload and verified pre-update data backups for operational upgrades.",
+      "retireWhen": "Upstream exact-version service verification works for authenticated instances and passes the same isolation and mismatch cases.",
+      "upstreamContribution": null,
       "upgradeDecisions": []
     }
   ]

@@ -66,3 +66,15 @@ old and new release tags so any future operator can reconstruct the comparison.
 It must be reassessed against the newly installed nightly before implementation;
 the previous-version diagnosis must not be treated as a finding on newer code.
 No downstream Paperclip runtime correction is included in this bootstrap.
+
+`STUDIO-0002` records a native update health-contract mismatch: an unauthenticated
+probe can receive healthy liveness without the protected version fields, while
+the updater requires an exact version and incorrectly rolls back. Keep protected
+health details private. A maintenance procedure can stop an idle service, update
+the inactive managed installation after a verified fresh backup, start it, and
+verify the exact version and commit through an authenticated health read. This
+operational procedure is not a source fix or worker qualification.
+
+Use a restrictive installation umask such as `022`: the pinned Copilot installer
+rejects group/world-writable executable files. Do not disable its permission,
+digest or closure checks to make an installation pass.
