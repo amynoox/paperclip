@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/paperclipai/paperclip",
+  "channel": "nightly",
+  "version": "2026.1110.0-nightly.0",
+  "tag": "nightly/v2026.1110.0-nightly.0",
+  "commit": "179694de7dc700aa5b4d0ab58fe8531cd8119f93",
+  "npmPackage": "paperclipai",
+  "npmIntegrity": "sha512-VxeKN/C4o+R+8QzMWFslCwSGTjvOFgM7eX6H2+4KXEx3BGvc6DHHe6L7nFG3PO60kqiW/BlXCLMhHnJy1z5qdw==",
+  "resolvedAt": "2026-11-10T19:48:34Z",
+  "downstreamBranch": "studio/2026.1110.0",
+  "note": "Source baseline only. Deployment and real application qualification are recorded separately."
+}

@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "patches": [
+    {
+      "id": "STUDIO-0001",
+      "title": "Keep native MCP access available during long active runs",
+      "status": "proposed",
+      "problem": "On the previously inspected nightly, the automatic heartbeat_run MCP token expires after one hour while the provider can still be working.",
+      "reason": "The earlier public minting API rejects heartbeat_run and adapter access is a frozen credential snapshot; replacement gateway_client or generic sessions do not establish equivalent authority.",
+      "observedOnUpstream": "2026.1104.0-nightly.0",
+      "needsReassessmentOn": "2026.1110.0-nightly.0",
+      "owner": "Native run preparation and gateway-token lifecycle",
+      "paths": [
+        "server/src/services/heartbeat/run-preparation.ts",
+        "server/src/services/tool-gateway.ts",
+        "packages/shared/src/validators/tool-access.ts",
+        "packages/adapter-utils/src/types.ts"
+      ],
+      "proposal": "Runtime-owned bounded extension of the same bearer before expiry, only while its run and execution lease are active. Preserve subject, company, agent, gateway/profile, assignments and allowed actions; retain live authorization and atomic terminal revocation.",
+      "commits": [],
+      "testsRequired": [
+        "Existing client remains authorized across the one-hour boundary without restarting",
+        "Terminal, cancellation and explicit-revocation races cannot extend authority",
+        "Expired or revoked tokens cannot be resurrected",
+        "Cross-run, company and gateway/profile isolation; removed permissions remain removed",
+        "Lost execution lease and renewal failure preserve bounded expiry and recovery evidence"
+      ],
+      "validation": "Contract checks on the old nightly only; no implementation or working-renewal acceptance.",
+      "migration": "Undetermined until the new nightly contract is reviewed; do not edit production token rows.",
+      "rollback": "To be specified with the implementation; do not release task reservations or discard collection obligations.",
+      "retireWhen": "An upstream version provides equivalent active-run continuity, authority boundaries and terminal revocation, confirmed by the same regression cases.",
+      "upstreamContribution": null,
+      "upgradeDecisions": []
+    }
+  ]
+}
