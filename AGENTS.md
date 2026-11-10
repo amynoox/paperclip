@@ -2,6 +2,17 @@
 
 Guidance for human and AI contributors working in this repository.
 
+## Studio fork maintenance
+
+For this downstream fork, also follow [studio/README.md](studio/README.md).
+Every downstream behavior change needs a stable patch record in
+`studio/patches.json`, its reason, relevant tests and limits, and a condition for
+retirement when upstream provides an equivalent fix. Preserve the pinned
+upstream baseline and original commit provenance during upgrades.
+Use available local/LAN machines for validation. GitHub Actions is disabled on
+this fork; enabling or triggering it requires the user's explicit permission.
+Never commit production credentials, dumps, private logs or instance settings.
+
 ## 1. Purpose
 
 Paperclip is a control plane for AI-agent companies.
