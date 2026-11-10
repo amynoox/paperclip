@@ -1206,9 +1206,11 @@ export async function buildPaperclipRuntimeMcpServers(input: {
       subjectType: "heartbeat_run",
       subjectId: input.runId,
       clientLabel: `${input.agent.name} heartbeat run`,
-      ownerNote: `Short-lived runtime MCP token for heartbeat run ${input.runId}.`,
+      ownerNote: `Run-scoped runtime MCP token for heartbeat run ${input.runId}.`,
       allowedActions: ["tools/list", "tools/call"],
-      expiresAt: new Date(Date.now() + 60 * 60 * 1_000),
+      // Long tasks retain their original credential. Terminal revocation and
+      // current run/permission checks still apply; this is only an expiry cap.
+      expiresAt: new Date(Date.now() + 4 * 24 * 60 * 60 * 1_000),
     },
     actor: { agentId: input.agent.id },
   });
@@ -1517,7 +1519,7 @@ export async function createManagedMcpRunConfig(input: {
   if (gateways.length === 0) return null;
 
   const service = createToolGatewayService(input.db);
-  const expiresAt = new Date(Date.now() + 60 * 60 * 1000);
+  const expiresAt = new Date(Date.now() + 4 * 24 * 60 * 60 * 1000);
   const managedGateways: ManagedMcpGatewayRunConfig["gateways"] = [];
   for (const gateway of gateways) {
     const token = await service.createNamedGatewayToken({
@@ -1528,7 +1530,7 @@ export async function createManagedMcpRunConfig(input: {
         subjectType: "heartbeat_run",
         subjectId: input.runId,
         clientLabel: `${input.agent.name} managed local adapter`,
-        ownerNote: `Short-lived Paperclip-managed MCP token for heartbeat run ${input.runId}.`,
+        ownerNote: `Run-scoped Paperclip-managed MCP token for heartbeat run ${input.runId}.`,
         allowedActions: ["tools/list", "tools/call"],
         expiresAt,
       },

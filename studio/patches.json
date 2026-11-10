@@ -4,34 +4,33 @@
     {
       "id": "STUDIO-0001",
       "title": "Keep native MCP access available during long active runs",
-      "status": "proposed",
-      "problem": "On the previously inspected nightly, the automatic heartbeat_run MCP token expires after one hour while the provider can still be working.",
-      "reason": "The earlier public minting API rejects heartbeat_run and adapter access is a frozen credential snapshot; replacement gateway_client or generic sessions do not establish equivalent authority.",
-      "observedOnUpstream": "2026.1104.0-nightly.0",
-      "needsReassessmentOn": "2026.1110.0-nightly.0",
+      "status": "implemented",
+      "problem": "New heartbeat_run MCP tokens expire after one hour even when an authorized run is still working.",
+      "reason": "The installed adapter exposes only an immutable getServers snapshot, and the public mint API rejects heartbeat_run. The operator selected a four-day default in this downstream fork.",
+      "observedOnUpstream": "2026.1110.0-nightly.0",
+      "needsReassessmentOn": null,
       "owner": "Native run preparation and gateway-token lifecycle",
       "paths": [
         "server/src/services/heartbeat/run-preparation.ts",
-        "server/src/services/tool-gateway.ts",
-        "packages/shared/src/validators/tool-access.ts",
-        "packages/adapter-utils/src/types.ts"
+        "server/src/__tests__/heartbeat-runtime-mcp-servers.test.ts",
+        "studio/runtime-mcp-lifetime.test.mjs",
+        "studio/build-runtime-overlay.mjs"
       ],
-      "proposal": "Runtime-owned bounded extension of the same bearer before expiry, only while its run and execution lease are active. Preserve subject, company, agent, gateway/profile, assignments and allowed actions; retain live authorization and atomic terminal revocation.",
+      "proposal": "Issue assigned and managed run MCP gateway tokens with a 96-hour expiry. Preserve all existing per-call checks and terminal revocation. No renewal mechanism or permission expansion.",
       "commits": [],
       "testsRequired": [
-        "Existing client remains authorized across the one-hour boundary without restarting",
-        "Terminal, cancellation and explicit-revocation races cannot extend authority",
-        "Expired or revoked tokens cannot be resurrected",
-        "Cross-run, company and gateway/profile isolation; removed permissions remain removed",
-        "Lost execution lease and renewal failure preserve bounded expiry and recovery evidence"
+        "Both runtime issuing paths use 96 hours and retain authority",
+        "Missing or changed assignments do not mint credentials",
+        "Native terminal revocation remains company/run-scoped",
+        "Gateway authentication refuses revoked credentials"
       ],
-      "validation": "Contract checks on the old nightly only; no implementation or working-renewal acceptance.",
-      "migration": "Undetermined until the new nightly contract is reviewed; do not edit production token rows.",
-      "rollback": "To be specified with the implementation; do not release task reservations or discard collection obligations.",
+      "validation": "Six focused offline source-function tests passed. PostgreSQL integration coverage has been updated but not yet run in this sparse checkout. No live task test has been run.",
+      "migration": "No schema or data migration. Existing credentials retain their stored expiry and revocation.",
+      "rollback": "Activate the retained upstream payload; do not roll back the database or task evidence. Future minting uses upstream expiry; existing tokens still use native revocation.",
       "retireWhen": "An upstream version provides equivalent active-run continuity, authority boundaries and terminal revocation, confirmed by the same regression cases.",
       "upstreamContribution": null,
       "upgradeDecisions": [],
-      "newBaselineObservation": "The installed 2026.1110.0-nightly.0 run-preparation source still creates an automatic token with a one-hour expiry. Full lifecycle and API review is still required before implementation."
+      "newBaselineObservation": "Reviewed the installed run-preparation, adapter interface, gateway routes and public validator on 2026-11-10. getServers has no refresh; public heartbeat_run minting is still rejected."
     },
     {
       "id": "STUDIO-0002",

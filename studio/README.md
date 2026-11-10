@@ -62,10 +62,11 @@ old and new release tags so any future operator can reconstruct the comparison.
 
 ## Initial backlog
 
-`STUDIO-0001` records the long-run MCP token issue and its proposed native owner.
-It must be reassessed against the newly installed nightly before implementation;
-the previous-version diagnosis must not be treated as a finding on newer code.
-No downstream Paperclip runtime correction is included in this bootstrap.
+`STUDIO-0001` implements a four-day default for new run MCP credentials after
+review of the installed nightly's issuing and public API contracts. See
+[runtime-mcp-lifetime.md](runtime-mcp-lifetime.md) for authority, test scope,
+artifact provenance, existing-token behavior and rollback limits. Implementation
+and deployment receipts remain separate claims.
 
 `STUDIO-0002` records a native update health-contract mismatch: an unauthenticated
 probe can receive healthy liveness without the protected version fields, while

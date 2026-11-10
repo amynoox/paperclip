@@ -28,6 +28,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { buildPaperclipRuntimeMcpServers, createManagedMcpRunConfig } from "../services/heartbeat.js";
+import { revokeHeartbeatRunGatewayTokens } from "../services/heartbeat/run-preparation.js";
 import { createToolGatewayService, ToolGatewayHttpError } from "../services/tool-gateway.js";
 
 import { toolAccessService } from "../services/tool-access.js";
@@ -166,8 +167,8 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     for (const token of tokens) {
       expect(token.subjectType).toBe("heartbeat_run");
       expect(token.subjectId).toMatch(/^[0-9a-f-]{36}$/);
-      expect(token.expiresAt!.getTime()).toBeGreaterThanOrEqual(before + 59 * 60 * 1000);
-      expect(token.expiresAt!.getTime()).toBeLessThanOrEqual(Date.now() + 61 * 60 * 1000);
+      expect(token.expiresAt!.getTime()).toBeGreaterThanOrEqual(before + 4 * 24 * 60 * 60 * 1000);
+      expect(token.expiresAt!.getTime()).toBeLessThanOrEqual(Date.now() + 4 * 24 * 60 * 60 * 1000);
     }
     expect(JSON.stringify(tokens)).not.toContain(first[0]!.token);
 
@@ -273,6 +274,20 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
     }
     return seeded;
   }
+
+  it("revokes the four-day token at termination without revoking another run", async () => {
+    const [owner, other] = await seedAssignedAgents(2);
+    const [server] = await buildPaperclipRuntimeMcpServers({ db, agent: owner!.agent, runId: owner!.run.id });
+    const [otherServer] = await buildPaperclipRuntimeMcpServers({ db, agent: other!.agent, runId: other!.run.id });
+    const service = createToolGatewayService(db);
+    const gateways = await db.select().from(toolMcpGateways);
+    const gateway = gateways.find(g => g.agentId === owner!.agent.id)!;
+    const otherGateway = gateways.find(g => g.agentId === other!.agent.id)!;
+    await service.initializeNamedGatewayProtocol({ gatewayId: gateway.id, bearerToken: server!.token });
+    await revokeHeartbeatRunGatewayTokens({ db, companyId: owner!.agent.companyId, runId: owner!.run.id });
+    await expect(service.initializeNamedGatewayProtocol({ gatewayId: gateway.id, bearerToken: server!.token })).rejects.toBeInstanceOf(ToolGatewayHttpError);
+    await expect(service.initializeNamedGatewayProtocol({ gatewayId: otherGateway.id, bearerToken: otherServer!.token })).resolves.toBeDefined();
+  });
 
   it("rejects another agent's run token on a run-scoped gateway", async () => {
     const [owner, other] = await seedAssignedAgents(2);
@@ -799,6 +814,7 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       targetId: agent!.id,
     });
 
+    const before = Date.now();
     const config = await createManagedMcpRunConfig({
       db,
       agent: agent!,
@@ -815,5 +831,8 @@ describeEmbeddedPostgres("heartbeat runtime MCP servers", () => {
       endpointPath: `/mcp/gateways/${gateways[0]!.gatewayPublicId}`,
     });
     expect(config?.gateways.some((gateway) => gateway.id === gateways[1]!.id)).toBe(false);
+    const [token] = await db.select().from(toolMcpGatewayTokens);
+    expect(token!.expiresAt!.getTime()).toBeGreaterThanOrEqual(before + 4 * 24 * 60 * 60 * 1000);
+    expect(token!.expiresAt!.getTime()).toBeLessThanOrEqual(Date.now() + 4 * 24 * 60 * 60 * 1000);
   });
 });
