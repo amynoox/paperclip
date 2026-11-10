@@ -67,8 +67,8 @@
       "id": "STUDIO-0003",
       "title": "Settle notification invocations and scope global plugin jobs",
       "status": "implemented",
-      "problem": "Completed event scopes retain a15-minute denial window; globaljobs receive no nativeinvocation.",
-      "reason": "The host and SDK must agree on lifecycle; pluginconfiguration or SDK-onlyupgrade cannot fix host registration.",
+      "problem": "Completed event scopes retain a 15-minute denial window; global jobs receive no native invocation.",
+      "reason": "The host and SDK must agree on lifecycle; plugin configuration or SDK-only upgrade cannot fix host registration.",
       "observedOnUpstream": "2026.1110.0-nightly.0",
       "owner": "Plugin worker host and SDK invocation lifecycle",
       "paths": [
@@ -96,13 +96,16 @@
         ]
       },
       "customApproval": "2026-11-10: owner explicitly approved notification-only settlement hardening after upstream search and failing adversarial regression.",
-      "commits": [],
+      "commits": [
+        "01c753f1dde1307be55565cfe4a894c36aca84be"
+      ],
       "validation": "14/14 focused local protocol tests pass on source and compiled overlays. Full workspace/DB suites and real workload tests not run. Test and artifact limits are documented.",
       "migration": "No database migration or new permissions. Deploy host and SDK together.",
       "rollback": "Restore the previous managed payload and plugin via native lifecycle only while drained. Verify authenticated health and versions; preserve database and evidence.",
       "retireWhen": "Upstream host and SDK implement equivalent lifecycle and pass the same negative authorization tests.",
       "pullRequest": "https://github.com/amynoox/paperclip/pull/1",
-      "upgradeDecisions": []
+      "upgradeDecisions": [],
+      "releaseTag": "studio/v2026.1110.0-studio.2"
     }
   ]
 }
