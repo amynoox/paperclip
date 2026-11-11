@@ -7,7 +7,9 @@ export function isPreDispatchResourceWait(run: Pick<typeof heartbeatRuns.$inferS
   "runtimeMode" | "status" | "errorCode" | "resultJson">): boolean {
   const evidence = run.resultJson?.executionRecovery as Record<string, unknown> | undefined;
   return run.runtimeMode === "legacy" && run.status === "cancelled" && evidence?.providerWorkStarted === false &&
-    (run.errorCode === "workspace_busy" && evidence.kind === "workspace_wait" ||
+    (run.errorCode === "adapter_interaction_pending" && evidence.kind === "bootstrap" &&
+      (run.resultJson?.adapterInteractionWait as Record<string, unknown> | undefined)?.version === 1 ||
+      run.errorCode === "workspace_busy" && evidence.kind === "workspace_wait" ||
       ["ai_connection_busy", "ai_connection_pool_exhausted", "provider_limit_wait"].includes(run.errorCode ?? "") &&
       evidence.kind === "ai_connection_wait");
 }

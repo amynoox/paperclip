@@ -292,6 +292,22 @@ describeEmbeddedPostgres("question response delivery", () => {
     };
   }
 
+  it("does not call a deferred adapter answer delivered merely because another queued successor exists", async () => {
+    const seeded = await seed({ successorStatus: "queued" });
+    const wakeup = vi.fn().mockImplementation(async () => {
+      await db.insert(agentWakeupRequests).values({ companyId: seeded.companyId, agentId: seeded.agentId,
+        source: "automation", reason: "issue_commented", status: "deferred_issue_execution",
+        idempotencyKey: `question-response:${seeded.interaction.id}`,
+        payload: { issueId: seeded.issueId, interactionId: seeded.interaction.id, interactionStatus: "answered",
+          adapterInteractionWait: { version: 1, kind: "pending_interaction", blockers: [] } } });
+      return null;
+    });
+    const service = questionResponseDeliveryService(db, { heartbeat: { wakeup } as never, steer: vi.fn() });
+    expect(await service.deliver(seeded.interaction.id)).toMatchObject({ status: "fallback_queued", mode: "wake_fallback", targetRunId: null });
+    expect(await service.deliver(seeded.interaction.id)).toMatchObject({ status: "fallback_queued", duplicate: true });
+    expect(wakeup).toHaveBeenCalledTimes(1);
+  });
+
   it("queues an answer to a running successor instead of automatically steering", async () => {
     const seeded = await seed({ successorStatus: "running" });
     const steer = vi.fn().mockResolvedValue({ turnId: "unexpected" });

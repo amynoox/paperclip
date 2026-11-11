@@ -2,6 +2,7 @@ import { agentConfigurationChangeTargetId } from "./change-consent-gate.js";
 import { assertAgentInteraction } from "./agent-interaction-policy.js";
 import { resolveNewTaskParent } from "./issue-hierarchy.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
+import { notifyDeferredExecutionWork } from "./deferred-execution-notifications.js";
 import { notifyMergeConfirmationWork, type MergeConfirmationScope } from "./merged-pr-confirmation-notifications.js";
 import { notifyNativeStatusReassessment } from "./native-status-reassessment-notifications.js";
 import { notifyIssueReviewState } from "./issue-review-state-notifications.js";
@@ -823,6 +824,9 @@ function hydrateInteraction(
 async function touchIssue(db: IssueTouchDb, issueId: string, companyId: string) {
   await db.transaction(async tx => {
     await notifyStatusCardIssueChange(tx, companyId);
+    // Reconsider existing saved inputs (including a co-op sibling). This
+    // does not create a wake for a continuationPolicy=none interaction.
+    await notifyDeferredExecutionWork(tx, { companyId });
     await tx.update(issues).set({ updatedAt: new Date() }).where(eq(issues.id, issueId));
   });
 }

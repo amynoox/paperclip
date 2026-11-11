@@ -819,12 +819,20 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
       .toMatchObject({ status: "deferred_issue_execution", runId: null });
     const [later] = await db.insert(issueComments).values({ companyId: company.id, issueId: issue.id,
       authorType: "user", authorUserId: "operator", body: "Resume the same task", createdAt: new Date(stoppedAt.getTime() + 1000) }).returning();
+    const [adapterWait] = await db.insert(agentWakeupRequests).values({ companyId: company.id, agentId: agent.id,
+      source: "on_demand", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: "user", requestedByActorId: "operator",
+      payload: { ...payload([later.id]), adapterInteractionWait: { version: 1, kind: "pending_interaction", blockers: [] } } }).returning();
     await db.update(agentWakeupRequests).set({ payload: payload([earlier.id, later.id]) }).where(eq(agentWakeupRequests.id, wake.id));
     await control.resumeRemoteStopComments(run);
     expect(deps.enqueueWakeup).toHaveBeenCalledExactlyOnceWith(agent.id, expect.objectContaining({ requestedByActorType: "user",
       requestedByActorId: "operator", queuedCommentRequestId: wake.id,
       payload: expect.objectContaining({ _paperclipWakeContext: expect.objectContaining({ wakeCommentIds: [earlier.id, later.id] }) }),
     }), wake.id);
+    // The adapter admission owner must revalidate its own saved input; generic
+    // post-Stop recovery cannot consume it or bypass its cleanup fence.
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, adapterWait.id)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null, payload: adapterWait.payload });
   });
 
   it.each(["ephemeral", "reuse_by_environment"] as const)("keeps %s cancellation eligible for retention when teardown loses the task lock", async leasePolicy => {
