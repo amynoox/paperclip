@@ -93,6 +93,10 @@ old and new release tags so any future operator can reconstruct the comparison.
 
 ## Initial backlog
 
+`STUDIO-0004` adds bounded native task/document reads and question responses to
+the existing legacy run MCP. See [legacy-run-task-mcp.md](legacy-run-task-mcp.md)
+for upstream provenance, unchanged authority, tests and rollback limits.
+
 `STUDIO-0003` reuses upstream event-settlement and global-job invocation fixes
 with an explicitly approved notification-only guard. See
 [plugin-invocation-scopes.md](plugin-invocation-scopes.md) for source provenance,

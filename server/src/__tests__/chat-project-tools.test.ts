@@ -20,6 +20,33 @@ import { recoveryPostgresSupport as support } from "./helpers/recovery-postgres.
   afterAll(async () => { await server?.close(); if (originalSecret === undefined) delete process.env.PAPERCLIP_AGENT_JWT_SECRET; else process.env.PAPERCLIP_AGENT_JWT_SECRET = originalSecret; });
   const call = (fixture: Awaited<ReturnType<typeof server.fixture>>, tool: string, args: Record<string, unknown>) => fixture.authority.execute({ tool, arguments: args, callId: randomUUID() });
 
+  it("delivers native task and document reads to legacy MCP using only the run identity", async () => {
+    const f = await server.fixture({ conversation: true, disableWakeOnDemand: true });
+    await documentService(server.db).upsertIssueDocument({ issueId: f.issueId, key: "report", format: "markdown", body: "Existing native evidence" });
+    const token = createLocalAgentJwt(f.agentId, f.companyId, "codex_local", f.runId, f.responsibleUserId)!;
+    const originalApiUrl = process.env.PAPERCLIP_API_URL;
+    process.env.PAPERCLIP_API_URL = server.apiUrl;
+    const mcp = async (name: string, args: Record<string, unknown> = {}, credential = token) => {
+      const response = await fetch(`${server.apiUrl}/api/mcp/project-tools`, { method: "POST",
+        headers: { Authorization: `Bearer ${credential}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args } }) });
+      return { status: response.status, body: await response.json() };
+    };
+    try {
+      expect((await mcp("get_task")).body.result.structuredContent.task.id).toBe(f.issueId);
+      expect((await mcp("read_task_document", { key: "report" })).body.result.structuredContent.document.body).toBe("Existing native evidence");
+      expect((await mcp("list_task_documents")).body.result.structuredContent.documents).toEqual(expect.any(Array));
+      expect((await mcp("list_task_interactions")).body.result.structuredContent.interactions).toEqual(expect.any(Array));
+      const other = await server.fixture({ conversation: true, disableWakeOnDemand: true });
+      expect((await mcp("get_task", { taskId: other.issueId })).body.result.isError).toBe(true);
+      await server.db.update(issues).set({ workMode: "ask" }).where(eq(issues.id, f.issueId));
+      expect((await mcp("respond_to_task_interaction", { interactionId: randomUUID(), response: { answers: [] } })).body.result.isError).toBe(true);
+      expect((await mcp("get_task", {}, "invalid-token")).status).not.toBe(200);
+    } finally {
+      if (originalApiUrl === undefined) delete process.env.PAPERCLIP_API_URL; else process.env.PAPERCLIP_API_URL = originalApiUrl;
+    }
+  });
+
   it("gives MCP list_projects rows the company-scoped project page href", async () => {
     const f = await server.fixture({ conversation: true, disableWakeOnDemand: true });
     const [{ issuePrefix }] = await server.db.select({ issuePrefix: companies.issuePrefix }).from(companies).where(eq(companies.id, f.companyId));

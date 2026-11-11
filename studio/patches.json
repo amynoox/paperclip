@@ -106,6 +106,50 @@
       "pullRequest": "https://github.com/amynoox/paperclip/pull/1",
       "upgradeDecisions": [],
       "releaseTag": "studio/v2026.1110.0-studio.2"
+    },
+    {
+      "id": "STUDIO-0004",
+      "title": "Deliver native task reads and question responses through legacy run MCP",
+      "status": "implemented",
+      "problem": "Legacy CLI runs receive project MCP but cannot read task documents or answer native interactions through its catalogue; private API access is correctly denied by the sandbox.",
+      "reason": "Preserve the existing runner, SSH checkout authentication and network policy; deliver only missing bounded native operations.",
+      "observedOnUpstream": "2026.1110.0-nightly.0",
+      "owner": "Managed project MCP transport and native issue routes",
+      "paths": [
+        "server/src/services/run-task-tools.ts",
+        "server/src/services/project-tools.ts",
+        "server/src/routes/project-tools.ts",
+        "server/src/__tests__/chat-project-tools.test.ts",
+        "studio/task-mcp-tests",
+        "studio/build-task-mcp-overlay.mjs"
+      ],
+      "proposal": "Expose five fixed task/document/interaction operations using the authenticated run JWT and native REST validation. Read-only modes cannot respond; human-only interactions remain denied.",
+      "upstreamSearch": {
+        "date": "2026-11-11",
+        "repository": "paperclipai/paperclip",
+        "details": "studio/legacy-run-task-mcp.md",
+        "partialMatch": {
+          "number": 16420,
+          "head": "517636bba8eb462e028a718e50e81fd5d7d9c814",
+          "disposition": "Architectural inspiration only; missing document/response operations and includes unrelated writes."
+        }
+      },
+      "customApproval": "2026-11-11: owner explicitly approved this minimal task/document/interaction transport, local tests and deployment after the completed upstream review.",
+      "commits": [],
+      "testsRequired": [
+        "Native run identity and conversation generation remain required",
+        "Ask and Planning cannot answer interactions",
+        "Native audiences, cross-company and cross-issue authority remain enforced",
+        "Bounded request paths and payloads, no supplied identity",
+        "Cancellation and 60-second deadline, no automatic response retry"
+      ],
+      "validation": "34 focused local HTTP/context/audience tests pass. Native PostgreSQL integration regression added but not executed; no full workspace build or real run. Compiled artifact validation is reported separately.",
+      "migration": "No database migration, new permissions, network exception or adapter-profile change. Preserve STUDIO-0001 and STUDIO-0003.",
+      "rollback": "Restore retained payload only while drained; verify authenticated version and hashes, preserve native answers and evidence.",
+      "retireWhen": "Upstream legacy run MCP supplies the bounded operations with the same native authority and passes the negative regressions.",
+      "pullRequest": "https://github.com/amynoox/paperclip/pull/1",
+      "upgradeDecisions": [],
+      "releaseTag": "studio/v2026.1110.0-studio.3"
     }
   ]
 }
