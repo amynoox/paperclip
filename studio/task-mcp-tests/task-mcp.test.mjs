@@ -9,7 +9,7 @@ import { evaluateIssueThreadInteractionResolverAudience as audience } from './.g
 
 const ids={ task:'11111111-1111-4111-8111-111111111111', interaction:'22222222-2222-4222-8222-222222222222' };
 const actor={ type:'agent',source:'agent_jwt',agentId:'agent-a',companyId:'company-a',runId:'run-a' };
-let mode, generation, runGeneration, active, seen, mutationCount, nativeStatus, nativeCode, nativeDelay, responseClosed, contextCalls, nativeRedirect;
+let mode, generation, runGeneration, active, seen, mutationCount, nativeStatus, nativeCode, nativeDelay, responseClosed, contextCalls, nativeRedirect, contextDelay;
 const issue=()=>({id:ids.task,companyId:'company-a',workMode:mode,conversationAgentId:'agent-a',conversationSessionGeneration:generation});
 const db={select:()=>({from:()=>({where:async()=>[issue()]})})};
 let server, api;
@@ -19,6 +19,7 @@ before(async()=>{
   // guards, native validators, HTTP transport and audience decision are real.
   globalThis.fixtureIdentity=async(_db,binding)=>{
     contextCalls++;
+    if (contextDelay) await new Promise(r=>setTimeout(r,contextDelay));
     if(!active||binding.agentId!==actor.agentId||binding.companyId!==actor.companyId||binding.runId!==actor.runId)throw Error('Inactive or mismatched run');
     return{run:{...binding,id:actor.runId,nativeIssueId:ids.task,responsibleUserId:'user-a',contextSnapshot:{conversationSessionGeneration:runGeneration}}};
   };
@@ -38,7 +39,7 @@ before(async()=>{
   server=app.listen(0,'127.0.0.1');await once(server,'listening');api=`http://127.0.0.1:${server.address().port}`;process.env.PAPERCLIP_API_URL=api;
 });
 after(async()=>{server.closeAllConnections();await new Promise(r=>server.close(r));delete globalThis.fixtureIdentity;delete process.env.PAPERCLIP_API_URL;});
-beforeEach(()=>{mode='standard';generation=1;runGeneration=1;active=true;seen=[];mutationCount=0;nativeStatus=0;nativeCode='';nativeDelay=0;responseClosed=false;contextCalls=0;nativeRedirect=false;});
+beforeEach(()=>{mode='standard';generation=1;runGeneration=1;active=true;seen=[];mutationCount=0;nativeStatus=0;nativeCode='';nativeDelay=0;responseClosed=false;contextCalls=0;nativeRedirect=false;contextDelay=0;});
 const invoke=(name,args={},extra={})=>callRunTaskTool({name,arguments:args,apiUrl:api,token:'fixture-run-token',issueId:ids.task,workMode:mode,...extra});
 const response={answers:[{questionId:'scope',optionIds:['yes'],otherText:null}],summaryMarkdown:'Verified existing fact.'};
 const writeArgs={interactionId:ids.interaction,response};
@@ -99,6 +100,11 @@ test('MCP client disconnect cancels the native request',async()=>{
   nativeDelay=100;const c=new AbortController();const p=fetch(api+'/api/mcp/project-tools',{method:'POST',signal:c.signal,headers:{authorization:'Bearer fixture-run-token','content-type':'application/json'},body:JSON.stringify({method:'tools/call',params:{name:'get_task'}})});
   while(!seen.length)await new Promise(r=>setTimeout(r,2));c.abort();await assert.rejects(p);
   await new Promise(r=>setTimeout(r,20));assert.equal(responseClosed,true);assert.equal(seen.length,1);
+});
+test('disconnect before context resolution sends no native response mutation',async()=>{
+  contextDelay=30;const c=new AbortController();const p=fetch(api+'/api/mcp/project-tools',{method:'POST',signal:c.signal,headers:{authorization:'Bearer fixture-run-token','content-type':'application/json'},body:JSON.stringify({method:'tools/call',params:{name:'respond_to_task_interaction',arguments:writeArgs}})});
+  while(!contextCalls)await new Promise(r=>setTimeout(r,2));c.abort();await assert.rejects(p);
+  await new Promise(r=>setTimeout(r,100));assert.equal(seen.length,0);assert.equal(mutationCount,0);
 });
 test('native HTTP 500 does not replay a response',async()=>{nativeStatus=500;await assert.rejects(invoke('respond_to_task_interaction',writeArgs));assert.equal(seen.length,1);});
 test('60 second production deadline is installed and aborts a stalled request',async()=>{

@@ -24,6 +24,8 @@ export function projectToolRoutes(db: Db) {
     const disconnect = () => { if (!res.writableEnded) abort.abort(); };
     req.once("aborted", disconnect);
     res.once("close", disconnect);
+    // The client can disappear while the initial run context is being resolved.
+    if (req.aborted || res.destroyed) abort.abort();
     try {
       if (!definitions.some(tool => tool.name === params?.name)) throw forbidden("Tool is unavailable in this mode");
       const callContext = isRunTaskWriteTool(params.name)

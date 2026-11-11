@@ -67,10 +67,12 @@ The deployment itself must not answer, wake or test a task.
 ## Local verification and limits
 
 Run `npm ci --ignore-scripts --workspaces=false` and `npm test` in
-`studio/task-mcp-tests`. The 34 focused local cases use real loopback HTTP,
+`studio/task-mcp-tests`. The 35 focused local cases use real loopback HTTP,
 Express, shared validators, the project context guards and native audience
 decision. They exercise cancellation, deadlines, malformed addressing, identity
 injection, redirects, mode/run/generation denial, response refusal and no retry.
+A negative control reproduces a response sent after the caller disconnects
+during initial context resolution; the final route pre-aborts that request.
 Database IO and identity capture are fixture boundaries. Native database
 transactions, authorization middleware and downstream continuation persistence
 are not established by this isolated suite.

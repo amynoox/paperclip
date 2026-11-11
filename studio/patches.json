@@ -135,7 +135,9 @@
         }
       },
       "customApproval": "2026-11-11: owner explicitly approved this minimal task/document/interaction transport, local tests and deployment after the completed upstream review.",
-      "commits": [],
+      "commits": [
+        "41bbe0132ce2b48da0aa742fa0783b2cb0f9ae78"
+      ],
       "testsRequired": [
         "Native run identity and conversation generation remain required",
         "Ask and Planning cannot answer interactions",
@@ -143,7 +145,7 @@
         "Bounded request paths and payloads, no supplied identity",
         "Cancellation and 60-second deadline, no automatic response retry"
       ],
-      "validation": "34 focused local HTTP/context/audience tests pass. Native PostgreSQL integration regression added but not executed; no full workspace build or real run. Compiled artifact validation is reported separately.",
+      "validation": "35 focused local HTTP/context/audience tests pass. Native PostgreSQL integration regression added but not executed; no full workspace build or real run. Compiled artifact validation is reported separately.",
       "migration": "No database migration, new permissions, network exception or adapter-profile change. Preserve STUDIO-0001 and STUDIO-0003.",
       "rollback": "Restore retained payload only while drained; verify authenticated version and hashes, preserve native answers and evidence.",
       "retireWhen": "Upstream legacy run MCP supplies the bounded operations with the same native authority and passes the negative regressions.",
