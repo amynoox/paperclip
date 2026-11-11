@@ -212,7 +212,7 @@ function SortableQueuedMessage({
           </button>
         </span>
       ) : (queue.targetRunId || queue.state === "deferred") && (!queue.targetRunId || queue.protocol === "legacy" || entry.source?.requiresFreshSession ||
-        (queue.steeringDisposition !== "available" && onInterrupt) ? (
+        (queue.protocol !== "adapter_interactive_v1" && queue.steeringDisposition !== "available" && onInterrupt) ? (
         <button
           type="button"
           onClick={onInterrupt}

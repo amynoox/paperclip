@@ -10,6 +10,37 @@ this branch does not prove deployment or application qualification. Deployment
 receipts, backups, machine details and credentials stay in private operations
 storage, outside this public fork.
 
+## Search upstream before changing behavior
+
+The owner authorizes maintenance of this fork independently of upstream review.
+Before each Paperclip behavior change, first isolate the problem and check the
+current pull requests in `paperclipai/paperclip`. Search open and draft PRs as
+well as merged and closed PRs, using the symptoms, errors, affected contracts and
+owning files. Read promising diffs, discussions, tests and dependencies; a matching
+title alone does not establish a solution. Check whether a merged fix is already
+part of our pinned baseline.
+
+Prefer integrating a suitable existing PR into the fork instead of rewriting
+the same fix. Upstream acceptance is not required. Pin the reviewed commit,
+preserve authorship and provenance (for example, `git cherry-pick -x`), review
+conflicts and compatibility, and run the relevant local checks. Reuse does not
+authorize unrelated changes, permission expansion, automatic merges or a
+deployment outside the currently authorized scope.
+
+Only begin a new custom implementation after the problem is isolated, a current
+documented search finds no suitable upstream PR, and the user explicitly approves
+the specific proposed correction. Report partial matches and why they do not
+solve the problem. If the search is unavailable or incomplete, state that gap;
+do not claim that no PR exists or start custom implementation on that basis.
+Refresh the search when resuming a stale investigation before implementation.
+
+For each future patch, record the search date, repository, queries, candidate PR
+URLs and disposition in `patches.json` or its linked design note. For reused work,
+record the source PR, exact commits and any adaptations. For custom work, record
+the isolated cause, absence of a suitable result at that time, and the explicit
+user approval and its scope. Do not invent retrospective search or approval
+evidence for existing patches. This policy was adopted on 2026-11-10.
+
 ## Record every downstream behavior change
 
 Use one reviewable commit or commit group per independent correction. Add its
@@ -62,10 +93,21 @@ old and new release tags so any future operator can reconstruct the comparison.
 
 ## Initial backlog
 
-`STUDIO-0001` records the long-run MCP token issue and its proposed native owner.
-It must be reassessed against the newly installed nightly before implementation;
-the previous-version diagnosis must not be treated as a finding on newer code.
-No downstream Paperclip runtime correction is included in this bootstrap.
+`STUDIO-0004` adds bounded native task/document reads and question responses to
+the existing legacy run MCP. See [legacy-run-task-mcp.md](legacy-run-task-mcp.md)
+for upstream provenance, unchanged authority, tests and rollback limits.
+
+`STUDIO-0003` reuses upstream event-settlement and global-job invocation fixes
+with an explicitly approved notification-only guard. See
+[plugin-invocation-scopes.md](plugin-invocation-scopes.md) for source provenance,
+the security regression, the isolated local suite and the two-module overlay.
+It does not change permissions or provide end-to-end worker qualification.
+
+`STUDIO-0001` implements a four-day default for new run MCP credentials after
+review of the installed nightly's issuing and public API contracts. See
+[runtime-mcp-lifetime.md](runtime-mcp-lifetime.md) for authority, test scope,
+artifact provenance, existing-token behavior and rollback limits. Implementation
+and deployment receipts remain separate claims.
 
 `STUDIO-0002` records a native update health-contract mismatch: an unauthenticated
 probe can receive healthy liveness without the protected version fields, while

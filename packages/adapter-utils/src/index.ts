@@ -12,6 +12,8 @@ export type {
   AdapterRuntimeMcpServer,
   AdapterRuntimeMcpAccess,
   AdapterExecutionContext,
+  AdapterInteractiveControl,
+  CodexPreparedProcessInput,
   AdapterRuntimeToolAccess,
   AdapterRuntimeToolDelivery,
   AdapterEnvironmentCheckLevel,

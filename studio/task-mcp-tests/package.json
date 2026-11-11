@@ -1,0 +1,7 @@
+{
+  "name": "paperclip-studio-task-mcp-regressions",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node build.mjs && node --test task-mcp.test.mjs" },
+  "dependencies": { "esbuild": "0.28.2", "express": "5.1.0", "zod": "4.6.7" }
+}

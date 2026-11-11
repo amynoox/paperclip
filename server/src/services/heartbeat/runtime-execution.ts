@@ -53,6 +53,8 @@ import { isConversation } from "../agent-conversations.js";
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
 import { remoteExecutionHasStopped } from "../remote-execution-termination.js";
 import { registerAdapterExecutionControl } from "../adapter-execution-control.js";
+import { withAdapterInteractiveControl, selectsAdapterInteractiveControl, ADAPTER_STEERING_EVENT } from "../adapter-interactive-control.js";
+import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
 import { resolveManagedOpenAiBilling } from "@paperclipai/adapter-utils";
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { heartbeatRuns, nativeRunFinalizations, workspaceOperations } from "@paperclipai/db";
@@ -861,7 +863,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         await dispatchWithTiming(
           (markDispatchStarted) => {
             input.effects.onLegacyAdapterEntered();
-            return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => adapter.execute({
+            return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => withAdapterInteractiveControl({
               getFreshSessionHandoff,
               agentIdentity,
               observability,
@@ -869,6 +871,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               agent,
               runtime: runtimeForAdapter,
               config: runtimeConfig,
+              ...(runtimeConfig.experimentalLiveSteering === true && !selectsAdapterInteractiveControl(run, runtimeConfig)
+                ? { config: { ...runtimeConfig, experimentalLiveSteering: false } } : {}),
               context: adapterContext,
               executionContinuation: executionContinuation ?? null,
               runtimeCommandSpec:
@@ -942,6 +946,18 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 });
               },
               authToken: authToken ?? undefined,
+            }, execution => adapter.execute(execution), async receipt => {
+              const payload = { protocol: "adapter_interactive_v1", correlationId: receipt.correlationId, turnId: receipt.turnId };
+              const saved = await appendHeartbeatRunEvent(db, {
+                companyId: agent.companyId, runId: run.id, agentId: agent.id,
+                eventType: receipt.phase === "attempt" ? "adapter.steering.attempted" : ADAPTER_STEERING_EVENT,
+                stream: "system", level: "info", payload,
+                nativeSource: { sourceInstanceId: receipt.sourceInstanceId,
+                  sourceEventId: `${receipt.phase === "attempt" ? "adapter-steer-attempt" : "adapter-steer"}:${receipt.correlationId}`, sourceSeq: receipt.sourceSeq,
+                  protocolSchemaVersion: 1, canonicalPayload: payload },
+              });
+              if (receipt.phase === "attempt" && saved.disposition === "duplicate")
+                throw new Error("A durable steering attempt already exists; automatic replay is prohibited");
             }));
           },
         );

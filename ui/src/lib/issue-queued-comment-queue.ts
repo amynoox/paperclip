@@ -101,7 +101,7 @@ export function normalizeIssueQueuedCommentQueue(
     protocol:
       source?.protocol === "paperclip_runner_v1"
         ? "paperclip_runner_v1"
-        : "legacy",
+        : source?.protocol === "adapter_interactive_v1" ? "adapter_interactive_v1" : "legacy",
     steeringDisposition:
       typeof disposition === "string" &&
       STEERING_DISPOSITIONS.has(
@@ -177,7 +177,7 @@ export function mergePendingIssueQueuedComments(params: {
     protocol,
     steeringDisposition:
       (authoritativeOwnsQueue ? params.authoritativeQueue?.steeringDisposition : undefined) ??
-      (protocol === "paperclip_runner_v1" && targetRunId
+      (protocol !== "legacy" && targetRunId
         ? "temporarily_unavailable"
         : "unsupported"),
     entries,

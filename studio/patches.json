@@ -4,34 +4,37 @@
     {
       "id": "STUDIO-0001",
       "title": "Keep native MCP access available during long active runs",
-      "status": "proposed",
-      "problem": "On the previously inspected nightly, the automatic heartbeat_run MCP token expires after one hour while the provider can still be working.",
-      "reason": "The earlier public minting API rejects heartbeat_run and adapter access is a frozen credential snapshot; replacement gateway_client or generic sessions do not establish equivalent authority.",
-      "observedOnUpstream": "2026.1104.0-nightly.0",
-      "needsReassessmentOn": "2026.1110.0-nightly.0",
+      "status": "implemented",
+      "problem": "New heartbeat_run MCP tokens expire after one hour even when an authorized run is still working.",
+      "reason": "The installed adapter exposes only an immutable getServers snapshot, and the public mint API rejects heartbeat_run. The operator selected a four-day default in this downstream fork.",
+      "observedOnUpstream": "2026.1110.0-nightly.0",
+      "needsReassessmentOn": null,
       "owner": "Native run preparation and gateway-token lifecycle",
       "paths": [
         "server/src/services/heartbeat/run-preparation.ts",
-        "server/src/services/tool-gateway.ts",
-        "packages/shared/src/validators/tool-access.ts",
-        "packages/adapter-utils/src/types.ts"
+        "server/src/__tests__/heartbeat-runtime-mcp-servers.test.ts",
+        "studio/runtime-mcp-lifetime.test.mjs",
+        "studio/build-runtime-overlay.mjs"
       ],
-      "proposal": "Runtime-owned bounded extension of the same bearer before expiry, only while its run and execution lease are active. Preserve subject, company, agent, gateway/profile, assignments and allowed actions; retain live authorization and atomic terminal revocation.",
-      "commits": [],
+      "proposal": "Issue assigned and managed run MCP gateway tokens with a 96-hour expiry. Preserve all existing per-call checks and terminal revocation. No renewal mechanism or permission expansion.",
+      "commits": [
+        "8c12f1c70031823308e4b8bcb1ff60de88544f0e"
+      ],
       "testsRequired": [
-        "Existing client remains authorized across the one-hour boundary without restarting",
-        "Terminal, cancellation and explicit-revocation races cannot extend authority",
-        "Expired or revoked tokens cannot be resurrected",
-        "Cross-run, company and gateway/profile isolation; removed permissions remain removed",
-        "Lost execution lease and renewal failure preserve bounded expiry and recovery evidence"
+        "Both runtime issuing paths use 96 hours and retain authority",
+        "Missing or changed assignments do not mint credentials",
+        "Native terminal revocation remains company/run-scoped",
+        "Gateway authentication refuses revoked credentials"
       ],
-      "validation": "Contract checks on the old nightly only; no implementation or working-renewal acceptance.",
-      "migration": "Undetermined until the new nightly contract is reviewed; do not edit production token rows.",
-      "rollback": "To be specified with the implementation; do not release task reservations or discard collection obligations.",
+      "validation": "Six focused offline source-function tests and the same six tests against the generated runtime passed. PostgreSQL integration coverage was updated but not run in the sparse checkout. The deployed runtime hash, exact version and commit were read back through authenticated health. No real task test was run.",
+      "migration": "No schema or data migration. Existing credentials retain their stored expiry and revocation.",
+      "rollback": "Activate the retained upstream payload; do not roll back the database or task evidence. Future minting uses upstream expiry; existing tokens still use native revocation.",
       "retireWhen": "An upstream version provides equivalent active-run continuity, authority boundaries and terminal revocation, confirmed by the same regression cases.",
       "upstreamContribution": null,
       "upgradeDecisions": [],
-      "newBaselineObservation": "The installed 2026.1110.0-nightly.0 run-preparation source still creates an automatic token with a one-hour expiry. Full lifecycle and API review is still required before implementation."
+      "newBaselineObservation": "Reviewed the installed run-preparation, adapter interface, gateway routes and public validator on 2026-11-10. getServers has no refresh; public heartbeat_run minting is still rejected.",
+      "pullRequest": "https://github.com/amynoox/paperclip/pull/1",
+      "releaseTag": "studio/v2026.1110.0-studio.1"
     },
     {
       "id": "STUDIO-0002",
@@ -58,6 +61,138 @@
       "rollback": "No implementation to roll back. Retain previous payload and verified pre-update data backups for operational upgrades.",
       "retireWhen": "Upstream exact-version service verification works for authenticated instances and passes the same isolation and mismatch cases.",
       "upstreamContribution": null,
+      "upgradeDecisions": []
+    },
+    {
+      "id": "STUDIO-0003",
+      "title": "Settle notification invocations and scope global plugin jobs",
+      "status": "implemented",
+      "problem": "Completed event scopes retain a 15-minute denial window; global jobs receive no native invocation.",
+      "reason": "The host and SDK must agree on lifecycle; plugin configuration or SDK-only upgrade cannot fix host registration.",
+      "observedOnUpstream": "2026.1110.0-nightly.0",
+      "owner": "Plugin worker host and SDK invocation lifecycle",
+      "paths": [
+        "server/src/services/plugin-worker-manager.ts",
+        "packages/plugins/sdk/src/worker-rpc-host.ts",
+        "server/src/__tests__/plugin-worker-manager.test.ts",
+        "packages/plugins/sdk/tests/worker-rpc-host.test.ts",
+        "studio/scope-tests",
+        "studio/build-invocation-overlay.mjs"
+      ],
+      "proposal": "Reuse official PR15925 and PR9368 with the explicitly approved host-owned notification-only settlement guard.",
+      "upstreamSearch": {
+        "date": "2026-11-10",
+        "repository": "paperclipai/paperclip",
+        "details": "studio/plugin-invocation-scopes.md",
+        "pullRequests": [
+          {
+            "number": 15925,
+            "head": "59cf44a3ac2a479ef6e9795acd16b8e85954e974"
+          },
+          {
+            "number": 9368,
+            "head": "4558c6fc38cd08b2d977b740ce61aea1d03e7dbb"
+          }
+        ]
+      },
+      "customApproval": "2026-11-10: owner explicitly approved notification-only settlement hardening after upstream search and failing adversarial regression.",
+      "commits": [
+        "01c753f1dde1307be55565cfe4a894c36aca84be"
+      ],
+      "validation": "14/14 focused local protocol tests pass on source and compiled overlays. Full workspace/DB suites and real workload tests not run. Test and artifact limits are documented.",
+      "migration": "No database migration or new permissions. Deploy host and SDK together.",
+      "rollback": "Restore the previous managed payload and plugin via native lifecycle only while drained. Verify authenticated health and versions; preserve database and evidence.",
+      "retireWhen": "Upstream host and SDK implement equivalent lifecycle and pass the same negative authorization tests.",
+      "pullRequest": "https://github.com/amynoox/paperclip/pull/1",
+      "upgradeDecisions": [],
+      "releaseTag": "studio/v2026.1110.0-studio.2"
+    },
+    {
+      "id": "STUDIO-0004",
+      "title": "Deliver native task reads and question responses through legacy run MCP",
+      "status": "implemented",
+      "problem": "Legacy CLI runs receive project MCP but cannot read task documents or answer native interactions through its catalogue; private API access is correctly denied by the sandbox.",
+      "reason": "Preserve the existing runner, SSH checkout authentication and network policy; deliver only missing bounded native operations.",
+      "observedOnUpstream": "2026.1110.0-nightly.0",
+      "owner": "Managed project MCP transport and native issue routes",
+      "paths": [
+        "server/src/services/run-task-tools.ts",
+        "server/src/services/project-tools.ts",
+        "server/src/routes/project-tools.ts",
+        "server/src/__tests__/chat-project-tools.test.ts",
+        "studio/task-mcp-tests",
+        "studio/build-task-mcp-overlay.mjs"
+      ],
+      "proposal": "Expose five fixed task/document/interaction operations using the authenticated run JWT and native REST validation. Read-only modes cannot respond; human-only interactions remain denied.",
+      "upstreamSearch": {
+        "date": "2026-11-11",
+        "repository": "paperclipai/paperclip",
+        "details": "studio/legacy-run-task-mcp.md",
+        "partialMatch": {
+          "number": 16420,
+          "head": "517636bba8eb462e028a718e50e81fd5d7d9c814",
+          "disposition": "Architectural inspiration only; missing document/response operations and includes unrelated writes."
+        }
+      },
+      "customApproval": "2026-11-11: owner explicitly approved this minimal task/document/interaction transport, local tests and deployment after the completed upstream review.",
+      "commits": [
+        "41bbe0132ce2b48da0aa742fa0783b2cb0f9ae78"
+      ],
+      "testsRequired": [
+        "Native run identity and conversation generation remain required",
+        "Ask and Planning cannot answer interactions",
+        "Native audiences, cross-company and cross-issue authority remain enforced",
+        "Bounded request paths and payloads, no supplied identity",
+        "Cancellation and 60-second deadline, no automatic response retry"
+      ],
+      "validation": "35 focused local HTTP/context/audience tests pass. Native PostgreSQL integration regression added but not executed; no full workspace build or real run. Compiled artifact validation is reported separately.",
+      "migration": "No database migration, new permissions, network exception or adapter-profile change. Preserve STUDIO-0001 and STUDIO-0003.",
+      "rollback": "Restore retained payload only while drained; verify authenticated version and hashes, preserve native answers and evidence.",
+      "retireWhen": "Upstream legacy run MCP supplies the bounded operations with the same native authority and passes the negative regressions.",
+      "pullRequest": "https://github.com/amynoox/paperclip/pull/1",
+      "upgradeDecisions": [],
+      "releaseTag": "studio/v2026.1110.0-studio.3"
+    },
+    {
+      "id": "STUDIO-0005",
+      "title": "Prototype host-owned same-turn control for interactive adapters",
+      "status": "implemented-not-deployed",
+      "problem": "The SSH CLI adapter has no same-turn provider control and queued messages cannot be steered into its running turn.",
+      "reason": "A config switch alone cannot add a bidirectional provider session, host-owned acknowledgement or trustworthy remote stop evidence while preserving native preparation and routed resources.",
+      "observedOnUpstream": "2026.1110.0-nightly.0",
+      "owner": "Adapter execution owner, queued-message routes and native Codex prepared process boundary",
+      "paths": [
+        "packages/adapter-utils/src/types.ts",
+        "packages/adapters/codex-local/src/server/execute.ts",
+        "server/src/services/adapter-interactive-control.ts",
+        "server/src/services/heartbeat",
+        "server/src/services/run-identity.ts",
+        "server/src/services/issue-queued-comment-queue.ts",
+        "server/src/routes/issues.ts",
+        "packages/shared/src/types/issue.ts",
+        "ui/src/components/task-chat/TaskChatQueuedMessages.tsx",
+        "ui/src/lib/issue-queued-comment-queue.ts",
+        "studio/steering-tests"
+      ],
+      "proposal": "Opt-in host control with run/company ownership, durable attempt and acknowledgement, phase-spanning deduplication, explicit adapter protocol and preserved native Codex preparation. The companion controlled launcher verifies approved native Codex artifacts and actual provider stop; unsupported or ambiguous ownership still fails closed.",
+      "upstreamSearch": {
+        "date": "2026-11-11",
+        "repository": "paperclipai/paperclip",
+        "details": "studio/interactive-adapter-contract.md",
+        "scope": "16 fully paginated all-state searches, 412 distinct PRs, 21 inspected candidates; no complete compatible solution identified.",
+        "candidates": [
+          { "number": 18856, "head": "53ba0044", "disposition": "Broader native SDK harness contract; not a legacy SSH control hook." },
+          { "number": 18858, "head": "7ea338a6", "disposition": "Broader native harness integration; not reused." },
+          { "number": 15120, "head": "77d46732f7943b3539dbf3d312f3fd3532dfb99c", "disposition": "Linux SSH process-session cleanup; does not prove cross-platform detached provider stop." },
+          { "number": 7686, "disposition": "Closed unmerged legacy app-server proposal without the required steering contract." }
+        ]
+      },
+      "customApproval": "2026-11-11: owner approved the isolated prototype, then completing provider ownership and full local integration, followed by publication/deployment and separately owned targeted real validation. Local build evidence does not itself establish activation or worker acceptance.",
+      "commits": ["5bcba78cd46989df614a492704fb36305659714f", "d513e7d00ac384ddbaadfbb6a19ecc145e3ec3d8"],
+      "validation": "17 original route/boundary regressions, 1 complete native preparation case, 5 actual PostgreSQL/HTTP cases, 7 React/jsdom UI cases and 1 composed HTTP/PG/host/public-adapter/native-preparation/real-Codex local-WSL case pass. Strict TypeScript 7.0.2 targeted semantic check passes. Actual provider stop is verified, not substituted; session setup, admission IPC, projections and SSH wire remain declared local fixtures. Full workspace build and LAN/macOS/Unity/KitWright acceptance remain untested. See studio/interactive-adapter-contract.md for precise limits and preserved initial failures.",
+      "migration": "None. No database, upstream version pin, role, skill, permission or deployed runtime changes.",
+      "rollback": "Before deployment, retain the exact prior payload/UI/install manifest and fresh native backups. Restore through the native install/lifecycle owner only while safely drained; verify authenticated health and protected state. No schema rollback or task reset. See studio/steering-release.md.",
+      "retireWhen": "A qualified upstream or native adapter control and provider owner preserves the same run identity, queue acknowledgement, prepared context and resource/stop guarantees on supported platforms.",
       "upgradeDecisions": []
     }
   ]

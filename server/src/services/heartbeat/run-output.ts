@@ -322,7 +322,7 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
       const eventType = event.eventType.trim();
       // This namespace attests host-owned handoff cleanup. Legacy adapters do
       // not carry nativeSource identities, so they must never author it.
-      if (!eventType || eventType.startsWith("legacy.case_handoff_")) return;
+      if (!eventType || eventType.startsWith("legacy.case_handoff_") || eventType.startsWith("adapter.steering.")) return;
       await appendRunEvent(currentRun, {
         eventType: eventType.slice(0, 120),
         stream: event.stream,
