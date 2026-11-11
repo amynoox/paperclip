@@ -181,19 +181,71 @@
         "details": "studio/interactive-adapter-contract.md",
         "scope": "16 fully paginated all-state searches, 412 distinct PRs, 21 inspected candidates; no complete compatible solution identified.",
         "candidates": [
-          { "number": 18856, "head": "53ba0044", "disposition": "Broader native SDK harness contract; not a legacy SSH control hook." },
-          { "number": 18858, "head": "7ea338a6", "disposition": "Broader native harness integration; not reused." },
-          { "number": 15120, "head": "77d46732f7943b3539dbf3d312f3fd3532dfb99c", "disposition": "Linux SSH process-session cleanup; does not prove cross-platform detached provider stop." },
-          { "number": 7686, "disposition": "Closed unmerged legacy app-server proposal without the required steering contract." }
+          {
+            "number": 18856,
+            "head": "53ba0044",
+            "disposition": "Broader native SDK harness contract; not a legacy SSH control hook."
+          },
+          {
+            "number": 18858,
+            "head": "7ea338a6",
+            "disposition": "Broader native harness integration; not reused."
+          },
+          {
+            "number": 15120,
+            "head": "77d46732f7943b3539dbf3d312f3fd3532dfb99c",
+            "disposition": "Linux SSH process-session cleanup; does not prove cross-platform detached provider stop."
+          },
+          {
+            "number": 7686,
+            "disposition": "Closed unmerged legacy app-server proposal without the required steering contract."
+          }
         ]
       },
       "customApproval": "2026-11-11: owner approved the isolated prototype, then completing provider ownership and full local integration, followed by publication/deployment and separately owned targeted real validation. Local build evidence does not itself establish activation or worker acceptance.",
-      "commits": ["5bcba78cd46989df614a492704fb36305659714f", "d513e7d00ac384ddbaadfbb6a19ecc145e3ec3d8"],
+      "commits": [
+        "5bcba78cd46989df614a492704fb36305659714f",
+        "d513e7d00ac384ddbaadfbb6a19ecc145e3ec3d8"
+      ],
       "validation": "17 original route/boundary regressions, 1 complete native preparation case, 5 actual PostgreSQL/HTTP cases, 7 React/jsdom UI cases and 1 composed HTTP/PG/host/public-adapter/native-preparation/real-Codex local-WSL case pass. Strict TypeScript 7.0.2 targeted semantic check passes. Actual provider stop is verified, not substituted; session setup, admission IPC, projections and SSH wire remain declared local fixtures. Full workspace build and LAN/macOS/Unity/KitWright acceptance remain untested. See studio/interactive-adapter-contract.md for precise limits and preserved initial failures.",
       "migration": "None. No database, upstream version pin, role, skill, permission or deployed runtime changes.",
       "rollback": "Before deployment, retain the exact prior payload/UI/install manifest and fresh native backups. Restore through the native install/lifecycle owner only while safely drained; verify authenticated health and protected state. No schema rollback or task reset. See studio/steering-release.md.",
       "retireWhen": "A qualified upstream or native adapter control and provider owner preserves the same run identity, queue acknowledgement, prepared context and resource/stop guarantees on supported platforms.",
       "upgradeDecisions": []
+    },
+    {
+      "id": "STUDIO-0006",
+      "title": "Verify pending interaction addressee through native claim",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "A native pending interaction addressed to a non-assignee is cancelled by queued ownership validation before the responder starts.",
+      "reason": "The owning native dispatch/claim gate must verify current stored interaction authority; adapter configuration is insufficient.",
+      "observedOnUpstream": "2026.1110.0-nightly.0",
+      "owner": "Run-dispatch and heartbeat queued-run claims",
+      "paths": [
+        "server/src/modules/run-dispatch",
+        "server/src/services/heartbeat/queue.ts",
+        "server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts",
+        "doc/run-log-events.md"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-11",
+        "repository": "paperclipai/paperclip",
+        "details": "studio/interaction-addressee-wakes.md",
+        "selected": {
+          "number": 14378,
+          "head": "e70c3129049d488b8c3eedbbb9dddc837645b34b",
+          "base": "f0006c77838fe2c2294376c38368669eb90b26f2",
+          "disposition": "Reuse eight relevant files; omit unrelated Runner fixture; preserve newer dependency-wake names in mechanical conflict resolution."
+        }
+      },
+      "validation": "70/70 native policy cases pass; old-policy negative control reproduces two failures. Real PostgreSQL18.1 native migrations/transactions:27 targeted cases pass (5 dispatch adapter,22 assembled heartbeat),151 cases intentionally filtered out. Strict TypeScript7.0.2 policy/test check and esbuild0.28.2 four-module compilation pass. Provider execution is a test adapter; no full-server build, live workload, worker test or deployment claimed. See studio/interaction-addressee-wakes.md.",
+      "migration": "None; no role, permission, upstream baseline or schema change.",
+      "rollback": "Restore prior managed payload only while drained; preserve all durable comments, cards, runs and redelivery receipts.",
+      "retireWhen": "Pinned upstream includes equivalent company-scoped addressee verification, locked ordinary/adopted claims and comment preservation with passing regressions.",
+      "upgradeDecisions": [],
+      "commits": [
+        "b8a4956df20fc7245aed294f5ea66a7aa5d7c6a0"
+      ]
     }
   ]
 }
