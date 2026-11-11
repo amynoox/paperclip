@@ -216,7 +216,7 @@
     {
       "id": "STUDIO-0006",
       "title": "Verify pending interaction addressee through native claim",
-      "status": "implemented-locally-validated-not-deployed",
+      "status": "deployed-live-response-pending",
       "problem": "A native pending interaction addressed to a non-assignee is cancelled by queued ownership validation before the responder starts.",
       "reason": "The owning native dispatch/claim gate must verify current stored interaction authority; adapter configuration is insufficient.",
       "observedOnUpstream": "2026.1110.0-nightly.0",
@@ -238,14 +238,21 @@
           "disposition": "Reuse eight relevant files; omit unrelated Runner fixture; preserve newer dependency-wake names in mechanical conflict resolution."
         }
       },
-      "validation": "70/70 native policy cases pass; old-policy negative control reproduces two failures. Real PostgreSQL18.1 native migrations/transactions:27 targeted cases pass (5 dispatch adapter,22 assembled heartbeat),151 cases intentionally filtered out. Strict TypeScript7.0.2 policy/test check and esbuild0.28.2 four-module compilation pass. Provider execution is a test adapter; no full-server build, live workload, worker test or deployment claimed. See studio/interaction-addressee-wakes.md.",
+      "validation": "70/70 native policy cases pass; old-policy negative control reproduces two failures. Real PostgreSQL18.1 native migrations/transactions:27 targeted cases pass (5 dispatch adapter,22 assembled heartbeat),151 cases intentionally filtered out. Strict TypeScript7.0.2 policy/test check and esbuild0.28.2 four-module compilation pass. Provider execution is a test adapter; no full-server build, live workload, worker test claimed. Deployment was verified separately at 2026-11-11T08:01:25Z; named-responder live acceptance remains pending. See studio/interaction-addressee-wakes.md.",
       "migration": "None; no role, permission, upstream baseline or schema change.",
       "rollback": "Restore prior managed payload only while drained; preserve all durable comments, cards, runs and redelivery receipts.",
       "retireWhen": "Pinned upstream includes equivalent company-scoped addressee verification, locked ordinary/adopted claims and comment preservation with passing regressions.",
       "upgradeDecisions": [],
       "commits": [
         "b8a4956df20fc7245aed294f5ea66a7aa5d7c6a0"
-      ]
+      ],
+      "deployment": {
+        "version": "2026.1110.0-studio.5",
+        "sourceCommit": "cb231052e2dbd28de86052538a3d0ed6ed422e6c",
+        "verifiedAt": "2026-11-11T08:01:25Z",
+        "details": "studio/interaction-addressee-wakes.md#deployment-receipt--2026-11-11",
+        "liveResponseValidated": false
+      }
     }
   ]
 }

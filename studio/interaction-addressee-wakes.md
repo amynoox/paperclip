@@ -1,8 +1,9 @@
 # Verified pending-interaction addressee admission
 
 STUDIO-0006 reuses official [Paperclip PR #14378](https://github.com/paperclipai/paperclip/pull/14378)
-on the existing studio.4 source. It is a local integration candidate; it is not a
-deployment or a successful live agent response.
+on the existing studio.4 source. The integration was published as studio.5 on
+2026-11-11. Deployment verification and a live agent response are separate
+acceptance steps; the latter remains pending in the receipt below.
 
 ## Problem and owning boundaries
 
@@ -102,12 +103,47 @@ containing esbuild 0.28.2 and pass a new output directory. It emits
 installed-baseline verification is deliberately false until deployment preparation.
 No SDK, adapter, UI, schema or earlier overlay is rebuilt by this builder.
 
-An eventual release must be compared against
-the installed baseline, with drained native lifecycle, verified backup and
-authenticated readback. Only the authorized validation owner may request a fresh
+Each release must be compared against the installed baseline, with drained
+native task execution, verified backup and authenticated readback. Only the authorized validation owner may request a fresh
 normal delivery; local fixtures do not establish a live response.
 
 Rollback restores the previous managed runtime while drained and preserves the
 database, comments, interaction and run receipts. Retire STUDIO-0006 when the
 pinned upstream includes equivalent verified addressee and locked-claim behavior
 and passes the same negative, race and redelivery regressions.
+
+
+## Deployment receipt — 2026-11-11
+
+Version `2026.1110.0-studio.5`, source
+`cb231052e2dbd28de86052538a3d0ed6ed422e6c`, was verified active at
+**08:01:25 UTC**. The source was reviewed in [downstream PR #2](https://github.com/amynoox/paperclip/pull/2).
+Authenticated health and startup recovery were ready. The four installed modules
+matched the compiled hashes from that committed source. The 70 policy and 27
+PostgreSQL tests above are the **97 local targeted cases**, not live acceptance.
+
+A fresh native database backup was read back in full; its compressed integrity
+and SQL format were checked before stopping the service. No schema migration
+was run. The previous managed installation was retained. UI, SDK, adapter, database
+package and earlier overlay hashes were preserved, including packages used by
+other installed plugins. The router plugin and external adapter remained at
+`0.29.18`. This update did not install or update another plugin.
+
+Configuration, permissions, instructions, skills and pending interactions were
+preserved. The run count was **1,251 before and after**, with **zero new runs**.
+The registry placement revision advanced once during the normal configuration
+replay; the other compared registry fields were preserved. This is not a claim
+that the whole registry was byte-identical.
+
+Five historical SSH cleanup records were preserved. Their associated runs had
+ended successfully, their recorded local transport PIDs were absent, and no
+current task execution or ownership was admitted through this exception. Fresh
+task execution and any new lease still blocked cutover. Background probes alone
+were not treated as active task execution. The update did not clean those records
+or establish that every historical remote process had exited.
+
+Private backups and raw operational receipts remain outside Git. The authorized
+validation owner was notified to check one normal delivery to the named responder.
+That live response was **not yet validated at this publication checkpoint**.
+No wake, provider call, worker test, gameplay result or full autonomous workflow
+acceptance is claimed by this deployment receipt.
