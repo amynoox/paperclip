@@ -378,6 +378,8 @@ const heartbeatRunIssueControlColumns = {
     else null end`,
   runnerProfileJson: sql<Record<string, unknown> | null>`case when jsonb_typeof(${heartbeatRuns.runnerProfileJson}) = 'object'
     then jsonb_build_object('adapterDispatch', jsonb_build_object('adapterType', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->'adapterType'))
+      || case when ${heartbeatRuns.runnerProfileJson}->>'adapterInteractiveProtocol' = 'adapter_interactive_v1'
+        then jsonb_build_object('adapterInteractiveProtocol', 'adapter_interactive_v1') else '{}'::jsonb end
     else null end`,
 } as const;
 

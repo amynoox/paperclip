@@ -1136,7 +1136,7 @@ export interface IssueComment {
   updatedAt: Date;
 }
 
-export type IssueQueuedCommentProtocol = "paperclip_runner_v1" | "legacy";
+export type IssueQueuedCommentProtocol = "paperclip_runner_v1" | "adapter_interactive_v1" | "legacy";
 export type IssueQueuedCommentQueueState = "deferred" | "queued";
 export type IssueQueuedCommentSteeringDisposition =
   | "available"

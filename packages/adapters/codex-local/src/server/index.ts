@@ -1,4 +1,6 @@
 export { execute, ensureCodexSkillsInjected } from "./execute.js";
+/** Opt-in prepared process hook; older hosts must not silently fall back to CLI. */
+export const supportsPreparedInteractiveProcess = true;
 export {
   resolveCodexAuthPrecedence,
   CODEX_SANDBOX_AUTH_PRECEDENCE_WARNING,

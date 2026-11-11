@@ -234,7 +234,35 @@ export interface AgentRuntimeIdentity {
   privateKeyPem: string;
 }
 
+export interface AdapterInteractiveControl {
+  readonly protocol: "adapter_interactive_v1";
+  /** Local provider observation; must not perform I/O or expose message contents. */
+  snapshot(): { activeTurnId: string | null; steering: boolean };
+  steer(input: {
+    expectedTurnId: string;
+    correlationId: string;
+    message: string;
+    signal: AbortSignal;
+  }): Promise<{ turnId: string; correlationId: string }>;
+}
+
+export interface CodexPreparedProcessInput {
+  runId: string;
+  target: Parameters<typeof import("./execution-target.js").runAdapterExecutionTargetProcess>[1];
+  command: string;
+  args: string[];
+  options: import("./execution-target.js").AdapterExecutionTargetProcessOptions;
+  resumeSessionId: string | null;
+  model: string | null;
+}
+
 export interface AdapterExecutionContext {
+  /** Host-scoped opt-in control. Revoked on cancellation/settlement; no stop authority. */
+  registerInteractiveControl?: (control: AdapterInteractiveControl) => () => void;
+  /** Trusted wrapper hook after native Codex preparation. Off by default. */
+  codexPreparedProcess?: (input: CodexPreparedProcessInput) => ReturnType<
+    typeof import("./execution-target.js").runAdapterExecutionTargetProcess
+  >;
   /** Company-owned exporter credentials. Transient; never persist or merge into config. */
   observability?: import("./agent-observability.js").ProviderObservabilityLaunch;
   /** Server-owned credentials. Never persist this object or merge it into config. */

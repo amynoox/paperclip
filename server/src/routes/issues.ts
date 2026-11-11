@@ -73,6 +73,8 @@ import {
   rejectSteeredIdentity,
 } from "../services/run-identity.js";
 import { createHash, randomUUID } from "node:crypto";
+import { AdapterSteeringError, hasAdapterInteractiveControl,
+  getAdapterInteractiveSteeringState, steerAdapterInteractive } from "../services/adapter-interactive-control.js";
 import { Router, type Request, type Response } from "express";
 import multer from "multer";
 import { z } from "zod";
@@ -7699,12 +7701,15 @@ export function issueRoutes(
       activeRun: input.activeRun,
       assignedAgentAdapterType: assignedAgent?.adapterType ?? null,
       queuedCommentCount: comments.length,
+      adapterInteractiveRegistered: Boolean(input.activeRun && hasAdapterInteractiveControl(input.issue.companyId, input.activeRun.id)),
     });
     const steeringDisposition: IssueQueuedCommentQueue["steeringDisposition"] =
       input.issue.conversationAgentId ? "unsupported" : steering.kind !== "probe"
         ? steering.kind
         : input.steeringDisposition
-          ?? (await getNativeSessionSteeringState(steering.steeringRunId)
+          ?? (await (steering.protocol === "adapter_interactive_v1"
+            ? Promise.resolve(getAdapterInteractiveSteeringState(input.issue.companyId, steering.steeringRunId))
+            : getNativeSessionSteeringState(steering.steeringRunId))
             .then((state) => state.disposition)
             .catch(() => "temporarily_unavailable" as const));
     const wait = queueState?.state === "deferred" ? readObject(readObject(wake?.payload).executionWait) : {};
@@ -17884,7 +17889,7 @@ export function issueRoutes(
             queueId: req.body.queueId,
             revision: req.body.revision,
           });
-          if (locked.queue.protocol !== "paperclip_runner_v1") {
+          if (locked.queue.protocol === "legacy") {
             throw conflict("This runner does not support same-turn steering", {
               code: "steering_unsupported",
             });
@@ -17912,7 +17917,8 @@ export function issueRoutes(
             (await storedSteeringAcknowledgement(tx, steeringIdentity ?? {
               companyId: issue.companyId, runId: locked.activeRun.id, messageId: commentId,
             })) ??
-            (await steerNativeSession({
+            (await (locked.queue.protocol === "adapter_interactive_v1" ? steerAdapterInteractive : steerNativeSession)({
+              companyId: issue.companyId,
               runId: locked.activeRun.id,
               message: entry.comment.body,
               correlationId: commentId,
@@ -17989,12 +17995,12 @@ export function issueRoutes(
       } catch (error) {
         const uncertain =
           steeringDeliveryAttempted &&
-          (!(error instanceof NativeSessionSteeringError) ||
-            error.code === "steering_timeout");
+          (error instanceof AdapterSteeringError ? error.deliveryUncertain :
+            !(error instanceof NativeSessionSteeringError) || error.code === "steering_timeout");
         if (steeringIdentity && !uncertain)
           await rejectSteeredIdentity(db, steeringIdentity);
 
-        if (error instanceof NativeSessionSteeringError) {
+        if (error instanceof NativeSessionSteeringError || error instanceof AdapterSteeringError) {
           throw conflict(error.message, { code: error.code, retryable: true });
         }
         throw error;

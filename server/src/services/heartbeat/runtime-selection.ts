@@ -1,4 +1,5 @@
 import { assertPaperclipRunnerBinaryConfiguration } from "../native-runtime/native-codex-runner.js";
+import { selectsAdapterInteractiveControl } from "../adapter-interactive-control.js";
 import { readNativeWorkspaceMigration, migratedNativeExecutionCwd } from "../native-runtime/native-workspace-migration.js";
 import { resolveProviderApiPlacement } from "../native-runtime/provider-api-placement.js";
 import { readClaimedNativeStopRecovery } from "../native-runtime/native-cancellation-request.js";
@@ -1144,7 +1145,10 @@ export async function selectHeartbeatRuntime(db: Db, input: HeartbeatRuntimeSele
                 else '{}'::jsonb end)
               || (case when ${heartbeatRuns.runnerProfileJson} ? 'adapterDispatch'
                 then jsonb_build_object('adapterDispatch', ${heartbeatRuns.runnerProfileJson}->'adapterDispatch')
-                else '{}'::jsonb end) || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,
+                else '{}'::jsonb end)
+              || ${JSON.stringify(selectsAdapterInteractiveControl(run, runtimeConfig)
+                ? { adapterInteractiveProtocol: "adapter_interactive_v1" } : {})}::jsonb
+              || ${JSON.stringify(providerTraceRequested ? { providerTrace: { mode: "raw", traceId: providerTraceCapture?.metadata.id ?? null, maxBytes: PROVIDER_TRACE_MAX_BYTES } } : {})}::jsonb`,
         updatedAt: new Date(),
       })
       .where(eq(heartbeatRuns.id, run.id)));

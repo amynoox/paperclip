@@ -111,13 +111,13 @@ export function withQueuedCommentIdsInRunContext(
   return context;
 }
 
-export type QueuedCommentQueueProtocol = "paperclip_runner_v1" | "legacy";
+export type QueuedCommentQueueProtocol = "paperclip_runner_v1" | "adapter_interactive_v1" | "legacy";
 
 export type QueuedCommentQueueSteeringDecision =
   | { protocol: QueuedCommentQueueProtocol; kind: "unsupported" }
   | { protocol: QueuedCommentQueueProtocol; kind: "temporarily_unavailable" }
   /** Only the caller can probe the live runner. `steeringRunId` names the run to probe. */
-  | { protocol: "paperclip_runner_v1"; kind: "probe"; steeringRunId: string };
+  | { protocol: "paperclip_runner_v1" | "adapter_interactive_v1"; kind: "probe"; steeringRunId: string };
 
 /**
  * Decides the queue protocol and the steering answer for one queued-comment
@@ -141,6 +141,8 @@ export function decideQueuedCommentQueueSteering(facts: {
   activeRun: { id: string; runtimeMode: string | null; runtimeModeResolvedAt?: Date | null; runnerProfileJson?: Record<string, unknown> | null } | null;
   assignedAgentAdapterType: string | null;
   queuedCommentCount: number;
+  /** Host registry observation for this company/run, never an agent config claim. */
+  adapterInteractiveRegistered?: boolean;
 }): QueuedCommentQueueSteeringDecision {
   // The default legacy value is not a selection receipt during preparation.
   // Use the run's immutable dispatch choice, never the agent's mutable settings.
@@ -158,9 +160,11 @@ export function decideQueuedCommentQueueSteering(facts: {
     preparingNative || persistedRuntimeMode === "native"
       || (persistedRuntimeMode === null && facts.assignedAgentAdapterType === "paperclip_runner")
       ? "paperclip_runner_v1"
-      : "legacy";
+      : facts.state === "deferred" && facts.activeRun &&
+        (facts.activeRun.runnerProfileJson?.adapterInteractiveProtocol === "adapter_interactive_v1" || facts.adapterInteractiveRegistered === true)
+        ? "adapter_interactive_v1" : "legacy";
 
-  if (protocol !== "paperclip_runner_v1") {
+  if (protocol === "legacy") {
     return { protocol, kind: "unsupported" };
   }
 

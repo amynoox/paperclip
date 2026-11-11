@@ -152,6 +152,48 @@
       "pullRequest": "https://github.com/amynoox/paperclip/pull/1",
       "upgradeDecisions": [],
       "releaseTag": "studio/v2026.1110.0-studio.3"
+    },
+    {
+      "id": "STUDIO-0005",
+      "title": "Prototype host-owned same-turn control for interactive adapters",
+      "status": "prototype-local-not-deployed",
+      "problem": "The SSH CLI adapter has no same-turn provider control and queued messages cannot be steered into its running turn.",
+      "reason": "A config switch alone cannot add a bidirectional provider session, host-owned acknowledgement or trustworthy remote stop evidence while preserving native preparation and routed resources.",
+      "observedOnUpstream": "2026.1110.0-nightly.0",
+      "owner": "Adapter execution owner, queued-message routes and native Codex prepared process boundary",
+      "paths": [
+        "packages/adapter-utils/src/types.ts",
+        "packages/adapters/codex-local/src/server/execute.ts",
+        "server/src/services/adapter-interactive-control.ts",
+        "server/src/services/heartbeat",
+        "server/src/services/run-identity.ts",
+        "server/src/services/issue-queued-comment-queue.ts",
+        "server/src/routes/issues.ts",
+        "packages/shared/src/types/issue.ts",
+        "ui/src/components/task-chat/TaskChatQueuedMessages.tsx",
+        "ui/src/lib/issue-queued-comment-queue.ts",
+        "studio/steering-tests"
+      ],
+      "proposal": "Opt-in host control with run/company ownership, durable attempt and acknowledgement, phase-spanning deduplication, explicit adapter protocol and preserved native Codex preparation. The companion public SSH wrapper remains blocked before claim/spawn until trustworthy provider ownership is available.",
+      "upstreamSearch": {
+        "date": "2026-11-11",
+        "repository": "paperclipai/paperclip",
+        "details": "studio/interactive-adapter-contract.md",
+        "scope": "16 fully paginated all-state searches, 412 distinct PRs, 21 inspected candidates; no complete compatible solution identified.",
+        "candidates": [
+          { "number": 18856, "head": "53ba0044", "disposition": "Broader native SDK harness contract; not a legacy SSH control hook." },
+          { "number": 18858, "head": "7ea338a6", "disposition": "Broader native harness integration; not reused." },
+          { "number": 15120, "head": "77d46732f7943b3539dbf3d312f3fd3532dfb99c", "disposition": "Linux SSH process-session cleanup; does not prove cross-platform detached provider stop." },
+          { "number": 7686, "disposition": "Closed unmerged legacy app-server proposal without the required steering contract." }
+        ]
+      },
+      "customApproval": "2026-11-11: owner explicitly approved implementation and local fixture tests of this isolated prototype only; no deployment, active configuration change or publication.",
+      "commits": [],
+      "validation": "17 local route/boundary tests pass; strict TypeScript 7.0.2 targeted semantic check and changed-owner syntax compilation pass. Independent host fixture review has 6 passing cases. Full server/UI/workspace build, PostgreSQL, real provider, SSH/platform and LAN acceptance remain untested. Public companion wrapper is intentionally non-activable; a detached-provider negative reproduction disproved launcher-only stop proof.",
+      "migration": "None. No database, upstream version pin, role, skill, permission or deployed runtime changes.",
+      "rollback": "Discard the isolated local prototype branch. No production state was modified. No activation is permitted merely because local fixtures pass.",
+      "retireWhen": "A qualified upstream or native adapter control and provider owner preserves the same run identity, queue acknowledgement, prepared context and resource/stop guarantees on supported platforms.",
+      "upgradeDecisions": []
     }
   ]
 }

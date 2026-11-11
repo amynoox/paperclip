@@ -1,5 +1,5 @@
 import { readTaskRetryIntent, readTaskRetryBoardMessageOrigin } from "./task-retry.js";
-import { and, asc, desc, eq, getTableColumns, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, getTableColumns, inArray, or, sql } from "drizzle-orm";
 import {
   agentWakeupRequests,
   heartbeatRuns,
@@ -635,7 +635,7 @@ export async function reconcileSteeredIdentity(
   });
 }
 
-/** Only events validated and persisted by the native control-plane transport count. */
+/** Only receipts validated and persisted by host-owned control-plane transports count. */
 export async function storedSteeringAcknowledgement(
   executor: Pick<Db, "select">,
   context: Pick<RunIdentityContext, "companyId" | "runId" | "messageId">,
@@ -648,13 +648,21 @@ export async function storedSteeringAcknowledgement(
       and(
         eq(heartbeatRunEvents.companyId, context.companyId),
         eq(heartbeatRunEvents.runId, context.runId),
-        eq(heartbeatRunEvents.eventType, "item.completed"),
         sql`${heartbeatRunEvents.sourceEventId} is not null`,
-        sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'steering_acknowledgement'`,
-        sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' like ${`%:steer:${context.messageId}`}`,
+        or(and(
+          eq(heartbeatRunEvents.eventType, "item.completed"),
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->'payload'->>'kind' = 'steering_acknowledgement'`,
+          sql`${heartbeatRunEvents.payload}->'prpEvent'->>'itemId' like ${`%:steer:${context.messageId}`}`,
+        ), and(
+          eq(heartbeatRunEvents.eventType, "adapter.steering.acknowledged"),
+          eq(heartbeatRunEvents.sourceEventId, `adapter-steer:${context.messageId}`),
+          sql`${heartbeatRunEvents.payload}->>'protocol' = 'adapter_interactive_v1'`,
+          sql`${heartbeatRunEvents.payload}->>'correlationId' = ${context.messageId}`,
+        )),
       ),
     )
     .limit(1);
-  const event = receipt?.payload?.prpEvent as { turnId?: string } | undefined;
+  const event = (receipt?.payload?.protocol === "adapter_interactive_v1"
+    ? receipt.payload : receipt?.payload?.prpEvent) as { turnId?: string } | undefined;
   return typeof event?.turnId === "string" ? { turnId: event.turnId } : null;
 }

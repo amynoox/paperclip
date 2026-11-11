@@ -577,6 +577,8 @@ export async function ensureCodexSkillsInjected(
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
+  // A transport return is not proof that a remote interactive provider stopped.
+  let interactiveInvocationPending = false;
   const engineSelection = await resolveCodexExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
     return {
@@ -1327,7 +1329,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const resolvedMonitorTimeoutMs = monitorResolution.mode === "disabled" ? null : monitorResolution.timeoutMs;
 
       const monitor =
-        monitorResolution.mode === "disabled"
+        monitorResolution.mode === "disabled" || ctx.codexPreparedProcess
           ? null
           : createCodexOutputInactivityMonitor({
               timeoutMs: monitorResolution.timeoutMs,
@@ -1391,8 +1393,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         return { usage: parsed.usageReported ? parsed.usage : undefined, costStatus: parsed.usageComplete ? undefined : "unpriced", usageBasis: "per_run", provider: "openai", biller, billingType, model, pricingContext, costUsd: null, complete: parsed.usageComplete };
       });
       try {
-        const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
-          onProcessStopped: providerStop.beginInvocation(),
+        const processStopped = providerStop.beginInvocation();
+        const processOptions = {
+          onProcessStopped: () => { processStopped(); interactiveInvocationPending = false; },
           cwd,
           env,
           stdin: prompt,
@@ -1400,7 +1403,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           graceSec,
           onSpawn: wrappedOnSpawn,
           onRuntimeProgress: ctx.onRuntimeProgress,
-          onLog: async (stream, chunk) => {
+          onLog: async (stream: "stdout" | "stderr", chunk: string) => {
             monitor?.noteOutputChunk(stream, chunk);
             if (stream === "stdout") {
               await accountingLog(stream, chunk);
@@ -1413,7 +1416,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           runLogTail: paperclipBridge?.runLogTail,
           settleRunDisposition: paperclipBridge?.settleRunDisposition,
           localProcessSandbox,
-        });
+        };
+        if (ctx.codexPreparedProcess && (ctx.config.experimentalLiveSteering !== true || !ctx.registerInteractiveControl)) {
+          throw new Error("Prepared interactive process requires host opt-in and live control ownership");
+        }
+        if (ctx.codexPreparedProcess) interactiveInvocationPending = true;
+        const proc = ctx.codexPreparedProcess
+          ? await ctx.codexPreparedProcess({ runId, target: runtimeExecutionTarget, command, args,
+              options: processOptions, resumeSessionId: resumeSessionId ?? null, model: model ?? null })
+          : await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, processOptions);
         await accountingLog.flush();
         const cleanedStderr = stripCodexRolloutNoise(proc.stderr);
         return {
@@ -1641,7 +1652,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     try {
       const initial = await runAttempt(sessionId);
       if (
-        sessionId &&
+        !ctx.codexPreparedProcess && sessionId &&
         !initial.proc.timedOut &&
         !initial.proc.signal &&
         // A started session can emit stale-rollout warnings for other threads.
@@ -1674,10 +1685,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       try {
         await providerStop.collectBeforeRestore();
       } finally {
-        if (paperclipBridge) {
+        if (paperclipBridge && !interactiveInvocationPending) {
           await paperclipBridge.stop();
         }
-        if (restoreRemoteWorkspace) {
+        if (restoreRemoteWorkspace && !interactiveInvocationPending) {
           try {
             await onLog(
               "stdout",
@@ -1702,10 +1713,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
     }
   } finally {
-    // Remove the staged CODEX_HOME allowlist temp dir on every exit path
-    // (teardown AND error), never only the happy path. Cleanup failure is
-    // logged, not fatal — a leaked temp dir must not crash the run.
-    if (stagedCodexHomeDir) {
+    // Remove the staged CODEX_HOME on verified exit paths, including failures.
+    // An interactive provider with uncertain termination may still use this
+    // context: preserve it until its owner can prove shutdown. Cleanup failure
+    // is logged, not fatal - a leaked temp dir must not crash the run.
+    if (stagedCodexHomeDir && !interactiveInvocationPending) {
       await fs.rm(stagedCodexHomeDir, { recursive: true, force: true }).catch(async (error) => {
         await onLog(
           "stderr",
@@ -1723,7 +1735,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // If the process dies before reaching this, the next
     // prepareCodexRuntimeConfig restores the original from the pre-run backup
     // written at prepare time.
-    await observabilityProfile?.cleanup();
-    await preparedRuntimeConfig.cleanup();
+    if (!interactiveInvocationPending) {
+      await observabilityProfile?.cleanup();
+      await preparedRuntimeConfig.cleanup();
+    }
   }
 }
