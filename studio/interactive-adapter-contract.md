@@ -1,7 +1,7 @@
 # Interactive adapter prototype contract
 
-Local prototype only, based on `7ca4f1808`. No deployment or active configuration
-change is authorized by this artifact. `experimentalLiveSteering === true` is
+Release candidate based on `7ca4f1808`. Build evidence is separate from deployment
+or active configuration receipts. `experimentalLiveSteering === true` is
 required in the admitted execution configuration; absent/false preserves CLI.
 The companion SSH wrapper now provides a bounded provider owner for the approved
 native Codex 0.166.0 artifacts. The complete local steering path has been exercised
@@ -183,8 +183,8 @@ path on Windows (native SQLite lock files do not tolerate every long path).
 The local WSL facade launches its shell with `nohup` to avoid a fixture-only
 SIGHUP race when `wsl.exe` exits; it does not edit the native SSH payload.
 
-No release/version pin was changed and no deployment or publication was made.
-Discarding the local prototype branch leaves the deployed system unchanged.
+The upstream version pin is unchanged. Publication/activation are tracked
+separately under the owner's deployment mandate; see [steering-release.md](steering-release.md).
 Local provider ownership and full steering integration are now demonstrated for
 the stated artifacts and fixtures. Before production adoption, qualify the
 existing worker transports and contexts in the approved Windows/macOS pilot.

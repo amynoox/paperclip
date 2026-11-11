@@ -156,7 +156,7 @@
     {
       "id": "STUDIO-0005",
       "title": "Prototype host-owned same-turn control for interactive adapters",
-      "status": "prototype-local-not-deployed",
+      "status": "implemented-not-deployed",
       "problem": "The SSH CLI adapter has no same-turn provider control and queued messages cannot be steered into its running turn.",
       "reason": "A config switch alone cannot add a bidirectional provider session, host-owned acknowledgement or trustworthy remote stop evidence while preserving native preparation and routed resources.",
       "observedOnUpstream": "2026.1110.0-nightly.0",
@@ -187,11 +187,11 @@
           { "number": 7686, "disposition": "Closed unmerged legacy app-server proposal without the required steering contract." }
         ]
       },
-      "customApproval": "2026-11-11: owner approved the isolated prototype, then explicitly approved completing provider ownership and full local integration. No deployment, active configuration change, publication or LAN acceptance test is authorized by this artifact.",
-      "commits": ["5bcba78cd46989df614a492704fb36305659714f"],
+      "customApproval": "2026-11-11: owner approved the isolated prototype, then completing provider ownership and full local integration, followed by publication/deployment and separately owned targeted real validation. Local build evidence does not itself establish activation or worker acceptance.",
+      "commits": ["5bcba78cd46989df614a492704fb36305659714f", "d513e7d00ac384ddbaadfbb6a19ecc145e3ec3d8"],
       "validation": "17 original route/boundary regressions, 1 complete native preparation case, 5 actual PostgreSQL/HTTP cases, 7 React/jsdom UI cases and 1 composed HTTP/PG/host/public-adapter/native-preparation/real-Codex local-WSL case pass. Strict TypeScript 7.0.2 targeted semantic check passes. Actual provider stop is verified, not substituted; session setup, admission IPC, projections and SSH wire remain declared local fixtures. Full workspace build and LAN/macOS/Unity/KitWright acceptance remain untested. See studio/interactive-adapter-contract.md for precise limits and preserved initial failures.",
       "migration": "None. No database, upstream version pin, role, skill, permission or deployed runtime changes.",
-      "rollback": "Discard the isolated local prototype branch. No production state was modified. No activation is permitted merely because local fixtures pass.",
+      "rollback": "Before deployment, retain the exact prior payload/UI/install manifest and fresh native backups. Restore through the native install/lifecycle owner only while safely drained; verify authenticated health and protected state. No schema rollback or task reset. See studio/steering-release.md.",
       "retireWhen": "A qualified upstream or native adapter control and provider owner preserves the same run identity, queue acknowledgement, prepared context and resource/stop guarantees on supported platforms.",
       "upgradeDecisions": []
     }
