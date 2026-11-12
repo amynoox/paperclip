@@ -281,7 +281,7 @@
       "retireWhen": "Pinned upstream or native adapter admission preserves pending routed inputs through promotion and dispatch, without blocking authorized responders or cleanup, and passes the same race, identity and delivery regressions.",
       "commits": [
         "ac0a37a40d7389a2e15dfe0de6f198b0e0018d4e (original, local Codex workspace)",
-        "2c821ab7f (this fork branch)"
+        "c9a026fb2 (this fork branch)"
       ],
       "upgradeDecisions": []
     },
