@@ -1644,6 +1644,100 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(countExecuteCallsForRun(delivered.runId!)).toBe(1);
     });
 
+    // End-to-end replays of 12 Nov production: the asker's real run holds the
+    // task while it asks, the wakes go through the same `wakeup` call as the
+    // interaction route, and the asker's own run end drives the release.
+    async function replayAskerTurn(input: { blockedByDependency?: boolean } = {}) {
+      const { companyId, agentId: askerId } = await seedCompanyAndAgent({ agentName: "Asker" });
+      const responders: string[] = [];
+      for (const name of ["Infra responder", "Quality responder"]) {
+        const [agent] = await db.insert(agents).values({ companyId, name, role: "engineer", status: "active",
+          adapterType: "codex_local", adapterConfig: {},
+          runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {} }).returning();
+        responders.push(agent.id);
+      }
+      const [infraId, qualityId] = responders;
+      const issueId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId, title: "Asker task", status: "in_progress",
+        priority: "medium", assigneeAgentId: askerId });
+      const asker = await seedQueuedRun({ companyId, agentId: askerId, issueId, wakeReason: "issue_assigned",
+        invocationSource: "assignment" });
+      const entered = Promise.withResolvers<void>();
+      const finish = Promise.withResolvers<void>();
+      mockAdapterExecute.mockImplementation(async (context: AdapterExecutionContext) => {
+        if (context.agent.id === askerId) { entered.resolve(); await finish.promise; }
+        return { exitCode: 0, signal: null, timedOut: false, errorMessage: null, summary: "Replay turn.",
+          provider: "test", model: "test-model" };
+      });
+      await heartbeat.resumeQueuedRuns();
+      await entered.promise;
+      expect((await db.select().from(issues).where(eq(issues.id, issueId)))[0]?.executionRunId).toBe(asker.runId);
+      if (input.blockedByDependency) await blockOnUnresolvedChild(companyId, issueId);
+
+      async function ask(addresseeAgentId: string) {
+        const [card] = await db.insert(issueThreadInteractions).values({ companyId, issueId,
+          kind: "request_confirmation", status: "pending", continuationPolicy: "wake_assignee",
+          requestedResolverPolicy: "not_creator", effectiveResolverPolicy: "not_creator",
+          title: "Question for another role", createdByAgentId: askerId, addresseeAgentId,
+          sourceRunId: asker.runId, payload: { version: 1, prompt: "Which disposition applies?" } }).returning();
+        // Same call as the interaction route (routes/issues.ts, interaction creation).
+        await heartbeat.wakeup(addresseeAgentId, {
+          source: "automation", triggerDetail: "system", reason: "interaction_pending",
+          payload: { issueId, interactionId: card.id, interactionKind: card.kind, sourceCommentId: null,
+            sourceRunId: asker.runId, mutation: "interaction" },
+          idempotencyKey: `interaction-pending:${card.id}`,
+          requestedByActorType: "agent", requestedByActorId: askerId,
+          contextSnapshot: { issueId, taskId: issueId, interactionId: card.id, interactionKind: card.kind,
+            sourceCommentId: null, sourceRunId: asker.runId, wakeReason: "interaction_pending",
+            source: "issue.interaction.created" },
+        });
+        return card.id;
+      }
+      const responderExecutions = (agentId: string) => mockAdapterExecute.mock.calls
+        .filter(([context]) => context?.agent.id === agentId)
+        .map(([context]) => (context.context as { interactionId?: string }).interactionId);
+      async function endAskerTurn() {
+        finish.resolve();
+        await heartbeat.waitForRunExecutionDrain(asker.runId);
+      }
+      return { companyId, askerId, infraId, qualityId, issueId, asker, ask, endAskerTurn, responderExecutions };
+    }
+
+    it("replays TR-522: a question redirected within a second reaches its new responder when the asker's turn ends", async () => {
+      const { infraId, qualityId, ask, endAskerTurn, responderExecutions } = await replayAskerTurn();
+      const firstCard = await ask(infraId);
+      // The asker supersedes its question to Infra with one to Quality.
+      await db.update(issueThreadInteractions).set({ status: "expired", resolvedAt: new Date(), updatedAt: new Date(),
+        result: { version: 1, outcome: "superseded_by_newer_request" } }).where(eq(issueThreadInteractions.id, firstCard));
+      const currentCard = await ask(qualityId);
+      // Both wakes wait behind the asker's running turn: no responder run yet.
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, qualityId))).toHaveLength(0);
+
+      await endAskerTurn();
+
+      expect(await waitForCondition(async () => {
+        await heartbeat.resumeQueuedRuns();
+        return responderExecutions(qualityId).length > 0;
+      }, 15_000)).toBe(true);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect(responderExecutions(qualityId)).toEqual([currentCard]);
+      expect(responderExecutions(infraId)).toEqual([]);
+    });
+
+    it("replays TR-518: a question asked from a task blocked by a dependency reaches its responder", async () => {
+      const { infraId, ask, endAskerTurn, responderExecutions } = await replayAskerTurn({ blockedByDependency: true });
+      const card = await ask(infraId);
+
+      await endAskerTurn();
+
+      expect(await waitForCondition(async () => {
+        await heartbeat.resumeQueuedRuns();
+        return responderExecutions(infraId).length > 0;
+      }, 15_000)).toBe(true);
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect(responderExecutions(infraId)).toEqual([card]);
+    });
+
     it("leaves a parked question alone once its card is no longer pending", async () => {
       const { parkedWakeId, addresseeAgentId } = await seedParkedQuestion("accepted");
 
