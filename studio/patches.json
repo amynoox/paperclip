@@ -246,6 +246,50 @@
       "commits": [
         "b8a4956df20fc7245aed294f5ea66a7aa5d7c6a0"
       ]
+    },
+    {
+      "id": "STUDIO-0008",
+      "title": "Handle SSH child stdin errors so a lost link cannot crash the server",
+      "status": "deployed-2026.1110.0-studio.5.1",
+      "problem": "On 2026-11-11 11:52 UTC the server exited on an unhandled 'write EPIPE': a large sandbox callback bridge response was piped to ssh stdin while the link to a LAN worker froze; ssh was killed by the timeout and the remaining write failed with no error listener (packages/adapter-utils/src/ssh.ts spawnText, child.stdin.end).",
+      "reason": "The SSH runner owns child stdin; the local runner already ignores EPIPE since upstream #14057. Three directory transfer paths had the same defect.",
+      "observedOnUpstream": "2026.1110.0 (master still unprotected on 2026-11-11)",
+      "owner": "adapter-utils SSH command runner and workspace transfers",
+      "paths": [
+        "packages/adapter-utils/src/ssh.ts",
+        "packages/adapter-utils/src/ssh-command-stdin-epipe.test.ts",
+        "packages/adapter-utils/src/ssh-stdin-epipe.test.ts",
+        "packages/adapter-utils/src/ssh-command-stdin-lost-link.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-11",
+        "repository": "paperclipai/paperclip",
+        "details": "Ranchers_Claude drafts/plantage-epipe/rapport.md section 4",
+        "selected": [
+          {
+            "number": 20318,
+            "head": "48fb56b17cc21daf3334bc90786d79a6c87f336b",
+            "disposition": "Reused as is (spawnText stdin error listener)."
+          },
+          {
+            "number": 13383,
+            "head": "7b56737f417388b4ad2144ce09157b2b0818039c",
+            "disposition": "Reused as is (directory transfer EPIPE guards and tests)."
+          }
+        ]
+      },
+      "validation": "Linux, Node 24.22.2: adapter-utils targeted SSH, bridge and stdin-race files 185 passed, 0 failed (6 unhandled EPIPE exceptions and 6 failures without the fix); tsc --noEmit 0 errors; rebuilt dist/ssh.js byte-identical to the deployed artifact.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to 2026.1110.0-studio.5 (kept intact).",
+      "retireWhen": "Pinned upstream contains #20318 and #13383 or equivalent stdin error handling on every SSH child.",
+      "upgradeDecisions": [],
+      "commits": [
+        "4684410f2",
+        "a9da0694e",
+        "6489fdd66",
+        "31c5e3203",
+        "8b5c45e6e"
+      ]
     }
   ]
 }
