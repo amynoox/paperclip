@@ -26,6 +26,7 @@ import {
   resolveAdapterExecutionTargetCommandForLogs,
   runAdapterExecutionTargetProcess,
   startAdapterExecutionTargetPaperclipBridge,
+  type AdapterExecutionTargetProcessOptions,
 } from "@paperclipai/adapter-utils/execution-target";
 import {
   asString,
@@ -1021,7 +1022,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           usageByModel: claudeModelReceipts(parsed.resultJson?.modelUsage), complete: parsed.resultJson !== null };
     });
     const processStopped = providerStop.beginInvocation();
-    const processOptions = {
+    const processOptions: AdapterExecutionTargetProcessOptions = {
       onProcessStopped: () => { processStopped(); interactiveInvocationPending = false; },
       cwd,
       env,
