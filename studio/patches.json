@@ -397,6 +397,36 @@
         "fa3dadce5",
         "643fa60dd"
       ]
+    },
+    {
+      "id": "STUDIO-0011",
+      "title": "Prepared interactive process hook for the Claude CLI engine (live steering)",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Live steering (adapter_interactive_v1, STUDIO-0005) exists only for codex_local; the routed Claude engine has no prepared-process boundary, so a steering message on a claude_local run stays queued until the next turn.",
+      "reason": "The host steering registry, queue, route, receipts and UI are engine independent; only the native adapter owns its fully prepared launch.",
+      "observedOnUpstream": "2026.1110.0 (paperclipai/paperclip#19970 keeps Claude on the queue)",
+      "owner": "adapter-claude-local server execute and adapter-utils context types",
+      "paths": [
+        "packages/adapter-utils/src/types.ts",
+        "packages/adapter-utils/src/index.ts",
+        "packages/adapters/claude-local/src/server/index.ts",
+        "packages/adapters/claude-local/src/server/execute.ts",
+        "packages/adapters/claude-local/src/server/execute.prepared-process.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-12",
+        "repository": "paperclipai/paperclip",
+        "details": "No PR gives live steering to claude_local; closest is closed #951 (stream-json comment injection without acknowledgement or stop proof). Studio workspace: drafts/routeur-deux-moteurs/amont/besoin-fork-pilotage-claude.md.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2: 8 new cases mirroring the codexPreparedProcess boundary pass (no hook keeps native launch and cleanup; the hook receives the unchanged launch including resume, model, stdin, env, terminalResultCleanup; cleanup only after the provider stop proof; failure or unproven success keeps bridge and remote workspace; missing opt-in or owner refuses before launch; no fresh-session retry while the hook owns the process). Open point: parse.ts keeps the last result event; summing per-message results waits for a real-binary trial.",
+      "migration": "None; experimentalLiveSteering stays false by default.",
+      "rollback": "Switch cli/current back to the previous install folder; the router refuses Claude live steering when supportsPreparedInteractiveProcess is absent.",
+      "retireWhen": "Pinned upstream offers a compatible prepared-process or steering contract for claude_local.",
+      "upgradeDecisions": [],
+      "commits": [
+        "887668cbf"
+      ]
     }
   ]
 }

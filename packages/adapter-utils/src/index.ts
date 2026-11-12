@@ -15,6 +15,7 @@ export type {
   AdapterExecutionContext,
   AdapterInteractiveControl,
   CodexPreparedProcessInput,
+  ClaudePreparedProcessInput,
   AdapterRuntimeToolAccess,
   AdapterRuntimeToolDelivery,
   AdapterEnvironmentCheckLevel,

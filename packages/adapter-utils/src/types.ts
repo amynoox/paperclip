@@ -260,12 +260,19 @@ export interface CodexPreparedProcessInput {
   model: string | null;
 }
 
+/** Same prepared-process boundary for the native Claude CLI engine. */
+export type ClaudePreparedProcessInput = CodexPreparedProcessInput;
+
 export interface AdapterExecutionContext {
   taskAdmissionWaitVersion?: 1;
   /** Host-scoped opt-in control. Revoked on cancellation/settlement; no stop authority. */
   registerInteractiveControl?: (control: AdapterInteractiveControl) => () => void;
   /** Trusted wrapper hook after native Codex preparation. Off by default. */
   codexPreparedProcess?: (input: CodexPreparedProcessInput) => ReturnType<
+    typeof import("./execution-target.js").runAdapterExecutionTargetProcess
+  >;
+  /** Trusted wrapper hook after native Claude CLI preparation. Off by default. */
+  claudePreparedProcess?: (input: ClaudePreparedProcessInput) => ReturnType<
     typeof import("./execution-target.js").runAdapterExecutionTargetProcess
   >;
   /** Company-owned exporter credentials. Transient; never persist or merge into config. */
