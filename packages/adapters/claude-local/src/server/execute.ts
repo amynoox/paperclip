@@ -68,7 +68,8 @@ import {
 import {
   claudeModelUsageTotals,
   claudeModelReceipts,
-  parseClaudeStreamJson, createClaudeStreamParser,
+  claudeInvocationModelUsage,
+  parseClaudeStreamJson, createClaudeStreamParser, readClaudeSessionTotals, type ClaudeSessionTotals,
   describeClaudeFailure,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
@@ -134,6 +135,12 @@ interface ClaudeRuntimeConfig {
   graceSec: number;
   extraArgs: string[];
 }
+
+/**
+ * Usage and cost reported by `execute` are this invocation's share, also for a
+ * resumed session (STUDIO-0013). Hosts may read this to rely on per-run amounts.
+ */
+export const usageAccounting = "per_invocation" as const;
 
 export function claudeSessionCwdMatchesExecutionTarget(input: {
   runtimeSessionCwd: string;
@@ -843,6 +850,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     hasMatchingSessionCwd &&
     hasMatchingExecutionTarget;
   const sessionId = canResumeSession ? runtimeSessionId : null;
+  // Totals the resumed session had reported when its previous run ended; the
+  // CLI's result ledger is cumulative over a resumed session.
+  const resumedSessionTotals = readClaudeSessionTotals(runtimeSessionParams.claudeSessionTotals, sessionId);
   if (runtimeSessionId && !isValidUuid) {
     await onLog(
       "stdout",
@@ -1013,13 +1023,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
     }
 
-    const consumeAccounting = createClaudeStreamParser();
+    const sessionBaseline = resumeSessionId ? resumedSessionTotals : null;
+    const consumeAccounting = createClaudeStreamParser({ sessionBaseline });
     const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
       const parsed = consumeAccounting(stdout);
       return { usage: parsed.usage ?? undefined, usageBasis: "per_run", costUsd: parsed.costUsd,
         provider: "anthropic", biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
         billingType, model: Object.keys(parseObject(parsed.resultJson?.modelUsage)).length > 1 ? "mixed" : parsed.model || model,
-          usageByModel: claudeModelReceipts(parsed.resultJson?.modelUsage), complete: parsed.resultJson !== null };
+          usageByModel: claudeModelReceipts(parsed.invocationModelUsage), complete: parsed.resultJson !== null };
     });
     const processStopped = providerStop.beginInvocation();
     const processOptions: AdapterExecutionTargetProcessOptions = {
@@ -1050,9 +1061,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       : await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, processOptions);
     await accountingLog.flush();
 
-    const parsedStream = parseClaudeStreamJson(proc.stdout);
+    const parsedStream = parseClaudeStreamJson(proc.stdout, { sessionBaseline });
     const parsed = parsedStream.resultJson ?? parseJson(proc.stdout);
-    return { proc, parsedStream, parsed };
+    return { proc, parsedStream, parsed, sessionBaseline };
   };
 
   const toAdapterResult = (
@@ -1060,10 +1071,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       proc: RunProcessResult;
       parsedStream: ReturnType<typeof parseClaudeStreamJson>;
       parsed: Record<string, unknown> | null;
+      sessionBaseline: ClaudeSessionTotals | null;
     },
     opts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean },
   ): AdapterExecutionResult => {
-    const { proc, parsedStream, parsed } = attempt;
+    const { proc, parsedStream, parsed, sessionBaseline } = attempt;
     const loginMeta = detectClaudeLoginRequired({
       parsed,
       stdout: proc.stdout,
@@ -1087,7 +1099,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         provider: "anthropic",
         biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
         model: Object.keys(parseObject(parsedStream.resultJson?.modelUsage)).length > 1 ? "mixed" : parsedStream.model || model,
-        usageByModel: claudeModelReceipts(parsedStream.resultJson?.modelUsage),
+        usageByModel: claudeModelReceipts(parsedStream.invocationModelUsage),
         billingType,
         costUsd: parsedStream.costUsd,
         errorMessage: `Timed out after ${timeoutSec}s`,
@@ -1157,7 +1169,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         provider: "anthropic",
         biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
         model: Object.keys(parseObject(parsedStream.resultJson?.modelUsage)).length > 1 ? "mixed" : parsedStream.model || model,
-        usageByModel: claudeModelReceipts(parsedStream.resultJson?.modelUsage),
+        usageByModel: claudeModelReceipts(parsedStream.invocationModelUsage),
         billingType,
         costUsd: parsedStream.costUsd,
         errorMessage: fallbackErrorMessage,
@@ -1184,7 +1196,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
 
-    const fallbackModelUsageTotals = parsedStream.usage ? null : claudeModelUsageTotals(parsed.modelUsage);
+    const invocationModelUsage = parsedStream.resultJson
+      ? parsedStream.invocationModelUsage
+      : claudeInvocationModelUsage(parsed.modelUsage, sessionBaseline);
+    const fallbackModelUsageTotals = parsedStream.usage ? null : claudeModelUsageTotals(invocationModelUsage);
     const usage =
       parsedStream.usage ??
       fallbackModelUsageTotals ??
@@ -1238,6 +1253,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         ...(workspaceId ? { workspaceId } : {}),
         ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
         ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+        ...(() => {
+          // Persist the cumulative ledger so the next resumed run reports only
+          // its own share; a run without a final result keeps the old baseline.
+          const totals = parsedStream.sessionTotals?.sessionId === resolvedSessionId
+            ? parsedStream.sessionTotals
+            : sessionBaseline?.sessionId === resolvedSessionId ? sessionBaseline : null;
+          return totals ? { claudeSessionTotals: totals } : {};
+        })(),
       } as Record<string, unknown>)
       : null;
     const errorMessage = failed
@@ -1336,7 +1359,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       retryNotBefore: transientRetryNotBefore ? transientRetryNotBefore.toISOString() : null,
       errorMeta,
       usage,
-      usageByModel: claudeModelReceipts(parsed.modelUsage),
+      usageByModel: claudeModelReceipts(invocationModelUsage),
       ...(usageBasis ? { usageBasis } : {}),
       sessionId: resolvedSessionId,
       sessionParams: resolvedSessionParams,

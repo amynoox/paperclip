@@ -465,6 +465,36 @@
       "commits": [
         "24fbdb2c4"
       ]
+    },
+    {
+      "id": "STUDIO-0013",
+      "title": "Per-invocation usage and cost for resumed Claude CLI sessions",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "The Claude CLI result ledger (modelUsage, total_cost_usd) is cumulative over the launch and, with --resume, over the whole resumed session (Claude Code 2.1.322: 0.0844 then 0.0942 USD, inputTokens 20 then 30 across two launches of one session). claude_local declared it per_run, so each resumed run recounted the earlier runs in usage, cost and per-model receipts.",
+      "reason": "Only the adapter sees the CLI ledger and the session params; declaring session_cumulative would let the server diff tokens but leave the cost unpriced for the budget (server/src/services/budget-exposure.ts).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "adapter-claude-local server parse and execute",
+      "paths": [
+        "packages/adapters/claude-local/src/server/parse.ts",
+        "packages/adapters/claude-local/src/server/execute.ts",
+        "packages/adapters/claude-local/src/server/index.ts",
+        "packages/adapters/claude-local/src/server/parse.test.ts",
+        "packages/adapters/claude-local/src/server/execute.resume-accounting.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-12",
+        "repository": "paperclipai/paperclip",
+        "details": "All PR states searched for modelUsage, total_cost_usd and resume accounting: no PR. Studio workspace: drafts/reveil-questions/comptage-et-skills.md (part A); router need drafts/routeur-deux-moteurs/amont/besoin-fork-comptage-et-skills.md. Custom fix approved by Amyne on 12 Nov 2026 (decision 18, \"Oui, on l'ajoute\").",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2: claude-local src/server 387 passed, 1 skipped, 0 failed (6 new parse cases, 3 new execute cases: fresh launch keeps its figures and stores the ledger; resumed launch reports 0.0098 USD and 10 input tokens and stores the new ledger; --resume passed and the receipt checkpoint carries the same share; a ledger stored for another session is not subtracted); server adapter-cost-failure-paths 31 passed. tsc 7.0.2 on claude-local: 0 errors. Built with tsc 7.0.2 (studio.5.1 parse.js, execute.js and index.js rebuild byte for byte from their source): dist/server/execute.js c4b2bcef181cd9df179965dd56bf6a4203da15848e97ff2da795ffc5367a3baa, dist/server/index.js 6c0da081e5a08b130a9f0777e2377feefeaf81b1283cd7557d8b0d0563a00353, dist/server/parse.js e85ecb35f192b770fea1ac03c29a2eda1847da2060144d3a01debb5b1ea18081.",
+      "migration": "None. Session params gain claudeSessionTotals; sessions without it report as before for their next run, then carry it.",
+      "rollback": "Switch cli/current back to the previous install folder; extra claudeSessionTotals in stored session params are ignored by the earlier adapter.",
+      "retireWhen": "Pinned upstream reports per-invocation usage and cost for resumed claude_local sessions.",
+      "upgradeDecisions": [],
+      "commits": [
+        "92cc50d4f"
+      ]
     }
   ]
 }

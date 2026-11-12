@@ -1,4 +1,4 @@
-export { claudeSessionCwdMatchesExecutionTarget, execute, runClaudeLogin } from "./execute.js";
+export { claudeSessionCwdMatchesExecutionTarget, execute, runClaudeLogin, usageAccounting } from "./execute.js";
 /** Opt-in prepared process hook; older hosts must not silently fall back to CLI. */
 export const supportsPreparedInteractiveProcess = true;
 export * from "./acp.js";
