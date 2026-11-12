@@ -175,6 +175,29 @@ function resolveClaudeBillingType(env: Record<string, string>): "api" | "subscri
   return hasNonEmptyEnvValue(env, "ANTHROPIC_API_KEY") ? "api" : "subscription";
 }
 
+export function resolveClaudeRunScopedRuntimeRoot(
+  executionTarget: ReturnType<typeof readAdapterExecutionTarget>,
+  runId: string,
+): { runtimeRootDir: string; removeRuntimeRootOnRestore: true } | Record<string, never> {
+  if (
+    executionTarget?.kind !== "remote" ||
+    executionTarget.transport !== "ssh" ||
+    executionTarget.workspaceRealization?.mode !== "in_place"
+  ) {
+    return {};
+  }
+  return {
+    runtimeRootDir: path.posix.join(
+      executionTarget.workspaceRealization.authoritativeRoot,
+      ".paperclip-runtime",
+      "runs",
+      runId,
+      "claude",
+    ),
+    removeRuntimeRootOnRestore: true,
+  };
+}
+
 async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<ClaudeRuntimeConfig> {
   const { runId, agent, config, context, runtimeCommandSpec, executionTarget, authToken } = input;
   const onLog = input.onLog ?? (async () => {});
@@ -206,12 +229,17 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
       )
     : [];
   const runtimePrimaryUrl = asString(context.paperclipRuntimePrimaryUrl, "");
+  const targetWorkspaceRealization = executionTarget?.workspaceRealization ?? null;
   const configuredCwd = asString(config.cwd, "");
   const useConfiguredInsteadOfAgentHome = workspaceSource === "agent_home" && configuredCwd.length > 0;
-  const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
+  const effectiveWorkspaceCwd = targetWorkspaceRealization?.mode === "in_place"
+    ? targetWorkspaceRealization.authoritativeRoot
+    : useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
   const cwd = effectiveWorkspaceCwd || configuredCwd || process.cwd();
   const executionTargetIsRemote = adapterExecutionTargetIsRemote(executionTarget);
-  let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
+  let effectiveExecutionCwd = targetWorkspaceRealization?.mode === "in_place"
+    ? targetWorkspaceRealization.authoritativeRoot
+    : adapterExecutionTargetRemoteCwd(executionTarget, cwd);
   const shapedWorkspaceEnv = shapePaperclipWorkspaceEnvForExecution({
     workspaceCwd: effectiveWorkspaceCwd,
     workspaceWorktreePath,
@@ -219,7 +247,9 @@ async function buildClaudeRuntimeConfig(input: ClaudeExecutionInput): Promise<Cl
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
   });
-  await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
+  if (!executionTargetIsRemote || targetWorkspaceRealization?.mode !== "in_place") {
+    await ensureAbsoluteDirectory(cwd, { createIfMissing: true });
+  }
 
   const envConfig = parseObject(config.env);
   const env: Record<string, string> = { ...buildPaperclipEnv(agent, input.agentIdentity) };
@@ -457,9 +487,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         (value): value is Record<string, unknown> => typeof value === "object" && value !== null,
       )
     : [];
+  const targetWorkspaceRealization = executionTarget?.workspaceRealization ?? null;
   const configuredCwd = asString(config.cwd, "");
   const useConfiguredInsteadOfAgentHome = workspaceSource === "agent_home" && configuredCwd.length > 0;
-  const effectiveWorkspaceCwd = useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
+  const effectiveWorkspaceCwd = targetWorkspaceRealization?.mode === "in_place"
+    ? targetWorkspaceRealization.authoritativeRoot
+    : useConfiguredInsteadOfAgentHome ? "" : workspaceCwd;
   const hasExplicitClaudeConfigDir =
     typeof configEnv.CLAUDE_CONFIG_DIR === "string" && configEnv.CLAUDE_CONFIG_DIR.trim().length > 0;
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
@@ -495,7 +528,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     includeRuntimeKeys: ["HOME", "CLAUDE_CONFIG_DIR"],
     resolvedCommand,
   });
-  let effectiveExecutionCwd = adapterExecutionTargetRemoteCwd(executionTarget, cwd);
+  let effectiveExecutionCwd = targetWorkspaceRealization?.mode === "in_place"
+    ? targetWorkspaceRealization.authoritativeRoot
+    : adapterExecutionTargetRemoteCwd(executionTarget, cwd);
   const terminalResultCleanupGraceMs = Math.max(
     0,
     asNumber(config.terminalResultCleanupGraceMs, 5_000),
@@ -627,7 +662,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     ? await (async () => {
         await onLog(
           "stdout",
-          `[paperclip] Syncing workspace and Claude runtime assets to ${describeAdapterExecutionTarget(executionTarget)}.\n`,
+          `[paperclip] Syncing ${targetWorkspaceRealization?.mode === "in_place" ? "Claude runtime assets" : "workspace and Claude runtime assets"} to ${describeAdapterExecutionTarget(executionTarget)}.\n`,
         );
         return await prepareAdapterExecutionTargetRuntime({
           runId,
@@ -635,6 +670,12 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           adapterKey: "claude",
           timeoutSec,
           workspaceLocalDir: cwd,
+          workspaceRemoteDir:
+            targetWorkspaceRealization?.mode === "in_place"
+              ? targetWorkspaceRealization.authoritativeRoot
+              : undefined,
+          ...resolveClaudeRunScopedRuntimeRoot(executionTarget, runId),
+          syncWorkspace: targetWorkspaceRealization?.mode !== "in_place",
           installCommand: SANDBOX_INSTALL_COMMAND,
           detectCommand: command,
           onProgress: (line) => onLog("stdout", line),
@@ -681,6 +722,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     executionTargetIsRemote,
     executionCwd: effectiveExecutionCwd,
   });
+  if (targetWorkspaceRealization) {
+    env.PAPERCLIP_WORKSPACE_REALIZATION_MODE = targetWorkspaceRealization.mode;
+    env.PAPERCLIP_WORKSPACE_AUTHORITATIVE_ROOT = targetWorkspaceRealization.authoritativeRoot;
+  }
   const restoreRemoteWorkspace = preparedExecutionTargetRuntime
     ? () => preparedExecutionTargetRuntime.restoreWorkspace((line) => onLog("stdout", line))
     : null;

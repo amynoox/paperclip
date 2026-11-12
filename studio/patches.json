@@ -322,6 +322,43 @@
         "51f3eb4e8",
         "7c6735e4d"
       ]
+    },
+    {
+      "id": "STUDIO-0010",
+      "title": "Honor in_place workspace realization in the Claude local adapter",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "claude_local ignores workspaceRealization.mode=in_place on an SSH target: it copies the workspace, creates the remote path locally and keeps no run-scoped runtime root, unlike codex_local.",
+      "reason": "The routed Claude engine needs the native adapter to run in the stable task folder; the router passes the same target it passes to codex_local.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "adapter-utils execution target runtime and adapter-claude-local server",
+      "paths": [
+        "packages/adapter-utils/src/execution-target.ts",
+        "packages/adapter-utils/src/remote-managed-runtime.ts",
+        "packages/adapters/claude-local/src/server/acp.ts",
+        "packages/adapters/claude-local/src/server/execute.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-12",
+        "repository": "paperclipai/paperclip",
+        "details": "drafts/routeur-deux-moteurs/amont/besoin-fork-16607.md in the studio workspace",
+        "selected": {
+          "number": 16607,
+          "head": "2506ef55327048acc231bd00ffd9fe9a04e57a62",
+          "base": "73659c6b27c1d97226f2da9ca39f256eefddac66",
+          "disposition": "Closed by its author on 2026-11-08 without maintainer review. Four commits reused with cherry-pick -x; one context-only conflict in claude-local execute.ts resolved by keeping the newer observability and logged-env lines and applying the PR's effectiveExecutionCwd change. Changed lines identical to the PR (+288/-9)."
+        }
+      },
+      "validation": "Linux, Node 24.22.2: adapter-utils 4055 passed, claude-local 792 passed, codex-local 1163 passed; the five PR cases pass; failure lists identical with and without the change (environment: missing dist fixtures, tsx, auth-merge archive). tsc 7.0.2 rebuilds the four production modules byte for byte from the base; built execute.js counts in_place 0 before, 9 after.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder; routed Claude runs are refused again by the router adapter.",
+      "retireWhen": "Pinned upstream claude_local honors in_place realization with a run-scoped runtime root.",
+      "upgradeDecisions": [],
+      "commits": [
+        "9a05840eb",
+        "dff7e4dcb",
+        "fa3dadce5",
+        "643fa60dd"
+      ]
     }
   ]
 }
