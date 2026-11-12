@@ -9,6 +9,7 @@ import { describeFailedAttachment } from "../native-runtime/remote-warm-session-
 
 import { usesNativeUsageDelivery } from "../native-runtime/native-usage-accounting.js";
 import { INTERACTION_DELIVERY_DENIED, preparedRunInteractionDeliveryDenied } from "../agent-interaction-delivery.js";
+import { readAdapterTaskWait, deferAdapterRun, checkedAdapterInteractionWait } from "../adapter-task-admission.js";
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import { readRemoteWorkspaceAuthority, saveRemoteWorkspace } from "../remote-workspaces.js";
 import { environmentService } from "../environments.js";
@@ -259,6 +260,14 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         errorCode: INTERACTION_DELIVERY_DENIED, suppressImmediateRecovery: true,
       });
       return { dispatched: false };
+    }
+    if (run.runtimeMode !== "native" && issueId) {
+      const wait = await readAdapterTaskWait(db, { companyId: run.companyId, agentId: run.agentId,
+        issueId, context: parseObject(run.contextSnapshot) });
+      if (wait) {
+        if (!await deferAdapterRun(db, run, wait, true)) throw new Error("adapter_task_wait_unverified");
+        return { dispatched: false };
+      }
     }
     const providerDispatch = AsyncLocalStorage.bind(dispatch);
     return measureRunPhase("execution.dispatch_admission", () => dispatchResolvedInteractionContinuationWithAtomicGate(providerDispatch));
@@ -864,6 +873,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
           (markDispatchStarted) => {
             input.effects.onLegacyAdapterEntered();
             return withAdapterExecutionPhase(executionPhaseContext, "adapter_execution", () => withAdapterInteractiveControl({
+              taskAdmissionWaitVersion: 1,
               getFreshSessionHandoff,
               agentIdentity,
               observability,
@@ -963,6 +973,13 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
         );
       if (!guardedDispatch.dispatched) return { dispatched: false };
       adapterResult = await guardedDispatch.resultPromise;
+    }
+    if (adapterResult.taskAdmissionWait) {
+      const claim = adapterResult.taskAdmissionWait;
+      const wait = checkedAdapterInteractionWait(claim);
+      if (!adapter.getTaskAdmission || !wait || claim.providerWorkStarted !== false || claim.transportSettled !== true ||
+          !await deferAdapterRun(db, run, wait, true)) throw new Error("adapter_task_wait_unverified");
+      return { dispatched: false };
     }
     adapterResult = identityRedactor.redact(adapterResult);
     if (run.runtimeMode === "legacy" && hasWorkspaceRestoreFailure(adapterResult.resultJson)

@@ -1243,7 +1243,7 @@ export function questionResponseDeliveryService(
         await releaseForRetry(claimed, errorCode, { bounded: false });
         return null;
       }
-      const eligibleQueuedSuccessor = externalChatBoundary
+      const eligibleQueuedSuccessor = externalChatBoundary || durableWake?.request.status === "deferred_issue_execution"
         ? null
         : queuedSuccessor;
       const targetRun =
@@ -1274,7 +1274,7 @@ export function questionResponseDeliveryService(
           idempotencyKey: wakeIdempotencyKey,
         });
         if (durableWake) {
-          const eligibleQueuedSuccessor = externalChatBoundary
+          const eligibleQueuedSuccessor = externalChatBoundary || durableWake.request.status === "deferred_issue_execution"
             ? null
             : queuedSuccessor;
           const targetRun = durableWake.run ?? eligibleQueuedSuccessor ?? null;

@@ -93,6 +93,11 @@ old and new release tags so any future operator can reconstruct the comparison.
 
 ## Initial backlog
 
+`STUDIO-0007` preserves routed input while required task interactions remain
+pending. See [adapter-interaction-admission.md](adapter-interaction-admission.md)
+for the read-only companion contract, durable queue ownership, upstream search,
+local validation limits and coordinated rollback requirements. It is local only.
+
 `STUDIO-0004` adds bounded native task/document reads and question responses to
 the existing legacy run MCP. See [legacy-run-task-mcp.md](legacy-run-task-mcp.md)
 for upstream provenance, unchanged authority, tests and rollback limits.

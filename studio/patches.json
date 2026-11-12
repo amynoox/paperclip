@@ -248,6 +248,44 @@
       ]
     },
     {
+      "id": "STUDIO-0007",
+      "title": "Preserve routed input while required interactions are pending",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Automatic assignee answer/comment wakes can reach a routed claim while other required cards remain pending and become failed provider attempts.",
+      "reason": "Admission and durable saved-input promotion belong to the host; current routing scope and canonical reservation restrictions belong to the installed adapter.",
+      "observedOnUpstream": "2026.1110.0-nightly.0",
+      "owner": "Heartbeat admission, saved-input promotion and optional read-only adapter contract",
+      "paths": [
+        "packages/adapter-utils/src/types.ts",
+        "packages/adapter-utils/src/index.ts",
+        "server/src/services/adapter-task-admission.ts",
+        "server/src/services/heartbeat/queue.ts",
+        "server/src/services/heartbeat/runtime-execution.ts",
+        "server/src/services/heartbeat/run-control.ts",
+        "server/src/services/question-response-delivery.ts",
+        "server/src/services/issue-thread-interactions.ts",
+        "server/src/services/pre-dispatch-execution-evidence.ts",
+        "server/src/modules/wake-queue/adapters/postgres.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-11",
+        "repository": "paperclipai/paperclip",
+        "details": "studio/adapter-interaction-admission.md",
+        "selected": null,
+        "disposition": "All-state targeted searches and candidate diffs found no compatible implementation of the required scoped admission wait. Related card, watchdog, blocked-comment and conversation patches are documented with reviewed heads."
+      },
+      "customApproval": "2026-11-11: owner approved the specific premature-wake correction and delegation; after the role-edit window ended, local tests were authorized. The read-only companion contract was approved within that correction. No publication, push, deployment or live test is authorized here.",
+      "validation": "33 targeted native PostgreSQL/runtime/delivery/queue cases passed (24 + 8 + 1; unrelated cases filtered), plus 32 companion adapter cases. Strict TypeScript 7.0.2 adapter contract check and esbuild 0.28.2 ten production-module transformations pass. Expanded assembled-heartbeat tests retain eleven provider-start timeouts, with two reproduced on an unmodified reference worktree; an intermediate new provenance test passed in the clean targeted rerun. Full-service semantic checking remains unavailable in the isolated dependency tree. No full build, live Paperclip/worker test, deployment or acceptance is claimed. See studio/adapter-interaction-admission.md. | 2026-11-12 requalification on top of STUDIO-0008/0009/0010 (Linux, Node 24.22.2, embedded PostgreSQL): own suites 188 passed; wake-queue and run-dispatch 502 passed; assembled heartbeat 111 passed, 11 failed. The 11 are timing only: 9 fail identically without STUDIO-0007 (3 s waits, run start about 5 s here); the 2 others (\"legacy owner finished\" non-assignee queue, unstarted-task answer) pass alone or with a 60 s wait (5.6 s). No behavioural assertion failed. One new tsc error, in adapter-task-admission.test.ts only. Router companion: worker-router commit 35604ae, to be ported by the router release.",
+      "migration": "No schema migration. Version 1 adapterInteractionWait lives in existing wake receipt JSON. Existing receipts stay valid; unknown or missing contracts preserve saved input. No agent, skill, routine or permission change.",
+      "rollback": "Coordinate host and adapter. Before reverting to an old host, drain or retain ownership of saved adapterInteractionWait receipts; an old generic queue reader does not understand the marker. Preserve all input, actor/provenance and uncertain resources.",
+      "retireWhen": "Pinned upstream or native adapter admission preserves pending routed inputs through promotion and dispatch, without blocking authorized responders or cleanup, and passes the same race, identity and delivery regressions.",
+      "commits": [
+        "ac0a37a40d7389a2e15dfe0de6f198b0e0018d4e (original, local Codex workspace)",
+        "c9a026fb2 (this fork branch)"
+      ],
+      "upgradeDecisions": []
+    },
+    {
       "id": "STUDIO-0008",
       "title": "Handle SSH child stdin errors so a lost link cannot crash the server",
       "status": "deployed-2026.1110.0-studio.5.1",

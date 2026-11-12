@@ -125,6 +125,37 @@ describe.skipIf(!support.supported)("heartbeat runtime execution boundary", () =
     };
     return { input, adapter, run };
   }
+  it.each(["pending", "resolved-during-claim"])("saves an adapter admission race without provider accounting (%s)", async scenario => {
+    const { input, adapter, run } = await fixture();
+    const issueId = input.task.issueId!;
+    const [wake] = await db.insert(agentWakeupRequests).values({ companyId: run.companyId, agentId: run.agentId,
+      source: "automation", status: "claimed", runId: run.id, payload: { issueId, _paperclipWakeContext: { issueId } } }).returning();
+    const [prepared] = await db.update(heartbeatRuns).set({ wakeupRequestId: wake.id, contextSnapshot: { issueId } })
+      .where(eq(heartbeatRuns.id, run.id)).returning();
+    input.run = prepared;
+    Object.assign(adapter, { getTaskAdmission: async () => null });
+    adapter.execute.mockResolvedValue({ exitCode: 1, signal: null, timedOut: false,
+      taskAdmissionWait: { kind: "pending_interaction", blockers: scenario === "pending" ? [{ issueId, interactionId: randomUUID() }] : [],
+        providerWorkStarted: false, transportSettled: true } });
+    expect(await executeHeartbeatRuntime(db, input)).toEqual({ dispatched: false });
+    expect(adapter.execute.mock.calls[0][0].taskAdmissionWaitVersion).toBe(1);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0])
+      .toMatchObject({ status: "cancelled", errorCode: "adapter_interaction_pending", costAccountingPending: true,
+        usageJson: { accountingProviderWorkStarted: false } });
+  });
+  it("rejects an adapter wait after provider process evidence rather than releasing it", async () => {
+    const { input, adapter, run } = await fixture();
+    const [prepared] = await db.update(heartbeatRuns).set({ processPid: 42, contextSnapshot: { issueId: input.task.issueId } })
+      .where(eq(heartbeatRuns.id, run.id)).returning();
+    input.run = prepared;
+    Object.assign(adapter, { getTaskAdmission: async () => null });
+    adapter.execute.mockResolvedValue({ exitCode: 1, signal: null, timedOut: false,
+      taskAdmissionWait: { kind: "pending_interaction", blockers: [], providerWorkStarted: false, transportSettled: true } });
+    await expect(executeHeartbeatRuntime(db, input)).rejects.toThrow("adapter_task_wait_unverified");
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)))[0].status).toBe("running");
+  });
   it.each(["current", "expired", "replaced-owner", "generation", "attempt", "boot", "pid", "process-start", "stopped", "unknown-code", "permission", "io", "diagnostic-sink-failed", "diagnostic-lock-busy"] as const)(
     "preserves post-result diagnostics without changing recovery authority (%s)", async scenario => {
       const { input } = await fixture(true);

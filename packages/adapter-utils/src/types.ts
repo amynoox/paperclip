@@ -100,6 +100,10 @@ export type AdapterExecutionErrorFamily =
   | "refresh_token_invalidated";
 
 export interface AdapterExecutionResult {
+  /** Only before provider work and after transport preparation has settled.
+   * The host must advertise taskAdmissionWaitVersion=1; older hosts must keep
+   * the named failure. Never use this to hide an uncertain live provider. */
+  taskAdmissionWait?: AdapterTaskInteractionWait & { providerWorkStarted: false; transportSettled: true };
   /** Positive evidence for retrying bootstrap; absent evidence never authorizes replay. */
   executionRecovery?: { kind: "bootstrap"; providerWorkStarted: false } | {
     kind: "interrupted";
@@ -257,6 +261,7 @@ export interface CodexPreparedProcessInput {
 }
 
 export interface AdapterExecutionContext {
+  taskAdmissionWaitVersion?: 1;
   /** Host-scoped opt-in control. Revoked on cancellation/settlement; no stop authority. */
   registerInteractiveControl?: (control: AdapterInteractiveControl) => () => void;
   /** Trusted wrapper hook after native Codex preparation. Off by default. */
@@ -535,6 +540,14 @@ export interface AcpTargetDescriptor {
 
 export interface ServerAdapterModule {
   type: string;
+  /** Read-only admission restriction. Never reserves resources or starts a provider.
+   * Null is not execution authority: every native admission gate still applies.
+   * A pending interaction wait is rechecked on promotion and before dispatch. */
+  getTaskAdmission?: (input: {
+    companyId: string; agentId: string; issueId: string;
+    defaultEnvironmentId: string | null;
+    config: Record<string, unknown>; context: Record<string, unknown>;
+  }) => Promise<AdapterTaskInteractionWait | null>;
   execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult>;
   testEnvironment(ctx: AdapterEnvironmentTestContext): Promise<AdapterEnvironmentTestResult>;
   acp?: AcpTargetDescriptor;
@@ -627,6 +640,11 @@ export interface ServerAdapterModule {
    * API-key-only vendor) omits it. The capability data holds no secret.
    */
   loginCapability?: import("./login-capability.js").AdapterLoginCapability;
+}
+
+export interface AdapterTaskInteractionWait {
+  kind: "pending_interaction";
+  blockers: Array<{ issueId: string; interactionId: string }>;
 }
 
 // ---------------------------------------------------------------------------
