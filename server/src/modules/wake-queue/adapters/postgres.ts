@@ -55,7 +55,7 @@ import {
   queuedCommentIdsFromRunContext,
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
-import { CHAT_CONVERSATION_ID_KEY, extractWakeCommentIds } from "../../run-dispatch/index.js";
+import { CHAT_CONVERSATION_ID_KEY, extractWakeCommentIds, verifyAddresseeInteractionWake } from "../../run-dispatch/index.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
@@ -429,6 +429,14 @@ function buildTransaction(tx: Db, deps: WakeQueuePostgresAdapterDeps, db: Db, ru
         .from(issueComments)
         .where(and(eq(issueComments.companyId, companyId), eq(issueComments.issueId, issueId), inArray(issueComments.id, commentIds)));
       return { allSelfAuthored: rows.length > 0 && rows.every((row) => row.createdByRunId === finishingRunId) };
+    },
+
+    async isStaleAddresseeInteractionWake({ companyId, issueId, agentId, contextSnapshot }) {
+      if (readNonEmptyString(contextSnapshot.wakeReason) !== "interaction_pending" ||
+          !readNonEmptyString(contextSnapshot.interactionId)) return false;
+      // The claim's own stored-state check. A card that left `pending` never
+      // returns to it, so a stale verdict here needs no row lock.
+      return !(await verifyAddresseeInteractionWake(tx, { companyId, issueId, agentId, contextSnapshot }));
     },
 
     async isCompletedDelegationMention({ companyId, issueId, finishingRunId, wakeAgentId, commentIds }) {

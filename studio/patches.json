@@ -290,6 +290,38 @@
         "31c5e3203",
         "8b5c45e6e"
       ]
+    },
+    {
+      "id": "STUDIO-0009",
+      "title": "Reach a question's responder when an older question wake is parked first",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "A release promotes one deferred wake, oldest first, without checking its card. A superseded or settled question wake was promoted and cancelled at claim, and the responder's current question stayed parked with no release left to promote it. A verified non-assignee responder was also cancelled by the dependency gate of the asker's blocked task.",
+      "reason": "Deferred-wake promotion, the stranded-queue sweep and the dependency gates are native wake-queue and heartbeat decisions; no adapter or role configuration can repair them.",
+      "observedOnUpstream": "2026.1110.0 (master 4228bcf89 on 2026-11-12 has the same drain, sweep join and dependency gate)",
+      "owner": "Wake-queue release drain, heartbeat stranded-queue sweep and dependency gates",
+      "paths": [
+        "server/src/modules/wake-queue",
+        "server/src/modules/run-dispatch/adapters/postgres.ts",
+        "server/src/modules/run-dispatch/index.ts",
+        "server/src/services/heartbeat/queue.ts",
+        "server/src/__tests__/heartbeat-stale-queue-invalidation.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-12",
+        "repository": "paperclipai/paperclip",
+        "details": "Extends STUDIO-0006 (paperclipai/paperclip#14378). No upstream PR or master commit changes the drain, the sweep join or the dependency exception.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL: wake-queue and run-dispatch unit and adapter suites 451 passed; assembled heartbeat 111 passed and 9 pre-existing STUDIO-0006 timing failures identical without the fix; 13 new cases plus 2 end-to-end replays of the 12 Nov production sequences, which fail on the original sources. Full server tsc: same 213 environment errors before and after. The original sources rebuild the five production modules byte for byte (esbuild 0.28.2 and tsc 7.0.2). Fork branch studio/question-wakes-0009 (stacked on studio/epipe-0008).",
+      "migration": "None; no role, permission, upstream baseline or schema change.",
+      "rollback": "Switch cli/current back to the previous install folder while drained; deferred wakes stay valid and fall back to the previous behaviour.",
+      "retireWhen": "Pinned upstream retires stale responder question wakes before promotion, revisits pending responder wakes and lets a verified non-assignee responder past the dependency gate, with passing regressions.",
+      "upgradeDecisions": [],
+      "commits": [
+        "16917f939",
+        "51f3eb4e8",
+        "7c6735e4d"
+      ]
     }
   ]
 }

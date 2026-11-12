@@ -226,6 +226,34 @@ async function runReleaseDrain(
       continue;
     }
 
+    // A question card's wake for a responder who does not own the task is
+    // cancelled at claim once the card has left `pending` (answered,
+    // superseded, withdrawn). Promoting it would spend this drain's single
+    // promotion on a run that cannot start and leave the responder's current
+    // card parked behind it with no later release to promote it. Retire it
+    // here instead; a wake carrying adopted comments keeps the claim path,
+    // which redelivers those comments to the assignee.
+    if (
+      candidate.agentId !== issue.assigneeAgentId &&
+      candidate.queuedCommentIds.length === 0 &&
+      candidate.deferredCommentIds.length === 0 &&
+      await ports.transaction.isStaleAddresseeInteractionWake({
+        companyId: run.companyId,
+        issueId: issue.id,
+        agentId: candidate.agentId,
+        contextSnapshot: candidate.deferredContextSeed,
+      })
+    ) {
+      await ports.transaction.cancelDeferredWake({
+        companyId: run.companyId,
+        wakeId: candidate.id,
+        agentId: candidate.agentId,
+        reason: "Deferred question is no longer pending for this responder",
+        now: input.now,
+      });
+      continue;
+    }
+
     let liveness: { liveNonSelfCommentIds: string[]; containedSelfAuthoredComment: boolean; deliveredCommentIds?: string[] } =
       { liveNonSelfCommentIds: candidate.queuedCommentIds, containedSelfAuthoredComment: false };
     if (
