@@ -307,7 +307,8 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
         continuationPolicy: "wake_assignee", requestedResolverPolicy: "not_creator", effectiveResolverPolicy: "not_creator",
         title: "Question for another role", createdByAgentId: input.askerId, addresseeAgentId: input.addresseeId,
         payload: { version: 1, prompt: "Which disposition applies?" },
-        ...(input.status === "pending" ? {} : { resolvedAt: new Date(), result: { version: 1 as const, outcome: input.status } }),
+        ...(input.status === "pending" ? {} : { resolvedAt: new Date(), result: { version: 1 as const,
+          outcome: input.status === "expired" ? "superseded_by_newer_request" as const : "accepted" as const } }),
       }).returning();
       return card.id;
     }

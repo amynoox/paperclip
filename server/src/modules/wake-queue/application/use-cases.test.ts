@@ -463,11 +463,11 @@ describe("releaseIssueExecution", () => {
     expect(transaction.finalizePromotedWake).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ wakeId: current.id }));
   });
 
-  it.each([
+  it.each<[string, Partial<DeferredWakeCandidate>]>([
     ["the responder owns the task", { agentId: ISSUE.assigneeAgentId! }],
     ["the wake carries adopted comments", { queuedCommentIds: ["adopted-comment"] }],
     ["the wake context carries comment ids", { deferredCommentIds: ["context-comment"] }],
-  ] as const)("leaves a stale question wake to the claim path when %s", async (_label, overrides) => {
+  ])("leaves a stale question wake to the claim path when %s", async (_label, overrides) => {
     const stale = questionWake("wake-stale", "infra-agent", "card-superseded", overrides);
     const queue = [stale];
     const transaction = createFakeTransaction({
