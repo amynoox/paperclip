@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
   claudeModelUsageTotals,
+  claudeSessionTotals,
+  readClaudeSessionTotals,
   parseClaudeStreamJson,
   detectClaudeLoginRequired,
   extractClaudeRetryNotBefore,
@@ -579,5 +581,79 @@ describe("interrupted Claude accounting", () => {
     expect(parsed.usage).toEqual({ inputTokens: 35, cachedInputTokens: 40, outputTokens: 9 });
     expect(parsed.usageBasis).toBe("per_run");
     expect(parsed.costUsd).toBeNull();
+  });
+});
+
+// The CLI's result ledger (`modelUsage`, `total_cost_usd`) is cumulative over the
+// launch and, with --resume, over the whole resumed session; `usage` covers one
+// message. Measured on Claude Code 2.1.322 (0.0844 then 0.0942 USD, inputTokens
+// 20 then 30 across two launches of one session).
+describe("Claude per-invocation accounting (STUDIO-0013)", () => {
+  const SESSION = "11111111-2222-4333-8444-555555555555";
+  const result = (cost: number, input: number, output: number, extra: Record<string, unknown> = {}) =>
+    JSON.stringify({
+      type: "result",
+      subtype: "success",
+      session_id: SESSION,
+      result: `reply ${cost}`,
+      total_cost_usd: cost,
+      usage: { input_tokens: 1, output_tokens: 2 },
+      modelUsage: { "claude-sonnet": { inputTokens: input, outputTokens: output, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: cost } },
+      ...extra,
+    });
+
+  it("keeps a fresh launch's figures and persists its cumulative ledger", () => {
+    const parsed = parseClaudeStreamJson(`${result(0.0844, 20, 5)}\n`);
+    expect(parsed.costUsd).toBeCloseTo(0.0844);
+    expect(parsed.usage).toEqual({ inputTokens: 20, outputTokens: 5, cachedInputTokens: 0 });
+    expect(parsed.sessionTotals).toEqual({
+      sessionId: SESSION,
+      modelUsage: { "claude-sonnet": { inputTokens: 20, outputTokens: 5, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.0844 } },
+      totalCostUsd: 0.0844,
+    });
+  });
+
+  it("reports only a resumed launch's share of the session ledger", () => {
+    const baseline = claudeSessionTotals(SESSION, JSON.parse(result(0.0844, 20, 5)));
+    const parsed = parseClaudeStreamJson(`${result(0.0942, 30, 8)}\n`, { sessionBaseline: baseline });
+    expect(parsed.usageBasis).toBe("per_run");
+    expect(parsed.costUsd).toBeCloseTo(0.0098);
+    expect(parsed.usage).toEqual({ inputTokens: 10, outputTokens: 3, cachedInputTokens: 0 });
+    expect(parsed.invocationModelUsage).toMatchObject({ "claude-sonnet": { inputTokens: 10, outputTokens: 3 } });
+    expect((parsed.invocationModelUsage["claude-sonnet"] as { costUSD: number }).costUSD).toBeCloseTo(0.0098);
+    expect(parsed.sessionTotals?.totalCostUsd).toBeCloseTo(0.0942);
+    expect(parsed.summary).toBe("reply 0.0942");
+  });
+
+  it("takes the last of several results in one launch as final, never adding the cumulative ledgers", () => {
+    const parsed = parseClaudeStreamJson([result(0.01, 4, 1), result(0.03, 9, 4)].join("\n"));
+    expect(parsed.costUsd).toBeCloseTo(0.03);
+    expect(parsed.usage).toEqual({ inputTokens: 9, outputTokens: 4, cachedInputTokens: 0 });
+    expect(parsed.summary).toBe("reply 0.03");
+  });
+
+  it("sums the per-message usage of every result when no ledger is reported", () => {
+    const bare = (input: number, output: number) =>
+      JSON.stringify({ type: "result", session_id: SESSION, result: "ok", usage: { input_tokens: input, output_tokens: output, cache_read_input_tokens: 1 } });
+    const parsed = parseClaudeStreamJson([bare(3, 2), bare(4, 5)].join("\n"));
+    expect(parsed.usage).toEqual({ inputTokens: 7, outputTokens: 7, cachedInputTokens: 2 });
+    expect(parsed.costUsd).toBeNull();
+  });
+
+  it("ignores a baseline from another session or one above the ledger", () => {
+    const other = claudeSessionTotals("99999999-2222-4333-8444-555555555555", JSON.parse(result(0.05, 15, 3)));
+    expect(parseClaudeStreamJson(`${result(0.0942, 30, 8)}\n`, { sessionBaseline: other }).costUsd).toBeCloseTo(0.0942);
+    const reset = claudeSessionTotals(SESSION, JSON.parse(result(0.5, 50, 9)));
+    const parsed = parseClaudeStreamJson(`${result(0.0942, 30, 8)}\n`, { sessionBaseline: reset });
+    expect(parsed.costUsd).toBeCloseTo(0.0942);
+    expect(parsed.usage).toEqual({ inputTokens: 30, outputTokens: 8, cachedInputTokens: 0 });
+  });
+
+  it("reads persisted totals only for the session being resumed", () => {
+    const stored = claudeSessionTotals(SESSION, JSON.parse(result(0.0844, 20, 5)));
+    expect(readClaudeSessionTotals(stored, SESSION)).toEqual(stored);
+    expect(readClaudeSessionTotals(stored, null)).toBeNull();
+    expect(readClaudeSessionTotals(stored, "99999999-2222-4333-8444-555555555555")).toBeNull();
+    expect(readClaudeSessionTotals("garbage", SESSION)).toBeNull();
   });
 });
