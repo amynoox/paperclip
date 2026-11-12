@@ -428,6 +428,43 @@
         "887668cbf",
         "3a3842a73"
       ]
+    },
+    {
+      "id": "STUDIO-0012",
+      "title": "Deliver plugin tools through the runtime MCP gateway",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Plugin tools reach a run only through the paperclip-assigned runtime MCP gateway, which run preparation builds only when the agent has at least one assigned external tool connection. Agents without one (Infra Manager, Resource Advisor on 12 Nov 2026) never see plugin tools such as the Worker Router maintenance tools.",
+      "reason": "Runtime MCP delivery and run-scoped tool grants are host decisions; no plugin or role setting can create the gateway.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "Heartbeat run preparation, native runtime MCP assignment and tool gateway",
+      "paths": [
+        "server/src/services/heartbeat/run-preparation.ts",
+        "server/src/services/native-runtime/assigned-mcp-tools.ts",
+        "server/src/services/native-runtime/runtime-context.ts",
+        "server/src/services/tool-access-policy.ts",
+        "server/src/services/tool-gateway-registry.ts",
+        "server/src/services/tool-gateway.ts",
+        "doc/plugins/PLUGIN_SPEC.md"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-12",
+        "repository": "paperclipai/paperclip",
+        "details": "Studio workspace drafts/routeur-deux-moteurs/amont/besoin-fork-14538.md; reuse approved by Amyne on 12 Nov 2026 (\"Oui, on la reprend\").",
+        "selected": {
+          "number": 14538,
+          "head": "5efb1bf53cb020b12bfbcdd53f3cabfd8840572d",
+          "base": "253bf071f0a496554b61fff897ad3f11afaf8766",
+          "disposition": "Open PR whose branch contains upstream merge commits; its complete reviewed diff (gh pr diff, 10 files) applied without conflict as one commit authored by the original author, with the upstream commit list in the message."
+        }
+      },
+      "validation": "Linux, Node 24.22.2: PR tests plus neighbouring suites (heartbeat-runtime-plugin-mcp-servers, assigned-mcp-tools, runtime-context, heartbeat-runtime-mcp-servers, tool-gateway, tool-gateway-service, tool-gateway-listing-memory, tool-gateway-discovery-http, plugin-tool-dispatcher-pluginDbId): 402 passed, 0 failed (389 passed, 0 failed without the change); the new PR file has 10 passing cases. Server tsc error set unchanged by this patch.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream includes paperclipai/paperclip#14538 or equivalent plugin tool delivery without assigned connections.",
+      "upgradeDecisions": [],
+      "commits": [
+        "24fbdb2c4"
+      ]
     }
   ]
 }
