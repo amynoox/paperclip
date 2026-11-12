@@ -439,6 +439,9 @@ export async function runClaudeLogin(input: {
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
+  // A prepared interactive process may outlive this call until its owner
+  // proves the provider stopped; keep the bridge and remote workspace until then.
+  let interactiveInvocationPending = false;
   const engineSelection = await resolveClaudeExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
     return {
@@ -1017,8 +1020,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         billingType, model: Object.keys(parseObject(parsed.resultJson?.modelUsage)).length > 1 ? "mixed" : parsed.model || model,
           usageByModel: claudeModelReceipts(parsed.resultJson?.modelUsage), complete: parsed.resultJson !== null };
     });
-    const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
-      onProcessStopped: providerStop.beginInvocation(),
+    const processStopped = providerStop.beginInvocation();
+    const processOptions = {
+      onProcessStopped: () => { processStopped(); interactiveInvocationPending = false; },
       cwd,
       env,
       stdin: prompt,
@@ -1034,7 +1038,15 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         hasTerminalResult: ({ stdout }) => parseClaudeStreamJson(stdout).resultJson !== null,
       },
       localProcessSandbox,
-    });
+    };
+    if (ctx.claudePreparedProcess && (ctx.config.experimentalLiveSteering !== true || !ctx.registerInteractiveControl)) {
+      throw new Error("Prepared interactive process requires host opt-in and live control ownership");
+    }
+    if (ctx.claudePreparedProcess) interactiveInvocationPending = true;
+    const proc = ctx.claudePreparedProcess
+      ? await ctx.claudePreparedProcess({ runId, target: runtimeExecutionTarget, command, args,
+          options: processOptions, resumeSessionId: resumeSessionId ?? null, model: model ?? null })
+      : await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, processOptions);
     await accountingLog.flush();
 
     const parsedStream = parseClaudeStreamJson(proc.stdout);
@@ -1422,6 +1434,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const initial = await runAttempt(sessionId ?? null);
     const sessionErrorKind =
+      !ctx.claudePreparedProcess &&
       sessionId &&
       !initial.proc.timedOut &&
       (initial.proc.exitCode ?? 0) !== 0 &&
@@ -1475,10 +1488,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     try {
       await providerStop.collectBeforeRestore();
     } finally {
-      if (paperclipBridge) {
+      if (paperclipBridge && !interactiveInvocationPending) {
         await paperclipBridge.stop();
       }
-      if (restoreRemoteWorkspace) {
+      if (restoreRemoteWorkspace && !interactiveInvocationPending) {
         await onLog(
           "stdout",
           `[paperclip] Restoring workspace changes from ${describeAdapterExecutionTarget(executionTarget)}.\n`,
