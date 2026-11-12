@@ -21,6 +21,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueDocuments,
+  issueRelations,
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
@@ -1556,6 +1557,102 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
       expect(wakeup).toMatchObject({ status: "completed" });
       expect(issue?.assigneeAgentId).toBe(assigneeAgentId);
       expect(countExecuteCallsForRun(runId)).toBe(1);
+    });
+
+    // TR-518 shape: the asker's own task waits on an unresolved child, and its
+    // question to another role must still reach that role.
+    async function blockOnUnresolvedChild(companyId: string, issueId: string) {
+      const [blocker] = await db.insert(issues).values({ companyId, title: "Unresolved child work",
+        status: "in_progress", priority: "medium" }).returning();
+      await db.insert(issueRelations).values({ companyId, issueId: blocker.id, relatedIssueId: issueId, type: "blocks" });
+      await db.update(issues).set({ status: "blocked", updatedAt: new Date() }).where(eq(issues.id, issueId));
+    }
+
+    async function settledRun(runId: string) {
+      expect(await waitForCondition(async () => {
+        const run = await heartbeat.getRun(runId);
+        return run?.status === "succeeded" || run?.status === "cancelled";
+      }, 10_000)).toBe(true);
+      await heartbeat.waitForRunExecutionDrain(runId);
+      return db.select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then((rows) => rows[0] ?? null);
+    }
+
+    it("runs the named addressee while the asker's task waits on an unresolved dependency", async () => {
+      const { companyId, issueId, runId, assigneeAgentId } = await seedAddressedInteractionFixture();
+      await blockOnUnresolvedChild(companyId, issueId);
+
+      await heartbeat.resumeQueuedRuns();
+
+      expect(await settledRun(runId)).toMatchObject({ status: "succeeded", errorCode: null });
+      expect(countExecuteCallsForRun(runId)).toBe(1);
+      const [issue] = await db.select().from(issues).where(eq(issues.id, issueId));
+      expect(issue).toMatchObject({ status: "blocked", assigneeAgentId });
+    });
+
+    it.each([
+      ["the card is no longer pending", "accepted" as const, false],
+      ["the addressee owns the blocked task", "pending" as const, true],
+    ])("keeps the dependency gate when %s", async (_label, interactionStatus, addresseeOwnsTask) => {
+      const { companyId, issueId, runId, addresseeAgentId } = await seedAddressedInteractionFixture({ interactionStatus });
+      await blockOnUnresolvedChild(companyId, issueId);
+      if (addresseeOwnsTask) {
+        await db.update(issues).set({ assigneeAgentId: addresseeAgentId }).where(eq(issues.id, issueId));
+      }
+
+      await heartbeat.resumeQueuedRuns();
+
+      expect(await settledRun(runId)).toMatchObject({ status: "cancelled", errorCode: "issue_dependencies_blocked" });
+      expect(countExecuteCallsForRun(runId)).toBe(0);
+    });
+
+    // TR-522 shape after the fact: the responder's question wake is parked
+    // and the turn that should have promoted it is already over.
+    async function seedParkedQuestion(interactionStatus: "pending" | "accepted") {
+      const fixture = await seedAddressedInteractionFixture({ interactionStatus });
+      const { companyId, issueId, assigneeAgentId, addresseeAgentId, interactionId, runId, wakeupRequestId } = fixture;
+      // Turn the queued addressee run into the cancelled stale run that left
+      // the queue behind, and park the current card's wake.
+      await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "issue_assignee_changed",
+        finishedAt: new Date(), updatedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+      await db.update(agentWakeupRequests).set({ status: "skipped", finishedAt: new Date() })
+        .where(eq(agentWakeupRequests.id, wakeupRequestId));
+      const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId: addresseeAgentId,
+        source: "automation", triggerDetail: "system", reason: "interaction_pending", status: "deferred_issue_execution",
+        requestedByActorType: "agent", requestedByActorId: assigneeAgentId,
+        idempotencyKey: `interaction-pending:${interactionId}`,
+        payload: { issueId, interactionId, mutation: "interaction", _paperclipWakeContext: { issueId, taskId: issueId,
+          interactionId, interactionKind: "request_confirmation", wakeReason: "interaction_pending",
+          mutation: "interaction", source: "issue.interaction.created" } },
+      }).returning();
+      return { ...fixture, parkedWakeId: wake.id };
+    }
+
+    it("revisits a responder's parked question once no turn is left to promote it", async () => {
+      const { parkedWakeId, addresseeAgentId, interactionId } = await seedParkedQuestion("pending");
+
+      await heartbeat.resumeQueuedRuns();
+
+      const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, parkedWakeId));
+      expect(delivered.runId).toBeTruthy();
+      expect(await settledRun(delivered.runId!)).toMatchObject({ status: "succeeded", errorCode: null });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, delivered.runId!));
+      expect(run).toMatchObject({ agentId: addresseeAgentId,
+        contextSnapshot: expect.objectContaining({ wakeReason: "interaction_pending", interactionId }) });
+      expect(countExecuteCallsForRun(delivered.runId!)).toBe(1);
+      await heartbeat.resumeQueuedRuns();
+      expect(countExecuteCallsForRun(delivered.runId!)).toBe(1);
+    });
+
+    it("leaves a parked question alone once its card is no longer pending", async () => {
+      const { parkedWakeId, addresseeAgentId } = await seedParkedQuestion("accepted");
+
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.resumeQueuedRuns();
+
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, parkedWakeId)))[0])
+        .toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(mockAdapterExecute.mock.calls.filter(([context]) => context?.agent.id === addresseeAgentId)).toHaveLength(0);
     });
   });
 

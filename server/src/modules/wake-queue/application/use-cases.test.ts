@@ -116,6 +116,7 @@ function createFakeTransaction(overrides: Partial<WakeQueueTransaction> = {}): W
     })),
     getCommentSelfAuthorship: vi.fn(async () => ({ allSelfAuthored: false })),
     isCompletedDelegationMention: vi.fn(async () => false),
+    isStaleAddresseeInteractionWake: vi.fn(async () => false),
     reopenIssue: vi.fn(async () => null),
     claimDeferredWakeForPromotion: vi.fn(async () => true),
     finalizePromotedWake: vi.fn(async (input) => runSummary(input.wakeId)),
@@ -402,6 +403,87 @@ describe("releaseIssueExecution", () => {
 
     expect(claimOrder).toEqual(["wake-earliest", "wake-latest"]);
     expect(transaction.failDeferredWake).toHaveBeenCalledTimes(2);
+  });
+
+  // TR-522 shape: the asker superseded its question to one responder with a
+  // question to another responder before its turn ended. Both wakes were
+  // parked behind that turn, the superseded one first.
+  function questionWake(id: string, agentId: string, interactionId: string, overrides: Partial<DeferredWakeCandidate> = {}) {
+    return wakeCandidate({
+      id, agentId, reason: "interaction_pending", wakeReason: "interaction_pending",
+      requestedByActorType: "agent", requestedByActorId: RUN.agentId,
+      payload: { mutation: "interaction", interactionId },
+      preservesIndependentContinuation: true,
+      deferredContextSeed: { issueId: ISSUE.id, wakeReason: "interaction_pending", interactionId, mutation: "interaction" },
+      ...overrides,
+    });
+  }
+
+  it("retires a responder's superseded question wake and promotes the current question behind it", async () => {
+    const superseded = questionWake("wake-superseded", "infra-agent", "card-superseded");
+    const current = questionWake("wake-current", "quality-agent", "card-current");
+    const queue = [superseded, current];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      findInvokableAgent: vi.fn(async (input: { agentId: string }) => ({ ...AGENT, id: input.agentId })),
+      isStaleAddresseeInteractionWake: vi.fn(async (input) => input.contextSnapshot.interactionId === "card-superseded"),
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction, ISSUE, { ...RUN, status: "succeeded" }),
+      recovery: createFakeRecovery(),
+    });
+
+    const result = await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() });
+
+    expect(result.outcome.kind).toBe("promoted");
+    expect(transaction.isStaleAddresseeInteractionWake).toHaveBeenNthCalledWith(1, {
+      companyId: RUN.companyId, issueId: ISSUE.id, agentId: "infra-agent", contextSnapshot: superseded.deferredContextSeed,
+    });
+    expect(transaction.cancelDeferredWake).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      wakeId: superseded.id, agentId: "infra-agent", reason: "Deferred question is no longer pending for this responder",
+    }));
+    expect(transaction.claimDeferredWakeForPromotion).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ wakeId: current.id }));
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({
+      wakeId: current.id, deferredAgent: expect.objectContaining({ id: "quality-agent" }),
+      contextSnapshot: expect.objectContaining({ interactionId: "card-current", wakeReason: "interaction_pending" }),
+    }));
+  });
+
+  it("promotes a responder's question wake whose card is still pending", async () => {
+    const current = questionWake("wake-current", "quality-agent", "card-current");
+    const queue = [current];
+    const transaction = createFakeTransaction({ findNextDeferredWake: vi.fn(async () => queue.shift() ?? null) });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction), recovery: createFakeRecovery(),
+    });
+
+    expect((await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() })).outcome.kind).toBe("promoted");
+    expect(transaction.isStaleAddresseeInteractionWake).toHaveBeenCalledTimes(1);
+    expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ wakeId: current.id }));
+  });
+
+  it.each([
+    ["the responder owns the task", { agentId: ISSUE.assigneeAgentId! }],
+    ["the wake carries adopted comments", { queuedCommentIds: ["adopted-comment"] }],
+    ["the wake context carries comment ids", { deferredCommentIds: ["context-comment"] }],
+  ] as const)("leaves a stale question wake to the claim path when %s", async (_label, overrides) => {
+    const stale = questionWake("wake-stale", "infra-agent", "card-superseded", overrides);
+    const queue = [stale];
+    const transaction = createFakeTransaction({
+      findNextDeferredWake: vi.fn(async () => queue.shift() ?? null),
+      findInvokableAgent: vi.fn(async (input: { agentId: string }) => ({ ...AGENT, id: input.agentId })),
+      getQueuedCommentLiveness: vi.fn(async (input) => ({ liveNonSelfCommentIds: input.queuedCommentIds, containedSelfAuthoredComment: false })),
+      isStaleAddresseeInteractionWake: vi.fn(async () => true),
+    });
+    const release = createReleaseIssueExecution({
+      issueLock: createFakeIssueLock(createFakeHost(), transaction), recovery: createFakeRecovery(),
+    });
+
+    expect((await release({ companyId: RUN.companyId, runId: RUN.id, now: new Date() })).outcome.kind).toBe("promoted");
+    expect(transaction.isStaleAddresseeInteractionWake).not.toHaveBeenCalled();
+    expect(transaction.cancelDeferredWake).not.toHaveBeenCalled();
+    expect(transaction.finalizePromotedWake).toHaveBeenCalledExactlyOnceWith(expect.objectContaining({ wakeId: stale.id }));
   });
 
   it("stops the loop after the first promotion", async () => {

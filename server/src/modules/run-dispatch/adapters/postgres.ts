@@ -308,6 +308,27 @@ export async function verifyAddresseeInteractionWake(
   return Boolean(rows[0]);
 }
 
+/**
+ * True when the run context is a verified `interaction_pending` wake (see
+ * `verifyAddresseeInteractionWake`) for a named responder who is not the
+ * task's assignee. That responder answers the card; it does not execute the
+ * task, so the task's own unresolved blockers must not hold the answer back.
+ * The assignee keeps the ordinary dependency gate.
+ */
+export async function verifyNonAssigneeAddresseeInteractionWake(
+  dbOrTx: Db,
+  input: AddresseeInteractionWakeInput,
+): Promise<boolean> {
+  if (readNonEmptyString(input.contextSnapshot.wakeReason) !== "interaction_pending") return false;
+  const [issue] = await dbOrTx
+    .select({ assigneeAgentId: issues.assigneeAgentId })
+    .from(issues)
+    .where(and(eq(issues.id, input.issueId), eq(issues.companyId, input.companyId)))
+    .limit(1);
+  if (!issue || issue.assigneeAgentId === input.agentId) return false;
+  return verifyAddresseeInteractionWake(dbOrTx, input);
+}
+
 export function createPostgresRunDispatchAdapter(
   db: Db,
 ): ScheduledRetryReader & RunDispatchWriter {

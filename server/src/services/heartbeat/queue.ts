@@ -178,7 +178,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../execution-workspace-policy.js";
 import { readContinuationAttempt } from "../recovery/index.js";
-import { allowsDependencyBlockedWake, verifyAddresseeInteractionWake, requeueAdoptedCommentsForAssignee, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
+import { allowsDependencyBlockedWake, verifyAddresseeInteractionWake, verifyNonAssigneeAddresseeInteractionWake, requeueAdoptedCommentsForAssignee, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
 import { withAgentStartLock } from "../agent-start-lock.js";
 import {
   evaluateAgentInvokability,
@@ -1129,7 +1129,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           blockerStallVerified,
           await isVerifiedDependencyInteractionResponse(db, { companyId: run.companyId,
             issueId, agentId: run.agentId, context }),
-        )
+        ) &&
+        // A named responder who does not own the task only answers its card;
+        // the task's blockers gate the assignee, not that answer.
+        !(await verifyNonAssigneeAddresseeInteractionWake(db, { companyId: run.companyId,
+          issueId, agentId: run.agentId, contextSnapshot: context }))
       ) {
         await cancelQueuedRunForBlockedDependencies(
           run,
@@ -2200,7 +2204,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
         or(eq(issues.assigneeAgentId, agentWakeupRequests.agentId),
           like(agentWakeupRequests.idempotencyKey, "stale-addressee-requeue:%"),
-          sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`)))
+          sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`,
+          // A named responder's question wake parked behind a run that was
+          // then cancelled (or never released the queue) has no owner run
+          // left to promote it. Revisit it while its card is still pending.
+          sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'interaction_pending'
+            AND EXISTS (SELECT 1 FROM issue_thread_interactions pending_card
+              WHERE pending_card.company_id = ${issues.companyId}
+                AND pending_card.issue_id = ${issues.id}
+                AND pending_card.id::text = ${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,interactionId}'
+                AND pending_card.addressee_agent_id = ${agentWakeupRequests.agentId}
+                AND pending_card.status = 'pending')`)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
         scope.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
@@ -2229,7 +2243,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const releasedNativeSources = new Set<string>();
     for (const { wake } of strandedQueues) {
       const dependencyWake = isDependencyResolvedWakePayload(wake.payload);
-      if (!dependencyWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
+      const pendingAddresseeWake = readNonEmptyString(parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]).wakeReason) === "interaction_pending" &&
+        await verifyAddresseeInteractionWake(db, { companyId: wake.companyId, issueId: String(wake.payload?.issueId),
+          agentId: wake.agentId, contextSnapshot: parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]) });
+      if (!dependencyWake && !pendingAddresseeWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const requeuedFromRunId = readNonEmptyString(parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]).requeuedFromRunId);
       if (requeuedFromRunId && wake.idempotencyKey === `stale-addressee-requeue:${requeuedFromRunId}`) {
@@ -4371,7 +4388,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             !activeExecutionRun &&
             dependencyReadiness &&
             !dependencyReadiness.isDependencyReady &&
-            !blockedInteractionWake
+            !blockedInteractionWake &&
+            // Same exception as the claim gate: a verified non-assignee
+            // responder answers its card and does not execute the task.
+            !(await verifyNonAssigneeAddresseeInteractionWake(tx as unknown as Db, { companyId: issue.companyId,
+              issueId: issue.id, agentId, contextSnapshot: enrichedContextSnapshot }))
           ) {
             if (caseRequest) waitForCaseAdmission("issue_dependencies_blocked", "Case handoff is waiting for task dependencies to resolve");
             await recordExecutionWait(tx as unknown as Db, {

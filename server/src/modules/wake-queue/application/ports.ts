@@ -171,6 +171,18 @@ export interface WakeQueueTransaction {
     finishingRunId: string;
     commentIds: string[];
   }): Promise<{ allSelfAuthored: boolean }>;
+  /**
+   * True when the deferred wake is a server-issued `interaction_pending` wake
+   * whose named card is no longer a pending card on this issue addressed to
+   * `agentId`. Such a wake would be cancelled at claim for a non-assignee, so
+   * the drain retires it instead of spending its single promotion on it.
+   */
+  isStaleAddresseeInteractionWake(input: {
+    companyId: string;
+    issueId: string;
+    agentId: string;
+    contextSnapshot: Record<string, unknown>;
+  }): Promise<boolean>;
   /** Proves all candidate comments only report completed child work in the finishing parent's own run. */
   isCompletedDelegationMention(input: {
     companyId: string;

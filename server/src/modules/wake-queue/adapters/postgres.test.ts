@@ -16,6 +16,7 @@ import {
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
   nativeRunFinalizations,
   subscribeDatabaseWork,
@@ -75,6 +76,7 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(issueRecoveryActions);
+    await db.delete(issueThreadInteractions);
     await db.delete(issues);
     await db.delete(agents);
     await db.delete(companies);
@@ -295,6 +297,107 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     await release(input);
     expect(await db.select().from(heartbeatRuns)).toHaveLength(2);
     expect((await db.select().from(issueComments).where(eq(issueComments.id, comment.id)))[0].body).toBe(comment.body);
+  });
+
+  describe("question wakes parked behind the asker's turn", () => {
+    async function seedQuestionCard(input: { companyId: string; issueId: string; askerId: string; addresseeId: string;
+      status: "pending" | "expired" | "answered" }) {
+      const [card] = await db.insert(issueThreadInteractions).values({
+        companyId: input.companyId, issueId: input.issueId, kind: "request_confirmation", status: input.status,
+        continuationPolicy: "wake_assignee", requestedResolverPolicy: "not_creator", effectiveResolverPolicy: "not_creator",
+        title: "Question for another role", createdByAgentId: input.askerId, addresseeAgentId: input.addresseeId,
+        payload: { version: 1, prompt: "Which disposition applies?" },
+        ...(input.status === "pending" ? {} : { resolvedAt: new Date(), result: { version: 1 as const, outcome: input.status } }),
+      }).returning();
+      return card.id;
+    }
+
+    async function parkQuestionWake(input: { companyId: string; issueId: string; askerId: string; addresseeId: string;
+      interactionId: string; requestedAt: Date }) {
+      const [wake] = await db.insert(agentWakeupRequests).values({
+        companyId: input.companyId, agentId: input.addresseeId, source: "automation", triggerDetail: "system",
+        reason: "interaction_pending", status: "deferred_issue_execution",
+        requestedByActorType: "agent", requestedByActorId: input.askerId, requestedAt: input.requestedAt,
+        idempotencyKey: `interaction-pending:${input.interactionId}`,
+        payload: { issueId: input.issueId, interactionId: input.interactionId, mutation: "interaction",
+          _paperclipWakeContext: { issueId: input.issueId, taskId: input.issueId, interactionId: input.interactionId,
+            interactionKind: "request_confirmation", wakeReason: "interaction_pending", mutation: "interaction",
+            source: "issue.interaction.created" } },
+      }).returning();
+      return wake.id;
+    }
+
+    async function seedAskerTurn() {
+      const companyId = await seedCompany();
+      const askerId = await seedAgent({ companyId, name: "Asker" });
+      const infraId = await seedAgent({ companyId, name: "First responder" });
+      const qualityId = await seedAgent({ companyId, name: "Second responder" });
+      const issueId = await seedIssue({ companyId, assigneeAgentId: askerId });
+      const runId = await seedRun({ companyId, agentId: askerId, status: "succeeded", contextSnapshot: { issueId } });
+      await db.update(heartbeatRuns).set({ finishedAt: new Date() }).where(eq(heartbeatRuns.id, runId));
+      await db.update(issues).set({ executionRunId: runId }).where(eq(issues.id, issueId));
+      return { companyId, askerId, infraId, qualityId, issueId, runId };
+    }
+
+    const release = () => createReleaseIssueExecution({ issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+      recovery: { escalateStrandedAssignedIssue: async () => undefined, escalateStrandedRecoveryIssueInPlace: async () => undefined },
+    });
+
+    it("promotes the second responder's pending question when the superseded question was parked first", async () => {
+      const { companyId, askerId, infraId, qualityId, issueId, runId } = await seedAskerTurn();
+      const supersededCard = await seedQuestionCard({ companyId, issueId, askerId, addresseeId: infraId, status: "expired" });
+      const currentCard = await seedQuestionCard({ companyId, issueId, askerId, addresseeId: qualityId, status: "pending" });
+      const supersededWake = await parkQuestionWake({ companyId, issueId, askerId, addresseeId: infraId,
+        interactionId: supersededCard, requestedAt: new Date(Date.now() - 2_000) });
+      const currentWake = await parkQuestionWake({ companyId, issueId, askerId, addresseeId: qualityId,
+        interactionId: currentCard, requestedAt: new Date(Date.now() - 1_000) });
+
+      const result = await release()({ companyId, runId, now: new Date(), suppressImmediateRecovery: true });
+
+      expect(result.outcome.kind).toBe("promoted");
+      const [retired] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, supersededWake));
+      expect(retired).toMatchObject({ status: "cancelled", runId: null, error: "Deferred question is no longer pending for this responder" });
+      const [delivered] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, currentWake));
+      expect(delivered).toMatchObject({ status: "queued", runId: expect.any(String) });
+      const [promoted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, delivered.runId!));
+      expect(promoted).toMatchObject({ agentId: qualityId, status: "queued",
+        contextSnapshot: expect.objectContaining({ wakeReason: "interaction_pending", interactionId: currentCard }) });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, infraId))).toHaveLength(0);
+    });
+
+    it("retires every superseded question and promotes nothing when no card is pending", async () => {
+      const { companyId, askerId, infraId, qualityId, issueId, runId } = await seedAskerTurn();
+      const expiredCard = await seedQuestionCard({ companyId, issueId, askerId, addresseeId: infraId, status: "expired" });
+      const answeredCard = await seedQuestionCard({ companyId, issueId, askerId, addresseeId: qualityId, status: "answered" });
+      const wakes = [
+        await parkQuestionWake({ companyId, issueId, askerId, addresseeId: infraId, interactionId: expiredCard, requestedAt: new Date(Date.now() - 2_000) }),
+        await parkQuestionWake({ companyId, issueId, askerId, addresseeId: qualityId, interactionId: answeredCard, requestedAt: new Date(Date.now() - 1_000) }),
+      ];
+
+      const result = await release()({ companyId, runId, now: new Date(), suppressImmediateRecovery: true });
+
+      expect(result.outcome.kind).not.toBe("promoted");
+      for (const id of wakes) {
+        expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, id)))[0])
+          .toMatchObject({ status: "cancelled", runId: null });
+      }
+      expect(await db.select().from(heartbeatRuns)).toHaveLength(1);
+    });
+
+    it("still promotes a question wake for the task's own assignee whatever its card state", async () => {
+      const { companyId, askerId, infraId, issueId, runId } = await seedAskerTurn();
+      // The asker handed the task to the responder after asking it.
+      await db.update(issues).set({ assigneeAgentId: infraId }).where(eq(issues.id, issueId));
+      const expiredCard = await seedQuestionCard({ companyId, issueId, askerId, addresseeId: infraId, status: "expired" });
+      const wake = await parkQuestionWake({ companyId, issueId, askerId, addresseeId: infraId, interactionId: expiredCard,
+        requestedAt: new Date(Date.now() - 1_000) });
+
+      const result = await release()({ companyId, runId, now: new Date(), suppressImmediateRecovery: true });
+
+      expect(result.outcome.kind).toBe("promoted");
+      expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake)))[0])
+        .toMatchObject({ status: "queued", runId: expect.any(String) });
+    });
   });
 
   it.each(["queued", "running", "scheduled_retry", "cancelled"])("preserves a stranded queue when another agent has a newer %s turn", async status => {
