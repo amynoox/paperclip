@@ -689,6 +689,33 @@
       "retireWhen": "Pinned upstream saves the comment when the superseded retry cannot be cancelled, confirmed by the same three cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0023",
+      "title": "A queued run denied by another run's active execution owner is proven never dispatched",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "The final dispatch gate cancels a queued legacy run with execution_reconciliation_required when the previous run still owns execution (getConversationOwnershipBlocker: live process or unreleased lease). That denial has no recovery action, so executionWait.recoveryActionId is null and the pre-dispatch proof (upstream #16894) does not recognize the wait: legacy recovery opens a replay-blocked hold and the task is blocked. Production, 13 Nov 2026, TR-638: run 3327ab6c cancelled at 09:41:33 while the local lease of a91195d4 was released at 09:41:39; hold 0bfcb6b8, issue blocked.",
+      "reason": "Approved by Amyne on 13 Nov 2026 (V233).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server run dispatch and legacy execution recovery",
+      "paths": [
+        "server/src/__tests__/heartbeat-undispatched-execution-wait.test.ts",
+        "server/src/modules/run-dispatch/adapters/postgres.test.ts",
+        "server/src/modules/run-dispatch/adapters/postgres.ts",
+        "server/src/services/pre-dispatch-execution-wait.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "Upstream master still requires executionWait.recoveryActionId (last changes #19466, #18838, #16894). #16894 introduced the proof for denials by an existing hold; it does not cover owner denials. No open or merged change found.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. heartbeat-undispatched-execution-wait.test.ts: 38 passed (one owner-denial case, four owner-less or self-referencing receipts kept held, one owner denial with execution evidence kept held); negative control on the base proof, the owner-denial case fails. Dispatcher (run-dispatch postgres.test.ts, 89 passed): the owner denial records blockerCause and ownerRunId and passes the proof. legacy-execution-recovery.test.ts and legacy-continuation-authority.test.ts: 75 passed.",
+      "migration": "None. Holds already opened by this case (TR-638) are not lifted retroactively: the receipt of those runs has no owner recorded. Use a board reconciliation.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream recognizes owner denials as pre-dispatch waits, confirmed by the same cases.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }

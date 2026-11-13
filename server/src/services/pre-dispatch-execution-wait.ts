@@ -17,7 +17,11 @@ function preDispatchExecutionWaitPredicate() {
       = ${canonicalExecutionUuid(sql`${heartbeatRuns.contextSnapshot}->>'issueId'`)}
     AND (${heartbeatRuns.issueId} IS NULL OR ${heartbeatRuns.issueId}
       = ${canonicalExecutionUuid(sql`${heartbeatRuns.contextSnapshot}->>'issueId'`)})
-    AND ${canonicalExecutionUuid(sql`${heartbeatRuns.resultJson}->'executionWait'->>'recoveryActionId'`)} IS NOT NULL
+    AND (${canonicalExecutionUuid(sql`${heartbeatRuns.resultJson}->'executionWait'->>'recoveryActionId'`)} IS NOT NULL
+      -- STUDIO-0023: or a denial by another run's still-active execution owner.
+      OR (${heartbeatRuns.resultJson}->'executionWait'->>'blockerCause' = 'execution_owner_active'
+        AND ${canonicalExecutionUuid(sql`${heartbeatRuns.resultJson}->'executionWait'->>'ownerRunId'`)} IS NOT NULL
+        AND ${canonicalExecutionUuid(sql`${heartbeatRuns.resultJson}->'executionWait'->>'ownerRunId'`)} <> ${heartbeatRuns.id}))
     AND ${noRetainedExecutionPredicate()}, false)`;
 }
 
