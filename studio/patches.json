@@ -769,6 +769,32 @@
       "retireWhen": "Pinned upstream keeps Steer for entries the server holds when a local entry is unacknowledged, confirmed by the same two UI cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0029",
+      "title": "A cancelled blocker is handed back to the dependent's assignee, who may drop it and change the status in one update",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "A cancelled blocker never resolves its dependents (by design: routes/issues.ts diagnostics, services/issues.ts listUnresolvedBlockerIssueIds), and on cancellation nothing wakes or tells the dependent's assignee: issue_blockers_resolved fires only when a blocker becomes done. An agent can already remove the relation on its own (PATCH blockedByIssueIds alone, or set_dependencies, returns 200), but any status change of its blocked task while the cancelled blocker is stored is refused 409 'Issue follow-up blocked by unresolved blockers' (assertExplicitResumeIntentAllowed reads the stored blockers, before the same request replaces them), including cancelling the task itself. Production, 13 Nov 2026: nine QA tickets stayed blocked behind cancelled tickets (TR-584 behind TR-625, cancelled 18:25:47 UTC); the CTO reported that its cancel of TR-625 (blocked by cancelled TR-626) was refused 409; the QM was only woken by people's comments and escalated a 'link disposition' Question to Amyne instead of changing the blocker set.",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server issue routes, dependency handoff",
+      "paths": [
+        "server/src/__tests__/issue-cancelled-blocker-handoff-routes.test.ts",
+        "server/src/routes/issues.ts",
+        "server/src/services/issues.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "Queries: gh search prs 'cancelled blocker', 'blocker cancelled'; gh search issues 'cancelled blocker'. Issue #9811 (open) describes the defect. Open PRs, none merged nor in the 2026.1110.0 baseline: #19843 'hand cancelled dependencies back to their owners' (head b285807202f4f32757d77563d0b4783ac389c0cc; system comment plus comment wake on cancellation, cancellation stays unresolved, plus a recovery backstop and a queue fence); #17524 'evaluate resume readiness against requested blockers' (head 8b65b2f695ec7abce367064e2d5d78d44f586ff1; same-request readiness, but counts a cancelled blocker in the requested set as resolved); #11412 'allow terminal transitions past cancelled blockers' (14 commits, ignores cancelled blockers for terminal transitions); #11837 'let cancelled blockers release dependent issues' (makes cancelled resolve like done, changes the contract in 19 files); #9819 'wake and release blocked dependents when their blocker dies' (989 added lines, recovery service changes). #11837 and #11412 change the dependency contract (cancelled counts as resolved) and were not taken; #9819 is far wider.",
+        "selected": "Adapted, not cherry-picked: the route handoff of #19843 (system comment on each assigned open dependent, issue_commented wake with idempotency key issue_dependency_cancelled:<commentId>, source issue.cancelled_dependency_handoff; without its recovery backstop and queue fence) and the same-request readiness of #17524 (restricted to updates that only remove blockers, keeping cancelled and unfinalized kept blockers unresolved)."
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. issue-cancelled-blocker-handoff-routes.test.ts: 6 passed. Negative control on the base routes/issues.ts: the 3 behavior cases fail (no handoff comment or wake; 409 on 'drop the cancelled blocker + todo'; 409 on 'drop it + cancelled') and the 3 guard cases pass; on the base services/issues.ts the handoff case fails. Related suites: issue-dependency-wakeups-routes, issue-agent-mutation-ownership-routes, issue-comment-reopen-routes, issue-blocker-diagnostics-routes, issue-dependency-restore-wake-policy, issue-recovery-dependencies, low-trust-red-team-routes, issue-update-comment-wakeup-routes, issue-activity-events-routes: 9 files, 423 passed. tsc --noEmit on server: no error in the changed files (the tree reports 309 unrelated errors from unbuilt workspace packages). Probe on the base before the change: an agent PATCH with blockedByIssueIds alone already returns 200 (assignee and blocker's assignee); any agent status change of the blocked issue returns 409 while the cancelled blocker is stored.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream wakes the assignee of a dependent whose blocker is cancelled and accepts one update that drops the cancelled blocker and changes the status (for example #19843 and #17524 merged), confirmed by issue-cancelled-blocker-handoff-routes.test.ts.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
