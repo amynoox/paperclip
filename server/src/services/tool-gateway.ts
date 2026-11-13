@@ -4941,11 +4941,12 @@ export function createToolGatewayService(
     // Studio (STUDIO-0015): a per_user run attributed to a member who has no
     // personal grant of their own may use the personal grant its owner
     // explicitly delegated to this agent (owner consent, owner still an
-    // active member). Fallback policies keep their organization grant.
+    // active member), whatever woke the run: an external chat message wakes
+    // it as an assignment. Ownerless runs keep the native rule (unattended
+    // only). Fallback policies keep their organization grant.
     if (
       !userGrant &&
-      (!actingUserId || connection.credentialPolicy === "per_user") &&
-      autonomous &&
+      (actingUserId ? connection.credentialPolicy === "per_user" : autonomous) &&
       session.agentId &&
       connection.credentialPolicy !== "shared"
     ) {
