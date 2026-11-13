@@ -664,6 +664,31 @@
       "retireWhen": "Pinned upstream includes paperclipai/paperclip#15696 or an equivalent idle wait.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0022",
+      "title": "A human comment is kept when cancelling the scheduled retry it supersedes fails",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "A human comment on an in-progress issue with a scheduled retry first cancels that retry. When the cancellation throws, the route rethrew and the whole request failed with 500 before the comment was inserted. Production, 13 Nov 2026, 16:48:17: Board comment on TR-617 lost, the Worker Router adapter refused with router_control_scope_busy while retry 1f315cc0 was being cancelled.",
+      "reason": "Approved by Amyne on 13 Nov 2026 (V233). A failed cleanup of a retry must not lose a person's message.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server issue comment routes",
+      "paths": [
+        "server/src/__tests__/issue-comment-reopen-routes.test.ts",
+        "server/src/routes/issues.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found for a failed retry cancellation on the comment path. Upstream tests assert the opposite contract (500, no comment) in issue-comment-reopen-routes.test.ts; this patch changes those two cases. paperclipai/paperclip#9732 (open) promotes parked retries when a comment wake coalesces into them and does not cover this.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2. issue-comment-reopen-routes.test.ts: 109 passed; negative control on the base issues.ts, the 3 new or changed cases fail with 500. issue-update-comment-wakeup-routes.test.ts and issue-scheduled-retry-routes.test.ts (embedded PostgreSQL): 76 passed.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream saves the comment when the superseded retry cannot be cancelled, confirmed by the same three cases.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
