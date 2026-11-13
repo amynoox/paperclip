@@ -24,7 +24,7 @@ describe("plugin-created interaction addressee wake", () => {
     await db.insert(companies).values({ id: companyId, name: "Router cards", issuePrefix: `R${companyId.slice(0, 6)}` });
     await db.insert(agents).values([
       { id: executor, companyId, name: "Executor", adapterType: "process", status: "idle", permissions: {} },
-      { id: manager, companyId, name: "Manager", adapterType: "process", status: "paused", permissions: {} },
+      { id: manager, companyId, name: "Manager", adapterType: "process", status: "idle", permissions: {} },
     ]);
     await db.insert(issues).values({ id: issueId, companyId, title: "Routed task", status: "in_progress", assigneeAgentId: executor });
     return { companyId, executor, manager, issueId };
