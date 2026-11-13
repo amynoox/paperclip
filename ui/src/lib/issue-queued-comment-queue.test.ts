@@ -3,6 +3,8 @@ import {
   mergePendingIssueQueuedComments,
   normalizeIssueQueuedCommentQueue,
   startingQueuedCommentIds,
+  isUnacknowledgedQueuedEntry,
+  steerQueueIdForEntry,
 } from "./issue-queued-comment-queue";
 
 function comment(id: string, body: string) {
@@ -185,5 +187,53 @@ describe("normalizeIssueQueuedCommentQueue", () => {
     expect(queue?.entries.map((entry) => entry.comment.id)).toEqual([
       "comment-1",
     ]);
+  });
+});
+
+// STUDIO-0021: TR-626, 13 Nov 2026. Two messages held by the server queue and a
+// Board message posted during the live run, which the server only queues when
+// that run ends. The held messages stay steerable; the local one waits.
+describe("steering a merged queue with an unacknowledged local entry", () => {
+  const held = [comment("cto-1", "First held message"), comment("cto-2", "Second held message")];
+  const board = comment("board-1", "Board message posted during the run");
+  const authoritativeQueue = {
+    issueId: "issue-1", queueId: "wake-held", state: "deferred" as const, targetRunId: "run-live",
+    revision: "rev-held", protocol: "adapter_interactive_v1" as const, steeringDisposition: "available" as const,
+    entries: held.map((c, position) => ({ comment: c, position, canEdit: false, canDiscard: true })),
+    executionWait: null,
+  };
+  const merged = () => mergePendingIssueQueuedComments({
+    issueId: "issue-1",
+    authoritativeQueue,
+    pendingComments: [{ comment: board, targetRunId: "run-live" }],
+    fallbackProtocol: "legacy",
+  });
+
+  it("withholds whole-queue mutations but keeps the server queue id for held entries", () => {
+    const queue = merged();
+    expect(queue).toMatchObject({ queueId: null, acknowledgedQueueId: "wake-held",
+      unacknowledgedCommentIds: ["board-1"], steeringDisposition: "available" });
+    expect(steerQueueIdForEntry(queue, "cto-1")).toBe("wake-held");
+    expect(steerQueueIdForEntry(queue, "cto-2")).toBe("wake-held");
+    expect(steerQueueIdForEntry(queue, "board-1")).toBeNull();
+    expect(isUnacknowledgedQueuedEntry(queue, "board-1")).toBe(true);
+    expect(isUnacknowledgedQueuedEntry(queue, "cto-1")).toBe(false);
+  });
+
+  it("uses the queue id itself once every entry is acknowledged", () => {
+    const queue = mergePendingIssueQueuedComments({
+      issueId: "issue-1", authoritativeQueue, pendingComments: [], fallbackProtocol: "legacy",
+    });
+    expect(queue).toMatchObject({ queueId: "wake-held", unacknowledgedCommentIds: [] });
+    expect(steerQueueIdForEntry(queue, "cto-1")).toBe("wake-held");
+  });
+
+  it("never invents a queue id when the server holds no queue", () => {
+    const queue = mergePendingIssueQueuedComments({
+      issueId: "issue-1", authoritativeQueue: null,
+      pendingComments: [{ comment: board, targetRunId: "run-live" }], fallbackProtocol: "legacy",
+    });
+    expect(steerQueueIdForEntry(queue, "board-1")).toBeNull();
+    expect(steerQueueIdForEntry(null, "board-1")).toBeNull();
   });
 });

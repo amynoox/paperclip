@@ -318,6 +318,30 @@ describe("TaskChatQueuedMessages", () => {
     );
   });
 
+  // STUDIO-0021: TR-626, 13 Nov 2026. A message shown locally but not yet in
+  // the server queue must not silently disable Steer on the messages the
+  // server does hold.
+  it("steers a held message while another entry awaits the server, and says why the other waits", async () => {
+    const merged = { ...queue, queueId: null, protocol: "adapter_interactive_v1" as const,
+      acknowledgedQueueId: "wake-1", unacknowledgedCommentIds: ["comment-2"] };
+    const props = render({ queue: merged });
+    const held = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-steer-comment-1"]')!;
+    const waiting = container.querySelector<HTMLButtonElement>('[data-testid="task-chat-queued-steer-comment-2"]')!;
+    expect(held.disabled).toBe(false);
+    expect(waiting.disabled).toBe(true);
+    expect(waiting.title).toContain("Waiting for the server to queue this message");
+    await act(async () => { held.click(); });
+    expect(props.onSteer).toHaveBeenCalledWith("comment-1", "rev-1");
+  });
+
+  it("keeps Steer disabled on every entry when the server holds no queue", () => {
+    render({ queue: { ...queue, queueId: null, acknowledgedQueueId: null,
+      unacknowledgedCommentIds: ["comment-1", "comment-2"] } as typeof queue });
+    for (const id of ["comment-1", "comment-2"]) {
+      expect(container.querySelector<HTMLButtonElement>(`[data-testid="task-chat-queued-steer-${id}"]`)!.disabled).toBe(true);
+    }
+  });
+
   it("disables steering when the provider does not advertise it", () => {
     render({ queue: { ...queue, steeringDisposition: "unsupported" } });
     expect(

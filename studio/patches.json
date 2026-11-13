@@ -689,6 +689,86 @@
       "retireWhen": "Pinned upstream saves the comment when the superseded retry cannot be cancelled, confirmed by the same three cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0023",
+      "title": "A queued run denied by another run's active execution owner is proven never dispatched",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "The final dispatch gate cancels a queued legacy run with execution_reconciliation_required when the previous run still owns execution (getConversationOwnershipBlocker: live process or unreleased lease). That denial has no recovery action, so executionWait.recoveryActionId is null and the pre-dispatch proof (upstream #16894) does not recognize the wait: legacy recovery opens a replay-blocked hold and the task is blocked. Production, 13 Nov 2026, TR-638: run 3327ab6c cancelled at 09:41:33 while the local lease of a91195d4 was released at 09:41:39; hold 0bfcb6b8, issue blocked.",
+      "reason": "Approved by Amyne on 13 Nov 2026 (V233).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server run dispatch and legacy execution recovery",
+      "paths": [
+        "server/src/__tests__/heartbeat-undispatched-execution-wait.test.ts",
+        "server/src/modules/run-dispatch/adapters/postgres.test.ts",
+        "server/src/modules/run-dispatch/adapters/postgres.ts",
+        "server/src/services/pre-dispatch-execution-wait.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "Upstream master still requires executionWait.recoveryActionId (last changes #19466, #18838, #16894). #16894 introduced the proof for denials by an existing hold; it does not cover owner denials. No open or merged change found.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. heartbeat-undispatched-execution-wait.test.ts: 38 passed (one owner-denial case, four owner-less or self-referencing receipts kept held, one owner denial with execution evidence kept held); negative control on the base proof, the owner-denial case fails. Dispatcher (run-dispatch postgres.test.ts, 89 passed): the owner denial records blockerCause and ownerRunId and passes the proof. legacy-execution-recovery.test.ts and legacy-continuation-authority.test.ts: 75 passed.",
+      "migration": "None. Holds already opened by this case (TR-638) are not lifted retroactively: the receipt of those runs has no owner recorded. Use a board reconciliation.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream recognizes owner denials as pre-dispatch waits, confirmed by the same cases.",
+      "upgradeDecisions": [],
+      "commits": []
+    },
+    {
+      "id": "STUDIO-0024",
+      "title": "The saved-wait drain checks people's messages first and asks the adapter once per task per pass",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "resumeDeferredExecutionReceipts takes the 50 oldest saved adapter waits and calls the adapter's getTaskAdmission hook for each, even when many belong to the same task. Production, 13 Nov 2026, 12:00-17:04 UTC: TR-617 accumulated hundreds of automatic waits; every hook call was refused with router_control_scope_busy (4811 router scope refusals, 67 drain failures logged), and the waits holding people's messages on TR-626 (5bcd7a8e, 6ce9b843) were never replayed. The scope refusals themselves were fixed by STUDIO-0017 (studio.10, zero drain failures since 17:04); this patch removes the starvation.",
+      "reason": "Approved by Amyne on 13 Nov 2026 (V233), as part of replaying saved wakes.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server heartbeat queue, deferred receipt drain",
+      "paths": [
+        "server/src/services/adapter-task-admission.test.ts",
+        "server/src/services/heartbeat/queue.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found for the adapter-wait drain order or per-task deduplication. paperclipai/paperclip#21427 (open) reorders recovery behind people's work in a different path and does not touch this drain.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. adapter-task-admission.test.ts: 20 passed; negative control on the base queue.ts, both new cases fail (7 adapter calls instead of 1; the person's wait is not checked first). deferred-execution-receipt-work.test.ts, question-response-delivery.test.ts and heartbeat-held-comment-wake.test.ts: 107 passed.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream bounds adapter calls per task in the saved-wait drain and serves people's saved input first, confirmed by the same two cases.",
+      "upgradeDecisions": [],
+      "commits": []
+    },
+    {
+      "id": "STUDIO-0021",
+      "title": "Steer stays available for queued messages the server holds while another entry awaits acknowledgement",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "The browser shows a message posted during a live run as queued, but the server only queues it when that run ends. mergePendingIssueQueuedComments then cleared queueId for the whole queue, so every Steer button was disabled, while its title still said it would steer, and no request was sent. Production, 13 Nov 2026, TR-626, 16:48-16:57 UTC: repeated Steer clicks, no POST /steer in the server journal; two messages held by the server could not be steered.",
+      "reason": "Approved by Amyne on 13 Nov 2026 (V233).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "ui task chat queued messages",
+      "paths": [
+        "ui/src/components/task-chat/TaskChatQueuedMessages.test.tsx",
+        "ui/src/components/task-chat/TaskChatQueuedMessages.tsx",
+        "ui/src/lib/issue-queued-comment-queue.test.ts",
+        "ui/src/lib/issue-queued-comment-queue.ts",
+        "ui/src/pages/IssueDetail.tsx"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "paperclipai/paperclip#19450 (Interrupt when steering is unavailable) and #19970 (auto-steer after 5 s) are already in the baseline and do not cover this. #15865 (mixed queue interrupts without hiding unsent messages) was closed unmerged. No change found that keeps Steer for server-held entries while a local entry is unacknowledged.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2. UI tests issue-queued-comment-queue.test.ts and TaskChatQueuedMessages.test.tsx: 52 passed; negative control, the held-entry case fails on the base component. Full Vite release build with studio/build-steering-ui.mjs from a CRLF checkout: the studio.4 production UI (10b89f1aa) rebuilds to identical chunk contents once chunk hash names are normalized (all 579 local files have a production twin). With this change only the index and issue-detail chunks differ in content.",
+      "migration": "None. Browsers must reload once to load the new interface.",
+      "rollback": "Switch cli/current back to the previous install folder; the previous ui-dist is kept unchanged.",
+      "retireWhen": "Pinned upstream keeps Steer for entries the server holds when a local entry is unacknowledged, confirmed by the same two UI cases.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }

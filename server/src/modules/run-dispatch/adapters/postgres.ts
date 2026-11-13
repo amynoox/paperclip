@@ -1404,7 +1404,12 @@ export function createPostgresRunDispatchAdapter(
     const recovery = await getExecutionBlocker(tx, run.companyId, issueId, { conversationResetCommentId: deriveCommentId(contextSnapshot) });
     if (recovery) return { issueId, facts: null, executionBlocker: recovery, decision: { stale: true as const,
       errorCode: "execution_reconciliation_required" as const, reason: recovery.nextAction,
-      details: { issueId, recoveryActionId: recovery.recoveryActionId },
+      details: { issueId, recoveryActionId: recovery.recoveryActionId,
+        // STUDIO-0023: a denial by the previous run's still-active execution
+        // owner has no recovery action. Name that owner so the pre-dispatch
+        // proof can recognize the wait instead of opening another hold.
+        ...(recovery.recoveryActionId === null && recovery.cause === "execution_owner_active" && recovery.runId
+          ? { blockerCause: recovery.cause, ownerRunId: recovery.runId } : {}) },
     } };
     const facts = await loadStalenessFacts(
       {

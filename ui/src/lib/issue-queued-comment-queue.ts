@@ -122,6 +122,36 @@ export interface PendingIssueQueuedComment {
 }
 
 /**
+ * STUDIO-0021: a merged queue keeps the server queue id for the entries the
+ * server already holds, so a local entry the server has not acknowledged (for
+ * example a message posted during a live run, which the server only queues
+ * when that run ends) no longer blocks steering the others.
+ */
+export type MergedIssueQueuedCommentQueue = IssueQueuedCommentQueue & {
+  acknowledgedQueueId?: string | null;
+  unacknowledgedCommentIds?: readonly string[];
+};
+
+/** STUDIO-0021: the queue id a Steer of this entry may use, or null when the server does not hold it. */
+export function steerQueueIdForEntry(
+  queue: MergedIssueQueuedCommentQueue | null | undefined,
+  commentId: string,
+): string | null {
+  if (!queue) return null;
+  if (queue.queueId) return queue.queueId;
+  if (queue.unacknowledgedCommentIds?.includes(commentId)) return null;
+  return queue.acknowledgedQueueId ?? null;
+}
+
+/** STUDIO-0021: true when the entry is shown locally but is not in the server queue yet. */
+export function isUnacknowledgedQueuedEntry(
+  queue: MergedIssueQueuedCommentQueue | null | undefined,
+  commentId: string,
+): boolean {
+  return Boolean(queue?.unacknowledgedCommentIds?.includes(commentId));
+}
+
+/**
  * Keeps a just-submitted follow-up in the composer queue while the comment and
  * queue endpoints acknowledge it independently. If the server has not yet
  * included every local entry, queue mutations are withheld by clearing the
@@ -133,7 +163,7 @@ export function mergePendingIssueQueuedComments(params: {
   authoritativeQueue: IssueQueuedCommentQueue | null | undefined;
   pendingComments: PendingIssueQueuedComment[];
   fallbackProtocol: IssueQueuedCommentProtocol;
-}): IssueQueuedCommentQueue | null {
+}): MergedIssueQueuedCommentQueue | null {
   const authoritativeEntries = params.authoritativeQueue?.entries ?? [];
   const authoritativeIds = new Set(
     authoritativeEntries.map((entry) => entry.comment.id),
@@ -182,5 +212,9 @@ export function mergePendingIssueQueuedComments(params: {
         : "unsupported"),
     entries,
     executionWait: params.authoritativeQueue?.executionWait ?? null,
+    acknowledgedQueueId: authoritativeOwnsQueue
+      ? (params.authoritativeQueue?.queueId ?? null)
+      : null,
+    unacknowledgedCommentIds: pendingEntries.map((entry) => entry.comment.id),
   };
 }
