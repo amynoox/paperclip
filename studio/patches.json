@@ -588,6 +588,31 @@
       "retireWhen": "Pinned upstream includes paperclipai/paperclip#17771 or an equivalent proof.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0016",
+      "title": "Stop on a never-started scheduled retry records that no provider work started",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Cancelling a legacy run writes executionRecovery {kind: bootstrap, providerWorkStarted: false} only when the run was queued (run-lifecycle.ts setRunStatus and setRunStatusFromLive). A legacy run waiting in scheduled_retry has not started either, but its Stop left no such proof, so legacy execution recovery classified it as an execution with unknown action outcomes, settled a legacy_execution_requires_reconciliation hold with replay blocked, and every later wake of the task was deferred with process_identity_missing. Production, 13 Nov 2026: TR-588, scheduled retry 09b5927e (ai_connection_pool_wait) stopped by the board at 04:51:47 before it started; the task stayed without a run until a board reconciliation at 06:10.",
+      "reason": "Approved by Amyne (studio decision V228, 13 Nov 2026). A waiting retry is not an execution; stopping it must not demand a human reconciliation.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server heartbeat run lifecycle (cancellation of legacy runs)",
+      "paths": [
+        "server/src/services/heartbeat/run-lifecycle.ts",
+        "server/src/__tests__/studio-scheduled-retry-cancel-proof.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "PRs and issues, all states, searched for cancelled scheduled retry, scheduled_retry cancel, scheduled retry never started, scheduled_retry bootstrap, stop scheduled retry hold, providerWorkStarted, legacy_execution_requires_reconciliation, process_identity_missing. Nearest: #20752 (open, fences the queued cancellation marker to the queued row; queued only), #20644 (open, native cancellations), #17771 (open, suppressed disposition repair; taken as STUDIO-0018), #18085 (closed). None covers a scheduled_retry Stop; the fix is a deliberate downstream deviation.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. New case studio-scheduled-retry-cancel-proof.test.ts: on the studio.9 source, Stop on a never-started legacy scheduled retry leaves no bootstrap proof and legacyExecutionNeedsReconciliation stays true (fails); with the change the proof is written and reconciliation is not needed (passes). The control case (a started run) keeps the ordinary cancellation in both. With the change: the new file, heartbeat retries and task-retry test files, 110 passed. Re-run on the combined studio.10 source recorded in the delivery folder.",
+      "migration": "None. Applies to cancellations after deployment; an existing hold is resolved by a board reconciliation (tools/reconcile-stopped-run.mjs in the studio workspace).",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream writes the bootstrap proof for a cancelled scheduled retry that never started, or otherwise exempts it from legacy reconciliation.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
