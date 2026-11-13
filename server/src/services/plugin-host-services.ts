@@ -43,6 +43,7 @@ import { projectService } from "./projects.js";
 import { executionWorkspaceService } from "./execution-workspaces.js";
 import { issueService } from "./issues.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
+import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 import { goalService } from "./goals.js";
 import { documentService } from "./documents.js";
 import { heartbeatService } from "./heartbeat.js";
@@ -2759,6 +2760,60 @@ export function buildHostServices(
             continuationPolicy: interaction.continuationPolicy,
           },
         });
+        // STUDIO-0026: a card a plugin addresses to an agent reaches that agent
+        // exactly like a card created through the issue interaction route
+        // (same attention rule, same idempotency key). A plugin cannot request
+        // this wake itself: requestWakeup only targets the issue assignee.
+        if (
+          interaction.addresseeAgentId &&
+          interaction.status === "pending" &&
+          issueThreadInteractionAttentionAgentAllowed({
+            agentId: interaction.addresseeAgentId,
+            interaction,
+            governedAction:
+              interaction.kind === "request_confirmation" &&
+              typeof interaction.payload === "object" &&
+              interaction.payload !== null &&
+              "toolAction" in interaction.payload &&
+              interaction.payload.toolAction !== undefined,
+          })
+        ) {
+          void heartbeat
+            .wakeup(interaction.addresseeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: "interaction_pending",
+              payload: {
+                issueId: issue.id,
+                interactionId: interaction.id,
+                interactionKind: interaction.kind,
+                sourceCommentId: interaction.sourceCommentId ?? null,
+                sourceRunId: interaction.sourceRunId ?? null,
+                mutation: "interaction",
+                pluginId,
+              },
+              idempotencyKey: `interaction-pending:${interaction.id}`,
+              requestedByActorType: "system",
+              requestedByActorId: pluginId,
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                interactionId: interaction.id,
+                interactionKind: interaction.kind,
+                sourceCommentId: interaction.sourceCommentId ?? null,
+                sourceRunId: interaction.sourceRunId ?? null,
+                wakeReason: "interaction_pending",
+                source: "plugin.issue.interaction.created",
+                pluginId,
+              },
+            })
+            .catch((err) =>
+              logger.warn(
+                { err, issueId: issue.id, interactionId: interaction.id, agentId: interaction.addresseeAgentId, pluginId },
+                "failed to wake addressee on plugin interaction creation",
+              ),
+            );
+        }
         return interaction as any;
       },
       async listInteractions(params) {
