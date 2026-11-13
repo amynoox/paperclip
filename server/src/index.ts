@@ -1,4 +1,5 @@
 import type { IdleDeadlineOwners } from "./services/idle-deadline-types.js";
+import { startShortCommandLauncher } from "@paperclipai/adapter-utils/short-command-launcher";
 import { closeProcessRunAdmission } from "./services/heartbeat/run-admission.js";
 import { registerOwnershipReconciliationWork } from "./services/native-runtime/native-finalization-reconciler.js";
 import { bindIdleDeadlineOwner } from "./services/idle-deadline-owner.js";
@@ -1087,6 +1088,17 @@ async function startServerWithDatabaseTeardown(
     });
   });
   startupListenerBound = true;
+  // Short commands (ssh, git) start from a small helper process, so that their
+  // fork does not copy the page tables of this process on the event loop.
+  // PAPERCLIP_SHORT_COMMAND_LAUNCHER=off keeps every start in this process.
+  // The helper exits by itself when this process exits.
+  const shortCommandLauncher = startShortCommandLauncher({
+    onEvent: (event) => {
+      if (event.type === "started") logger.info({ pid: event.pid }, "short-command launcher started");
+      else logger.warn(event, "short-command launcher exited; commands start directly until it is back");
+    },
+  });
+  if (!shortCommandLauncher.enabled) logger.info("short-command launcher is off; commands start from this process");
   // The factory publishes the verified numeric endpoint on listening. Native
   // recovery must never fall back to a configured/public URL if it is absent.
   resolveLocalRuntimeApiUrl();
@@ -2214,6 +2226,8 @@ async function startServerWithDatabaseTeardown(
       });
     }
 
+    // Last: commands of the ordered shutdown above still went through the helper.
+    await shortCommandLauncher.stop();
     if (exitProcess) process.exit(0);
   };
 

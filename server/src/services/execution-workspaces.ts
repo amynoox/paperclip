@@ -52,13 +52,13 @@ import {
   purgeStaleWorkspaceCompactionTrash,
   restoreWorkspaceDirsFromTrash,
 } from "./workspace-compaction.js";
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { isDeepStrictEqual, promisify } from "node:util";
+import { isDeepStrictEqual } from "node:util";
 import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { execFileText } from "@paperclipai/adapter-utils/short-command-launcher";
 import {
   executionWorkspaces,
   agents,
@@ -129,7 +129,6 @@ type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
 type WorkspaceRuntimeServiceRow = typeof workspaceRuntimeServices.$inferSelect;
 type RuntimeServiceReadDb = Pick<Db, "select">;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
-const execFileAsync = promisify(execFile);
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 
 // Return the timestamp when an issue became terminal. A `done` issue uses
@@ -564,7 +563,8 @@ async function hasGitMarkerInPathOrAncestors(start: string) {
 }
 
 async function runGit(args: string[], cwd: string) {
-  return await execFileAsync("git", ["-C", cwd, ...args], { cwd });
+  // Same contract as the promisified execFile it replaces: no timeout, 1 MiB of output.
+  return await execFileText("git", ["-C", cwd, ...args], { cwd, timeout: 0, maxBuffer: 1024 * 1024 });
 }
 
 async function runExpensiveGitStatus(input: {
