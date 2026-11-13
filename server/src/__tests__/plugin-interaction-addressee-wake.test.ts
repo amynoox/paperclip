@@ -21,7 +21,7 @@ describe("plugin-created interaction addressee wake", () => {
 
   async function seed() {
     const companyId = randomUUID(), executor = randomUUID(), manager = randomUUID(), issueId = randomUUID();
-    await db.insert(companies).values({ id: companyId, name: "Router cards", issuePrefix: `R${companyId.slice(0, 6)}` });
+    await db.insert(companies).values({ id: companyId, name: "Router cards", defaultResponsibleUserId: "board", issuePrefix: `R${companyId.slice(0, 6)}` });
     await db.insert(agents).values([
       { id: executor, companyId, name: "Executor", adapterType: "process", status: "idle", permissions: {} },
       { id: manager, companyId, name: "Manager", adapterType: "process", status: "idle", permissions: {} },
