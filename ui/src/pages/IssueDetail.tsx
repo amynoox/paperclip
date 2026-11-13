@@ -135,6 +135,7 @@ import {
   mergePendingIssueQueuedComments,
   normalizeIssueQueuedCommentQueue,
   startingQueuedCommentIds,
+  steerQueueIdForEntry,
 } from "../lib/issue-queued-comment-queue";
 import { collectLiveIssueIds } from "../lib/liveIssueIds";
 import {
@@ -2336,7 +2337,9 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
 
   const steerQueuedComment = useCallback(
     async (commentId: string, revision: string) => {
-      const queueId = effectiveQueuedCommentQueue?.queueId;
+      // STUDIO-0021: an entry the server already holds can be steered even
+      // while another, locally shown entry awaits server acknowledgement.
+      const queueId = steerQueueIdForEntry(effectiveQueuedCommentQueue, commentId);
       const targetRunId = effectiveQueuedCommentQueue?.targetRunId;
       if (!queueId || !targetRunId)
         throw new Error(
