@@ -7809,6 +7809,7 @@ registry.registerPath({
       agentId: z.string().optional(),
       limit: z.coerce.number().int().min(1).max(1000).default(200),
       summary: z.enum(["true", "false", "1", "0"]).optional(),
+      fullUsage: z.enum(["true", "false", "1", "0"]).optional().describe("Return the whole usageJson record. By default list rows keep only token counts, cost, provider, model and billing fields; GET /api/heartbeat-runs/{runId} always returns the whole record. Ignored with summary."),
       latestFailuresOnly: z.enum(["true", "false"]).optional().describe("Return failures only when the agent's latest run within the bounded result failed or timed out. Applied before read redaction."),
     }),
   },

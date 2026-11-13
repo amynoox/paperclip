@@ -487,6 +487,41 @@ export function summarizeHeartbeatRunListResultJson(input: {
   return Object.keys(summary).length > 0 ? summary : null;
 }
 
+// Usage fields that run lists read: token counts, cost, provider and model, and
+// the billing hints that decide how tokens and cost display. Receipt fences,
+// per-model breakdowns and budget details stay on the single-run route, or on
+// the list with `fullUsage`.
+const HEARTBEAT_RUN_LIST_USAGE_KEYS = [
+  "inputTokens",
+  "input_tokens",
+  "outputTokens",
+  "output_tokens",
+  "cachedInputTokens",
+  "cached_input_tokens",
+  "cache_read_input_tokens",
+  "totalTokens",
+  "provider",
+  "model",
+  "billingType",
+  "accountingReceiptId",
+  "cacheAdjustedCostUsd",
+  "costUsdExact",
+  "costUsd",
+  "cost_usd",
+  "total_cost_usd",
+] as const;
+
+export function summarizeHeartbeatRunListUsageJson(
+  usage: Record<string, unknown> | null,
+): Record<string, unknown> | null {
+  if (!usage || typeof usage !== "object" || Array.isArray(usage)) return usage;
+  const summary: Record<string, unknown> = {};
+  for (const key of HEARTBEAT_RUN_LIST_USAGE_KEYS) {
+    if (Object.hasOwn(usage, key)) summary[key] = usage[key];
+  }
+  return summary;
+}
+
 export function normalizeLedgerBillingType(value: unknown): BillingType {
   const raw = readNonEmptyString(value);
   switch (raw) {
@@ -1799,10 +1834,11 @@ export function createHeartbeatRunState(db: Db) {
       companyId: string,
       agentId?: string,
       limit?: number,
-      options: { summary?: boolean } = {},
+      options: { summary?: boolean; fullUsage?: boolean } = {},
     ) => {
       const safeForLegacyEncoding = await hasUnsafeTextProjectionDatabase();
       const summary = options.summary === true;
+      const fullUsage = options.fullUsage === true;
       const rows = await retryIdempotentDatabaseOperation(async () => {
         const query = db
           .select(
@@ -1870,6 +1906,7 @@ export function createHeartbeatRunState(db: Db) {
 
         return {
           ...rest,
+          usageJson: fullUsage ? rest.usageJson : summarizeHeartbeatRunListUsageJson(rest.usageJson),
           contextSnapshot: summarizeHeartbeatRunContextSnapshot({
             issueId: contextIssueId,
             taskId: contextTaskId,
