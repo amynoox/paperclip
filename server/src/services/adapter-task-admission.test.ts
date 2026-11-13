@@ -181,6 +181,41 @@ describe("adapter interaction admission", () => {
     expect(await deferAdapterRun(db, run, f.wait, true)).toBe(false);
     expect((await db.select().from(agentWakeupRequests))[0].runId).toBe(run.id);
   });
+  // STUDIO-0024: 13 Nov 2026, TR-617 kept hundreds of automatic adapter waits
+  // while TR-626 held people's messages; every pass called the router once per
+  // saved wait (refused router_control_scope_busy), oldest first, 50 at a time.
+  async function saveWaits(f: Awaited<ReturnType<typeof fixture>>, issueId: string, count: number,
+    actor: "system" | "user", ageMs: number) {
+    const context = { issueId, source: "issue.comment" };
+    const rows = Array.from({ length: count }, (_, n) => ({ companyId: f.company.id, agentId: f.agent.id,
+      source: "automation", triggerDetail: "system", reason: "issue_commented", status: "deferred_issue_execution",
+      requestedByActorType: actor, requestedByActorId: actor === "user" ? "board-user" : "monitor",
+      updatedAt: new Date(Date.now() - ageMs + n), requestedAt: new Date(Date.now() - ageMs + n),
+      payload: adapterWaitPayload({ issueId }, context, { kind: "pending_interaction", blockers: [] }) }));
+    return db.insert(agentWakeupRequests).values(rows).returning();
+  }
+  it("asks the adapter once per task in a pass, whatever the number of saved waits", async () => {
+    const f = await fixture();
+    await saveWaits(f, f.issue.id, 7, "system", 60_000);
+    hook.mockClear();
+    await f.queue.resumeDeferredExecutionReceipts({ companyId: f.company.id });
+    expect(hook).toHaveBeenCalledTimes(1);
+    expect((await db.select().from(agentWakeupRequests)).every(w => w.status === "deferred_issue_execution")).toBe(true);
+    hook.mockRejectedValue(new Error("router_control_scope_busy")); hook.mockClear();
+    const onError = vi.fn(); await f.queue.resumeDeferredExecutionReceipts({ companyId: f.company.id, onError });
+    expect(hook).toHaveBeenCalledTimes(1); expect(onError).toHaveBeenCalledTimes(1);
+  });
+  it("checks a person's saved message before a larger, older burst of automatic waits", async () => {
+    const f = await fixture();
+    const [other] = await db.insert(issues).values({ companyId: f.company.id, title: "Person waiting",
+      status: "in_progress", assigneeAgentId: f.agent.id }).returning();
+    await saveWaits(f, f.issue.id, 60, "system", 120_000);
+    await saveWaits(f, other.id, 1, "user", 1_000);
+    hook.mockClear();
+    await f.queue.resumeDeferredExecutionReceipts({ companyId: f.company.id, onError: () => undefined });
+    const askedIssues = hook.mock.calls.map(call => (call[0] as { issueId?: string }).issueId);
+    expect(askedIssues[0]).toBe(other.id);
+  });
   it("does not resume while environment cleanup remains held", async () => {
     const f = await fixture(), q = await queued(f, "running");
     await deferAdapterRun(db, q.run, f.wait, true);
