@@ -2109,14 +2109,25 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
       scope.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
       sql`${agentWakeupRequests.payload}->'adapterInteractionWait'->>'version' = '1'`,
-    )).orderBy(asc(agentWakeupRequests.updatedAt), asc(agentWakeupRequests.id)).limit(50);
+    // STUDIO-0024: a person's saved message is checked before automatic
+    // signals, so a burst of automatic waits on one task cannot keep it out
+    // of the bounded pass.
+    )).orderBy(sql`case when ${agentWakeupRequests.requestedByActorType} = 'user' then 0 else 1 end`,
+      asc(agentWakeupRequests.updatedAt), asc(agentWakeupRequests.id)).limit(50);
+    // STUDIO-0024: the adapter answers per agent and task. Once it says the
+    // task still waits (or cannot answer), the other saved waits of that task
+    // keep their place without another adapter call in this pass.
+    const stillWaiting = new Set<string>();
     for (const wake of adapterWaits) {
+      let waitKey: string | null = null;
       try {
         await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
           eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)));
         const context = parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]);
         const issueId = readNonEmptyString(wake.payload?.issueId);
         if (!issueId || !isUuidLike(issueId)) continue;
+        waitKey = `${wake.companyId}:${wake.agentId}:${issueId}`;
+        if (stillWaiting.has(waitKey)) continue;
         const preparationRunId = readNonEmptyString(parseObject(wake.payload?.adapterInteractionWait).preparationRunId);
         if (preparationRunId) {
           if (!isUuidLike(preparationRunId) || activeRunExecutions.has(preparationRunId) || adapterExecutionControls.has(preparationRunId)) continue;
@@ -2125,7 +2136,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             or(isNull(environmentLeases.releasedAt), inArray(environmentLeases.status, ["active", "pending_cleanup"])))).limit(1);
           if (lease) continue;
         }
-        if (await readAdapterTaskWait(db, { companyId: wake.companyId, agentId: wake.agentId, issueId, context }, true)) continue;
+        if (await readAdapterTaskWait(db, { companyId: wake.companyId, agentId: wake.agentId, issueId, context }, true)) {
+          stillWaiting.add(waitKey);
+          continue;
+        }
         const { adapterInteractionWait: _wait, executionWait: _execution, ...payload } = parseObject(wake.payload);
         await enqueueWakeup(wake.agentId, { source: wake.source as WakeupOptions["source"],
           triggerDetail: wake.triggerDetail as WakeupOptions["triggerDetail"], reason: wake.reason ?? undefined,
@@ -2134,6 +2148,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           requestedByActorId: wake.requestedByActorId, allowRunCoalescing: false,
         }, undefined, wake.payload?.interactionOrigin, wake.id);
       } catch (err) {
+        if (waitKey) stillWaiting.add(waitKey);
         scope.onError?.(err);
         logger.warn({ err, requestId: wake.id }, "saved adapter interaction wait could not resume");
       }
