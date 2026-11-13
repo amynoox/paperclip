@@ -38,6 +38,10 @@ import {
   queuedMessageAutoSteerKey,
 } from "./queued-message-auto-steer";
 import {
+  isUnacknowledgedQueuedEntry,
+  steerQueueIdForEntry,
+} from "@/lib/issue-queued-comment-queue";
+import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -101,6 +105,8 @@ function SortableQueuedMessage({
   queue,
   busy,
   queueMutationDisabled,
+  steerBlocked,
+  awaitingServer,
   action,
   autoSteerSecondsLeft,
   onEdit,
@@ -113,6 +119,10 @@ function SortableQueuedMessage({
   queue: IssueQueuedCommentQueue;
   busy: boolean;
   queueMutationDisabled: boolean;
+  /** STUDIO-0021: Steer has no server queue to target for this entry, or another action runs. */
+  steerBlocked: boolean;
+  /** STUDIO-0021: shown locally, not yet in the server queue. */
+  awaitingServer: boolean;
   action: QueueAction;
   /** Seconds until this message is steered automatically, or null when it waits in the queue. */
   autoSteerSecondsLeft: number | null;
@@ -136,9 +146,11 @@ function SortableQueuedMessage({
     transition: sortable.transition,
   };
   const steerDisabled =
-    queueMutationDisabled || queue.steeringDisposition !== "available";
+    steerBlocked || queue.steeringDisposition !== "available";
   const steerTitle =
-    queue.steeringDisposition === "unsupported"
+    awaitingServer
+      ? "Waiting for the server to queue this message. It can be steered once it is queued."
+      : queue.steeringDisposition === "unsupported"
       ? "This runner does not support steering"
       : queue.steeringDisposition === "temporarily_unavailable"
         ? "Steering is temporarily unavailable"
@@ -451,11 +463,16 @@ export function TaskChatQueuedMessages({
   ) {
     const locallyDiscardable =
       action === "discard" && commentId.startsWith("optimistic-");
-    if (
-      pending ||
-      reordering ||
-      (!queue.queueId && action !== "interrupt" && !locallyDiscardable)
-    ) {
+    if (pending || reordering) return;
+    // STUDIO-0021: Steer targets the server queue that holds this entry; a
+    // refused action says why instead of doing nothing.
+    const actionQueueId = action === "steer" ? steerQueueIdForEntry(queue, commentId) : queue.queueId;
+    if (!actionQueueId && action !== "interrupt" && !locallyDiscardable) {
+      setVisibleError(
+        isUnacknowledgedQueuedEntry(queue, commentId)
+          ? "This message is not in the server queue yet. Try again in a moment."
+          : "The queue is waiting for the server. Try again in a moment.",
+      );
       return;
     }
     const deliveredIds = action === "interrupt"
@@ -567,6 +584,8 @@ export function TaskChatQueuedMessages({
                 queue={queue}
                 busy={busy}
                 queueMutationDisabled={queueMutationDisabled}
+                steerBlocked={Boolean(pending || reordering || !steerQueueIdForEntry(queue, entry.comment.id))}
+                awaitingServer={isUnacknowledgedQueuedEntry(queue, entry.comment.id)}
                 action={action}
                 autoSteerSecondsLeft={(() => {
                   const deadline = autoSteerDeadlines.get(entry.comment.id);

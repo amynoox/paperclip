@@ -741,6 +741,34 @@
       "retireWhen": "Pinned upstream bounds adapter calls per task in the saved-wait drain and serves people's saved input first, confirmed by the same two cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0021",
+      "title": "Steer stays available for queued messages the server holds while another entry awaits acknowledgement",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "The browser shows a message posted during a live run as queued, but the server only queues it when that run ends. mergePendingIssueQueuedComments then cleared queueId for the whole queue, so every Steer button was disabled, while its title still said it would steer, and no request was sent. Production, 13 Nov 2026, TR-626, 16:48-16:57 UTC: repeated Steer clicks, no POST /steer in the server journal; two messages held by the server could not be steered.",
+      "reason": "Approved by Amyne on 13 Nov 2026 (V233).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "ui task chat queued messages",
+      "paths": [
+        "ui/src/components/task-chat/TaskChatQueuedMessages.test.tsx",
+        "ui/src/components/task-chat/TaskChatQueuedMessages.tsx",
+        "ui/src/lib/issue-queued-comment-queue.test.ts",
+        "ui/src/lib/issue-queued-comment-queue.ts",
+        "ui/src/pages/IssueDetail.tsx"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "paperclipai/paperclip#19450 (Interrupt when steering is unavailable) and #19970 (auto-steer after 5 s) are already in the baseline and do not cover this. #15865 (mixed queue interrupts without hiding unsent messages) was closed unmerged. No change found that keeps Steer for server-held entries while a local entry is unacknowledged.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2. UI tests issue-queued-comment-queue.test.ts and TaskChatQueuedMessages.test.tsx: 52 passed; negative control, the held-entry case fails on the base component. Full Vite release build with studio/build-steering-ui.mjs from a CRLF checkout: the studio.4 production UI (10b89f1aa) rebuilds to identical chunk contents once chunk hash names are normalized (all 579 local files have a production twin). With this change only the index and issue-detail chunks differ in content.",
+      "migration": "None. Browsers must reload once to load the new interface.",
+      "rollback": "Switch cli/current back to the previous install folder; the previous ui-dist is kept unchanged.",
+      "retireWhen": "Pinned upstream keeps Steer for entries the server holds when a local entry is unacknowledged, confirmed by the same two UI cases.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
