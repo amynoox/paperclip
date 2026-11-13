@@ -495,6 +495,37 @@
       "commits": [
         "92cc50d4f"
       ]
+    },
+    {
+      "id": "STUDIO-0014",
+      "title": "Unwrap the plugin tool envelope in MCP gateway responses",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "For a paperclip_plugin tool the gateway service returned the dispatcher envelope {pluginId, toolName, result: {content, data}}. The MCP route (server/src/routes/tool-gateway.ts) looked for data at the envelope level and answered structuredContent: null, with the whole envelope as text and isError: false even when the plugin refused. The Claude Code 2.1.322 MCP client rejects such a result whole (\"structuredContent expected record, received null\"), so every plugin tool (router, Discord Notifier, agent-ledger) was unusable for agents on the Claude engine (Dev Unity run 03ff8ab1, 13 Nov 2026). Codex 0.166.0 tolerated it and handed its agents the envelope as text.",
+      "reason": "Taken as is from the open upstream fix rather than a studio patch: the service returns the plugin's own result; the route sets structuredContent only for an object data, uses the plugin content as text, and turns a plugin error into isError: true with its message; the native Runner treats a plugin error the same way.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server tool gateway route, service and native-runtime assigned MCP tools",
+      "paths": [
+        "server/src/routes/tool-gateway.ts",
+        "server/src/services/tool-gateway.ts",
+        "server/src/services/native-runtime/assigned-mcp-tools.ts",
+        "server/src/__tests__/tool-gateway.test.ts",
+        "server/src/__tests__/tool-gateway-service.test.ts",
+        "server/src/services/native-runtime/assigned-mcp-tools.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "Issue paperclipai/paperclip#15253 (open). PR paperclipai/paperclip#10317 (open, head 3615e6a818cacdf836441ecd6f648779e0511449, 4 commits by Valerii Lapin) fixes plugin tools; its cumulative diff applies cleanly on studio/2026.1110.0. Neighbour PR paperclipai/paperclip#18497 (connected MCP tools, services/tool-gateway.ts) not taken: no connected MCP tool in use. Diagnosis: studio workspace drafts/routeur-deux-moteurs/amont/outils-de-plugin-illisibles-par-claude.md.",
+        "selected": "paperclipai/paperclip#10317"
+      },
+      "validation": "Linux, Node 24.22.2: server tool-gateway.test.ts, tool-gateway-service.test.ts (embedded Postgres) and native-runtime/assigned-mcp-tools.test.ts: 344 passed before, 359 passed after (15 upstream cases added), 0 failed. tsc 7.0.2 on server: the same 309 environment errors before and after, none new. Built with tsc 7.0.2 (studio.6 sources rebuild the production files byte for byte): dist/routes/tool-gateway.js 5bfdd05c8d7b2dd60f3f2f91e55bb26cc7647a2fe2995103c2b933ba575001a4, dist/services/tool-gateway.js fa099ce4fdb73c5d4b30f58dd93c1f91b0ae3aa20fefc93e38c8eb3d45826620, dist/services/native-runtime/assigned-mcp-tools.js 11365306d45ff604b5026dbd9626676175d090e6780b86e44d97e6da9a23c913. Real clients against the built route (stand-in service and model, real router tool results): claude 2.1.322 rejects all 11 router tools on the studio.6 route and receives each result complete on the studio.7 route, a refusal as an error with its reason; codex 0.166.0 receives the envelope today and the tool's own result after, 48 of 48 checks.",
+      "migration": "None. Plugin tool results reach agents and REST callers without the envelope; tool_invocations result summaries and hashes are computed on the unwrapped result from now on.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream includes paperclipai/paperclip#10317 or an equivalent unwrap of plugin tool results.",
+      "upgradeDecisions": [],
+      "commits": [
+        "b2ce8620d"
+      ]
     }
   ]
 }
