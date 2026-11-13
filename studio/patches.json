@@ -526,6 +526,36 @@
       "commits": [
         "b2ce8620d"
       ]
+    },
+    {
+      "id": "STUDIO-0015",
+      "title": "A delegated personal grant serves a run whose responsible user has none",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "A per_user tool connection used a personal grant delegated to an agent only for runs without a responsible user (tool-gateway.ts resolveConnectionGrant, token-broker issuance). A run attributed to a member who has no personal grant of their own was refused with user_authorization_required, even when the grant owner had delegated the grant to that exact agent. The Studio Secretary answers Fahd, whose Discord messages make him the responsible user of her runs (run-preparation.ts resolveResponsibleUserIdForRunSeed, comment author); Fahd never opens the board, so the Notion Reader connection, per_user with Amyne's grant only, stayed unusable for her (run aee047cf, 13 Nov 2026).",
+      "reason": "Amyne decided the Secretary reads Notion with his access (studio decision V185, 13 Nov 2026). Sharing the connection with the company is not acceptable: its finalize step rebinds the app profile to every active catalog entry (78, of which 39 write or destructive) for every agent. A second connection would start with its whole catalog enabled. A delegation names one owner, one grant, one connection and one agent, and changes no profile, policy or catalog.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server tool-access grant resolution: gateway, token broker, connection readiness",
+      "paths": [
+        "server/src/services/tool-gateway.ts",
+        "server/src/services/tool-access/token-broker/service.ts",
+        "server/src/services/connection-intents.ts",
+        "server/src/__tests__/tool-gateway.test.ts",
+        "server/src/__tests__/connection-intents-service.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "PRs and issues, all states, searched for delegation, connectionGrantDelegations, delegated personal grant, per_user delegation agent, grant delegation autonomous, personal grant fallback, responsible user has no grant, user_authorization_required agent, per_user_with_fallback. Nearest: #15899 (open, GitHub managed identity, ownerless standing delegation; it states that attributed runs remain delegation-free) and #17473 (open, GitHub organization grant). None covers this case; the fix is a deliberate downstream deviation. Diagnosis and options: studio workspace drafts/reveil-questions/version-8/README.md.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL: tool-gateway, connection-intents-service, tool-access-service, agent-runtime-connector-access and satisfied-connection-intents test files: 744 passed on the studio.7 source and the same 744 passed with this change, plus 2 new STUDIO-0015 cases that pass with the change and fail without it (user_authorization_required; connection not ready). The gateway case proves: no delegation, refused; delegation to this agent, the read tool completes; a tool outside the agent's profile is not offered; another per_user connection of the same owner and another agent of the same responsible user stay refused; the owner suspended, the delegation stops serving (grant_owner_membership_inactive); a responsible user with a grant of their own keeps using it. The readiness case proves: connections_search reports needs_user_action, then ready for the delegated agent only, and ready for the owner's own runs. tsc 7.0.2 on server: the same 309 environment errors before and after, none new. Built with tsc 7.0.2 (studio.7 sources rebuild the production files byte for byte): dist/services/tool-gateway.js 5d58ecc530d53791d79ebd4d2a9030d9e57633b954f5631f5c160003695af120, dist/services/tool-access/token-broker/service.js 0164224142867461c7a3979816acb7160c65427258faf7877f3ad5c00293d468, dist/services/connection-intents.js ad4a6ddeee98d95fea663bcc4372f08fa21badc81fc5bab40eba660ce38f0b49. Approved by Amyne on 13 Nov 2026 (studio decision V187, \"Oui, ajoute la règle\").",
+      "migration": "None. Behavior changes only where a delegation exists; none exists in production at the time of writing.",
+      "rollback": "Delete the delegation (DELETE /api/tool-connections/:id/grants/:grantId/delegations/:delegationId), or switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream lets a delegated personal grant serve a run attributed to a member without a personal grant, or provides an equivalent per-agent read identity.",
+      "upgradeDecisions": [],
+      "commits": [
+        "797900569"
+      ]
     }
   ]
 }

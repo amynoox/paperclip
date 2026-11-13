@@ -14,7 +14,7 @@ import { logActivity } from "./activity-log.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { aiConnectionBindingSchema, aiConnectionRouterBindingSchema } from "@paperclipai/shared";
 import { aiBindingForAuthRecovery, isAiAuthenticationFailure, isAiAuthenticationRepairable } from "./ai-auth-failure.js";
-import { and, eq, desc, isNull, notInArray, sql } from "drizzle-orm";
+import { and, eq, desc, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agents,
@@ -23,6 +23,7 @@ import {
   companies,
   toolConnections,
   connectionGrants,
+  connectionGrantDelegations,
   toolCatalogEntries,
   toolProfiles,
   toolProfileEntries,
@@ -340,6 +341,33 @@ export function connectionIntentService(db: Db) {
     return binding?.provider === serviceSlug ? { agent, binding, adapterConfig: agent.adapterConfig, requiresAdoption: !saved } : null;
   }
 
+  // Studio (STUDIO-0015): per_user connections whose active personal grant its
+  // owner delegated to this agent, with the number of such delegations. Same
+  // rule as the gateway: such a grant serves a run whose responsible user has
+  // no personal grant of their own.
+  async function delegatedPersonalGrantCounts(companyId: string, agentId: string, connectionIds: string[]) {
+    const counts = new Map<string, number>();
+    if (connectionIds.length === 0) return counts;
+    const rows = await db
+      .select({ connectionId: connectionGrants.connectionId })
+      .from(connectionGrantDelegations)
+      .innerJoin(connectionGrants, and(
+        eq(connectionGrants.id, connectionGrantDelegations.grantId),
+        eq(connectionGrants.companyId, connectionGrantDelegations.companyId),
+      ))
+      .innerJoin(toolConnections, eq(toolConnections.id, connectionGrants.connectionId))
+      .where(and(
+        eq(connectionGrantDelegations.companyId, companyId),
+        eq(connectionGrantDelegations.agentId, agentId),
+        inArray(connectionGrants.connectionId, connectionIds),
+        eq(connectionGrants.kind, "user"),
+        eq(connectionGrants.status, "active"),
+        eq(toolConnections.credentialPolicy, "per_user"),
+      ));
+    for (const row of rows) counts.set(row.connectionId, (counts.get(row.connectionId) ?? 0) + 1);
+    return counts;
+  }
+
   async function usableConnectionForAgent(input: {
     companyId: string;
     agentId: string;
@@ -407,6 +435,12 @@ export function connectionIntentService(db: Db) {
     if (personal.length > 0) {
       const active = personal.filter(({ grant }) => grant.status === "active");
       return active.length === 1 ? usable(active[0]!.connection) : null;
+    }
+
+    const delegatedCounts = await delegatedPersonalGrantCounts(input.companyId, input.agentId, installed.map((connection) => connection.id));
+    const delegated = installed.filter((connection) => delegatedCounts.has(connection.id));
+    if (delegated.length > 0) {
+      return delegated.length === 1 && delegatedCounts.get(delegated[0]!.id) === 1 ? usable(delegated[0]!) : null;
     }
 
     const organization = grantsByConnection.flatMap(({ connection, grants }) => grants
@@ -541,7 +575,7 @@ export function connectionIntentService(db: Db) {
         const authorized = grants.some((grant) => grant.status === "active" && (
           grant.kind === "organization" || (grant.kind === "user" && grant.subjectUserId === run.responsibleUserId)
           || (grant.kind === "agent" && grant.subjectAgentId === agent.id)
-        ));
+        )) || (await delegatedPersonalGrantCounts(run.companyId, agent.id, [connection.id])).has(connection.id);
         const entries = authorized ? await indexedCatalog(connection.id, run.companyId) : [];
         authorizedCatalogs.set(connection.id, entries);
         return entries;

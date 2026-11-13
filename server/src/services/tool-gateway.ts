@@ -4938,9 +4938,13 @@ export function createToolGatewayService(
       connection.credentialPolicy === "shared"
         ? undefined
         : await findUserGrant();
+    // Studio (STUDIO-0015): a per_user run attributed to a member who has no
+    // personal grant of their own may use the personal grant its owner
+    // explicitly delegated to this agent (owner consent, owner still an
+    // active member). Fallback policies keep their organization grant.
     if (
       !userGrant &&
-      !actingUserId &&
+      (!actingUserId || connection.credentialPolicy === "per_user") &&
       autonomous &&
       session.agentId &&
       connection.credentialPolicy !== "shared"

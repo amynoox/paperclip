@@ -969,6 +969,36 @@ describeEmbeddedPostgres("connectionIntentService", () => {
     return { company, agent, otherAgent, issue, connection, catalog, service: connectionIntentService(db), claims: { ...claims, sub: agent.id, company_id: company.id, run_id: run.id, responsible_user_id: "grant-user" } };
   }
 
+  it("STUDIO-0015: a delegated personal grant makes the connection ready only for the named agent of a requester without a grant", async () => {
+    const f = await accessFixture("notion");
+    await db.update(toolConnections).set({ credentialPolicy: "per_user" }).where(eq(toolConnections.id, f.connection.id));
+    const [grant] = await db.update(connectionGrants).set({ kind: "user", subjectUserId: "grant-user", isDefault: false })
+      .where(eq(connectionGrants.connectionId, f.connection.id)).returning();
+    await toolAccessService(db).finishGalleryAppConnection(f.company.id, f.connection.id, {
+      enabledCatalogEntryIds: [f.catalog[0].id], askFirstCatalogEntryIds: [], access: { agentIds: [f.agent.id, f.otherAgent.id] },
+    }, { actorType: "user", actorId: "grant-user" });
+    await db.insert(companyMemberships).values({ companyId: f.company.id, principalType: "user", principalId: "requester", membershipRole: "operator", status: "active" });
+    const runFor = async (agentId: string) => {
+      const [issue] = agentId === f.agent.id ? [f.issue]
+        : await db.insert(issues).values({ companyId: f.company.id, title: "Read the game docs", status: "in_progress", assigneeAgentId: agentId }).returning();
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.company.id, agentId, status: "running", responsibleUserId: "requester", contextSnapshot: { issueId: issue.id } }).returning();
+      return { ...f.claims, sub: agentId, run_id: run.id, responsible_user_id: "requester" };
+    };
+    const secretaryClaims = await runFor(f.agent.id);
+    const otherClaims = await runFor(f.otherAgent.id);
+    const notion = async (claimsForRun: typeof secretaryClaims) => (await f.service.search(claimsForRun, "notion")).results.find(result => result.service === "notion");
+
+    expect(await notion(secretaryClaims)).toMatchObject({ state: "needs_user_action", connectionId: null });
+    await db.insert(connectionGrantDelegations).values({ companyId: f.company.id, grantId: grant!.id, agentId: f.agent.id, createdByUserId: "grant-user" });
+    expect(await notion(secretaryClaims)).toMatchObject({ state: "ready", connectionId: f.connection.id });
+    // The other agent of the same requester is not delegated: unchanged.
+    expect(await notion(otherClaims)).toMatchObject({ state: "needs_user_action", connectionId: null });
+    // The grant owner's own runs keep their personal grant.
+    const ownerClaims = { ...secretaryClaims, responsible_user_id: "grant-user" };
+    await db.update(heartbeatRuns).set({ responsibleUserId: "grant-user" }).where(eq(heartbeatRuns.id, secretaryClaims.run_id));
+    expect(await notion(ownerClaims)).toMatchObject({ state: "ready", connectionId: f.connection.id });
+  });
+
   it("keeps GitHub permission saves aligned with credential admission for existing and future agents", async () => {
     const f = await accessFixture("github");
     await db.update(connectionGrants).set({ kind: "user", subjectUserId: "grant-user" })
