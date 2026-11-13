@@ -43,6 +43,7 @@ import { createPostgresRunDispatchAdapter, requeueAdoptedCommentsForAssignee } f
 import type { Db } from "@paperclipai/db";
 import { settleUnrecoverableExecutions } from "../../../services/execution-recovery-resolution.js";
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
+import { isPreDispatchExecutionWaitVerified } from "../../../services/pre-dispatch-execution-wait.js";
 import { projectTaskInterruption } from "../../../services/task-interruption-presentation.js";
 import { reserveRunBudget } from "../../../services/budget-reservations.js";
 import { budgetService, flushBudgetEvaluationWork, recheckAdmittedRunBudgetReadOnly } from "../../../services/budgets.js";
@@ -297,6 +298,20 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       .where(eq(heartbeatRuns.id, f.runId));
     expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ ...f, expectedStatus: "queued" }))
       .toMatchObject({ outcome: "cancelled", errorCode: "execution_reconciliation_required" });
+  });
+
+  // STUDIO-0023: TR-638, 13 Nov 2026. A queued run denied because the previous
+  // run still owns execution (its lease awaits cleanup) records that owner, and
+  // the pre-dispatch proof recognizes the wait as never dispatched.
+  it("records the active execution owner on an owner denial and proves the run never dispatched", async () => {
+    const f = await seedCleanupRetry("queued");
+    await db.update(heartbeatRuns).set({ resultJson: {} }).where(eq(heartbeatRuns.id, f.runId));
+    expect(await createPostgresRunDispatchAdapter(db).cancelStaleQueuedRun({ ...f, expectedStatus: "queued" }))
+      .toMatchObject({ outcome: "cancelled", errorCode: "execution_reconciliation_required" });
+    const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.runId));
+    expect(run!.resultJson).toMatchObject({ executionWait: { issueId: f.issueId, recoveryActionId: null,
+      blockerCause: "execution_owner_active", ownerRunId: f.sourceId } });
+    expect(await isPreDispatchExecutionWaitVerified(db, run!)).toBe(true);
   });
 
   async function seedContinuationSummary(input: {
