@@ -1154,7 +1154,9 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     }
     if (
       status === "cancelled" &&
-      previousStatus?.status === "queued" &&
+      // Studio (STUDIO-0016): a scheduled retry that is stopped while it waits
+      // never started either; without this proof its Stop left a no-replay hold.
+      (previousStatus?.status === "queued" || previousStatus?.status === "scheduled_retry") &&
       previousStatus.runtimeMode !== "native" &&
       !previousStatus.startedAt &&
       !previousStatus.processPid
@@ -1285,7 +1287,9 @@ export function createHeartbeatLifecycle(db: Db, dependencies: HeartbeatLifecycl
     // positive bootstrap evidence. It must not hold unrelated queued messages.
     if (
       status === "cancelled" &&
-      previousStatus?.status === "queued" &&
+      // Studio (STUDIO-0016): a scheduled retry that is stopped while it waits
+      // never started either; without this proof its Stop left a no-replay hold.
+      (previousStatus?.status === "queued" || previousStatus?.status === "scheduled_retry") &&
       previousStatus.runtimeMode !== "native" &&
       !previousStatus.startedAt &&
       !previousStatus.processPid
