@@ -38,6 +38,15 @@ function sendNestedHostRequest(originalRequest, invocationId) {
         namespace: params.namespace || "ns",
         stateKey: params.stateKey || "key",
       }
+    : hostMethod === "db.query" || hostMethod === "db.execute"
+    ? {
+        // The plugin's own database: SQL and parameters only (STUDIO-0017).
+        // nestedCompanyId adds a top-level company to prove that a call naming
+        // a company keeps the ordinary proactive rule.
+        sql: params.sql || "select 1",
+        params: [],
+        ...(params.nestedCompanyId ? { companyId: params.nestedCompanyId } : {}),
+      }
     : hostMethod === "events.subscribe"
     ? {
         // The subscribe shape the SDK issues from setup() via
