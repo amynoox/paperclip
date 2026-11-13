@@ -5,6 +5,7 @@ import { agentWakeupRequests, agents, companies, createDb, heartbeatRuns, issues
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { PAUSE_MISSED_WAKE_REASON, replayWakesMissedDuringPause } from "../services/pause-missed-wakes.js";
+import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 
 // STUDIO-0028: production, 13 Nov 2026. During the 19:20–20:08 pause the
 // Quality Manager received three wakes on TR-29 (another agent's comments, a
@@ -67,6 +68,18 @@ describe("wakes missed during an agent pause", () => {
     expect(replayed).toHaveLength(1);
     expect(replayed[0].status).not.toBe("skipped");
     await heartbeat.drainActiveRunExecutions?.();
+  });
+
+  it("replays the missed wake when the lifecycle driver reports the agent ready again", async () => {
+    const f = await seed();
+    await refuseDuringPause(f);
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.agentId));
+    const driver = createLifecycleDriver(db, {} as never);
+    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    await driver.onReady(agent as never);
+    const replayed = (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.agentId, f.agentId)))).filter(w => w.reason === PAUSE_MISSED_WAKE_REASON);
+    expect(replayed).toHaveLength(1);
   });
 
   it.each([
