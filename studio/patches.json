@@ -613,6 +613,32 @@
       "retireWhen": "Pinned upstream writes the bootstrap proof for a cancelled scheduled retry that never started, or otherwise exempts it from legacy reconciliation.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0017",
+      "title": "A plugin's own database calls are admitted without an invocation id while a non-agent invocation is active",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "plugin-worker-manager.ts contextForWorkerMessage refuses every worker-to-host call that carries no invocation id while any invocation of the plugin is active (Missing or unknown invocation scope). The Worker Router's native adapter reaches the plugin through its private channel, not through a host invocation, and its first host call is a read of its own registry (ctx.db.query). While the router's periodic job or any event or getData ran (16 to 36 s), those reads were refused: 41 router_control_scope_busy refusals between 05:45 and 06:25 UTC on 13 Nov 2026, delaying run admission and claim.",
+      "reason": "Approved by Amyne (studio decision V228, 13 Nov 2026). db.query and db.execute are confined to the plugin's namespace (plugin-database.ts) and hold no other company's data, so their result does not depend on the invocation's company. Agent-origin invocations keep the strict refusal, so no call made during an agent's tool call escapes its attribution.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server plugin worker host-call scoping",
+      "paths": [
+        "server/src/services/plugin-worker-manager.ts",
+        "server/src/__tests__/fixtures/plugin-worker-invocation-scope.cjs",
+        "server/src/__tests__/studio-plugin-own-db-channel.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "PRs and issues, all states, searched for invocation scope, unknown invocation scope, INVOCATION_SCOPE_DENIED, agentOrigin. Already in the fork baseline: #15925 (event scopes retired on settle) and #9368 (runJob sentinel scope). Not applicable: #10580 (SDK runProactively; id-less calls are still refused under concurrency), #17797 (SDK, stale ids from timers), #8159 (grace after settle). Issues #8633, #11163 and #15765 describe neighbours. None admits id-less calls during a concurrent invocation; the fix is a deliberate downstream deviation.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2. New file studio-plugin-own-db-channel.test.ts through a real worker process (fixture plugin-worker-invocation-scope.cjs) and the real SDK gate. On the studio.9 source: the admitted case (id-less db.query and db.execute during a getData invocation) fails; the four refusal cases pass. With the change: all 5 pass. Refusal cases that must stay refused: id-less db.query during an agent-origin executeTool invocation; db.query echoing a forged invocation id; id-less db.query naming an unconfigured company; id-less companies.get and instance state.get during an invocation. With the change: the new file and plugin-worker-manager.test.ts, 102 passed.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream lets a plugin reach its own namespace database during a concurrent invocation (for example a host-issued proactive scope for setup-created callbacks), confirmed by the same refusal cases.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
