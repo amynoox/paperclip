@@ -557,6 +557,37 @@
         "797900569",
         "a2cc58cfd"
       ]
+    },
+    {
+      "id": "STUDIO-0018",
+      "title": "A suppressed disposition repair keeps proof that it never dispatched (upstream #17771)",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "The final dispatch check cancels a legacy disposition-repair run with legacy_disposition_repair_suppressed before the adapter is called; recovery treated it as an execution with unknown outcomes and settled a replay-blocked hold. Production, 13 Nov 2026: TR-566 run 8f98ce85 created hold d747880f; its blocker-resolved wakes at 06:18 were skipped with execution_reconciliation_required.",
+      "reason": "Upstream fix for the exact production case.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server legacy execution recovery",
+      "paths": [
+        "doc/execution-semantics.md",
+        "server/src/__tests__/heartbeat-process-recovery.test.ts",
+        "server/src/services/heartbeat.ts",
+        "server/src/services/heartbeat/retries.ts",
+        "server/src/services/heartbeat/run-lifecycle.ts",
+        "server/src/services/legacy-execution-recovery.test.ts",
+        "server/src/services/legacy-execution-recovery.ts",
+        "server/src/services/recovery/service.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "PR paperclipai/paperclip#17771 (open, head 8a369aebfbc3803f5c0065427d4bee87d251095e, issue #16816), one commit on a later master; applied on studio/2026.1110.0 with one signature conflict in legacyExecutionNeedsReconciliation, resolved to the upstream form.",
+        "selected": "paperclipai/paperclip#17771"
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. Negative control on the studio.9 source with the upstream tests: the 3 new process-recovery cases and the new legacy-execution-recovery unit fail. With the change: heartbeat-process-recovery.test.ts and legacy-execution-recovery.test.ts filtered on legacy, disposition repair and suppression cases, 41 passed; legacy-continuation, execution-recovery-attempt, run-dispatch policy, heartbeat retries and review-path files, 146 passed. The whole process-recovery file (430 cases) was not run end to end: it exceeds 25 minutes on this machine.",
+      "migration": "None. An existing hold is resolved by a board reconciliation.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream includes paperclipai/paperclip#17771 or an equivalent proof.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
