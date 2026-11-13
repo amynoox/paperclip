@@ -769,6 +769,32 @@
       "retireWhen": "Pinned upstream keeps Steer for entries the server holds when a local entry is unacknowledged, confirmed by the same two UI cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0028",
+      "title": "Wakes refused during an agent pause reach the agent once when it is ready again",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "While an agent is paused, only a person's comment is saved as a deferred message and replayed when the pause lifts (queue.ts canSaveDeferredMessage, pause-lift replay limited to requestedByActorType user). Every other wake for the paused agent (another agent's comment, a resolved dependency, an automatic signal) is recorded as skipped with reason agent.not_invokable and never replayed. Production, 13 Nov 2026: during the 19:20-20:08 pause the Quality Manager received three wakes on TR-29 (19:19:25, 19:19:29, 19:19:47, all skipped) and only resumed after an operator note at 20:11:13.",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server agent lifecycle and heartbeat wakes",
+      "paths": [
+        "server/src/__tests__/pause-missed-wakes.test.ts",
+        "server/src/services/agent-lifecycle-driver.ts",
+        "server/src/services/pause-missed-wakes.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found for replaying non-human wakes refused during an agent pause (searches: wake paused agent replay, skipped wake agent paused resume, pause lifted replay wakes agent).",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. pause-missed-wakes.test.ts (new, 6 cases: a real system wake refused by the pause is recorded skipped; one replay per task; exactly one replayed wake through the real queue across repeated resumes; replay from the lifecycle driver; no replay for a finished task, a reassigned task, or a task already run after the refusal) and heartbeat-held-comment-wake.test.ts: 31 passed. Negative control on the base agent-lifecycle-driver.ts: the driver case fails (no replayed wake).",
+      "migration": "None. Looks back 24 hours of skipped agent.not_invokable wakes at each agent resume.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream replays or saves non-human wakes refused during an agent pause, confirmed by the same cases.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
