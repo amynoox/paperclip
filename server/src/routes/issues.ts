@@ -4378,7 +4378,14 @@ export function issueRoutes(
         { err, issueId: input.issue.id, runId: scheduledRetryRunId },
         "failed to cancel scheduled retry superseded by issue comment",
       );
-      throw err;
+      // STUDIO-0022: a failed cancellation must not lose the person's comment.
+      // Read the retry back: when it ended up cancelled (a later cleanup step
+      // failed), the comment supersedes it as usual; otherwise it stays
+      // scheduled and the comment is saved without moving the issue.
+      const after = await Promise.resolve()
+        .then(() => heartbeat.getRun(scheduledRetryRunId))
+        .catch(() => null);
+      return after?.status === "cancelled" ? after.id : null;
     }
   }
 
