@@ -21,7 +21,7 @@ const support = await getEmbeddedPostgresTestSupport();
   }, 90_000);
   afterAll(async () => { await database?.cleanup(); });
 
-  async function seed(withHistoricalHold = false) {
+  async function seed(withHistoricalHold = false, executionWait?: (f: { issueId: string; runId: string; originalActionId: string }) => Record<string, unknown>) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     const runId = randomUUID(), actionId = randomUUID(), originalActionId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Admission wait", defaultResponsibleUserId: "board", issuePrefix: "W" + companyId.replaceAll("-", "") });
@@ -33,7 +33,7 @@ const support = await getEmbeddedPostgresTestSupport();
       contextSnapshot: { issueId, taskId: issueId },
       resultJson: { stopReason: "execution_reconciliation_required", timeoutSource: "stale_queued_run_gate",
         timeoutFired: false, timeoutConfigured: false, effectiveTimeoutSec: 0,
-        executionWait: { issueId, recoveryActionId: originalActionId } },
+        executionWait: executionWait ? executionWait({ issueId, runId, originalActionId }) : { issueId, recoveryActionId: originalActionId } },
     }).returning();
     if (withHistoricalHold) await db.insert(issueRecoveryActions).values({
       id: actionId, companyId, sourceIssueId: issueId, kind: "active_run_watchdog",
@@ -66,6 +66,37 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await legacyExecutionNeedsReconciliationWithEvidence(db, f.run)).toBe(false);
     await terminalizeLegacyExecution({ db, run: f.run, status: "cancelled", reconcileIfNeeded: true });
     expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toHaveLength(0);
+  });
+
+  // STUDIO-0023: TR-638, 13 Nov 2026, 09:41:33. The gate denied a queued run
+  // because the previous run's local lease was not released yet (released six
+  // seconds later). That owner denial has no recovery action, so the proof did
+  // not recognize the wait and a replay-blocked hold stopped the task.
+  it("does not create another incident for a denial by another run's active execution owner", async () => {
+    const ownerRunId = randomUUID();
+    const f = await seed(false, ({ issueId }) => ({ issueId, recoveryActionId: null,
+      blockerCause: "execution_owner_active", ownerRunId }));
+    expect(await legacyExecutionNeedsReconciliationWithEvidence(db, f.run)).toBe(false);
+    await terminalizeLegacyExecution({ db, run: f.run, status: "cancelled", reconcileIfNeeded: true });
+    expect(await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.companyId, f.companyId))).toHaveLength(0);
+  });
+
+  it.each(["no_owner", "self_owner", "other_cause", "invalid_owner"] as const)(
+    "keeps holding an owner-less or self-referencing wait receipt (%s)", async kind => {
+      const f = await seed(false, ({ issueId, runId }) => ({ issueId, recoveryActionId: null,
+        ...(kind === "no_owner" ? { blockerCause: "execution_owner_active" }
+          : kind === "self_owner" ? { blockerCause: "execution_owner_active", ownerRunId: runId }
+          : kind === "other_cause" ? { blockerCause: "something_else", ownerRunId: randomUUID() }
+          : { blockerCause: "execution_owner_active", ownerRunId: "not-a-uuid" }) }));
+      expect(await legacyExecutionNeedsReconciliationWithEvidence(db, f.run)).toBe(true);
+    },
+  );
+
+  it("still holds an owner-denied run that shows execution evidence", async () => {
+    const f = await seed(false, ({ issueId }) => ({ issueId, recoveryActionId: null,
+      blockerCause: "execution_owner_active", ownerRunId: randomUUID() }));
+    const [run] = await db.update(heartbeatRuns).set({ startedAt: new Date() }).where(eq(heartbeatRuns.id, f.runId)).returning();
+    expect(await legacyExecutionNeedsReconciliationWithEvidence(db, run!)).toBe(true);
   });
 
   it("recognizes a historical false hold without deleting its audit history", async () => {
