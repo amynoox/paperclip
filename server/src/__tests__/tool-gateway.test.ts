@@ -2,7 +2,7 @@ import { resolveExternalTestDatabaseUrl } from "./helpers/external-test-database
 import { createHash, randomUUID } from "node:crypto";
 import { createServer, type IncomingMessage } from "node:http";
 import express from "express";
-import { and, eq, sql } from "drizzle-orm";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
@@ -3053,6 +3053,96 @@ rl.on("line", (line) => {
       }))
         .rejects.toMatchObject({ status: 403, reasonCode: "grant_owner_membership_inactive" });
       expect(fake.requests).toHaveLength(2);
+    } finally {
+      await fake.close();
+    }
+  });
+
+  it("STUDIO-0015: a delegation serves only its agent, connection and grant, and only without the responsible user's own grant", async () => {
+    const company = await createCompany(db);
+    const secretary = await createAgent(db, company.id);
+    const other = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, secretary.id);
+    const { run: otherRun } = await createIssueAndRun(db, company.id, other.id);
+    await createActiveMember(db, company.id, "owner");
+    await createActiveMember(db, company.id, "requester");
+    await db.update(heartbeatRuns).set({ responsibleUserId: "requester", invocationSource: "automation" })
+      .where(inArray(heartbeatRuns.id, [run.id, otherRun.id]));
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "read" }] } },
+    }));
+    try {
+      // Two per_user connections owned by the same person; only the first is delegated.
+      const delegatedConnection = await createRemoteMcpTool(db, company.id, { url: fake.url, toolName: "search", riskLevel: "read" });
+      const otherConnection = await createRemoteMcpTool(db, company.id, { url: fake.url, toolName: "fetch", riskLevel: "read" });
+      // A write tool on the delegated connection, outside the agent's profile.
+      await db.insert(toolCatalogEntries).values({
+        ...delegatedConnection.catalogEntry, id: undefined, name: `update_page-${randomUUID()}`, toolName: "update_page",
+        riskLevel: "write", isReadOnly: false, isWrite: true, versionHash: randomUUID(), createdAt: undefined, updatedAt: undefined,
+      } as typeof toolCatalogEntries.$inferInsert);
+      const grants: Record<string, typeof connectionGrants.$inferSelect> = {};
+      for (const { connection } of [delegatedConnection, otherConnection]) {
+        await db.update(toolConnections).set({ credentialPolicy: "per_user" }).where(eq(toolConnections.id, connection.id));
+        grants[connection.id] = await db.insert(connectionGrants).values({
+          companyId: company.id, connectionId: connection.id, kind: "user", subjectUserId: "owner",
+          credentialSecretRefs: [], status: "active", isDefault: false,
+        }).returning().then((rows) => rows[0]!);
+      }
+      const qualified = (created: typeof delegatedConnection, toolName: string) => expectedConnectedToolName({
+        applicationKey: created.application.applicationKey, connectionId: created.connection.id, toolName });
+      await allowToolsForAgent(db, company.id, secretary.id, [qualified(delegatedConnection, "search"), qualified(otherConnection, "fetch")]);
+      await allowAllToolsForAgent(db, company.id, other.id);
+      const gateway = createTestToolGatewayService(db);
+      const call = async (runId: string, agentId: string, toolName: string) => {
+        const session = await gateway.createSession({ companyId: company.id, agentId, runId });
+        const listed = await gateway.listToolsForSession(session.token);
+        const created = toolName === "fetch" ? otherConnection : delegatedConnection;
+        const tool = listed.find((item) => item.providerType === "mcp_remote_http" && item.name === qualified(created, toolName));
+        if (!tool) return { listed: false as const };
+        return gateway.executeTool({ sessionToken: session.token, tool: tool.name, parameters: {} });
+      };
+      const authorizationRequired = { status: 409, reasonCode: "user_authorization_required" };
+
+      // Before any delegation: refused, nothing reaches the provider.
+      await expect(call(run.id, secretary.id, "search")).rejects.toMatchObject(authorizationRequired);
+      expect(fake.requests).toHaveLength(0);
+
+      // The owner delegates the first connection's grant to the secretary only.
+      await db.insert(connectionGrantDelegations).values({
+        companyId: company.id, grantId: grants[delegatedConnection.connection.id]!.id, agentId: secretary.id, createdByUserId: "owner",
+      });
+      await expect(call(run.id, secretary.id, "search")).resolves.toMatchObject({ status: "completed", result: { content: "read" } });
+      expect(fake.requests).toHaveLength(1);
+
+      // The profile still decides which tools exist: the write tool is not offered.
+      await expect(call(run.id, secretary.id, "update_page")).resolves.toEqual({ listed: false });
+      // Another per_user connection of the same owner, not delegated: unchanged.
+      await expect(call(run.id, secretary.id, "fetch")).rejects.toMatchObject(authorizationRequired);
+      // Another agent of the same responsible user: unchanged.
+      await expect(call(otherRun.id, other.id, "search")).rejects.toMatchObject(authorizationRequired);
+      expect(fake.requests).toHaveLength(1);
+
+      // A fallback policy keeps its own path: the delegation is not used for an attributed run.
+      await db.update(toolConnections).set({ credentialPolicy: "per_user_with_fallback" }).where(eq(toolConnections.id, delegatedConnection.connection.id));
+      await call(run.id, secretary.id, "search").catch(() => undefined);
+      await db.update(toolConnections).set({ credentialPolicy: "per_user" }).where(eq(toolConnections.id, delegatedConnection.connection.id));
+
+      // The owner leaves: the delegation stops serving.
+      await db.update(companyMemberships).set({ status: "suspended" }).where(and(
+        eq(companyMemberships.companyId, company.id), eq(companyMemberships.principalId, "owner"),
+      ));
+      const before = fake.requests.length;
+      await expect(call(run.id, secretary.id, "search")).rejects.toMatchObject({ status: 403, reasonCode: "grant_owner_membership_inactive" });
+      expect(fake.requests).toHaveLength(before);
+
+      // A responsible user with a grant of their own keeps using it, delegation or not:
+      // the suspended owner's delegation is never consulted.
+      await db.insert(connectionGrants).values({
+        companyId: company.id, connectionId: delegatedConnection.connection.id, kind: "user", subjectUserId: "requester",
+        credentialSecretRefs: [], status: "active", isDefault: false,
+      });
+      await expect(call(run.id, secretary.id, "search")).resolves.toMatchObject({ status: "completed" });
+      expect(fake.requests).toHaveLength(before + 1);
     } finally {
       await fake.close();
     }

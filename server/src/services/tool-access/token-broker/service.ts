@@ -286,7 +286,10 @@ export function createConnectionTokenBroker(db: Db, { now, secrets, policySvc, a
             ),
           )
           .limit(1);
-      } else if (connection.credentialPolicy === "per_user" && autonomous) {
+      }
+      // Studio (STUDIO-0015): also for a run attributed to a member without a
+      // personal grant, the owner's explicit delegation to this agent applies.
+      if (!grant && connection.credentialPolicy === "per_user" && autonomous) {
         const delegated = await db
           .select({ grant: connectionGrants })
           .from(connectionGrantDelegations)
