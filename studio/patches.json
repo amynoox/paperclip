@@ -639,6 +639,31 @@
       "retireWhen": "Pinned upstream lets a plugin reach its own namespace database during a concurrent invocation (for example a host-issued proactive scope for setup-created callbacks), confirmed by the same refusal cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0020",
+      "title": "The callback bridge waits inside the sandbox when idle (upstream #15696)",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "On a command-managed (SSH) target, the callback bridge worker lists the request directory every 100 ms and each listing is a new ssh process from the server, also when the run makes no API call. Production, 13 Nov 2026: the server saturates beyond about ten concurrent remote runs.",
+      "reason": "Upstream fix for the exact cause; open upstream, green CI.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "adapter-utils sandbox callback bridge",
+      "paths": [
+        "packages/adapter-utils/src/sandbox-callback-bridge.test.ts",
+        "packages/adapter-utils/src/sandbox-callback-bridge.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "PR paperclipai/paperclip#15696 (open, head c41f9b168, three commits) cherry-picked on studio/2026.1110.0 without conflict. paperclipai/paperclip#6970 (ControlMaster) is closed upstream and not taken.",
+        "selected": "paperclipai/paperclip#15696"
+      },
+      "validation": "Linux, Node 24.22.2, tsc 7.0.2. The studio.10 production sandbox-callback-bridge.js (a9e9d81a) is rebuilt byte for byte from this branch's base. Tests: sandbox-callback-bridge and its body test, 111 passed before, 117 passed after; negative control, 4 of the 6 new cases fail on the base source. Measure on a real local sshd (OpenSSH 9.6p1), one worker, 60 s idle then 20 requests: idle ssh execs 217 -> 11 (3.62/s -> 0.18/s); execs during the request phase 216 -> 98; request pickup median 520 -> 409 ms, max 623 -> 429 ms, none lost; CPU of the measuring process and its ssh children 31.7 s -> 8.4 s.",
+      "migration": "None. The in-sandbox script is sent with each run; nothing to install on workers.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream includes paperclipai/paperclip#15696 or an equivalent idle wait.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
