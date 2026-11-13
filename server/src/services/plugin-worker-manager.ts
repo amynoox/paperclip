@@ -2886,6 +2886,16 @@ export function createPluginWorkerHandle(
       if (proactiveCompanyId && proactiveCompanyScopes.has(proactiveCompanyId)) {
         return { invocationScope: { companyId: proactiveCompanyId } };
       }
+      // Studio (STUDIO-0017): the plugin's own database (db.query / db.execute)
+      // is confined to the plugin namespace (plugin-database.ts) and holds no
+      // other company's data. A proactive call to it that names no company is
+      // admitted unscoped even while a non-agent invocation (a job, an event, a
+      // getData) is active, exactly as when no invocation is active. An
+      // agent-origin invocation still refuses every id-less call (above), and a
+      // forged or unknown id is still refused (below).
+      if ((message.method === "db.query" || message.method === "db.execute") && proactiveCompanyId === null) {
+        return {};
+      }
       const hasActiveInvocation = activeInvocations.size > 0 ||
         Array.from(pendingRequests.values()).some((pending) => pending.invocationId);
       return hasActiveInvocation ? { invalidInvocationScope: true } : {};
