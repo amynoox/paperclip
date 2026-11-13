@@ -2688,6 +2688,81 @@ rl.on("line", (line) => {
     }
   });
 
+  it("STUDIO-0015 end to end: a chat-woken run of a requester without a grant reads through the assigned gateway with the owner's delegation", async () => {
+    const originalApiUrl = process.env.PAPERCLIP_API_URL;
+    process.env.PAPERCLIP_API_URL = "http://paperclip.example.test";
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    await createActiveMember(db, company.id, "owner");
+    await createActiveMember(db, company.id, "requester");
+    // As in production: an external chat message wakes the agent as an assignment, its author is the responsible user.
+    await db.update(heartbeatRuns).set({ responsibleUserId: "requester", invocationSource: "assignment", triggerDetail: "system" })
+      .where(eq(heartbeatRuns.id, run.id));
+    const fake = await startFakeRemoteMcpServer((fakeRequest) => ({
+      body: { jsonrpc: "2.0", id: fakeRequest.body?.id, result: { content: [{ type: "text", text: "page found" }] } },
+    }));
+    try {
+      const { connection, application, catalogEntry } = await createRemoteMcpTool(db, company.id, {
+        url: fake.url, toolName: "notion-search", riskLevel: "read",
+      });
+      await db.insert(toolCatalogEntries).values({
+        ...catalogEntry, id: undefined, name: `notion-update-page-${randomUUID()}`, toolName: "notion-update-page",
+        riskLevel: "write", isReadOnly: false, isWrite: true, versionHash: randomUUID(), createdAt: undefined, updatedAt: undefined,
+      } as typeof toolCatalogEntries.$inferInsert);
+      await db.update(toolConnections).set({ credentialPolicy: "per_user" }).where(eq(toolConnections.id, connection.id));
+      await db.delete(connectionGrants).where(eq(connectionGrants.connectionId, connection.id));
+      const [grant] = await db.insert(connectionGrants).values({
+        companyId: company.id, connectionId: connection.id, kind: "user",
+        subjectUserId: "owner", credentialSecretRefs: [], status: "active", isDefault: false,
+      }).returning();
+      const qualified = (toolName: string) => expectedConnectedToolName({
+        applicationKey: application.applicationKey, connectionId: connection.id, toolName });
+      // As in production (profile app:<connection> "Notion Reader"): one catalog entry allowed, bound to the agent.
+      const [profile] = await db.insert(toolProfiles).values({
+        companyId: company.id, profileKey: `app:${connection.id}`, name: "Notion Reader", defaultAction: "deny",
+      }).returning();
+      await db.insert(toolProfileEntries).values({
+        companyId: company.id, profileId: profile!.id, selectorType: "catalog_entry", effect: "include",
+        catalogEntryId: catalogEntry.id, connectionId: connection.id, applicationId: application.id,
+      });
+      await db.insert(toolProfileBindings).values({ companyId: company.id, profileId: profile!.id, targetType: "agent", targetId: agent.id });
+      await db.insert(toolConnectionInstalls).values({
+        companyId: company.id, connectionId: connection.id, targetType: "agent", targetId: agent.id,
+      });
+      const snapshot = await resolveNativeRuntimeMcpSnapshot({ db, agent, runId: run.id });
+      const runtime = await buildPaperclipRuntimeMcpServers({ db, agent, runId: run.id, expectedAssignmentDigest: snapshot.digest });
+      expect(runtime).toHaveLength(1);
+      expect(runtime[0]!.name).toBe("paperclip-assigned");
+      const app = createGatewayRouteApp(db, createTestToolGatewayService(db));
+      const endpoint = new URL(runtime[0]!.url!).pathname;
+      const rpc = (body: Record<string, unknown>) => request(app).post(endpoint).set("authorization", `Bearer ${runtime[0]!.token}`).send(body);
+      const listed = await rpc({ jsonrpc: "2.0", id: "list", method: "tools/list" }).expect(200);
+      const names = listed.body.result.tools.map((entry: { name: string }) => entry.name);
+      expect(names).toContain(qualified("notion-search"));
+      expect(names).not.toContain(qualified("notion-update-page")); // outside the profile: not offered
+      const search = () => rpc({ jsonrpc: "2.0", id: "call", method: "tools/call", params: { name: qualified("notion-search"), arguments: {} } });
+
+      // Before the delegation: the production failure of run 1dd8fd50.
+      const refused = await search().expect(409);
+      expect(refused.body.error.data).toMatchObject({ reasonCode: "user_authorization_required", actingUserId: "requester" });
+      expect(fake.requests).toHaveLength(0);
+
+      await db.insert(connectionGrantDelegations).values({ companyId: company.id, grantId: grant!.id, agentId: agent.id, createdByUserId: "owner" });
+      const read = await search().expect(200);
+      expect(read.body.result.content).toEqual([{ type: "text", text: "page found" }]);
+      expect(read.body.result.isError).toBe(false);
+      expect(fake.requests).toHaveLength(1);
+      const write = await rpc({ jsonrpc: "2.0", id: "write", method: "tools/call", params: { name: qualified("notion-update-page"), arguments: {} } });
+      expect(write.status === 200 ? write.body.result?.isError ?? write.body.error : write.body.error).toBeTruthy();
+      expect(fake.requests).toHaveLength(1);
+    } finally {
+      if (originalApiUrl === undefined) delete process.env.PAPERCLIP_API_URL;
+      else process.env.PAPERCLIP_API_URL = originalApiUrl;
+      await fake.close();
+    }
+  });
+
   it("starts with another user's personal app and requests authorization only when used", async () => {
     const originalApiUrl = process.env.PAPERCLIP_API_URL;
     process.env.PAPERCLIP_API_URL = "http://paperclip.example.test";
