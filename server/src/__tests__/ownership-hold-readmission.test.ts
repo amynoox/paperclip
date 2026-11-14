@@ -159,7 +159,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(run.contextSnapshot).not.toHaveProperty("executionWait");
     // The held copy was retired; ordinary admission wrote the run's own receipt.
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, held.id)))[0])
-      .toMatchObject({ status: "cancelled", runId: null });
+      .toMatchObject({ status: "skipped", runId: null });
     expect(executionsOf(f.cto)).toHaveLength(0);
     // Delivered once: another sweep starts nothing.
     await heartbeat.resumeQueuedRuns();
@@ -168,12 +168,15 @@ const support = await getEmbeddedPostgresTestSupport();
   });
 
   // A held wake can carry a key covered by a partial unique index on
-  // (companyId, idempotencyKey), for example `interaction:`. Re-admission must
-  // reuse that row: inserting a second row with the same key would fail on
-  // every sweep and the wake would never be released.
-  it("re-admits a held wake whose idempotency key is unique (interaction:)", async () => {
+  // (companyId, idempotencyKey). The held copy is retired as `skipped`, outside
+  // every such index that has a status condition (`interaction:` excludes
+  // skipped, failed and cancelled; `tree-hold-resume:` and
+  // `issue_review_path_lost:` exclude skipped only), so the new admission can
+  // reuse the key instead of failing on every sweep.
+  it.each(["interaction", "tree-hold-resume", "issue_review_path_lost"])(
+    "re-admits a held wake whose idempotency key is unique (%s:)", async (prefix) => {
     const f = await seed("lease");
-    const key = `interaction:${randomUUID()}`;
+    const key = `${prefix}:${randomUUID()}`;
     const held = await heldWake(f, key);
     expect(held.idempotencyKey).toBe(key);
     await f.release();
@@ -183,10 +186,22 @@ const support = await getEmbeddedPostgresTestSupport();
     }, { timeout: 15_000, interval: 100 });
     const [run] = await runsOf(f, f.dev);
     await heartbeat.waitForRunExecutionDrain(run.id);
-    // The held copy is cancelled and the new admission reused the same key.
+    // The held copy is skipped and the new admission reused the same key.
     const rows = (await wakesOf(f, f.dev)).filter(wake => wake.idempotencyKey === key);
-    expect(rows.find(row => row.id === held.id)).toMatchObject({ status: "cancelled" });
+    expect(rows.find(row => row.id === held.id)).toMatchObject({ status: "skipped" });
     expect(rows.filter(row => row.id !== held.id)).toHaveLength(1);
+  });
+
+  // `task-retry:` and `chat-completion:` are unique whatever the status: a
+  // second row can never be inserted, so this sweep leaves them alone.
+  it.each(["task-retry", "chat-completion"])("leaves a held wake keyed %s: to its own path", async (prefix) => {
+    const f = await seed("lease");
+    const held = await heldWake(f, `${prefix}:${randomUUID()}`);
+    await f.release();
+    await heartbeat.resumeQueuedRuns();
+    expect(await runsOf(f, f.dev)).toHaveLength(0);
+    expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, held.id)))[0])
+      .toMatchObject({ status: "deferred_issue_execution", runId: null });
   });
 
   it("keeps the wake held while the task carries an active recovery action", async () => {
@@ -228,7 +243,7 @@ const support = await getEmbeddedPostgresTestSupport();
     // Ordinary admission refused it on the dependency gate and recorded why,
     // in its own receipt; the held copy was retired.
     const wakes = await wakesOf(f, f.dev);
-    expect(wakes.find(wake => wake.id === held.id)).toMatchObject({ status: "cancelled", runId: null });
+    expect(wakes.find(wake => wake.id === held.id)).toMatchObject({ status: "skipped", runId: null });
     expect(wakes.some(wake => wake.id !== held.id && ["skipped", "deferred_issue_execution"].includes(wake.status))).toBe(true);
   });
 

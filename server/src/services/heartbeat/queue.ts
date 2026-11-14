@@ -2281,6 +2281,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         sql`jsonb_typeof(${agentWakeupRequests.payload}->'executionWait'->'recoveryActionId') = 'null'`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'stale-addressee-requeue:%'`,
+        // Unique whatever the status: a second row with the same key can never be inserted.
+        sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'task-retry:%'`,
+        sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-completion:%'`,
         sql`exists (select 1 from agents held_agent where held_agent.id = ${agentWakeupRequests.agentId}
           and held_agent.status not in ('paused', 'terminated', 'pending_approval'))`,
         sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
@@ -2300,11 +2303,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (await getExecutionBlocker(db, wake.companyId, heldIssueId)) continue;
         const context = parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]);
         const { executionWait: _wait, [DEFERRED_WAKE_CONTEXT_KEY]: _context, ...payload } = parseObject(wake.payload);
-        // Retire the held row first: `cancelled` is outside every partial
-        // unique index on (companyId, idempotencyKey), so the new admission
-        // below can reuse the same key (`interaction:`, `question-response:`…).
+        // Retire the held row first: `skipped` is outside every partial unique
+        // index on (companyId, idempotencyKey) that has a status condition
+        // (`interaction:`, `question-response:`, `connection-intent:`,
+        // `tool-action-response:`, `tree-hold-resume:`, `issue_review_path_lost:`,
+        // `issue_disposition_repair:`, `issue_blocker_stalled:`), so the new
+        // admission below can reuse the same key. `task-retry:` and
+        // `chat-completion:` are unique whatever the status: the selection
+        // above leaves them out.
         const retiredAt = new Date();
-        const [retired] = await db.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: retiredAt,
+        const [retired] = await db.update(agentWakeupRequests).set({ status: "skipped", finishedAt: retiredAt,
           updatedAt: retiredAt, error: "Re-admitted after the previous execution owner stopped" })
           .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
             eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)))
@@ -2330,7 +2338,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // Admission failed or wrote nothing: keep the held wake, never lose it.
           if (!readmitted) await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", finishedAt: null,
             error: null, updatedAt: new Date() }).where(and(eq(agentWakeupRequests.id, wake.id),
-            eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.status, "cancelled"),
+            eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.status, "skipped"),
             isNull(agentWakeupRequests.runId)));
         }
       } catch (err) {
