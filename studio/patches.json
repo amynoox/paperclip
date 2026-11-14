@@ -769,6 +769,30 @@
       "retireWhen": "Pinned upstream keeps Steer for entries the server holds when a local entry is unacknowledged, confirmed by the same two UI cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0037",
+      "title": "The workspace issue-tree lookup reads its result rows through an index (upstream #18331)",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "listWorkspaceIssueTree (server/src/services/execution-workspaces.ts) filters issues with id IN (WITH RECURSIVE issue_tree ...). PostgreSQL plans this form as a hash semi join over a sequential scan of issues. The terminal workspace sweep and the delivery assessment (assessDelivery) call it for each workspace. Production, 13-14 Nov 2026, 2026.1110.0-studio.12, read-only: issues (666 rows) got 33 to 48 sequential scans per second.",
+      "reason": "Upstream change for this query; the selected rows do not change. Reuse of an upstream pull request, no custom code.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "execution workspaces issue-tree lookup",
+      "paths": [
+        "server/src/services/execution-workspaces.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "Queries: listWorkspaceIssueTree, issue_tree sequential scan. Selected paperclipai/paperclip#18331 (open, author Jegor1, head d0b96a1a6b021f45c352b226afc5b18ddad31ffe, one commit, one file, +2/-2): cherry-picked with -x, no conflict (the hunks moved from line 1893 to line 2037), no adaptation. It has no test and no maintainer review. Not taken: paperclipai/paperclip#14119 (open, +539/-17, seven files) guards recursive issue-tree walks against parent cycles; it touches the same query for another purpose.",
+        "selected": "paperclipai/paperclip#18331"
+      },
+      "validation": "Linux (WSL 2), Node 24.22.2, vitest 5, embedded PostgreSQL 18.1. execution-workspaces-service.test.ts (86), execution-workspace-reopen.test.ts (40), execution-workspace-compaction.test.ts (20), execution-workspaces-routes.test.ts (22), terminal-workspace-work.test.ts (8): 5 files, 176 passed on the base source and 176 passed with the change. No existing test detects the change: none reads the query plan, and there is no negative control. Server tsc: 309 errors on the base and with the change, identical lists once line numbers are removed. Local check outside the repository tests, on a seeded issues table with the query text of both forms: same rows for a tree of four issues on three levels, a leaf, an issue without children and an id of another company. Scans of issues made by one call (pg_stat_xact_user_tables), company of 666 issues: issue without children 2 sequential scans -> 1; tree on three levels 4 -> 3. The remaining ones come from the recursive step, which this change does not touch: at this size the planner reads the children with a hash join over a sequential scan, once per level, although issues_company_parent_idx exists. Company of 5 000 issues: 1 sequential scan -> 0 in both cases (the recursive step uses issues_company_parent_idx there). EXPLAIN (ANALYZE, BUFFERS), 666 issues: outer read Hash Semi Join over Seq Scan on issues -> Bitmap Heap Scan through issues_company_id_uq (custom plan) or Index Scan on issues_company_id_uq (generic plan).",
+      "migration": "None. No schema change.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream includes paperclipai/paperclip#18331 or reads the result rows of this lookup through an index in another way.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
