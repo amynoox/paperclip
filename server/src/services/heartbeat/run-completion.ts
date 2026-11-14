@@ -983,7 +983,16 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         // for router_provider_stop_unverified, see adapter-declared-wait.ts).
         !suppressesTransientRetry(livenessRun.errorCode)
       ) {
-        await scheduleBoundedRetryForRun(livenessRun, agent);
+        const transientRetry = await scheduleBoundedRetryForRun(livenessRun, agent);
+        // STUDIO-0046: once its bounded retries are spent, a cut run keeps the
+        // path it had before (interaction-continuation retry or its escalation).
+        if (
+          isServerTransientRetryCode(livenessRun.errorCode) &&
+          transientRetry?.outcome !== "scheduled" &&
+          !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
+        ) {
+          await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent);
+        }
       } else if (
         outcome === "failed" &&
         !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))

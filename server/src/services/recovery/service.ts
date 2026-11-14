@@ -996,6 +996,21 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
   }
 
+  async function getLatestStartedIssueRunForAgent(companyId: string, issueId: string, agentId: string) {
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.agentId, agentId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        isNotNull(heartbeatRuns.startedAt),
+      ))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1);
+    return run ?? null;
+  }
+
   async function getLatestIssueRunForAgent(
     companyId: string,
     issueId: string,
@@ -1147,10 +1162,13 @@ export function recoveryService(
     issueId: string,
     agentId: string,
   ): Promise<Date | null> {
+    // STUDIO-0046: a run that never started (a retry cancelled by a gate
+    // before dispatch) neither breaks nor ends the series.
     const agentIssueRuns = and(
       eq(heartbeatRuns.companyId, companyId),
       eq(heartbeatRuns.agentId, agentId),
       sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+      isNotNull(heartbeatRuns.startedAt),
     );
     const waitRun = and(
       eq(heartbeatRuns.status, "failed"),
@@ -5087,12 +5105,14 @@ export function recoveryService(
       // coordinating on its executor's issue during the wait): read the
       // assignee's own latest run on the issue then. `in_review` keeps its
       // review-path recovery, which follows the review participant's runs.
+      // STUDIO-0046: a retry cancelled before it started (response, approval
+      // or dependency gate) is not the assignee's latest run for this purpose.
       const assigneeLatestRun =
         issue.status === "in_review"
           ? null
-          : latestRun?.agentId === agentId
+          : latestRun?.agentId === agentId && latestRun.startedAt
             ? latestRun
-            : await getLatestIssueRunForAgent(issue.companyId, issue.id, agentId);
+            : await getLatestStartedIssueRunForAgent(issue.companyId, issue.id, agentId);
       if (isAdapterDeclaredWaitRun(assigneeLatestRun)) {
         const waitStart = await readAdapterDeclaredWaitBoundStart(
           issue.companyId,
