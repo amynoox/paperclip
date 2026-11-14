@@ -904,6 +904,33 @@
       "retireWhen": "Pinned upstream answers close readiness for a directory without a .git marker without spawning git, confirmed by the same three cases, or the reaper stops re-inspecting plain directories.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0040",
+      "title": "A non-assignee responder's question wake passes the task's recovery hold",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "A recovery hold (a recovery action kept 'without replay', for example legacy_execution_requires_reconciliation with automaticRecovery.replay = blocked) holds every wake of its task: enqueue parks it as deferred_issue_execution with executionWait.reason = execution_recovery, the claim and dispatch gate cancels a queued run with execution_reconciliation_required, and a release keeps every deferred wake of a held task. The dependency gate and the claim already exempt a verified non-assignee responder (verifyNonAssigneeAddresseeInteractionWake: that responder answers the card and does not execute the task); the recovery hold did not. An 'Executor run interrupted' card is created exactly when a run is interrupted, so its responder could never be woken before the reconciliation its answer decides. Production, 14 Nov 2026, after studio.13: TR-702 (blocked, assigned to the Unity developer). The Board cancelled the developer's run around 01:40 UTC; its recovery action was resolved with replay = blocked. At 01:46:01 the Worker Router created card 3531672e addressed to the CTO. STUDIO-0026 recorded the CTO's interaction_pending wake, but it was parked as deferred_issue_execution behind that hold and never started; no run held the task (execution_run_id, checkout_run_id and execution_locked_at null).",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server heartbeat queue and run dispatch",
+      "paths": [
+        "server/src/__tests__/addressee-wake-recovery-hold.test.ts",
+        "server/src/modules/run-dispatch/adapters/postgres.ts",
+        "server/src/modules/run-dispatch/index.ts",
+        "server/src/services/heartbeat/queue.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "gh search prs --repo paperclipai/paperclip with: addressee recovery hold, interaction_pending execution recovery, non-assignee responder reconciliation, deferred_issue_execution addressee, execution blocker interaction wake, question responder blocked, reconciliation hold wake: no result. addressee wake: #17643, #16914, #18907, #14378 (open) and #13211 (closed) cover ownership, staleness and prompt checks for a non-assignee addressee, none the recovery hold.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. addressee-wake-recovery-hold.test.ts (new, 6 cases: plugin card, route card, already queued responder turn, wake already parked behind the hold, assignee still held, answered card still held): 6 passed. 31 neighbouring files (recovery hold, question wakes, run dispatch, wake queue, queued comments, task retry): 1589 passed, 12 failed, all in heartbeat-stale-queue-invalidation.test.ts; the same 12 fail on the base studio.13 tree in this environment (85 of 97 passed on both). Negative controls: with the base queue.ts, the plugin, route and parked cases fail (3 of 6); with queue.ts without the sweep re-admission, the parked case fails; with postgres.ts without the claim and dispatch exemption, 4 of 6 fail. tsc: no error in the changed files.",
+      "migration": "None. A question wake already parked behind a recovery hold is re-admitted by the deferred-wake sweep while its card is still pending and no run holds the task.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream lets a verified non-assignee responder's interaction_pending wake pass the execution recovery hold at enqueue, claim and dispatch, and re-admits one already parked behind it.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }

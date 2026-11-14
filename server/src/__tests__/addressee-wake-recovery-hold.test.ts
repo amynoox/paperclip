@@ -46,7 +46,7 @@ const support = await getEmbeddedPostgresTestSupport();
     mockAdapterExecute.mockClear();
     runningProcesses.clear();
   });
-  afterAll(async () => { await db?.$client.end(); await database?.cleanup(); });
+  afterAll(async () => { await database?.cleanup(); });
 
   async function seed() {
     const companyId = randomUUID(), assignee = randomUUID(), responder = randomUUID(), issueId = randomUUID();
