@@ -769,6 +769,33 @@
       "retireWhen": "Pinned upstream keeps Steer for entries the server holds when a local entry is unacknowledged, confirmed by the same two UI cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0036",
+      "title": "The agent stop check reads only the run columns its proof needs (upstream #20037)",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "While an agent is in lifecycle state pausing, terminating or cleaning_up, the server retries the stop proof every 2 seconds (agent-lifecycle-driver.ts runHost, retry in modules/agent-lifecycle/adapters/postgres.ts). Each attempt read every historical heartbeat_runs row of the agent with all columns, twice (stopInvocationsForAgents in heartbeat.ts, agentExecutionsHaveStopped in agent-execution-stop.ts). Production, 13-14 Nov 2026, 2026.1110.0-studio.12, read-only: four terminated agents stuck in terminating; heartbeat_runs holds 2 463 rows in 475 MB (result_json 115 592 bytes and context_snapshot 56 741 bytes per row on average); PostgreSQL used 88 % to 113 % of one core with 2 running runs; in a 30 s sample of pg_stat_activity the full-row select on heartbeat_runs was the top active statement (11 % of active samples).",
+      "reason": "Upstream change for the two read sites; the stop proof stays as strict. Reuse of an upstream pull request, no custom code.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "agent lifecycle stop proof",
+      "paths": [
+        "server/src/modules/agent-lifecycle/__tests__/lifecycle.test.ts",
+        "server/src/services/agent-execution-stop.ts",
+        "server/src/services/heartbeat.ts",
+        "server/src/services/heartbeat/run-control.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "Queries: agentExecutionsHaveStopped, stopInvocationsForAgents. Three open candidates read in full (diff, description, reviews, comments). Selected paperclipai/paperclip#20037 (draft, author stellardynamix, head 380a51f823479004c908c2ef36f93492d7d23854): its seven commits 0b0e9f009e6e330cc9198ab61c725d9a920db900, 36d7b8d414184d6797063f6e42bed796cccf7ec5, 43ccb1c8c07684dca4055d08c86a2467d73ec9f4, 363d4b35fa78541d3b76a84f2a4398c1dcf0226b, ce9370eccb212d540fba4ba2607267cb983574d8, 4ef1c9f28bed45f60a36e432cfbb91895edcb4d3, 380a51f823479004c908c2ef36f93492d7d23854 are cherry-picked in order with -x, without conflict and without adaptation; the added and removed lines are the ones of the upstream diff. Not taken: paperclipai/paperclip#17236 (head aba46fc7cc): its heartbeat.ts hunk does not apply to the baseline (upstream marks the pull request as conflicting), and its select still computes a value out of result_json for every historical row, so PostgreSQL still loads each stored result_json (local measure in the validation). Not taken: paperclipai/paperclip#17204 (head 661db68036): open review objection (context_snapshot replaced by null breaks the proof of a run cancelled before dispatch, so a stop can stay pending), and it adds an unrelated rule that treats runs older than the host boot as stopped, which loosens the proof; its diff does not apply to the baseline. Related and not part of this record: paperclipai/paperclip#20766 and paperclipai/paperclip#21116 change what the proof accepts.",
+        "selected": "paperclipai/paperclip#20037"
+      },
+      "validation": "Linux (WSL 2), Node 24.22.2, vitest 5, embedded PostgreSQL 18.1. With the change: lifecycle.test.ts (78, with the two new cases), resource-wait-stop.test.ts (41), driver-scope.test.ts (1), heartbeat-held-comment-wake.test.ts (25), heartbeat-native-restart-suspension.test.ts (96), native-failed-run-owner-release.test.ts (25): 6 files, 266 passed; environment-runtime.test.ts case 'destroys a failed retained lease when the agent stops': passed; heartbeat-process-recovery.test.ts, the two 'agent-wide cancellation' cases: passed. Negative control: the new test file on the base source gives 1 failed, 77 passed; 'does not fetch historical run payloads during stop checks' fails with three full-row selects recorded. The other new case (legacy acknowledgement, SSH receipt) passes on the base and with the change. In heartbeat-process-recovery.test.ts the two cases 'fences adapter registration while an earlier no-owner single Stop / agent pause waits to commit' fail in this environment with the same assertion on the base source and with the change. Server tsc: 309 errors on the base and with the change, identical lists once line numbers are removed. Local measure, one agent, 300 terminal runs with result_json 115 592 bytes and context_snapshot 56 741 bytes stored per row, median of 10 calls: stopInvocationsForAgents 205.7 ms -> 6.0 ms; with one more cancelled run on an expired SSH lease without receipt (answer false in both) 156.8 ms -> 5.1 ms; agentExecutionsHaveStopped alone 103.1 ms -> 2.2 ms. Selects on heartbeat_runs with all columns in one stop call: 3 -> 0. EXPLAIN (ANALYZE, BUFFERS, SERIALIZE) of the history read: all columns 50 830 kB sent, 8 227 buffer reads while sending; the ten columns 56 kB, none; the select of #17236 47 kB sent, 5 227 buffer reads in the scan.",
+      "migration": "None. No schema change.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream includes paperclipai/paperclip#20037 or an equivalent column-narrow stop check, confirmed by the case 'does not fetch historical run payloads during stop checks'.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
