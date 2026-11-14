@@ -5,6 +5,7 @@ import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } fro
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
+import { isPreDispatchCancellation } from "./pre-dispatch-cancellation.js";
 
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
@@ -36,8 +37,11 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
     if (!["succeeded", "failed", "cancelled", "timed_out", "interrupted"].includes(run.status)) return false;
     if (run.controllerLeaseExpiresAt && run.controllerLeaseExpiresAt > new Date()) return false;
     const runLeases = leases.filter(lease => lease.heartbeatRunId === run.id);
+    // STUDIO-0043: cancelled by the server before its adapter was entered, so
+    // no process ran and no remote command was sent on its lease.
+    const cancelledBeforeDispatch = isPreDispatchCancellation(run);
     if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
-      if (run.status === "cancelled" && !runLeases.every(hasRemoteTerminationReceipt)) return false;
+      if (run.status === "cancelled" && !cancelledBeforeDispatch && !runLeases.every(hasRemoteTerminationReceipt)) return false;
       continue;
     }
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
@@ -54,7 +58,7 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[]) {
     if (run.runtimeMode === "native" && !run.processPid && !run.processGroupId &&
         !await hasNativeLocalProcessStop(db, run.companyId, run.id) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
-    if (run.runtimeMode === "legacy" && !run.processPid && !run.processGroupId &&
+    if (run.runtimeMode === "legacy" && !run.processPid && !run.processGroupId && !cancelledBeforeDispatch &&
         (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged" &&
         !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
         !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;

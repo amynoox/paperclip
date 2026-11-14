@@ -1,4 +1,5 @@
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
+import { preDispatchCancellationResult } from "../../../services/pre-dispatch-cancellation.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
 import { hasRequiredWorkspaceRecovery } from "../../../services/workspace-restore-recovery-state.js";
 import { readNativeWorkspaceSyncReference } from "../../../services/native-runtime/native-workspace-sync.js";
@@ -1301,6 +1302,9 @@ export function createPostgresRunDispatchAdapter(
             ...(providerDispatchNotStarted && decision.errorCode === "issue_waiting_for_response"
               ? { preDispatchResponseWait: { version: 1, providerWorkStarted: false } }
               : {}),
+            // STUDIO-0043: the adapter was never entered; the agent stop proof
+            // needs no process acknowledgement or remote receipt for this run.
+            ...(providerDispatchNotStarted ? preDispatchCancellationResult("stale_queued_run_gate", now) : {}),
             ...(decision.errorCode === "execution_reconciliation_required"
               ? { executionWait: decision.details }
               : {}),

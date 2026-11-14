@@ -479,7 +479,9 @@ describePostgres("saved intents while another run's accounting is pending", () =
     await closeByAgent(f);
     await settle(f); await settle(f);
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stale.id)))[0]).toMatchObject({
-      status: "cancelled", errorCode: "continuation_task_ownership_changed" });
+      status: "cancelled", errorCode: "continuation_task_ownership_changed",
+      // STUDIO-0043: cancelled before its adapter was entered, recorded for the agent stop proof.
+      resultJson: { preDispatchCancellation: { version: 1, providerWorkStarted: false, source: "stale_execution_continuation" } } });
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) })
       .where(and(eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
     await settle(f); await settle(f);
