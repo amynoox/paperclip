@@ -1130,7 +1130,8 @@ describeEmbeddedPostgres("issueThreadInteractionService", () => {
     });
   });
 
-  it.each(["paused", "pending_approval", "terminated"])(
+  // STUDIO-0038: a paused addressee is accepted (paused-addressee-card.test.ts).
+  it.each(["pending_approval", "terminated"])(
     "rejects %s interaction addressees",
     async (status) => {
       const { companyId, issueId } = await seedConfirmationIssue(`Reject ${status} addressee`);
