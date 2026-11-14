@@ -1268,6 +1268,31 @@
       },
       "validation": "Linux, Node 24.22.2, embedded PostgreSQL. recovery-adapter-declared-wait.test.ts, 15 cases with three new: an unproven stop without errorFamily gets the transient_failure retry; a due retry is held behind the responsible's live run (liveRunWait, re-check in 15 s), is not cancelled by a card with continuation policy none, and is promoted once that run ends; a card with continuation policy wake_assignee still cancels it (issue_waiting_for_response). With satisfied-connection-intents.test.ts and run-dispatch postgres.test.ts: 156 passed. heartbeat-retry-scheduling: 67 of 68, the pre-provider quota case failing as on studio.14. Negative controls (one studio.16 file swapped): run-completion.ts, the code-alone case fails; satisfied-connection-intents.ts and run-dispatch postgres.ts, the held-retry case fails.",
       "migration": "None. Contract with the worker router (0.30.10 unchanged): the adapter declares no errorFamily (transient_upstream would also switch a codex_local agent's retry to the Codex fallback mode); the server schedules the existing bounded transient retry on the code (SERVER_TRANSIENT_RETRY_CODES: router_provider_stop_unverified), 2 attempts at most, 30 s then 60 s with jitter, counted in the retry chain (a run started by another wake starts a new count). A pending card with continuation policy none no longer counts as a response to wait for. A due transient retry of such a run stays scheduled while another run of the same task is running or queued (any agent), re-checked every 15 s for at most 10 min (resultJson.liveRunWait), then promoted. The chain stops on success, on router_previous_dispatch_unsettled (never retried, STUDIO-0042), when the attempts are spent, or on the ordinary retry gates."
+    },
+    {
+      "id": "STUDIO-0047",
+      "title": "The HTTP/2 callback relay on the worker exits once its host session closes",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, Razer, 14 Nov 2026: paperclip-bridge-server.mjs (PID 1463) still running from run 44d28dd6 of * Dev Unity, started 13 Nov around 23:09 and ended router_provider_stop_unverified at 23:30:28 (studio.13). In HTTP/2 mode the relay talks to the host over its ssh stdin/stdout; when the link is cut its stdin ends and the session is marked unavailable, but its local server keeps listening on the run's port: it exits only on SIGINT/SIGTERM or a failed bind. When the host cannot reach the worker at stop time (a cut link, the office line cuts being permanent, V292), the relay stays for ever, and a later run given the same port on that worker would fail to bind its own relay.",
+      "reason": "Requested by Amyne (14 Nov 2026, V303): prepare the next server batch, deploy only after the game PRs are merged. Prepared as a separate commit so it can leave the batch alone.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "adapter-utils sandbox callback bridge",
+      "paths": [
+        "packages/adapter-utils/src/sandbox-callback-bridge.ts",
+        "packages/adapter-utils/src/sandbox-callback-bridge.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found that stops the HTTP/2 gateway when its stdio session closes.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2. sandbox-callback-bridge.test.ts and http2-bridge-server.test.ts: 151 passed, with one new case spawning the real generated gateway in http2_v1 mode: after READY, its stdin is closed; it exits with code 0, logs 'host session closed; the gateway stops', and the port can be bound again. Negative control with the previous sandbox-callback-bridge.ts: the gateway keeps running and the case times out.",
+      "migration": "None. Why it breaks nothing: each run opens its own relay (host-reserved port, token and nonce, execution-target.ts); the host never reopens the channel of a run: a channel exit is recorded as a loss (channel_exit) and fails the run closed with duplex_channel_lost (execution-target.ts, run disposition seam); a closed session is never reopened by the relay itself (openSession keeps the dead session). So no run keeps a usable relay after its session closes, and a run relaunched after a cut gets its own new relay. The gateway source is synced to the worker at each run, so only relays started after deployment change; nothing to install on the workers. The relay already left on Razer is removed by hand (Infra role, on Amyne's agreement, at deployment).",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream stops the HTTP/2 gateway when its session closes, confirmed by the same case.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
