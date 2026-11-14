@@ -31,9 +31,9 @@ const invocation=codexSlice('        const processStopped = providerStop.beginIn
 const innerCleanup=codexSlice('        await providerStop.collectBeforeRestore();','  } finally {\n    // Remove the staged CODEX_HOME');
 const outerCleanup=codexSlice('    // Remove the staged CODEX_HOME','\n  }\n}');
 await build({entryPoints:[path.join(repo,'packages/adapter-utils/src/provider-stopped-boundary.ts')],outfile:path.join(out,'provider-boundary.mjs'),bundle:true,platform:'node',format:'esm',target:'node24',tsconfigRaw:{}});
-const boundary=`import {createProviderStoppedBoundary} from './provider-boundary.mjs';
+const boundary=`import {createProviderStoppedBoundary,deferOrphanedBridgeStop,ORPHANED_BRIDGE_STOP_MAX_DELAY_MS} from './provider-boundary.mjs';
 export async function runPrepared(input){const {ctx,cwd,env,prompt,timeoutSec,graceSec,wrappedOnSpawn,monitor,accountingLog,onLog,stripCodexRolloutNoise,paperclipBridge,localProcessSandbox,runId,runtimeExecutionTarget,executionTarget,command,args,resumeSessionId,model,runAdapterExecutionTargetProcess,restoreRemoteWorkspace,describeAdapterExecutionTarget,fs,stagedCodexHomeDir,observabilityProfile,preparedRuntimeConfig}=input;
-let interactiveInvocationPending=false; let executionError=null;
+let interactiveInvocationPending=false; let releaseOrphanedBridge=null; let executionError=null;
 const providerStop=createProviderStoppedBoundary(ctx.onProviderStopped);
 try { try { ${invocation}\nreturn proc; } finally { try { ${innerCleanup} } finally { ${outerCleanup}\n} }`;
 fs.writeFileSync(path.join(out,'prepared-boundary.mjs'),(await transform(boundary,{loader:'ts',format:'esm',target:'node24'})).code);

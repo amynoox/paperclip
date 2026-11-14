@@ -1,11 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { execFile, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { constants as fsConstants, createReadStream, createWriteStream, promises as fs } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Transform } from "node:stream";
 import type { CommandManagedRuntimeRunner } from "./command-managed-runtime.js";
+import { execFileText, spawnText } from "./short-command-launcher.js";
 import {
   createUnrelatedHistoryGraftCommit,
   GIT_SYNC_COMMIT_IDENTITY_ARGS,
@@ -189,148 +190,6 @@ export function parseSshRemoteExecutionSpec(value: unknown): SshRemoteExecutionS
     strictHostKeyChecking:
       typeof parsed.strictHostKeyChecking === "boolean" ? parsed.strictHostKeyChecking : true,
   };
-}
-
-async function execFileText(
-  file: string,
-  args: string[],
-  options: {
-    timeout?: number;
-    maxBuffer?: number;
-  } = {},
-): Promise<SshCommandResult> {
-  return await new Promise<SshCommandResult>((resolve, reject) => {
-    execFile(
-      file,
-      args,
-      {
-        timeout: options.timeout ?? 15_000,
-        maxBuffer: options.maxBuffer ?? 1024 * 128,
-      },
-      (error, stdout, stderr) => {
-        if (error) {
-          reject(Object.assign(error, { stdout: stdout ?? "", stderr: stderr ?? "" }));
-          return;
-        }
-        resolve({
-          stdout: stdout ?? "",
-          stderr: stderr ?? "",
-        });
-      },
-    );
-  });
-}
-
-async function spawnText(
-  file: string,
-  args: string[],
-  options: {
-    stdin?: string;
-    timeout?: number;
-    maxBuffer?: number;
-  } = {},
-): Promise<SshCommandResult> {
-  return await new Promise<SshCommandResult>((resolve, reject) => {
-    const child = spawn(file, args, {
-      stdio: [options.stdin != null ? "pipe" : "ignore", "pipe", "pipe"],
-    });
-
-    const maxBuffer = options.maxBuffer ?? 1024 * 128;
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    let timedOut = false;
-
-    const finishReject = (error: Error & { stdout?: string; stderr?: string; code?: number | null; killed?: boolean }) => {
-      if (settled) return;
-      settled = true;
-      error.stdout = stdout;
-      error.stderr = stderr;
-      error.killed = timedOut;
-      reject(error);
-    };
-
-    const append = (
-      streamName: "stdout" | "stderr",
-      chunk: unknown,
-    ) => {
-      const text = String(chunk);
-      if (streamName === "stdout") {
-        stdout += text;
-      } else {
-        stderr += text;
-      }
-      if (Buffer.byteLength(stdout, "utf8") > maxBuffer || Buffer.byteLength(stderr, "utf8") > maxBuffer) {
-        child.kill("SIGTERM");
-        finishReject(Object.assign(new Error(`Process output exceeded maxBuffer of ${maxBuffer} bytes.`), {
-          code: null,
-        }));
-      }
-    };
-
-    let killEscalation: NodeJS.Timeout | null = null;
-    const terminateChild = () => {
-      child.kill("SIGTERM");
-      if (killEscalation) return;
-      killEscalation = setTimeout(() => {
-        try {
-          child.kill("SIGKILL");
-        } catch {
-          return;
-        }
-      }, 5_000);
-      killEscalation.unref?.();
-    };
-    const timeout = options.timeout && options.timeout > 0
-      ? setTimeout(() => {
-          timedOut = true;
-          terminateChild();
-        }, options.timeout)
-      : null;
-
-    const clearTimers = () => {
-      if (timeout) clearTimeout(timeout);
-      if (killEscalation) clearTimeout(killEscalation);
-    };
-
-    child.stdout?.on("data", (chunk) => {
-      append("stdout", chunk);
-    });
-    child.stderr?.on("data", (chunk) => {
-      append("stderr", chunk);
-    });
-
-    child.on("error", (error) => {
-      clearTimers();
-      finishReject(Object.assign(error, { code: null }));
-    });
-
-    child.on("close", (code, signal) => {
-      clearTimers();
-      if (settled) return;
-      settled = true;
-      if (code === 0) {
-        resolve({ stdout, stderr });
-        return;
-      }
-      reject(Object.assign(new Error(stderr.trim() || stdout.trim() || `Process exited with code ${code ?? -1}`), {
-        stdout,
-        stderr,
-        code,
-        signal,
-        killed: timedOut,
-      }));
-    });
-
-    child.stdin?.on("error", (error) => {
-      terminateChild();
-      finishReject(error);
-    });
-
-    if (options.stdin != null && child.stdin) {
-      child.stdin.end(options.stdin);
-    }
-  });
 }
 
 async function runLocalGit(
