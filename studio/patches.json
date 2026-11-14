@@ -1019,6 +1019,36 @@
       "retireWhen": "Pinned upstream returns a reduced usage record in run lists, confirmed by the same two cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0032",
+      "title": "The project-tools MCP server lists its tools on npm installs: create_project's JSON Schema is built by the zod copy that built the schema",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "On the npm install, @paperclipai/server carries its own nested zod 4.4.3 (package-lock: node_modules/@paperclipai/server/node_modules/zod, inBundle) while @paperclipai/shared uses the hoisted zod 4.6.7. projectToolDefinitions() called the server's z.toJSONSchema() on the shared createProjectSchema; the 4.6.7 record processor pushes to ctx.deferred, which the 4.4.3 context lacks (TypeError: Cannot read properties of undefined (reading 'push'), json-schema-processors.js:640). Every tools/list (and server/discover) on POST /api/mcp/project-tools in standard and skill_test work mode answered 500: 3 354 errors on 13 Nov 2026 (3 328 tools/list, 26 server/discover), all with errorKind type_error and origin frame recordProcessor. Agents in those modes got none of the project and task tools (create_project, list_projects, create_task, set_task_title, get_task, read_task_document, respond_to_task_interaction...).",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server project-tools MCP route, shared project validators",
+      "paths": [
+        "packages/shared/src/index.ts",
+        "packages/shared/src/validators/index.ts",
+        "packages/shared/src/validators/project.ts",
+        "packages/shared/src/validators/project-tool-input.test.ts",
+        "server/src/services/project-tools.ts",
+        "server/src/__tests__/project-tools-pagination.test.ts",
+        "server/src/__tests__/project-tools-zod-copy.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "paperclipai/paperclip#18202 (open, fixes issue #18200, confirmed by other users on 2026.1106.0) is the same fix. Ported with one difference: the shared helper calls the schema's own toJSONSchema() method instead of the shared module's z.toJSONSchema(), so a test can emulate a foreign zod copy on the server's \"zod\" import. The code path is unchanged on upstream master 1140984b8.",
+        "selected": "paperclipai/paperclip#18202"
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL, server resolving the tree's own packages/shared. New project-tools-zod-copy.test.ts gives the server's zod import the foreign-copy behaviour on record fields: passes; negative control with the base project-tools.ts fails with the production error (TypeError: Cannot read properties of undefined (reading 'push')). project-tools-pagination.test.ts (with the upstream case), chat-project-tools.test.ts, task-title-routes.test.ts, assistant-connections-guidance.test.ts: 49 + 10 passed. Shared project-tool-input.test.ts: 2 passed, including equality with z.toJSONSchema() of the same schema (the advertised schema does not change). Standalone repro with the installed zod 4.4.3 and 4.6.7: 4.4.3 z.toJSONSchema() throws on a 4.6.7 record, the schema's own toJSONSchema() succeeds with identical output. tsc --noEmit on packages/shared: no error.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream contains paperclipai/paperclip#18202 or another change that converts shared schemas with their own zod copy, confirmed by project-tools-zod-copy.test.ts.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }

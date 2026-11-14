@@ -133,6 +133,20 @@ export const createProjectSchema = z.object({
 
 export type CreateProject = z.infer<typeof createProjectSchema>;
 
+export const createProjectToolInputSchema = createProjectSchema.extend({
+  idempotencyKey: z.string().min(1).max(255),
+});
+
+/**
+ * The create_project tool input as JSON Schema. The conversion runs on the
+ * schema itself, so it uses the zod copy that built it: an npm install can give
+ * the server a different zod copy than this package, and one copy cannot
+ * convert another copy's record fields.
+ */
+export function createProjectToolInputJsonSchema(): Record<string, unknown> {
+  return createProjectToolInputSchema.toJSONSchema() as Record<string, unknown>;
+}
+
 export const updateProjectSchema = objectWithoutDefaults(
   z.object(projectFields),
 ).partial();
