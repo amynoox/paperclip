@@ -225,7 +225,7 @@ export async function markExecutionReconciliation(
   decision: ExecutionReconciliation,
   actorId: string,
   deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
-  options?: { workspaceRepairOnly?: boolean; controllerContainmentOnly?: boolean },
+  options?: { workspaceRepairOnly?: boolean; controllerContainmentOnly?: boolean; dependencyBlockedOnly?: boolean },
 ) {
   if (options?.controllerContainmentOnly && (!decision.controllerStopped || !decision.controllerAuthorityDigest || deliveryOwner))
     throw conflict("Controller containment records no automatic continuation.");
@@ -280,8 +280,11 @@ export async function markExecutionReconciliation(
             actorId,
             recordedAt: new Date().toISOString(),
           },
-          continuationDelivery: options?.workspaceRepairOnly || options?.controllerContainmentOnly ? "not_requested" : deliveryOwner ? "delegated" : "pending",
+          // STUDIO-0048: a task still blocked by its dependencies gets no
+          // continuation now; its dependency wake starts it once unblocked.
+          continuationDelivery: options?.workspaceRepairOnly || options?.controllerContainmentOnly || options?.dependencyBlockedOnly ? "not_requested" : deliveryOwner ? "delegated" : "pending",
           ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
+          ...(options?.dependencyBlockedOnly ? { dependencyBlockedReconciliation: true } : {}),
         },
       })
       .where(

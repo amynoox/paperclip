@@ -369,6 +369,19 @@ describe("issue validators", () => {
     } }).success).toBe(true);
   });
 
+  it.each([["blocked", true], ["backlog", false], ["in_progress", false], ["cancelled", false]] as const)(
+    "lets the exact hold of a dependency-blocked task be reconciled at unchanged %s status: %s",
+    (sourceIssueStatus, allowed) => {
+      const input = { actionId: "22222222-2222-4222-8222-222222222222", outcome: "restored", sourceIssueStatus };
+      const executionReconciliation = { runId: "11111111-1111-4111-8111-111111111111", providerStopped: true,
+        actionOutcome: "not_performed", outcomeEvidence: "The Board cancelled the run before any provider action." };
+      expect(resolveIssueRecoveryActionSchema.safeParse(input).success).toBe(false);
+      expect(resolveIssueRecoveryActionSchema.safeParse({ ...input, executionReconciliation }).success).toBe(allowed);
+      const { actionId: _actionId, ...withoutAction } = input;
+      expect(resolveIssueRecoveryActionSchema.safeParse({ ...withoutAction, executionReconciliation }).success).toBe(false);
+    },
+  );
+
   it.each(["backlog", "in_progress", "blocked"] as const)("allows a complete controller containment request to retain %s status for locked route validation", sourceIssueStatus => {
     const input = { actionId: "22222222-2222-4222-8222-222222222222", outcome: "restored", sourceIssueStatus,
       executionReconciliation: { runId: "11111111-1111-4111-8111-111111111111", providerStopped: true,

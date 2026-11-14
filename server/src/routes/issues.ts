@@ -10513,6 +10513,7 @@ export function issueRoutes(
           lockedIssue.id,
           tx,
         );
+        let dependencyBlockedReconciliation = false;
         if (
           actionId &&
           (!activeRecoveryAction || activeRecoveryAction.id !== actionId)
@@ -10541,9 +10542,19 @@ export function issueRoutes(
               // An automatic no-replay disposition is final until new evidence
               // arrives. Keep the supported evidence API usable without a dialog.
               assertBoard(req);
+              // STUDIO-0048: a task that is still blocked by an unresolved
+              // first-class blocker can be reconciled without leaving `blocked`:
+              // the evidence is recorded and the hold lifted, no continuation is
+              // delivered, and the dependency wake starts the task once unblocked
+              // (production, 14 Nov 2026: TR-724, TR-723, TR-698).
+              dependencyBlockedReconciliation = sourceIssueStatus === "blocked" &&
+                lockedIssue.status === "blocked" && outcome === "restored" &&
+                // Native causes keep their fresh-session continuation: todo only.
+                settled.cause === "legacy_execution_requires_reconciliation" &&
+                (await svc.getDependencyReadiness(lockedIssue.id, tx)).unresolvedBlockerCount > 0;
               if (
                 activeRecoveryAction ||
-                sourceIssueStatus !== "todo" ||
+                (sourceIssueStatus !== "todo" && !dependencyBlockedReconciliation) ||
                 outcome !== "restored"
               ) {
                 throw conflict(
@@ -10729,7 +10740,7 @@ export function issueRoutes(
             sourceRunId: activeRecoveryAction.evidence.runId, decision: executionReconciliation,
             controllerContainment: { actionId, actorId: actor.actorId } });
         } else if (
-          sourceIssueStatus === "todo" &&
+          (sourceIssueStatus === "todo" || dependencyBlockedReconciliation) &&
           requiresExecutionReconciliation(activeRecoveryAction.cause)
         ) {
           assertBoard(req);
@@ -10750,6 +10761,20 @@ export function issueRoutes(
         }
 
         let chatRetry: { actionId: string; issueId: string } | null = null;
+        if (dependencyBlockedReconciliation) {
+          // A restricted chat request is retried only through its own durable
+          // chat retry on the todo path; a later generic dependency wake would
+          // drop it. Keep the hold until the task can be reconciled to todo.
+          const [chatBinding] = await tx.select({ id: chatConversations.id }).from(chatConversations)
+            .innerJoin(chatEndpoints, eq(chatEndpoints.id, chatConversations.endpointId))
+            .where(and(eq(chatEndpoints.externalExecutionPolicy, "restricted"),
+              eq(chatConversations.companyId, lockedIssue.companyId), eq(chatConversations.issueId, lockedIssue.id)))
+            .limit(1);
+          if (chatBinding) {
+            throw conflict("This task belongs to a connected conversation. Reconcile it once its blockers are resolved.",
+              { code: "dependency_blocked_reconciliation_chat_bound" });
+          }
+        }
         if (!controllerContainment && outcome === "restored" && sourceIssueStatus === "todo") {
           const [chatBinding] = await tx
             .select({ id: chatConversations.id })
@@ -10805,7 +10830,8 @@ export function issueRoutes(
             chatRetry
               ? { kind: "chat_failed_run_retry", actionId: chatRetry.actionId }
               : undefined,
-            controllerContainment ? { controllerContainmentOnly: true } : undefined,
+            controllerContainment ? { controllerContainmentOnly: true }
+              : dependencyBlockedReconciliation ? { dependencyBlockedOnly: true } : undefined,
           );
         }
         let issue = lockedIssue;

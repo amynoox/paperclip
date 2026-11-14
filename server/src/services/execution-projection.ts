@@ -366,6 +366,13 @@ export function projectExecution(
       projection.nextAction = "The original execution was contained and its action outcomes reviewed. Use Retry to request another attempt.";
       return set("failed", "Execution contained");
     }
+    if (recoveryAction.evidence.dependencyBlockedReconciliation === true
+      && recoveryAction.evidence.continuationDelivery === "not_requested") {
+      // STUDIO-0048: reconciled while blocked; the dependency wake restarts it.
+      projection.cause = null;
+      projection.nextAction = "The previous execution is reconciled. The task starts again through its dependency wake once its blockers are resolved.";
+      return set("completed", "Reconciled");
+    }
     const deliveredRunId = text(recoveryAction.evidence.continuationRunId);
     projection.successorRunId = deliveredRunId;
     projection.cause = null;

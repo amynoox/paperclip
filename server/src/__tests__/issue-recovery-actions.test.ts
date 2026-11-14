@@ -2145,6 +2145,108 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action!.id)))[0]).toEqual(recorded);
   });
 
+  // STUDIO-0048: production 14 Nov 2026 (TR-724, TR-723, TR-698). A follow-up
+  // blocked by an open child had its assignee run cancelled by the Board; the
+  // legacy hold then turned every system wake into a skipped
+  // `execution_reconciliation_required` row, and the hold could only be
+  // reconciled once the ticket left `blocked`.
+  async function seedDependencyBlockedLegacyHold(childStatus: "in_progress" | "done",
+    cause = "legacy_execution_requires_reconciliation") {
+    const fixture = await seedCompany();
+    const { companyId, coderId, sourceIssueId, prefix } = fixture;
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId, companyId, title: "Open child", status: childStatus, priority: "medium",
+      assigneeAgentId: coderId, parentId: sourceIssueId, issueNumber: 2, identifier: `${prefix}-2`,
+    });
+    await db.insert(issueRelations).values({ companyId, issueId: childIssueId, relatedIssueId: sourceIssueId, type: "blocks" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const cutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: cutRunId, companyId, agentId: coderId, invocationSource: "assignment", status: "cancelled",
+      runtimeMode: "legacy", errorCode: "cancelled", startedAt: new Date(Date.now() - 120_000),
+      finishedAt: new Date(Date.now() - 60_000), contextSnapshot: { issueId: sourceIssueId },
+    });
+    const responsibleUserId = randomUUID();
+    await db.insert(authUsers).values({ id: responsibleUserId, name: "Recovery operator",
+      email: `${responsibleUserId}@example.test`, emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
+    await db.update(companies).set({ defaultResponsibleUserId: responsibleUserId }).where(eq(companies.id, companyId));
+    // Keep the agent's only slot busy on another task so admitted wakes stay queued.
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, coderId));
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId: randomUUID(), status: "running" });
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: coderId, cause,
+      fingerprint: `legacy-execution:${cutRunId}`, nextAction: "Automatic recovery stopped.",
+      evidence: { runId: cutRunId, automaticRecovery: { replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const body = {
+      actionId: action!.id, outcome: "restored", sourceIssueStatus: "blocked",
+      executionReconciliation: { runId: cutRunId, providerStopped: true, actionOutcome: "not_performed",
+        outcomeEvidence: "The Board cancelled the run before any provider action; the stopped process has no remaining effects." },
+    } as const;
+    const wakeBlockersResolved = (key: string) => heartbeatService(db, { runtimeEnv: {} }).wakeup(coderId, {
+      source: "automation", triggerDetail: "system", reason: "issue_blockers_resolved",
+      payload: { issueId: sourceIssueId, resolvedBlockerIssueId: childIssueId, blockerIssueIds: [childIssueId] },
+      idempotencyKey: key,
+      contextSnapshot: { issueId: sourceIssueId, taskId: sourceIssueId, wakeReason: "issue_blockers_resolved",
+        resolvedBlockerIssueId: childIssueId, blockerIssueIds: [childIssueId] },
+    });
+    return { ...fixture, childIssueId, cutRunId, action: action!, body, wakeBlockersResolved };
+  }
+
+  it("reconciles a legacy hold while the follow-up stays blocked by an open child, then admits its dependency wake", async () => {
+    const { companyId, sourceIssueId, childIssueId, cutRunId, action, body, wakeBlockersResolved } =
+      await seedDependencyBlockedLegacyHold("in_progress");
+    const wakesOf = async () => db.select().from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, "execution_reconciliation_required")));
+
+    // Before the fix's gesture: the system wake is recorded skipped by the hold.
+    await wakeBlockersResolved(`dependency-wake:${sourceIssueId}:held`);
+    const held = await wakesOf();
+    expect(held).toHaveLength(1);
+    expect(held[0]).toMatchObject({ status: "skipped", reason: "execution_reconciliation_required" });
+
+    // The reconciliation keeps the task blocked by its open child.
+    const app = createApp();
+    const resolved = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    expect(resolved.body.issue.status).toBe("blocked");
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded).toMatchObject({ status: "resolved", outcome: "restored", evidence: {
+      executionReconciliation: { runId: cutRunId, actionOutcome: "not_performed" },
+      continuationDelivery: "not_requested", dependencyBlockedReconciliation: true,
+    } });
+    expect(recorded!.evidence).not.toHaveProperty("automaticRecovery");
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
+    // No continuation is delivered now, and a repeated request changes nothing.
+    await deliverReconciledExecutions(db, heartbeatService(db, { runtimeEnv: {} }).wakeup);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, cutRunId))).toEqual([]);
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    expect((await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id)))[0]).toEqual(recorded);
+
+    // The child ends: the dependency wake is admitted, not skipped.
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, childIssueId));
+    await wakeBlockersResolved(`dependency-wake:${sourceIssueId}:ready`);
+    expect(await wakesOf()).toHaveLength(1);
+    const admitted = await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.reason, "issue_blockers_resolved")));
+    expect(admitted).toHaveLength(1);
+    expect(admitted[0]!.status).not.toBe("skipped");
+    const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId));
+    expect(runs.filter((run) => (run.contextSnapshot as Record<string, unknown> | null)?.wakeReason === "issue_blockers_resolved"
+      && (run.contextSnapshot as Record<string, unknown>).issueId === sourceIssueId)).toHaveLength(1);
+  });
+
+  it.each([["done", "legacy_execution_requires_reconciliation"], ["in_progress", "uncertain_external_action"]] as const)(
+    "keeps the hold when a blocked reconciliation has no unresolved blocker or another cause (child %s, %s)", async (childStatus, cause) => {
+    const { sourceIssueId, action, body } = await seedDependencyBlockedLegacyHold(childStatus, cause);
+    await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(409);
+    const [unchanged] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(unchanged).toMatchObject({ status: "resolved", outcome: "blocked",
+      evidence: { automaticRecovery: { replay: "blocked" } } });
+    expect(unchanged!.evidence).not.toHaveProperty("executionReconciliation");
+  });
+
   async function seedReconciledDelivery() {
     const fixture = await seedCompany();
     const { companyId, coderId, sourceIssueId } = fixture;
