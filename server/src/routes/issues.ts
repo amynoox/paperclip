@@ -7140,6 +7140,32 @@ export function issueRoutes(
     return false;
   }
 
+  /**
+   * STUDIO-0029, adapted from paperclipai/paperclip#17524: a request that only
+   * removes blockers is judged on the blockers it keeps, so one update can drop
+   * a cancelled blocker and change the status. It never adds a blocker and
+   * keeps the stored readiness rules (a cancelled or unfinalized blocker that
+   * stays is still unresolved), so it allows nothing that two separate updates
+   * (remove, then change status) do not already allow. Any other request keeps
+   * the stored blocker set.
+   */
+  async function getRequestedDependencyReadiness(req: Request, issueId: string) {
+    const readiness = await svc.getDependencyReadiness(issueId);
+    if (!Array.isArray(req.body?.blockedByIssueIds)) return readiness;
+    const kept = new Set(req.body.blockedByIssueIds as string[]);
+    const stored = new Set(readiness.blockerIssueIds ?? []);
+    if ([...kept].some((id) => !stored.has(id))) return readiness;
+    // Only a stored blocker that this request removes stops counting.
+    const unresolvedBlockerIssueIds = readiness.unresolvedBlockerIssueIds.filter(
+      (id) => kept.has(id) || !stored.has(id),
+    );
+    return {
+      ...readiness,
+      unresolvedBlockerIssueIds,
+      unresolvedBlockerCount: unresolvedBlockerIssueIds.length,
+    };
+  }
+
   async function assertExplicitResumeIntentAllowed(
     req: Request,
     res: Response,
@@ -7192,7 +7218,7 @@ export function issueRoutes(
     }
 
     if (issue.status === "blocked") {
-      const readiness = await svc.getDependencyReadiness(issue.id);
+      const readiness = await getRequestedDependencyReadiness(req, issue.id);
       if (readiness.unresolvedBlockerCount > 0) {
         res.status(409).json({
           error: "Issue follow-up blocked by unresolved blockers",
@@ -15089,7 +15115,7 @@ export function issueRoutes(
         : null;
       const hasUnresolvedFirstClassBlockers =
         isBlocked && effectiveMoveToTodoRequested
-          ? (await svc.getDependencyReadiness(existing.id))
+          ? (await getRequestedDependencyReadiness(req, existing.id))
               .unresolvedBlockerCount > 0
           : false;
       if (
@@ -16945,6 +16971,76 @@ export function issueRoutes(
               source: "issue.blockers_resolved",
               mutation: "blocker_done",
             });
+          }
+        }
+
+        // STUDIO-0029, adapted from paperclipai/paperclip#19843: a cancelled
+        // blocker stays unresolved, so its dependents would wait forever. Hand
+        // the dependency back to each assigned dependent's agent through a
+        // system comment and the existing comment wake, which may run while the
+        // dependent is still blocked.
+        const becameCancelled =
+          existing.status !== "cancelled" && issue.status === "cancelled";
+        if (
+          becameCancelled &&
+          typeof svc.addCancelledBlockerHandoffComments === "function"
+        ) {
+          try {
+            const handoffs = await svc.addCancelledBlockerHandoffComments(issue);
+            for (const { comment: handoffComment, dependent } of handoffs) {
+              await logActivity(db, {
+                companyId: dependent.companyId,
+                actorType: "system",
+                actorId: "cancelled_blocker_handoff",
+                agentId: null,
+                runId: actor.runId,
+                agentApiKeyId: actor.agentApiKeyId,
+                action: "issue.comment_added",
+                entityType: "issue",
+                entityId: dependent.id,
+                details: {
+                  commentId: handoffComment.id,
+                  source: "issue.cancelled_dependency_handoff",
+                  cancelledBlockerIssueId: issue.id,
+                  cancelledBlockerIdentifier: issue.identifier,
+                },
+              });
+              if (
+                await treeControlSvc.getActivePauseHoldGate(
+                  dependent.companyId,
+                  dependent.id,
+                )
+              )
+                continue;
+              addWakeup(dependent.assigneeAgentId, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "issue_commented",
+                payload: {
+                  issueId: dependent.id,
+                  commentId: handoffComment.id,
+                  mutation: "comment",
+                  cancelledBlockerIssueId: issue.id,
+                },
+                idempotencyKey: `issue_dependency_cancelled:${handoffComment.id}`,
+                requestedByActorType: "system",
+                requestedByActorId: "cancelled_blocker_handoff",
+                contextSnapshot: {
+                  issueId: dependent.id,
+                  taskId: dependent.id,
+                  commentId: handoffComment.id,
+                  wakeCommentId: handoffComment.id,
+                  source: "issue.cancelled_dependency_handoff",
+                  wakeReason: "issue_commented",
+                  cancelledBlockerIssueId: issue.id,
+                },
+              });
+            }
+          } catch (err) {
+            logger.warn(
+              { err, issueId: issue.id },
+              "failed to hand cancelled blocker dependencies back to their assignees",
+            );
           }
         }
 
