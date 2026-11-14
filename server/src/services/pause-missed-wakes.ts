@@ -1,24 +1,39 @@
-import { and, desc, eq, gt, inArray, isNotNull, sql } from "drizzle-orm";
-import { agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { and, desc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
+import { agentWakeupRequests, heartbeatRuns, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
+import { AGENT_LIFECYCLE_STOP_REASON, AGENT_PAUSE_STOP_REASON, BUDGET_PAUSE_STOP_REASON } from "./governance-pause-stop.js";
 
 /**
- * STUDIO-0028: wakes refused while an agent was paused.
+ * STUDIO-0028: wakes lost to an agent pause.
  *
- * A pause saves a person's comment and replays it when the pause lifts, but any
- * other wake for the paused agent (a dependency that resolved, a comment from
- * another agent, an automatic signal) is recorded as `skipped` with reason
- * `agent.not_invokable` and never replayed. Production, 13 Nov 2026: the
- * Quality Manager missed three wakes on TR-29 during the 19:20–20:08 pause and
- * only resumed after an operator note.
+ * A pause saves a person's comment and replays it when the pause lifts. Two
+ * other kinds of wake were lost:
+ * - a wake sent while the agent was paused is recorded as `skipped` with
+ *   reason `agent.not_invokable` and never replayed (13 Nov 2026: the Quality
+ *   Manager missed three wakes on TR-29 during the 19:20-20:08 pause);
+ * - a wake already waiting when the pause started (`queued`, or
+ *   `deferred_issue_execution` behind another agent's run) is cancelled by the
+ *   pause stop, never started, and never replayed (14 Nov 2026, 00:28:23: the
+ *   Quality Manager's wake for a question card the Game Tester addressed to it
+ *   on TR-699, deferred behind the tester's run, cancelled at 00:28:51 by the
+ *   pause; the card was still pending after the resume).
  *
- * When the agent becomes ready again, wake it once per task it still owns that
- * received such a skipped wake and has had no run of this agent since. The
- * idempotency key names the latest skipped wake, so a repeated resume or a
- * concurrent caller never doubles the wake.
+ * When the agent becomes ready again, wake it once per task where such a wake
+ * was lost and nothing has happened since: the task is still the agent's, or
+ * the lost wake was for a card that is still pending and addressed to the
+ * agent. No wake when the agent already ran on that task after the loss, or
+ * when a wake of the agent for that task is still live. The idempotency key
+ * names the lost wake, so a repeated resume or a concurrent caller never
+ * doubles the wake.
+ *
+ * Not covered: a wake that was never requested (no row), for example a task
+ * whose recovery settled as blocked; there is nothing to replay.
  */
 export const PAUSE_MISSED_WAKE_REASON = "issue_wakes_missed_during_pause";
 const LOOKBACK_MS = 24 * 60 * 60 * 1000;
 const NOT_INVOKABLE_REASONS = ["agent.not_invokable"];
+const PAUSE_STOP_ERRORS = [AGENT_LIFECYCLE_STOP_REASON, AGENT_PAUSE_STOP_REASON, BUDGET_PAUSE_STOP_REASON];
+const LIVE_WAKE_STATUSES = ["queued", "deferred_issue_execution", "claimed"];
+const UUID = /^[0-9a-f-]{36}$/i;
 
 type Wakeup = (agentId: string, opts: {
   source: "automation";
@@ -31,6 +46,8 @@ type Wakeup = (agentId: string, opts: {
   contextSnapshot: Record<string, unknown>;
 }) => Promise<unknown>;
 
+type Missed = { id: string; finishedAt: Date; interactionId: string | null };
+
 export async function replayWakesMissedDuringPause(db: Db, input: {
   companyId: string;
   agentId: string;
@@ -38,32 +55,56 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
   now?: Date;
 }): Promise<{ issues: number; woken: number }> {
   const since = new Date((input.now ?? new Date()).getTime() - LOOKBACK_MS);
-  const skipped = await db.select({
+  const lost = await db.select({
     id: agentWakeupRequests.id,
     issueId: sql<string | null>`${agentWakeupRequests.payload}->>'issueId'`,
+    interactionId: sql<string | null>`${agentWakeupRequests.payload}->>'interactionId'`,
     finishedAt: agentWakeupRequests.finishedAt,
-    reason: agentWakeupRequests.reason,
   }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, input.companyId),
     eq(agentWakeupRequests.agentId, input.agentId),
-    eq(agentWakeupRequests.status, "skipped"),
-    inArray(agentWakeupRequests.reason, NOT_INVOKABLE_REASONS),
+    or(
+      and(eq(agentWakeupRequests.status, "skipped"), inArray(agentWakeupRequests.reason, NOT_INVOKABLE_REASONS)),
+      // Cancelled by a pause stop before it ever started a run.
+      and(eq(agentWakeupRequests.status, "cancelled"), inArray(agentWakeupRequests.error, PAUSE_STOP_ERRORS),
+        isNull(agentWakeupRequests.runId)),
+    ),
     isNotNull(agentWakeupRequests.finishedAt),
     gt(agentWakeupRequests.finishedAt, since),
   )).orderBy(desc(agentWakeupRequests.finishedAt));
 
-  const latestByIssue = new Map<string, { id: string; finishedAt: Date }>();
-  for (const row of skipped) {
-    if (!row.issueId || !/^[0-9a-f-]{36}$/i.test(row.issueId) || latestByIssue.has(row.issueId)) continue;
-    latestByIssue.set(row.issueId, { id: row.id, finishedAt: row.finishedAt! });
+  // Per task: the latest lost wake, and the latest one that was for a card.
+  const latest = new Map<string, Missed>();
+  const latestCard = new Map<string, Missed>();
+  for (const row of lost) {
+    if (!row.issueId || !UUID.test(row.issueId)) continue;
+    const missed = { id: row.id, finishedAt: row.finishedAt!, interactionId: row.interactionId && UUID.test(row.interactionId) ? row.interactionId : null };
+    if (!latest.has(row.issueId)) latest.set(row.issueId, missed);
+    if (missed.interactionId && !latestCard.has(row.issueId)) latestCard.set(row.issueId, missed);
   }
 
   let woken = 0;
-  for (const [issueId, missed] of latestByIssue) {
+  for (const [issueId, last] of latest) {
     const [issue] = await db.select({ id: issues.id, status: issues.status, assigneeAgentId: issues.assigneeAgentId })
       .from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueId))).limit(1);
-    if (!issue || issue.assigneeAgentId !== input.agentId) continue;
-    if (["done", "cancelled", "backlog"].includes(issue.status)) continue;
+    if (!issue || ["done", "cancelled", "backlog"].includes(issue.status)) continue;
+    let missed: Missed | null = issue.assigneeAgentId === input.agentId ? last : null;
+    let interactionId: string | null = null;
+    if (!missed) {
+      // Not the agent's task: replay only the wake of a card still pending and addressed to the agent.
+      const card = latestCard.get(issueId);
+      if (!card) continue;
+      const [pending] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+        eq(issueThreadInteractions.companyId, input.companyId),
+        eq(issueThreadInteractions.issueId, issueId),
+        eq(issueThreadInteractions.id, card.interactionId!),
+        eq(issueThreadInteractions.status, "pending"),
+        eq(issueThreadInteractions.addresseeAgentId, input.agentId),
+      )).limit(1);
+      if (!pending) continue;
+      missed = card;
+      interactionId = card.interactionId;
+    }
     const [later] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, input.companyId),
       eq(heartbeatRuns.agentId, input.agentId),
@@ -71,12 +112,19 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
       gt(heartbeatRuns.createdAt, missed.finishedAt),
     )).limit(1);
     if (later) continue;
+    const [live] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, input.companyId),
+      eq(agentWakeupRequests.agentId, input.agentId),
+      inArray(agentWakeupRequests.status, LIVE_WAKE_STATUSES),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`,
+    )).limit(1);
+    if (live) continue;
     try {
       await input.wakeup(input.agentId, {
         source: "automation",
         triggerDetail: "system",
         reason: PAUSE_MISSED_WAKE_REASON,
-        payload: { issueId, mutation: "pause_lifted", missedWakeRequestId: missed.id },
+        payload: { issueId, mutation: "pause_lifted", missedWakeRequestId: missed.id, ...(interactionId ? { interactionId } : {}) },
         idempotencyKey: `pause-missed:${input.agentId}:${issueId}:${missed.id}`,
         requestedByActorType: "system",
         requestedByActorId: "pause-missed-wakes",
@@ -86,6 +134,7 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
           wakeReason: PAUSE_MISSED_WAKE_REASON,
           source: "agent.pause_lifted",
           missedWakeRequestId: missed.id,
+          ...(interactionId ? { interactionId } : {}),
         },
       });
       woken += 1;
@@ -94,5 +143,5 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
       // lost: its own refusal is recorded, and the next resume retries it.
     }
   }
-  return { issues: latestByIssue.size, woken };
+  return { issues: latest.size, woken };
 }
