@@ -114,6 +114,76 @@ its new children apart. After the switch, the new direct children of the server 
 zero, the new children of the helper must take their place, and the kernel time of the main thread
 must fall. Reference without any process start, 13 Nov 22:18 UTC, same memory: `sys` 4.5.
 
+## Measure on the bench server
+
+A copy of the production program (`2026.1110.0-studio.12`, worker router 0.30.6, PostgreSQL 18.1) with
+this change as an overlay, 13 and 14 Nov 2026, about 10 real short `ssh` commands per second sent
+by the server to a local `sshd`, plus git status reads. Process memory raised to the production size.
+Medians of 2 or 3 windows of 30 s:
+
+| Resident memory | Main thread, % of one core (of which kernel) before | after | `ssh` probe, median before | after |
+|---|---|---|---|---|
+| 0.81 GiB | 13.6 (7.5) | 7.9 (2.5) | 192 ms | 188 ms |
+| 1.57 GiB | 37.9 (30.8) | 12.2 (6.5) | 301 ms | 238 ms |
+| 2.37 GiB | 43.5 (39.1) | 14.1 (9.2) | 5 188 ms | 347 ms |
+
+Also checked there: start, health, the router plugin `ready`, both router adapters loaded, stop
+with no process left, restart, return to the previous program, and the switch `off`.
+
+## Known limits
+
+- The launcher covers `execFileText` and `spawnText` (short `ssh`, `ssh-keygen`, `ps`) and `runGit`.
+  It does not cover `runWorkspaceGitProcess` (`packages/adapter-utils/src/workspace-git-stream.ts`),
+  used by the workspace git operation scheduler for status scans. This is on purpose: that runner
+  has another contract (abort signal, kill of the process group, streamed output), and the scheduler
+  already bounds and caches these scans. On the bench they were the 3.3 remaining starts per second,
+  one per close-readiness read of a real git repository. In the production census of 13 Nov, every
+  identified `git` child was `rev-parse --show-toplevel`, which is `runGit` and is covered.
+- Other files of the server import `child_process` for long-lived or rare children. They are not
+  changed.
+- The helper is one more process of the service. Its own memory and CPU were not measured on the
+  bench; only the main thread of the server was.
+
+## Turn it off without a rollback
+
+Add `PAPERCLIP_SHORT_COMMAND_LAUNCHER=off` to the environment of the service and restart the service.
+The server logs `short-command launcher is off; commands start from this process`, no helper
+process exists, and every command starts from the server as before this change. No file changes.
+
+## Re-apply after an upstream update
+
+The change is one commit group on four source files:
+
+1. `packages/adapter-utils/src/short-command-launcher.ts` and its two test files are new files: they
+   re-apply without conflict.
+2. `packages/adapter-utils/src/ssh.ts`: the local functions `execFileText` and `spawnText` are removed
+   and imported from `./short-command-launcher.js`. If upstream changed these two functions, move the
+   upstream version of their bodies into `execFileTextWith` and `spawnTextWith` (keep the injected
+   `execFileImpl` / `spawnImpl` parameter: the helper receives the source text of these two functions),
+   then run `short-command-launcher.test.ts`: its parity cases compare the direct and the helper path.
+3. `server/src/services/execution-workspaces.ts`: `runGit` calls `execFileText` with `timeout: 0` and
+   `maxBuffer: 1024 * 1024` (the contract of the promisified `execFile` it replaces).
+4. `server/src/index.ts`: `startShortCommandLauncher` after the listener is bound, and
+   `shortCommandLauncher.stop()` as the last step of the ordered shutdown.
+
+Then: the launcher tests, the adapter-utils suites that use SSH commands, the execution-workspaces
+server suites, and `studio/short-command-launcher-bench.mjs` in the three modes.
+
+Retire the patch when upstream no longer starts short commands from the server process (see
+`retireWhen` in `patches.json`).
+
+## Worker router
+
+- The router adapters import `@paperclipai/adapter-utils/ssh` from the host installation: their short
+  `ssh` commands follow the launcher when they run in the server process. Nothing to change in the
+  router. The installed plugin was `ready` on the bench with this change.
+- The router publisher pins the fingerprints of seven host files. This change modifies
+  `server/dist/index.js` (label `host`); every studio version also changes `build-info.json` and the
+  install folder. The publisher refuses to publish against a server whose files differ from its
+  template. So, after this version is in service and before the next router publication, the template
+  must be adopted again from a fresh re-read of the server (`adopter-serveur.py` of the router
+  delivery folder). This does not affect the router version already installed.
+
 ## What a local test cannot show
 
 - The real load of the server: bridge requests, open browser pages and plugins together.

@@ -1095,6 +1095,8 @@ async function startServerWithDatabaseTeardown(
   const shortCommandLauncher = startShortCommandLauncher({
     onEvent: (event) => {
       if (event.type === "started") logger.info({ pid: event.pid }, "short-command launcher started");
+      // The ordered shutdown stops the helper on purpose: not a warning.
+      else if (event.reason === "stopped") logger.info(event, "short-command launcher stopped");
       else logger.warn(event, "short-command launcher exited; commands start directly until it is back");
     },
   });
