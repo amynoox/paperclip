@@ -769,6 +769,38 @@
       "retireWhen": "Pinned upstream keeps Steer for entries the server holds when a local entry is unacknowledged, confirmed by the same two UI cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0039",
+      "title": "A callback bridge kept after an unproven provider stop is stopped later, never orphaned",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "When a prepared interactive process (codexPreparedProcess, claudePreparedProcess) has not proven its stop, the finally block of the codex_local and claude_local execute keeps the callback bridge for the provider but drops the only reference to it; only onProcessStopped clears the flag, so a cancellation without that receipt leaves the bridge poll loop running for the life of the server. Production, 14 Nov 2026: run e3dff48b-fdf2-46f4-b900-596aa4b802ae (Game Tester, TR-710, router 0.30.6 native-ssh adapter) was cancelled at 00:30:55 UTC; its bridge kept starting ssh to MAC-02 (100.80.44.46), logged transient poll failures during the MAC-02 restart at 00:32:36 and resumed at 00:33:03, with the server not restarted. These ssh children load the server main thread. The poll loop also retried a failing channel once more after stop, even during its backoff wait.",
+      "reason": "The bridge is kept because the provider may still call back until its stop is proven (fail-closed lifetime of STUDIO-0005 and STUDIO-0011); this keeps that rule but bounds it. The router 0.30.7 calls onProcessStopped only when the stop is proven, not when the worker is unreachable, so the server, which owns the bridge, must stop it itself. Downstream code path only: the prepared-process hooks exist only in this fork.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "codex_local and claude_local execute cleanup; adapter-utils provider stop boundary and sandbox callback bridge",
+      "paths": [
+        "packages/adapter-utils/src/provider-stopped-boundary.ts",
+        "packages/adapter-utils/src/provider-stopped-boundary.test.ts",
+        "packages/adapter-utils/src/sandbox-callback-bridge.ts",
+        "packages/adapter-utils/src/sandbox-callback-bridge.test.ts",
+        "packages/adapters/codex-local/src/server/execute.ts",
+        "packages/adapters/codex-local/src/server/execute.remote.test.ts",
+        "packages/adapters/claude-local/src/server/execute.ts",
+        "packages/adapters/claude-local/src/server/execute.prepared-process.test.ts",
+        "studio/steering-tests/build.mjs"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "gh search prs --repo paperclipai/paperclip with \"callback bridge stop\", \"bridge cancelled\", \"orphaned bridge\", \"sandbox callback bridge loop\", \"bridge poll stop\", \"onProcessStopped\", \"transient poll failure\", \"callback bridge\", \"bridge worker stop\", \"bridge leak\", \"paperclipBridge\" (all states). Nearest: #18724 (open, the bridge claims its pid file so stop() kills the server: stop effectiveness, not a missing stop call), #16390 (open, test-only backstop loop), #15003 (closed, late bridge request drain), #9536 (closed, wedged host drain), #18438 (open, claude unknown-session retry). None stops a bridge kept for an unproven prepared process; that path is fork-only.",
+        "selected": null
+      },
+      "validation": "Linux (WSL), Node 24.22.2, vitest 5.0.3, tsc 7.0.2. tsc --noEmit: adapter-utils, claude-local, codex-local, 0 errors. Targeted: provider-stopped-boundary and sandbox-callback-bridge 106 passed before, 111 after; claude-local execute.prepared-process 8 -> 10 (with execute.remote, 28 passed); codex-local execute.remote 7 -> 8 (with execute.test, 18 passed). Full package suites: claude-local 418 passed, 1 skipped; codex-local 592 passed; adapter-utils 2055 passed, 5 skipped, 4 failed for the test tree only (tsx missing under cli/node_modules: directory-merge-lock and server-utils, files not touched). studio/steering-tests prepared-boundary harness 5 of 5 passed. Negative control with the base execute.ts (both) and sandbox-callback-bridge.ts: all 4 new execute and bridge cases fail (bridge stop called 0 times after a cancel without receipt, codex and claude; 0 times after a late receipt, claude; 2 poll execs instead of 1 after stop during backoff).",
+      "migration": "None. Server code only; nothing to install on workers or in the router.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream owns the prepared-process lifetime (STUDIO-0005, STUDIO-0011 retired) with an equivalent bounded stop of the callback bridge, or the router proves stop for every cancellation including an unreachable worker.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
