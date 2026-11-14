@@ -769,6 +769,33 @@
       "retireWhen": "Pinned upstream keeps Steer for entries the server holds when a local entry is unacknowledged, confirmed by the same two UI cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0035",
+      "title": "Short SSH commands share one connection per host (switch, off by default; from upstream #6970)",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Every short SSH command of the server opens its own TCP connection and does its own key exchange and authentication. Production, 13 Nov 2026, 2026.1110.0-studio.12, read from /proc over 30 s with about 5 remote runs: 113 ssh processes started by the server, median lifetime 0.35 s. The callback bridge runs four of them in sequence for one agent request to the API (size, read, write the response, remove): about 1.05 s before the agent has its answer and 1.4 s in all, on top of the API call. STUDIO-0020 lowered the count of idle polls; it did not change the cost of one command.",
+      "reason": "Requested by Amyne on 13 Nov 2026 (correct the known bottlenecks of the server; register entry G4 of the studio production watch). An upstream pull request exists for the cause and is reused. The adaptations (switch, short commands only, private control directory, one socket per identity, keepalives) are downstream choices: merge and activation need Amyne's explicit approval. No native setting adds SSH options to these commands.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "adapter-utils SSH command execution (ssh.ts)",
+      "paths": [
+        "packages/adapter-utils/src/ssh.ts",
+        "packages/adapter-utils/src/ssh-connection-sharing.test.ts",
+        "studio/ssh-connection-sharing.md",
+        "studio/ssh-connection-sharing-bench.mjs"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "Queries on pull requests and issues, open, merged and closed: 'ssh duplex bridge', 'openDuplexChannel', 'callback bridge ssh', 'http2 bridge ssh', 'ControlMaster', 'ControlPersist', 'ssh multiplex', 'ssh connection reuse', 'bridge queue_v1', 'bridge poll ssh', 'callback bridge latency', 'bridge request ssh exec', 'sandbox callback bridge exec per request', 'duplexCommandStream ssh'. Selected: paperclipai/paperclip#6970 (author dr89mh, head d3e9dd55d2344ab120426a5ad1bdbbab19cfae70, three commits, closed on 6 Nov 2026 for inactivity after a rebase request, not merged, no objection on the substance). Its diff no longer applies to the baseline, so the change is written again on the current createSshAuthArgs and not cherry-picked. Taken: ControlMaster=auto, ControlPath with %C, ControlPersist of 60 s, never on a Windows client. Not taken: the dial-pacing queue for a Windows client. Adapted: off unless the switch is on; runSshCommand only; private control directory; identity in the socket name; ServerAlive keepalives. Other results: #11738 (merged, in the baseline) gives the HTTP/2 duplex bridge for sandbox providers only; the SSH runner has no duplex channel and no pull request adds one. #15696 is already STUDIO-0020. #15002 (closed) is about stopping the remote agent, not connection cost.",
+        "selected": "paperclipai/paperclip#6970"
+      },
+      "validation": "Linux (WSL 2 Ubuntu 24.04), Node 24.22.2, OpenSSH 9.6p1 client and a real local sshd. New tests (ssh-connection-sharing.test.ts): 10 passed; with the switch off the ssh arguments are the ones of before the change and 6 commands open 6 connections; with the switch on 6 commands open 1 connection; stdin, 300 kB of output, exit code, stderr and timeout are the same in both modes; 8 concurrent first commands succeed; after the background process is killed the next command opens one new shared connection. The 12 existing adapter-utils suites that use SSH commands, plus the new one: 13 files, 432 passed with the switch not set, and 13 files, 432 passed with the switch on for the whole run. tsc on adapter-utils: no error. Measure (studio/ssh-connection-sharing-bench.mjs, loopback, two runs): one short command 176.7 ms -> 14.2 ms median; one bridge request (four commands) 717.2 ms -> 67.7 ms; until the response is written 540.5 ms -> 52.1 ms. Not tried: a remote OpenSSH server for Windows or macOS, the real network, the reaction of the worker router to a lost host.",
+      "migration": "None. Nothing to install on the machines. With the switch on, the server creates a private directory 'pcssh-XXXXXX' in its temporary directory for the control sockets.",
+      "rollback": "Remove PAPERCLIP_SSH_CONNECTION_SHARING from the environment of the service (or set it to off) and restart it: every command opens its own connection as before. Or switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream shares SSH connections for short commands, or the callback bridge of SSH targets no longer runs one ssh per operation (a persistent channel); confirmed by studio/ssh-connection-sharing-bench.mjs with the switch off.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }

@@ -1,6 +1,6 @@
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFile, spawn } from "node:child_process";
-import { constants as fsConstants, createReadStream, createWriteStream, promises as fs } from "node:fs";
+import { constants as fsConstants, createReadStream, createWriteStream, promises as fs, rmSync } from "node:fs";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -378,8 +378,114 @@ async function withTempFile(
   };
 }
 
+// Shared SSH connection for short commands.
+//
+// Without it, every short command opens its own TCP connection and does its own
+// key exchange and authentication. With it, the first short command to a host
+// starts a background `ssh` master that keeps one authenticated connection, and
+// the next commands open a session on that connection.
+//
+// Adapted from upstream pull request paperclipai/paperclip#6970 (closed, not
+// merged). Differences: an environment switch that is off when not set; short
+// commands only (`runSshCommand`), so the long-lived agent session and the
+// `tar` streams keep their own connection; a private control directory; one
+// control socket per identity; keepalives so a dead connection is detected.
+export const SSH_CONNECTION_SHARING_ENV = "PAPERCLIP_SSH_CONNECTION_SHARING";
+
+// The master exits when no command used it for this time.
+const SSH_CONTROL_PERSIST_SECONDS = 60;
+// The master probes the server at this interval and exits after this count of
+// unanswered probes, so a connection lost without a TCP reset does not block
+// the next commands longer than interval * count.
+const SSH_CONTROL_ALIVE_INTERVAL_SECONDS = 5;
+const SSH_CONTROL_ALIVE_COUNT_MAX = 3;
+// A Unix socket path holds 104 bytes on macOS and 108 on Linux. `ssh` adds a
+// 17-character suffix to the path while it creates the socket.
+const SSH_CONTROL_PATH_MAX_LENGTH = 104 - 17 - 1;
+const SSH_CONTROL_DIR_PREFIX = "pcssh-";
+// "<directory>/<16 hex of the identity>-<40 hex of %C>"
+const SSH_CONTROL_NAME_LENGTH = 16 + 1 + 40;
+
+/**
+ * True when short SSH commands share one connection per host. The switch is
+ * `PAPERCLIP_SSH_CONNECTION_SHARING`: `on` enables it; any other value, or no
+ * value, keeps one connection per command. It is always off on Windows: the
+ * OpenSSH client for Windows cannot create a control socket (upstream #6970).
+ */
+export function sshConnectionSharingEnabled(
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
+  if (platform === "win32") return false;
+  const raw = env[SSH_CONNECTION_SHARING_ENV]?.trim().toLowerCase();
+  return raw === "on" || raw === "1" || raw === "true";
+}
+
+let sshControlDirPromise: Promise<string | null> | null = null;
+
+// One private directory (mode 0700) per process for the control sockets. A
+// control socket in a directory that other users can write is not safe. The
+// result is null when no directory gives a short enough socket path; commands
+// then keep one connection each.
+async function resolveSshControlDir(): Promise<string | null> {
+  sshControlDirPromise ??= (async () => {
+    for (const base of [os.tmpdir(), "/tmp"]) {
+      const dirLength = base.length + 1 + SSH_CONTROL_DIR_PREFIX.length + 6;
+      if (dirLength + 1 + SSH_CONTROL_NAME_LENGTH > SSH_CONTROL_PATH_MAX_LENGTH) continue;
+      try {
+        const dir = await fs.mkdtemp(path.join(base, SSH_CONTROL_DIR_PREFIX));
+        // `%` starts a token in a ControlPath value.
+        if (dir.includes("%")) {
+          await fs.rm(dir, { recursive: true, force: true }).catch(() => undefined);
+          continue;
+        }
+        process.once("exit", () => {
+          try {
+            rmSync(dir, { recursive: true, force: true });
+          } catch {
+            // Best effort: a master that lost its socket exits by itself.
+          }
+        });
+        return dir;
+      } catch {
+        // Try the next base directory.
+      }
+    }
+    return null;
+  })();
+  return sshControlDirPromise;
+}
+
+async function createSshConnectionSharingArgs(
+  config: Pick<SshConnectionConfig, "privateKey" | "knownHosts" | "strictHostKeyChecking">,
+): Promise<string[]> {
+  if (!sshConnectionSharingEnabled()) return [];
+  const controlDir = await resolveSshControlDir();
+  if (!controlDir) return [];
+  // `%C` hashes the local host name, the remote host, the port and the user. It
+  // does not cover the key or the host-key policy, so two configurations for the
+  // same account never share a connection that only one of them could open.
+  const identity = createHash("sha256")
+    .update(JSON.stringify([config.privateKey ?? null, config.knownHosts ?? null, config.strictHostKeyChecking === true]))
+    .digest("hex")
+    .slice(0, 16);
+  return [
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    `ControlPath=${path.join(controlDir, `${identity}-%C`)}`,
+    "-o",
+    `ControlPersist=${SSH_CONTROL_PERSIST_SECONDS}`,
+    "-o",
+    `ServerAliveInterval=${SSH_CONTROL_ALIVE_INTERVAL_SECONDS}`,
+    "-o",
+    `ServerAliveCountMax=${SSH_CONTROL_ALIVE_COUNT_MAX}`,
+  ];
+}
+
 async function createSshAuthArgs(
   config: Pick<SshConnectionConfig, "privateKey" | "knownHosts" | "strictHostKeyChecking">,
+  options: { shareConnection?: boolean } = {},
 ): Promise<{ args: string[]; cleanup: () => Promise<void> }> {
   const tempFiles: Array<() => Promise<void>> = [];
   const sshArgs = [
@@ -390,6 +496,10 @@ async function createSshAuthArgs(
     "-o",
     `StrictHostKeyChecking=${config.strictHostKeyChecking ? "yes" : "no"}`,
   ];
+
+  if (options.shareConnection) {
+    sshArgs.push(...await createSshConnectionSharingArgs(config));
+  }
 
   if (config.strictHostKeyChecking) {
     if (config.knownHosts) {
@@ -1306,7 +1416,9 @@ export async function runSshCommand(
 ): Promise<SshCommandResult> {
   let cleanup: () => Promise<void> = () => Promise.resolve();
   try {
-    const auth = await createSshAuthArgs(config);
+    // Short commands are the only ones that share a connection. See
+    // `SSH_CONNECTION_SHARING_ENV`.
+    const auth = await createSshAuthArgs(config, { shareConnection: true });
     cleanup = auth.cleanup;
     const sshArgs = [...auth.args];
     const envEntries = Object.entries(options.env ?? {})
