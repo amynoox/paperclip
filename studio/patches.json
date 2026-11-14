@@ -1322,6 +1322,32 @@
       "retireWhen": "Upstream lets an execution reconciliation keep a dependency-blocked task blocked, or drops the legacy no-replay hold.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0049",
+      "title": "A monitor that used up its checks or passed its timeout without a next check wakes its owner once",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, studio.17, 14 Nov 2026, TR-915 (Game Integrator): an external-service monitor (TeamCity Debug, maxAttempts 3, timeoutAt 23:31:41Z, recoveryPolicy escalate_to_board) ran its third check at 23:01:37 and then ended silently: no next check, state triggered 3/3, no comment, no activity, no wake. The limit handling (heartbeat/scheduling.ts, issueMonitorLimitClearReason and clearIssueMonitorAndRecover) runs only when a scheduled check falls due with nextAttemptCount above maxAttempts, while rescheduling is refused once attemptCount reaches maxAttempts ('Monitor bounds are already exhausted', issue-execution-policy.ts); the timeout acts only on a scheduled check too. So the attempt limit was unreachable and every recovery policy dead after the last check. Three roles (Game Integrator, CEO on TR-978, Infra Manager on TR-969) then searched for an automatic Board escalation and asked the owner for a way to reach Paperclip support.",
+      "reason": "Requested by the studio setup session for Amyne (14 Nov 2026, V303/V306: fixes prepared by the owning chats; V317: no Desktop chat in operations).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server issue monitors (heartbeat scheduling)",
+      "paths": [
+        "server/src/services/heartbeat/scheduling.ts",
+        "server/src/__tests__/issue-monitor-scheduler.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "Upstream has the same limit handling at dispatch only and the same refusal to reschedule exhausted bounds; no counterpart found.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. issue-monitor-scheduler.test.ts, 27 passed with six new cases: a monitor in the exact state of TR-915 (triggered 3/3, no next check, no monitor in the policy) is settled once under escalate_to_board and under wake_owner (state cleared max_attempts_exhausted, one comment naming 3/3 and saying there is no Paperclip support, issue.monitor_exhausted, issue.monitor_escalated_to_board for that policy only, one issue_monitor_recovery wake with monitorExhaustedWithoutNextCheck); a second tick after the woken run wakes nobody and posts nothing (the role re-armed nothing); a timed-out monitor without a next check is settled timeout_exceeded; a task with a run scheduled for retry, or with a pending question, is left alone (no wake, no comment, state still triggered) and settled on the first tick after the run ends or the question is answered; from a real final check (third due check triggered by the tick, its run settled, task in progress), nextIssueMonitorAt returns a time and the next tick wakes the owner once. Negative control (the new tests on the studio.18 code, 73b4ede7): all six fail. Typecheck: no error in the changed files.",
+      "migration": "None. The monitor tick also settles, once, every open task (in_progress or in_review, assigned to an agent only) whose monitor is triggered with no next check, no monitor left in the policy, and either attemptCount >= maxAttempts or timeoutAt passed, provided no run of the task is queued, claimed, running or scheduled for retry and no question on the task is pending. In one transaction it clears the monitor state (clearReason max_attempts_exhausted or timeout_exceeded), posts a comment that says what to do (read the service once, record the result, continue or ask the Board on the task; there is no Paperclip support) and logs issue.monitor_exhausted (and issue.monitor_escalated_to_board for that policy). It then wakes the assignee once (issue_monitor_recovery, idempotency key issue-monitor-recovery:<task>:<clearReason>:<lastTriggeredAt>), whatever the policy; create_recovery_issue keeps its child recovery task and wake. Once per exhausted monitor: the cleared state is no longer a candidate, so a role that re-arms nothing is not woken again. nextIssueMonitorAt also returns a time for such candidates, at most one look a minute while one waits on a live run or a question. Existing tasks in this state at install time are settled on the first tick.",
+      "rollback": "Switch cli/current back to the previous install folder. Monitors already settled stay cleared with their comment; nothing else changes.",
+      "retireWhen": "Upstream handles a monitor whose bounds are used up without a next check, or lets the last check carry the recovery policy itself.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: settle exhausted monitors without a next check (comment, activity, one owner wake). Why: the recovery policy was unreachable after the last allowed check (TR-915, 14 Nov 2026). Origin: studio fork only; to re-apply after an upstream update, keep tickExhaustedIssueMonitors and its two conditions in heartbeat/scheduling.ts, its call in tickIssueMonitors and the extra term in nextIssueMonitorAt, then run the five STUDIO-0049 cases of issue-monitor-scheduler.test.ts."
     }
   ]
 }
