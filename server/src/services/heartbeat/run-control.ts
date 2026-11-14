@@ -1690,7 +1690,7 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
     errorCode = "cancelled",
   ) {
     const runs = await db
-      .select()
+      .select({ id: heartbeatRuns.id })
       .from(heartbeatRuns)
       .where(
         and(
