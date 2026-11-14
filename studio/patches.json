@@ -795,6 +795,34 @@
       "retireWhen": "Pinned upstream replays or keeps the wakes an agent pause refuses or cancels, confirmed by the same cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0038",
+      "title": "A card addressed to a paused agent is accepted and reaches the agent when the pause lifts",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Creating an issue-thread interaction addressed to a paused agent is refused with 422 'addresseeAgentId must reference an invokable agent' (issue-thread-interactions.ts create, evaluateAgentInvokabilityFromDb), on the issue route and for plugins alike (plugin-host-services.ts createInteraction calls the same service). Production, 14 Nov 2026: the worker router queued a confirmation card on TR-710 for the Quality Manager while it was paused; the router passes of 00:32:00 and 00:34:00 failed on this refusal, the notice stayed queued, the publisher refuses a non-empty queue, and the Quality Manager had to be resumed for a moment so the card could be posted (V257). Same refusal on 13 Nov at 07:15:40 for a TR-606 notice to the paused CTO. Checking the replay end to end also showed two gaps once such a card exists: a card created by a person leaves no wake row while the agent is paused (queue.ts keeps no skipped row for a refused user request), and the STUDIO-0028 replay of a card wake on another agent's task was cancelled at dispatch as 'issue assignee changed' (its context carried neither wakeReason interaction_pending nor the card id, which the run context keeps only for an interaction mutation), so the card still waited.",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers. Registry entry B12 (OBSERVATIONS-PROD.md).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server issue-thread interactions and agent pause wakes",
+      "paths": [
+        "server/src/__tests__/issue-thread-interactions-service.test.ts",
+        "server/src/__tests__/paused-addressee-card.test.ts",
+        "server/src/services/agent-invokability.ts",
+        "server/src/services/issue-thread-interactions.ts",
+        "server/src/services/pause-missed-wakes.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found that accepts a paused addressee or replays its card wake (gh search prs: paused addressee, addressee paused, not invokable addressee, invokable agent interaction, paused agent card, paused agent interaction, pause lifted wake, paused agent wake replay, addresseeAgentId, interaction addressee). The invokable-addressee check comes from merged #10252 (governed agent addressees). Related open PRs keep a card's addressee wake through dispatch (#15991, #17643, #20806) but do not touch the paused case.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. New paused-addressee-card.test.ts, 8 cases: a card from an agent to the paused Quality Manager is accepted, the route's wake is recorded skipped (agent.not_invokable), and after status idle plus createLifecycleDriver(db).onReady (twice) exactly one issue_wakes_missed_during_pause wake carries the card id and reaches dispatch (not skipped, not cancelled as assignee changed); the same for a card from a person (no wake row during the pause, replay keyed on the card id); the same for a plugin-created card (buildHostServices issues.createInteraction); no replay once the card is answered; terminated and pending_approval addressees still refused; a paused addressee under a terminated manager still refused (manager_terminated); a missing or other-company addressee still refused. With the neighbouring suites (pause-missed-wakes, issue-thread-interactions service/routes/telemetry, agent-invokability, agent-lifecycle lifecycle, run-dispatch postgres adapter, interaction-resolution cross-issue cap, agent-interaction-acceptance): 463 passed, 1 failed for the bench only (agent-interaction-acceptance launches the CLI, whose tsx loader is missing from the bench's linked node_modules). Negative controls: with the base issue-thread-interactions.ts, 5 of the 8 cases fail (card refused, 'must reference an invokable agent'); with the STUDIO-0028 pause-missed-wakes.ts, 3 fail (agent card replay skipped as assignee changed; person and plugin cards not replayed). tsc: no error in the touched files.",
+      "migration": "None. Depends on STUDIO-0028 (branch studio/replay-wakes-missed-during-pause), whose replay it extends. The upstream case 'rejects paused interaction addressees' is narrowed to pending_approval and terminated. At each resume the replay also looks back 24 hours at pending cards addressed to the agent with no wake recorded for them.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream accepts a card addressed to a paused agent and delivers its wake when the pause lifts, confirmed by the same cases.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
