@@ -1001,32 +1001,46 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
     };
   }
 
+  // A plain directory (e.g. a local_fs shared workspace) has no git state to
+  // lose. Only treat it that way when no `.git` exists on the path, so a
+  // broken or unreadable repository still fails closed.
+  const plainDirectoryReadiness = () => ({
+    git: {
+      repoRoot: null,
+      workspacePath,
+      branchName: workspace.branchName,
+      baseRef: workspace.baseRef,
+      hasDirtyTrackedFiles: false,
+      hasUntrackedFiles: false,
+      dirtyEntryCount: 0,
+      untrackedEntryCount: 0,
+      aheadCount: null,
+      behindCount: null,
+      isMergedIntoBase: null,
+      createdByRuntime,
+    },
+    warnings,
+    statusInspectionSucceeded: true,
+  });
+  // Check the marker on disk before spawning git. The terminal workspace sweep
+  // inspects every terminal candidate on each rotation, and each git spawn
+  // forks the whole server process, so a plain directory must cost no process.
+  // An explicit GIT_DIR lets git find a repository without a marker; keep the
+  // git probe in that case.
+  if (
+    workspace.providerType !== "git_worktree"
+    && !process.env.GIT_DIR
+    && !(await hasGitMarkerInPathOrAncestors(workspacePath))
+  ) {
+    return plainDirectoryReadiness();
+  }
+
   let repoRoot: string | null = null;
   try {
     repoRoot = (await runGit(["rev-parse", "--show-toplevel"], workspacePath)).stdout.trim() || null;
   } catch (error) {
-    // A plain directory (e.g. a local_fs shared workspace) has no git state to
-    // lose. Only treat it that way when no `.git` exists on the path, so a
-    // broken or unreadable repository still fails closed.
     if (workspace.providerType !== "git_worktree" && !(await hasGitMarkerInPathOrAncestors(workspacePath))) {
-      return {
-        git: {
-          repoRoot: null,
-          workspacePath,
-          branchName: workspace.branchName,
-          baseRef: workspace.baseRef,
-          hasDirtyTrackedFiles: false,
-          hasUntrackedFiles: false,
-          dirtyEntryCount: 0,
-          untrackedEntryCount: 0,
-          aheadCount: null,
-          behindCount: null,
-          isMergedIntoBase: null,
-          createdByRuntime,
-        },
-        warnings,
-        statusInspectionSucceeded: true,
-      };
+      return plainDirectoryReadiness();
     }
     warnings.push(
       `Could not inspect git status for "${workspacePath}": ${error instanceof Error ? error.message : String(error)}`,

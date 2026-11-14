@@ -879,6 +879,31 @@
       "retireWhen": "Pinned upstream wakes the assignee of a dependent whose blocker is cancelled and accepts one update that drops the cancelled blocker and changes the status (for example #19843 and #17524 merged), confirmed by issue-cancelled-blocker-handoff-routes.test.ts.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0030",
+      "title": "Close-readiness inspection checks the .git marker before spawning git for a plain directory",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "inspectGitCloseReadiness spawned 'git -C <dir> rev-parse --show-toplevel' for every workspace directory and only looked for a .git marker after git failed. The terminal workspace reaper (sweepTerminalWorkspaces, a delivery-work queue that re-runs every second while its cursor has a next page and starts a new rotation about every 5 minutes) inspects every terminal candidate that passes its gates; plain task folders are never archived, so they are inspected again on every rotation. Production, 13 Nov 2026 22:10-22:18 UTC (bpftrace): 1101 such execs in 8 minutes from the server main thread, up to 24/s, on isolated-workspaces, project _default and router-pilot folders that are not git repositories; each fork copies the 1.6 GB server process. The reaper log line is throttled to once per 10 minutes and showed full 50-row pages with 16 inspected-and-skipped candidates and zero backoff hits.",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server execution workspaces, close readiness and terminal workspace reaper",
+      "paths": [
+        "server/src/__tests__/execution-workspaces-service.test.ts",
+        "server/src/services/execution-workspaces.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "gh search prs for 'inspectGitCloseReadiness', 'rev-parse show-toplevel workspace', 'git marker plain directory close readiness', 'terminal workspace sweep git'. paperclipai/paperclip#19553 (merged, in the pinned base) added the marker check after a failed git probe; it does not avoid the process. #14124 (open) and #11973 (open) make the reaper archive local_fs or shared-session rows, a behavior change that needs its own decision. #11753 (open) moves git scans behind other proofs across workspace-runtime and is much wider. None avoids the probe while keeping today's results.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL, a git shim on PATH that records each spawn. execution-workspaces-service.test.ts: 3 new cases (plain directory readiness spawns no git; a reaper sweep of 3 terminal plain directories spawns no git; a directory under an ancestor .git marker still spawns the probe and stays blocked). Negative control on the base execution-workspaces.ts: the 2 no-spawn cases fail (1 and 3 rev-parse spawns), the marker case passes on both. execution-workspaces-service.test.ts and execution-workspaces-routes.test.ts: 111 passed.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream answers close readiness for a directory without a .git marker without spawning git, confirmed by the same three cases, or the reaper stops re-inspecting plain directories.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
