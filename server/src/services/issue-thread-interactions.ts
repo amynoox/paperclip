@@ -126,7 +126,7 @@ import {
   publishActivity,
   type ActivityPublication,
 } from "./activity-log.js";
-import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
+import { evaluateAgentAddressabilityFromDb } from "./agent-invokability.js";
 import { getNativeReviewAssignment } from "./native-runtime/native-review-participant.js";
 import {
   assertIssueReviewVerdictActorAllowed,
@@ -3824,7 +3824,9 @@ export function issueThreadInteractionService(
             "addresseeAgentId must belong to the same company",
           );
         }
-        const invokability = await evaluateAgentInvokabilityFromDb(
+        // STUDIO-0038: a paused addressee is accepted; its wake is refused
+        // now and replayed when the pause lifts (pause-missed-wakes.ts).
+        const invokability = await evaluateAgentAddressabilityFromDb(
           db,
           addressee,
         );

@@ -695,4 +695,60 @@ describe("codex remote execution", () => {
     expect(retry.split("Append the same ledger entry.")).toHaveLength(3);
   });
 
+
+  it("stops the kept bridge when a prepared run is cancelled without a provider stop receipt", async () => {
+    // Production case: the operator cancels, the wrapper raises without calling
+    // onProcessStopped (worker unreachable). The bridge must not keep polling.
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bridgeStop = vi.fn(async () => {});
+    startAdapterExecutionTargetPaperclipBridge.mockResolvedValueOnce({
+      env: {
+        PAPERCLIP_API_URL: "http://127.0.0.1:4310",
+        PAPERCLIP_API_KEY: "bridge-token",
+        PAPERCLIP_API_BRIDGE_MODE: "queue_v1",
+      },
+      stop: bridgeStop,
+    });
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-remote-cancel-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHomeDir = path.join(rootDir, "codex-home");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(codexHomeDir, { recursive: true });
+    await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+    const controller = new AbortController();
+    const codexPreparedProcess = vi.fn(async () => {
+      controller.abort(new Error("operator cancel"));
+      throw new Error("router_cancelled");
+    });
+
+    await expect(execute({
+      runId: "run-ssh-prepared-cancel",
+      agent: { id: "agent-1", companyId: "company-1", name: "CodexCoder", adapterType: "codex_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { engine: "cli", command: "codex", experimentalLiveSteering: true, env: { CODEX_HOME: codexHomeDir } },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      registerInteractiveControl: () => () => {},
+      codexPreparedProcess,
+      signal: controller.signal,
+      onLog: async () => {},
+    })).rejects.toThrow(/router_cancelled/);
+
+    expect(codexPreparedProcess).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(bridgeStop).toHaveBeenCalledTimes(1));
+    expect(restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
+  });
+
 });

@@ -1,7 +1,11 @@
 import { asStringArray } from "@paperclipai/adapter-utils/server-utils";
 import { applyObservabilityEnvironment } from "@paperclipai/adapter-utils/agent-observability";
 import { prepareCodexObservabilityProfile, selectedCodexProfile, replaceCodexProfileArgs, disableCodexObservabilityArgs } from "@paperclipai/adapter-utils/codex-observability-profile";
-import { createProviderStoppedBoundary } from "@paperclipai/adapter-utils/provider-stopped-boundary";
+import {
+  createProviderStoppedBoundary,
+  deferOrphanedBridgeStop,
+  ORPHANED_BRIDGE_STOP_MAX_DELAY_MS,
+} from "@paperclipai/adapter-utils/provider-stopped-boundary";
 import { createUsageCheckpointLog } from "@paperclipai/adapter-utils/usage-checkpoint";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
@@ -579,6 +583,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const providerStop = createProviderStoppedBoundary(ctx.onProviderStopped);
   // A transport return is not proof that a remote interactive provider stopped.
   let interactiveInvocationPending = false;
+  // Late provider-stop receipt for a bridge kept past this call (see finally).
+  let releaseOrphanedBridge: (() => void) | null = null;
   const engineSelection = await resolveCodexExecutionEngineForRun(ctx);
   if (engineSelection.unavailableReason) {
     return {
@@ -1395,7 +1401,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       try {
         const processStopped = providerStop.beginInvocation();
         const processOptions = {
-          onProcessStopped: () => { processStopped(); interactiveInvocationPending = false; },
+          onProcessStopped: () => { processStopped(); interactiveInvocationPending = false; releaseOrphanedBridge?.(); },
           cwd,
           env,
           stdin: prompt,
@@ -1687,6 +1693,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       } finally {
         if (paperclipBridge && !interactiveInvocationPending) {
           await paperclipBridge.stop();
+        } else if (paperclipBridge) {
+          // The provider may still use the bridge until its stop is proven, but the
+          // bridge must not outlive the run: hand it to a bounded deferred stop.
+          await Promise.resolve(onLog(
+            "stdout",
+            `[paperclip] Provider stop not proven; keeping the callback bridge until stop proof, run cancellation or ${ORPHANED_BRIDGE_STOP_MAX_DELAY_MS / 60_000} min.\n`,
+          )).catch(() => undefined);
+          releaseOrphanedBridge = deferOrphanedBridgeStop({ bridge: paperclipBridge, signal: ctx.signal });
         }
         if (restoreRemoteWorkspace && !interactiveInvocationPending) {
           try {

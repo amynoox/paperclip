@@ -1,7 +1,7 @@
 import { describe, expect, it, vi, afterEach } from "vitest";
 import * as serverUtils from "./server-utils.js";
 import { runAdapterExecutionTargetProcess } from "./execution-target.js";
-import { createProviderStoppedBoundary } from "./provider-stopped-boundary.js";
+import { createProviderStoppedBoundary, deferOrphanedBridgeStop, ORPHANED_BRIDGE_STOP_MAX_DELAY_MS } from "./provider-stopped-boundary.js";
 
 const result = { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: 12, startedAt: "now" };
 const options = (onProcessStopped: () => void) => ({ cwd: "/tmp", env: {}, timeoutSec: 1, graceSec: 1, onLog: async () => {}, onProcessStopped });
@@ -71,5 +71,52 @@ describe("final invocation instruction collection fence", () => {
       ...options(stopped), runLogTail: { create: () => ({ wrapCommand: (command: string, args: string[]) => ({ command, args }), start: () => {}, finish: async () => { throw new Error("log flush failed"); }, abort: async () => {} }) } as any,
     })).rejects.toThrow("log flush failed");
     expect(stopped).toHaveBeenCalledOnce();
+  });
+});
+
+describe("deferred stop of a callback bridge kept after an unproven provider stop", () => {
+  const settle = () => new Promise(resolve => setTimeout(resolve, 0));
+  afterEach(() => vi.useRealTimers());
+  it("keeps the bridge until a late provider-stop receipt, then stops it once", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const stop = vi.fn(async () => {});
+    const release = deferOrphanedBridgeStop({ bridge: { stop } });
+    await settle();
+    expect(stop).not.toHaveBeenCalled();
+    release(); release("max_delay");
+    await settle();
+    expect(stop).toHaveBeenCalledOnce();
+  });
+  it("stops the bridge when the run is cancelled, already or later", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const already = new AbortController(); already.abort();
+    const stopNow = vi.fn(async () => {});
+    deferOrphanedBridgeStop({ bridge: { stop: stopNow }, signal: already.signal });
+    await settle();
+    expect(stopNow).toHaveBeenCalledOnce();
+    const later = new AbortController();
+    const stopLater = vi.fn(async () => {});
+    const release = deferOrphanedBridgeStop({ bridge: { stop: stopLater }, signal: later.signal });
+    await settle();
+    expect(stopLater).not.toHaveBeenCalled();
+    later.abort(); release();
+    await settle();
+    expect(stopLater).toHaveBeenCalledOnce();
+  });
+  it("stops the bridge at the bound when no receipt or cancellation arrives", async () => {
+    vi.useFakeTimers();
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const stop = vi.fn(async () => {});
+    deferOrphanedBridgeStop({ bridge: { stop }, signal: new AbortController().signal });
+    await vi.advanceTimersByTimeAsync(ORPHANED_BRIDGE_STOP_MAX_DELAY_MS - 1);
+    expect(stop).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(stop).toHaveBeenCalledOnce();
+  });
+  it("does not surface a failing deferred stop as an unhandled rejection", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    deferOrphanedBridgeStop({ bridge: { stop: async () => { throw new Error("ssh unreachable"); } } })();
+    await settle();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("ssh unreachable"));
   });
 });
