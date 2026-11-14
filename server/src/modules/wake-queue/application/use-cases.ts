@@ -1,4 +1,5 @@
 import { readWakeChatConversationId } from "../../run-dispatch/index.js";
+import { isAdapterDeclaredWaitErrorCode } from "../../../services/recovery/adapter-declared-wait.js";
 import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun } from "../domain/context.js";
 import {
   decideQueuedCommentAction,
@@ -654,6 +655,8 @@ async function runReleaseRecoveryTail(
         expectedRetryReason,
       ),
       sourceRequiresExplicitRecovery,
+      isAdapterDeclaredWaitRun:
+        run.status === "failed" && isAdapterDeclaredWaitErrorCode(run.errorCode),
     },
     shared: {
       hasExistingExecutionPath,
