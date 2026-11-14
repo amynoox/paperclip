@@ -23,6 +23,7 @@ import {
   ADAPTER_DECLARED_STOP_WAIT_MAX_MS,
   ADAPTER_DECLARED_WAIT_ERROR_CODES,
   ADAPTER_DECLARED_WAIT_MAX_MS,
+  ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES,
   adapterDeclaredWaitMaxMs,
 } from "../services/recovery/adapter-declared-wait.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
@@ -45,7 +46,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   const adapterType = "codex_local";
   const dispatched = new Set<string>();
   // Per-issue adapter outcome; default finishes the task.
-  const modes = new Map<string, "wait" | "wait-transient" | "other-transient" | "stop-transient">();
+  const modes = new Map<string, "wait" | "wait-transient" | "other-transient" | "stop-transient" | "unsettled-transient">();
   const oldHome = process.env.PAPERCLIP_HOME;
   let home: string;
   const WAIT = "router_waiting_for_resources";
@@ -67,7 +68,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
         if (mode) {
           return {
             exitCode: 1, signal: null, timedOut: false,
-            errorCode: mode === "other-transient" ? "codex_transient_upstream" : mode === "stop-transient" ? STOP : WAIT,
+            errorCode: mode === "other-transient" ? "codex_transient_upstream" : mode === "stop-transient" ? STOP : mode === "unsettled-transient" ? UNSETTLED : WAIT,
             errorMessage: mode === "other-transient" ? "upstream unavailable" : "Waiting for a worker machine",
             ...(mode === "wait" ? {} : { errorFamily: "transient_upstream" as const }),
           };
@@ -137,7 +138,32 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     expect(adapterDeclaredWaitMaxMs(WAIT)).toBe(12 * 60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(STOP)).toBe(60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(UNSETTLED)).toBe(60 * 60_000);
+    // The cut run keeps its transient retry (the retried run waits for the link itself).
+    expect(ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES).toEqual([WAIT, UNSETTLED]);
   });
+
+  // Production, 14 Nov 2026: the responsible coordinates on its executor's
+  // issue during the wait (Quality Manager run 2252fdcb, succeeded, between two
+  // runs of the tester). The issue's latest run is then not the assignee's.
+  it("keeps the wait when another agent's run on the issue came after the assignee's waiting run", async () => {
+    for (const [status, code] of [["in_progress", WAIT], ["in_progress", UNSETTLED], ["todo", WAIT]] as const) {
+      const f = await seed(status, [{ minutesAgo: 40, errorCode: code }, { minutesAgo: 20, errorCode: code, retry: true }]);
+      const otherAgentId = randomUUID();
+      await db.insert(agents).values({ id: otherAgentId, companyId: f.companyId, name: "Responsible", adapterType, status: "idle", adapterConfig: {} });
+      const at = new Date(Date.now() - 5 * 60_000);
+      await db.insert(heartbeatRuns).values({
+        companyId: f.companyId, agentId: otherAgentId, invocationSource: "on_demand", triggerDetail: "system", status: "succeeded", livenessState: "advanced",
+        createdAt: at, startedAt: at, updatedAt: new Date(at.getTime() + 2 * 60_000), finishedAt: new Date(at.getTime() + 2 * 60_000),
+        contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented" },
+      });
+      for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      expect((await issueOf(f.issueId)).status).toBe(status);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect(await commentsOf(f.issueId)).toHaveLength(0);
+    }
+  }, 180_000);
 
   // Office line cut, 14 Nov 2026, 06:01 and 06:27 (TR-731, TR-743): the cut run
   // ended `router_provider_stop_unverified`, each retry
@@ -304,16 +330,25 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     const waiting = await seed("todo", []);
     const other = await seed("todo", []);
     const stopped = await seed("todo", []);
+    const unsettled = await seed("todo", []);
     modes.set(waiting.issueId, "wait-transient");
     modes.set(other.issueId, "other-transient");
     modes.set(stopped.issueId, "stop-transient");
+    modes.set(unsettled.issueId, "unsettled-transient");
     const waitRun = await boardWake(waiting);
     const otherRun = await boardWake(other);
     const stopRun = await boardWake(stopped);
+    const unsettledRun = await boardWake(unsettled);
     await heartbeat.drainActiveRunExecutions();
     await expect.poll(async () => (await runsOf(stopped)).find(run => run.id === stopRun.id)?.status, { timeout: 30_000 }).toBe("failed");
+    await expect.poll(async () => (await runsOf(unsettled)).find(run => run.id === unsettledRun.id)?.status, { timeout: 30_000 }).toBe("failed");
+    // The cut run keeps its transient retry; the unsettled one gets none.
     expect((await runsOf(stopped)).find(run => run.id === stopRun.id)).toMatchObject({ errorCode: STOP });
-    expect((await runsOf(stopped)).filter(run => run.retryOfRunId === stopRun.id)).toHaveLength(0);
+    expect((await runsOf(stopped)).filter(run => run.retryOfRunId === stopRun.id)).toEqual([
+      expect.objectContaining({ status: "scheduled_retry", scheduledRetryReason: "transient_failure" }),
+    ]);
+    expect((await runsOf(unsettled)).find(run => run.id === unsettledRun.id)).toMatchObject({ errorCode: UNSETTLED });
+    expect((await runsOf(unsettled)).filter(run => run.retryOfRunId === unsettledRun.id)).toHaveLength(0);
     await expect.poll(async () => (await runsOf(waiting)).find(run => run.id === waitRun.id)?.status, { timeout: 30_000 }).toBe("failed");
     await expect.poll(async () => (await runsOf(other)).find(run => run.id === otherRun.id)?.status, { timeout: 30_000 }).toBe("failed");
     expect((await runsOf(waiting)).find(run => run.id === waitRun.id)).toMatchObject({ errorCode: WAIT });

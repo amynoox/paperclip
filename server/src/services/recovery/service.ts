@@ -5078,18 +5078,24 @@ export function recoveryService(
       // on release. That is a live wait, not a lost path: within the bound,
       // neither requeue nor block (a blocked issue is no longer served by
       // the router). Past the bound, normal recovery applies.
-      if (
-        issue.status !== "in_review" &&
-        latestRun?.agentId === agentId &&
-        isAdapterDeclaredWaitRun(latestRun)
-      ) {
+      // The issue's latest run can be another agent's (the responsible
+      // coordinating on its executor's issue during the wait): read the
+      // assignee's own latest run on the issue then. `in_review` keeps its
+      // review-path recovery, which follows the review participant's runs.
+      const assigneeLatestRun =
+        issue.status === "in_review"
+          ? null
+          : latestRun?.agentId === agentId
+            ? latestRun
+            : await getLatestIssueRunForAgent(issue.companyId, issue.id, agentId);
+      if (isAdapterDeclaredWaitRun(assigneeLatestRun)) {
         const waitStart = await readAdapterDeclaredWaitBoundStart(
           issue.companyId,
           issue.id,
           agentId,
         );
         const waitDeadline = waitStart
-          ? waitStart.getTime() + adapterDeclaredWaitMaxMs(latestRun.errorCode)
+          ? waitStart.getTime() + adapterDeclaredWaitMaxMs(assigneeLatestRun!.errorCode)
           : null;
         if (waitDeadline !== null && recoveryNow.getTime() < waitDeadline) {
           opts?.onDeferredDeadline?.(waitDeadline);

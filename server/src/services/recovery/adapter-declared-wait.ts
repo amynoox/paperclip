@@ -15,7 +15,8 @@
 //   settles the dispatch and wakes the assignee with
 //   `worker_router_dispatch_settled` (at most twice per reservation).
 // - router_previous_dispatch_unsettled: the same state seen by the next run
-//   (it waited up to 10 min for the proof); same settlement and wake.
+//   (it waited up to 10 min for the proof); same settlement and wake by the
+//   router's periodic pass.
 export const ADAPTER_DECLARED_WAIT_ERROR_CODES: readonly string[] = Object.freeze([
   "router_waiting_for_resources",
   "router_provider_stop_unverified",
@@ -50,6 +51,21 @@ const ADAPTER_DECLARED_WAIT_MAX_MS_BY_CODE: Readonly<Record<string, number>> = O
 
 export function isAdapterDeclaredWaitErrorCode(code: string | null | undefined): boolean {
   return Boolean(code && ADAPTER_DECLARED_WAIT_ERROR_CODES.includes(code));
+}
+
+// Codes of the list for which run completion schedules no transient retry.
+// router_provider_stop_unverified is left out on purpose: with router 0.30.10
+// the retried run itself waits for the link (one read a minute, 10 min at
+// most), proves the stop and starts the engine, so the transient retry is the
+// fastest way back after a cut link; it ends router_previous_dispatch_unsettled
+// at worst, which is then neither retried nor blocked within the bound.
+export const ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES: readonly string[] = Object.freeze([
+  "router_waiting_for_resources",
+  "router_previous_dispatch_unsettled",
+]);
+
+export function suppressesTransientRetry(code: string | null | undefined): boolean {
+  return Boolean(code && ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES.includes(code));
 }
 
 export function adapterDeclaredWaitMaxMs(code: string | null | undefined): number {

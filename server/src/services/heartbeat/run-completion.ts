@@ -50,7 +50,7 @@ import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitrat
 import { conversationTurnPresentsAnswer } from "../native-runtime/native-governance.js";
 import { readAcceptedTaskContinuationSummary } from "../heartbeat-run-summary.js";
 import { SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON } from "../recovery/stranded-notice.js";
-import { isAdapterDeclaredWaitErrorCode } from "../recovery/adapter-declared-wait.js";
+import { suppressesTransientRetry } from "../recovery/adapter-declared-wait.js";
 import { MAX_TURN_CONTINUATION_RETRY_REASON, isResolvedInteractionContinuationWakeContext } from "../../modules/run-dispatch/index.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
@@ -978,8 +978,9 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         outcome === "failed" &&
         readTransientRecoveryContractFromRun(livenessRun) &&
         // An adapter-declared resource wait is woken by the resource's owner on
-        // release; a transient retry would only repeat the same request.
-        !isAdapterDeclaredWaitErrorCode(livenessRun.errorCode)
+        // release; a transient retry would only repeat the same request (not
+        // for router_provider_stop_unverified, see adapter-declared-wait.ts).
+        !suppressesTransientRetry(livenessRun.errorCode)
       ) {
         await scheduleBoundedRetryForRun(livenessRun, agent);
       } else if (
