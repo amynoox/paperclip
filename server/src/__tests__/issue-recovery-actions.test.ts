@@ -13,6 +13,7 @@ import {
   agents,
   agentRuntimeState,
   authUsers,
+  agentTaskSessions,
   agentWakeupRequests,
   activityLog,
   caseHandoffs,
@@ -44,6 +45,7 @@ import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
 import { issueService } from "../services/issues.js";
+import { executionProjectionForRun } from "../services/execution-projection.js";
 import { caseHandoffService } from "../services/case-handoffs.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { withNativeWorkspaceFinalizationOwnership } from "../services/native-runtime/native-workspace-finalization-ownership.js";
@@ -195,6 +197,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await db.delete(environmentLeases);
     await db.delete(activityLog);
     await db.delete(costEvents);
+    await db.delete(agentTaskSessions);
     await db.delete(heartbeatRuns);
     await db.delete(agentWakeupRequests);
     await db.delete(environments);
@@ -2150,7 +2153,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
   // legacy hold then turned every system wake into a skipped
   // `execution_reconciliation_required` row, and the hold could only be
   // reconciled once the ticket left `blocked`.
-  async function seedDependencyBlockedLegacyHold(childStatus: "in_progress" | "done",
+  async function seedDependencyBlockedLegacyHold(childStatus: "in_progress" | "done" | "cancelled",
     cause = "legacy_execution_requires_reconciliation") {
     const fixture = await seedCompany();
     const { companyId, coderId, sourceIssueId, prefix } = fixture;
@@ -2192,6 +2195,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       contextSnapshot: { issueId: sourceIssueId, taskId: sourceIssueId, wakeReason: "issue_blockers_resolved",
         resolvedBlockerIssueId: childIssueId, blockerIssueIds: [childIssueId] },
     });
+    // The session the cut run resumed and left mid-turn.
+    await db.insert(agentTaskSessions).values({ companyId, agentId: coderId, adapterType: "codex_local", taskKey: sourceIssueId,
+      sessionParamsJson: { sessionId: "cut-thread" }, sessionDisplayId: "cut-thread", lastRunId: cutRunId });
     return { ...fixture, childIssueId, cutRunId, action: action!, body, wakeBlockersResolved };
   }
 
@@ -2218,6 +2224,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     } });
     expect(recorded!.evidence).not.toHaveProperty("automaticRecovery");
     expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
+    // The next run starts fresh, as the todo path's continuation does.
+    expect(await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, sourceIssueId))).toEqual([]);
     // No continuation is delivered now, and a repeated request changes nothing.
     await deliverReconciledExecutions(db, heartbeatService(db, { runtimeEnv: {} }).wakeup);
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, cutRunId))).toEqual([]);
@@ -2245,6 +2253,21 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(unchanged).toMatchObject({ status: "resolved", outcome: "blocked",
       evidence: { automaticRecovery: { replay: "blocked" } } });
     expect(unchanged!.evidence).not.toHaveProperty("executionReconciliation");
+    expect(await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, sourceIssueId))).toHaveLength(1);
+  });
+
+  it("accepts a blocked reconciliation behind a cancelled child but does not promise a dependency wake", async () => {
+    const { sourceIssueId, action, body, cutRunId, wakeBlockersResolved, companyId } = await seedDependencyBlockedLegacyHold("cancelled");
+    const resolved = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    expect(resolved.body.issue.status).toBe("blocked");
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded!.evidence).toMatchObject({ continuationDelivery: "not_requested", dependencyBlockedReconciliation: true });
+    // A cancelled blocker stays unresolved: the task is not dependency-ready.
+    expect((await issueService(db).getDependencyReadiness(sourceIssueId)).unresolvedBlockerCount).toBe(1);
+    const projection = await executionProjectionForRun(db, companyId, cutRunId);
+    expect(projection).toMatchObject({ phase: "completed", label: "Reconciled" });
+    expect(projection!.nextAction).toContain("a cancelled blocker must be removed or replaced first");
+    void wakeBlockersResolved;
   });
 
   async function seedReconciledDelivery() {

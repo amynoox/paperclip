@@ -14,7 +14,9 @@ import { persistActivity } from "./activity-log.js";
 import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
 import { and, eq, exists, inArray, isNull, not, or, sql } from "drizzle-orm";
+import { notifyExternalConversationSettlement } from "./external-conversation-settlement-notifications.js";
 import {
+  agentTaskSessions,
   agentWakeupRequests,
   chatActions,
   environmentLeases,
@@ -298,6 +300,24 @@ export async function markExecutionReconciliation(
         kind: issueRecoveryActions.kind,
         evidence: issueRecoveryActions.evidence,
       });
+    if (options?.dependencyBlockedOnly) {
+      // STUDIO-0048: no continuation run carries forceFreshSession here, so the
+      // next run (the dependency wake) would resume the session the cut run
+      // left mid-turn. Drop the cut run owner's session for this task: the next
+      // run starts fresh with the task handoff, as on the todo path.
+      const [cutRun] = await tx.select({ agentId: heartbeatRuns.agentId }).from(heartbeatRuns)
+        .where(and(eq(heartbeatRuns.companyId, action.companyId), eq(heartbeatRuns.id, decision.runId))).limit(1);
+      const [task] = await tx.select({ id: issues.id, identifier: issues.identifier }).from(issues)
+        .where(and(eq(issues.companyId, action.companyId), eq(issues.id, action.sourceIssueId))).limit(1);
+      if (cutRun && task) {
+        const scope = and(eq(agentTaskSessions.companyId, action.companyId), eq(agentTaskSessions.agentId, cutRun.agentId),
+          task.identifier ? inArray(agentTaskSessions.taskKey, [task.id, task.identifier]) : eq(agentTaskSessions.taskKey, task.id));
+        const [goal] = await tx.select({ id: agentTaskSessions.id }).from(agentTaskSessions)
+          .where(and(scope, sql`${agentTaskSessions.goalStatus} is not null`, sql`${agentTaskSessions.goalStatus} <> 'complete'`)).limit(1);
+        if (goal) await notifyExternalConversationSettlement(tx, { companyId: action.companyId });
+        await tx.delete(agentTaskSessions).where(scope);
+      }
+    }
     if (options?.controllerContainmentOnly) {
       // A Retry clicked before the operator reviewed the effects must not turn
       // into an automatic replay after containment. Retain only that exact,

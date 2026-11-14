@@ -370,7 +370,9 @@ export function projectExecution(
       && recoveryAction.evidence.continuationDelivery === "not_requested") {
       // STUDIO-0048: reconciled while blocked; the dependency wake restarts it.
       projection.cause = null;
-      projection.nextAction = "The previous execution is reconciled. The task starts again through its dependency wake once its blockers are resolved.";
+      // A cancelled blocker never resolves on its own (dependency readiness
+      // counts only done blockers), so it produces no dependency wake.
+      projection.nextAction = "The previous execution is reconciled. The task starts again through its dependency wake once every blocker is done; a cancelled blocker must be removed or replaced first.";
       return set("completed", "Reconciled");
     }
     const deliveredRunId = text(recoveryAction.evidence.continuationRunId);
