@@ -1186,6 +1186,32 @@
       "retireWhen": "Pinned upstream records pre-dispatch cancellations for the stop proof and the ssh driver returns termination receipts, confirmed by the same cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0044",
+      "title": "A disposition repair addressed to the task's owner no longer carries the third-party recovery contract",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, studio.15, 14 Nov 2026, TR-825. At 10:49:51 a deliberate_wait_without_target action (bounded_owner_disposition_repair, attempt 1 of 2) opened on the Infra Manager's own task; its repair wake coalesced into the run created for a Quality Manager comment with a new instruction. Because the run's context named an active recovery action, the wake payload carried `recovery`, and the prompt added the recovery contract written for an agent recovering someone else's task: \"your job is to RECOVER this task, not to do the work\", \"hand it back to <original assignee>\" (the Infra Manager itself), fallback \"(4) convert to an explicit manual-review state for the board\". The role did no work and asked the Board for a manual review; a delegated answer was needed at 10:56:51.",
+      "reason": "Requested by Amyne (14 Nov 2026, V294): every unblocking gesture must be followed by the fix that makes it unnecessary.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server heartbeat run preparation",
+      "paths": [
+        "server/src/services/heartbeat/run-preparation.ts",
+        "server/src/services/recovery/legacy-continuation.ts",
+        "server/src/services/heartbeat/run-preparation.review-path.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found that separates the owner's disposition repair from the third-party recovery contract.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2. run-preparation.review-path.test.ts: 6 passed, with two new cases: an owner's deliberate_wait_without_target repair gets no recovery payload, no recovery contract and no Board manual-review fallback, and still gets the Task disposition repair block with the instruction to do newly arrived work first; the same action owned by another agent, and a stranded_assigned_issue action of the owner, keep the recovery contract. Negative control with the studio.15 run-preparation.ts: the owner case fails.",
+      "migration": "None. Applies when the run's recovery action is deliberate_wait_without_target and its ownerAgentId is the run's agent. The legacy repair instruction gains: \"You remain the owner of this task: if new comments or instructions arrived, do that work first, then record the disposition.\" Repair attempts, resolution and the Board escalation after the last attempt are unchanged.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream gives the owner's disposition repair its own prompt contract, confirmed by the same cases.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }

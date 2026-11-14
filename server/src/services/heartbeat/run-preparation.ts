@@ -2648,6 +2648,14 @@ export async function buildPaperclipWakePayload(input: {
   const recoveryStillActive = recoveryAction
     ? ["active", "escalated"].includes(recoveryAction.status)
     : !recoveryActionId && Boolean(recoveryCause);
+  // STUDIO-0044: a disposition repair is addressed to the task's own owner,
+  // who stays responsible for the work. The recovery contract ("recover, do
+  // not do the work, hand back to the original assignee") is written for an
+  // agent recovering someone else's task; given to the owner (production
+  // TR-825, 14 Nov 2026) it left no way forward but a Board manual review. The
+  // "Task disposition repair" block (attempt, instruction) still reaches it.
+  const ownerDispositionRepair = recoveryAction?.kind === "deliberate_wait_without_target" &&
+    Boolean(input.agentId) && recoveryAction.ownerAgentId === input.agentId;
   const originalAssigneeId =
     recoveryAction?.returnOwnerAgentId ??
     recoveryAction?.previousOwnerAgentId ??
@@ -2695,7 +2703,7 @@ export async function buildPaperclipWakePayload(input: {
           commentIds: externalChatProvider === "github" ? commentIds : [] })
       : [],
     recovery:
-      recoveryStillActive
+      recoveryStillActive && !ownerDispositionRepair
         ? {
             cause: recoveryAction?.cause ?? recoveryCause,
             failureSummary: readNonEmptyString(recoveryEvidence.failureSummary),
