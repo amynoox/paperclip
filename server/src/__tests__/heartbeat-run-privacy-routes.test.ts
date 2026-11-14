@@ -289,11 +289,11 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
 
   it("returns compact usage in run lists and the whole usage on request or by run id", async () => {
     const f = await seedFixture();
-    const displayed = { inputTokens: 900, outputTokens: 40, cachedInputTokens: 300, provider: "anthropic", model: "claude-sonnet", costUsd: 0.02 };
+    const displayed = { inputTokens: 900, outputTokens: 40, cachedInputTokens: 300, provider: "example-provider", model: "example-model", costUsd: 0.02 };
     const usage = {
       ...displayed,
       accountingReceiptSourceFences: Array.from({ length: 30 }, (_, index) => ({ sourceId: randomUUID(), sequence: index })),
-      usageByModel: { "claude-sonnet": { inputTokens: 900, outputTokens: 40 } },
+      usageByModel: { "example-model": { inputTokens: 900, outputTokens: 40 } },
       budgetDispatch: { reservationId: randomUUID(), state: "settled" },
     };
     await db.update(heartbeatRuns).set({ usageJson: usage }).where(eq(heartbeatRuns.id, f.maintenanceRunId));
