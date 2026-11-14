@@ -122,11 +122,11 @@ describe("wakes missed during an agent pause", () => {
     const replayed = (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
       eq(agentWakeupRequests.agentId, f.agentId)))).filter(w => w.reason === PAUSE_MISSED_WAKE_REASON);
     expect(replayed).toHaveLength(1);
+    // Not refused, and not cancelled by dispatch because the addressee does not own the task.
+    expect({ status: replayed[0].status, error: replayed[0].error ?? "" }).not.toMatchObject({ error: expect.stringContaining("assignee changed") });
+    expect(replayed[0].status).not.toBe("skipped");
     expect(replayed[0].payload).toMatchObject({ issueId: f.issueId, mutation: "interaction", interactionId: f.interactionId,
       interactionKind: "ask_user_questions", missedWakeRequestId: f.cancelled.id });
-    // Not refused, and not cancelled by dispatch because the addressee does not own the task.
-    expect(replayed[0].status).not.toBe("skipped");
-    expect(replayed[0].error ?? "").not.toContain("assignee changed");
     await heartbeat.drainActiveRunExecutions?.();
   });
 
