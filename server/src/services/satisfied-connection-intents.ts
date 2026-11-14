@@ -101,16 +101,21 @@ export async function findSatisfiedToolConnection(db: Db, task: Task, intent: In
 // executor's conversation, so the retry of that very run does not wait for it.
 // Every other card keeps holding the retry (OAuth connection card, native
 // questions, any card of another run).
-function isRouterInterruptionCardOfRun(interaction: typeof issueThreadInteractions.$inferSelect, cutRunId: string) {
-  return interaction.status === "pending" && interaction.kind === "request_confirmation" &&
-    interaction.continuationPolicy === "none" && Boolean(interaction.addresseeAgentId) && !interaction.addresseeUserId &&
-    !interaction.createdByAgentId && !interaction.createdByUserId &&
-    typeof interaction.idempotencyKey === "string" && interaction.idempotencyKey.startsWith("interruption/") &&
-    interaction.idempotencyKey.endsWith("/" + cutRunId);
+// The worker router keys its card `interruption/<generation>/<cut run>`, or
+// `interruption/<generation>/<cut run>/to/<addressee agent>` when the task's
+// manager changed since the reservation.
+function isRouterInterruptionCardOfRun(interaction: typeof issueThreadInteractions.$inferSelect, cutRunIds: readonly string[]) {
+  const key = interaction.idempotencyKey;
+  if (interaction.status !== "pending" || interaction.kind !== "request_confirmation" ||
+    interaction.continuationPolicy !== "none" || !interaction.addresseeAgentId || interaction.addresseeUserId ||
+    interaction.createdByAgentId || interaction.createdByUserId ||
+    typeof key !== "string" || !key.startsWith("interruption/")) return false;
+  const redirected = "/to/" + interaction.addresseeAgentId;
+  return cutRunIds.some((runId) => key.endsWith("/" + runId) || key.endsWith("/" + runId + redirected));
 }
 
 export async function connectionContinuationPendingResponse(db: Db, task: Task, responsibleUserId: string | null,
-  policyRunId?: string | null, options: { routerInterruptionOfRunId?: string | null } = {}): Promise<"interaction" | "approval" | null> {
+  policyRunId?: string | null, options: { routerInterruptionOfRunIds?: readonly string[] } = {}): Promise<"interaction" | "approval" | null> {
   const interactions = await db.select().from(issueThreadInteractions).where(and(
     eq(issueThreadInteractions.companyId, task.companyId), eq(issueThreadInteractions.issueId, task.id),
     or(eq(issueThreadInteractions.status, "pending"), and(eq(issueThreadInteractions.kind, "connection_intent"), eq(issueThreadInteractions.status, "expired"))),
@@ -119,7 +124,7 @@ export async function connectionContinuationPendingResponse(db: Db, task: Task, 
     const retired = interaction.status === "expired" && interaction.result?.outcome === "expired"
       && "connectionId" in interaction.result && typeof interaction.result.connectionId === "string";
     if (interaction.status !== "pending" && !retired) continue;
-    if (options.routerInterruptionOfRunId && isRouterInterruptionCardOfRun(interaction, options.routerInterruptionOfRunId)) continue;
+    if (options.routerInterruptionOfRunIds?.length && isRouterInterruptionCardOfRun(interaction, options.routerInterruptionOfRunIds)) continue;
     if (retired && (interaction.payload as { requestingAgentId?: string }).requestingAgentId !== task.assigneeAgentId) continue;
     if (interaction.addresseeUserId !== responsibleUserId) return "interaction";
     const connection = await findAvailableToolConnection(db, task, { ...interaction, status: "pending" }, policyRunId);

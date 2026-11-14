@@ -449,13 +449,23 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     ]);
   }, 180_000);
 
-  type CardShape = "router" | "router-other-run" | "oauth" | "native-question" | "wake-assignee" | "none";
-  async function dueStopRetry(card: CardShape, opts: { sourceCode?: string; liveStatus?: "running" | "queued" } = {}) {
+  type CardShape = "router" | "router-redirected" | "router-redirected-elsewhere" | "router-other-run" | "oauth" | "native-question"
+    | "wake-assignee" | "none";
+  async function dueStopRetry(card: CardShape, opts: { sourceCode?: string; liveStatus?: "running" | "queued";
+    liveAgent?: "responsible" | "assignee"; chain?: boolean; recutCode?: string } = {}) {
     const f = await seed("in_progress", [{ minutesAgo: 2, durationMinutes: 1, errorCode: opts.sourceCode ?? STOP }]);
     await db.update(issues).set({ checkoutRunId: null }).where(eq(issues.id, f.issueId));
+    // chain: the first retry was cut again; the due retry is the retry of that
+    // retry, and the router's card still names the first cut run.
+    const [recut] = opts.chain ? await db.insert(heartbeatRuns).values({
+      companyId: f.companyId, agentId: f.agentId, invocationSource: "automation", triggerDetail: "system", status: "failed",
+      runtimeMode: "legacy", retryOfRunId: f.runIds[0], errorCode: opts.recutCode ?? STOP, scheduledRetryAttempt: 1, scheduledRetryReason: "transient_failure",
+      startedAt: new Date(Date.now() - 50_000), finishedAt: new Date(Date.now() - 40_000),
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "transient_failure_retry", retryReason: "transient_failure" },
+    }).returning() : [];
     const [retry] = await db.insert(heartbeatRuns).values({
       companyId: f.companyId, agentId: f.agentId, invocationSource: "automation", triggerDetail: "system", status: "scheduled_retry",
-      runtimeMode: "legacy", retryOfRunId: f.runIds[0], scheduledRetryAt: new Date(Date.now() - 1_000), scheduledRetryAttempt: 1,
+      runtimeMode: "legacy", retryOfRunId: recut?.id ?? f.runIds[0], scheduledRetryAt: new Date(Date.now() - 1_000), scheduledRetryAttempt: recut ? 2 : 1,
       scheduledRetryReason: "transient_failure", resultJson: { conversationContinuation: "continue_conversation_v1" },
       contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "transient_failure_retry", retryReason: "transient_failure" },
     }).returning();
@@ -465,6 +475,11 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       // The worker router's card for this very cut run (production key shape).
       router: { kind: "request_confirmation", continuationPolicy: "none", addresseeAgentId: responsible.id,
         idempotencyKey: `interruption/${randomUUID()}/${f.runIds[0]}`, payload: confirm },
+      // The same card when the manager changed since the reservation.
+      "router-redirected": { kind: "request_confirmation", continuationPolicy: "none", addresseeAgentId: responsible.id,
+        idempotencyKey: `interruption/${randomUUID()}/${f.runIds[0]}/to/${responsible.id}`, payload: confirm },
+      "router-redirected-elsewhere": { kind: "request_confirmation", continuationPolicy: "none", addresseeAgentId: responsible.id,
+        idempotencyKey: `interruption/${randomUUID()}/${f.runIds[0]}/to/${randomUUID()}`, payload: confirm },
       "router-other-run": { kind: "request_confirmation", continuationPolicy: "none", addresseeAgentId: responsible.id,
         idempotencyKey: `interruption/${randomUUID()}/${randomUUID()}`, payload: confirm },
       // "Connect your account to continue" (tool-access OAuth): policy none, addressed to a person.
@@ -476,7 +491,8 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       "wake-assignee": { kind: "request_confirmation", continuationPolicy: "wake_assignee", addresseeAgentId: responsible.id, payload: confirm },
     };
     if (card !== "none") await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, status: "pending", ...cards[card] } as never);
-    const [live] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: responsible.id, invocationSource: "automation",
+    const [live] = await db.insert(heartbeatRuns).values({ companyId: f.companyId,
+      agentId: opts.liveAgent === "assignee" ? f.agentId : responsible.id, invocationSource: "automation",
       triggerDetail: "system", status: opts.liveStatus ?? "running", startedAt: opts.liveStatus === "queued" ? null : new Date(),
       contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "interaction_pending" } }).returning();
     return { f, retry, live };
@@ -497,17 +513,47 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       .toMatchObject({ outcome: "not_stale" });
   }, 180_000);
 
-  it.each(["oauth", "native-question", "router-other-run"] as const)(
+  // STUDIO-0046 follow-ups: the card keyed `/to/<addressee>` after a manager
+  // change, and the first cut's card while the retry of a re-cut retry is due.
+  it.each([["router-redirected", false], ["router", true]] as const)(
+    "does not let the router's %s card cancel the retry (retry of a re-cut retry: %s)", async (card, chain) => {
+      const { f, retry, live } = await dueStopRetry(card, { chain });
+      const dispatch = createPostgresRunDispatchAdapter(db);
+      expect(await dispatch.promoteOrCancelDueRetry({ companyId: f.companyId, runId: retry.id, now: new Date() })).toMatchObject({ outcome: "not_promoted" });
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, live.id));
+      expect(await dispatch.promoteOrCancelDueRetry({ companyId: f.companyId, runId: retry.id, now: new Date(Date.now() + 20_000) }))
+        .toMatchObject({ outcome: "promoted" });
+      expect(await dispatch.cancelStaleQueuedRun({ companyId: f.companyId, runId: retry.id, expectedStatus: "queued", now: new Date(Date.now() + 21_000) }))
+        .toMatchObject({ outcome: "not_stale" });
+    }, 180_000);
+
+  it("keeps cancelling the retry for the first cut's card when the chain is broken by another code", async () => {
+    const { f, retry } = await dueStopRetry("router", { chain: true, recutCode: "process_lost" });
+    expect(await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({ companyId: f.companyId, runId: retry.id, now: new Date() }))
+      .toMatchObject({ outcome: "gate_suppressed", errorCode: "issue_waiting_for_response" });
+  }, 180_000);
+
+  it.each(["oauth", "native-question", "router-other-run", "router-redirected-elsewhere"] as const)(
     "keeps cancelling the retry for a pending %s card", async (card) => {
       const { f, retry } = await dueStopRetry(card);
       expect(await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({ companyId: f.companyId, runId: retry.id, now: new Date() }))
         .toMatchObject({ outcome: "gate_suppressed", errorCode: "issue_waiting_for_response" });
     }, 180_000);
 
-  it("does not hold the retry behind a queued run, nor the retry of a run cut under another code", async () => {
-    const queued = await dueStopRetry("none", { liveStatus: "queued" });
-    expect(await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({ companyId: queued.f.companyId, runId: queued.retry.id, now: new Date() }))
+  it("holds the retry behind another agent's queued run, but not behind a queued run of its own agent", async () => {
+    const other = await dueStopRetry("none", { liveStatus: "queued" });
+    const dispatch = createPostgresRunDispatchAdapter(db);
+    expect(await dispatch.promoteOrCancelDueRetry({ companyId: other.f.companyId, runId: other.retry.id, now: new Date() }))
+      .toMatchObject({ outcome: "not_promoted" });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, other.retry.id)))[0]!.resultJson?.liveRunWait)
+      .toMatchObject({ runId: other.live.id });
+    // A queued run of the retry's own agent may wait for the lock the retry holds.
+    const own = await dueStopRetry("none", { liveStatus: "queued", liveAgent: "assignee" });
+    expect(await dispatch.promoteOrCancelDueRetry({ companyId: own.f.companyId, runId: own.retry.id, now: new Date() }))
       .toMatchObject({ outcome: "promoted" });
+  }, 180_000);
+
+  it("does not hold the retry of a run cut under another code", async () => {
     const other = await dueStopRetry("none", { sourceCode: "process_lost" });
     expect(await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({ companyId: other.f.companyId, runId: other.retry.id, now: new Date() }))
       .toMatchObject({ outcome: "promoted" });
