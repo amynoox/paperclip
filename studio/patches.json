@@ -772,9 +772,9 @@
     },
     {
       "id": "STUDIO-0028",
-      "title": "Wakes refused during an agent pause reach the agent once when it is ready again",
+      "title": "Wakes lost to an agent pause reach the agent once when it is ready again",
       "status": "implemented-locally-validated-not-deployed",
-      "problem": "While an agent is paused, only a person's comment is saved as a deferred message and replayed when the pause lifts (queue.ts canSaveDeferredMessage, pause-lift replay limited to requestedByActorType user). Every other wake for the paused agent (another agent's comment, a resolved dependency, an automatic signal) is recorded as skipped with reason agent.not_invokable and never replayed. Production, 13 Nov 2026: during the 19:20-20:08 pause the Quality Manager received three wakes on TR-29 (19:19:25, 19:19:29, 19:19:47, all skipped) and only resumed after an operator note at 20:11:13.",
+      "problem": "While an agent is paused, only a person's comment is saved as a deferred message and replayed when the pause lifts (queue.ts canSaveDeferredMessage, pause-lift replay limited to requestedByActorType user). Every other wake for the paused agent (another agent's comment, a resolved dependency, an automatic signal) is recorded as skipped with reason agent.not_invokable and never replayed. Production, 13 Nov 2026: during the 19:20-20:08 pause the Quality Manager received three wakes on TR-29 (19:19:25, 19:19:29, 19:19:47, all skipped) and only resumed after an operator note at 20:11:13. Second case, 14 Nov 2026: a wake already waiting when the pause started is cancelled by the pause stop ('Agent lifecycle stop requested', run-control.ts cancelPendingWakeupsForAgentsInternal) and never replayed. At 00:28:23 the Game Tester addressed a question card on TR-699 (its own task) to the Quality Manager; the Quality Manager's wake was deferred behind the tester's run, cancelled at 00:28:51 by the pause, and the card was still pending after the resume of 00:41.",
       "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers.",
       "observedOnUpstream": "2026.1110.0",
       "owner": "server agent lifecycle and heartbeat wakes",
@@ -789,10 +789,10 @@
         "details": "No upstream change found for replaying non-human wakes refused during an agent pause (searches: wake paused agent replay, skipped wake agent paused resume, pause lifted replay wakes agent).",
         "selected": null
       },
-      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. pause-missed-wakes.test.ts (new, 6 cases: a real system wake refused by the pause is recorded skipped; one replay per task; exactly one replayed wake through the real queue across repeated resumes; replay from the lifecycle driver; no replay for a finished task, a reassigned task, or a task already run after the refusal) and heartbeat-held-comment-wake.test.ts: 31 passed. Negative control on the base agent-lifecycle-driver.ts: the driver case fails (no replayed wake).",
-      "migration": "None. Looks back 24 hours of skipped agent.not_invokable wakes at each agent resume.",
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. pause-missed-wakes.test.ts (10 cases: a real system wake refused by the pause is recorded skipped; one replay per task; exactly one replayed wake through the real queue across repeated resumes; replay from the lifecycle driver; the addressee of a pending card whose deferred wake the real pause stop cancelled is woken, with the card id; no wake once the card is answered; no wake when a wake for the task is still live; a queued wake of the agent's own task cancelled by the real pause stop is replayed, one cancelled by an operator is not; no replay for a finished task, a reassigned task, or a task already run after the loss) and heartbeat-held-comment-wake.test.ts: 35 passed. Negative controls: the base agent-lifecycle-driver.ts fails the driver case; the first version of pause-missed-wakes.ts fails the two pause-stop cases.",
+      "migration": "None. At each agent resume, looks back 24 hours of wakes skipped as agent.not_invokable or cancelled by a pause stop before any run. Limit: a wake that was never requested (no row) is not replayed; for example TR-710 on 14 Nov, whose recovery settled as blocked at 00:31:10, had no wake of the paused Game Tester to replay.",
       "rollback": "Switch cli/current back to the previous install folder.",
-      "retireWhen": "Pinned upstream replays or saves non-human wakes refused during an agent pause, confirmed by the same cases.",
+      "retireWhen": "Pinned upstream replays or keeps the wakes an agent pause refuses or cancels, confirmed by the same cases.",
       "upgradeDecisions": [],
       "commits": []
     }
