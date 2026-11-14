@@ -1,4 +1,5 @@
 import { notifyExecutionRunWork } from "../../../services/execution-control-notifications.js";
+import { isServerTransientRetryCode } from "../../../services/recovery/adapter-declared-wait.js";
 import { preDispatchCancellationResult } from "../../../services/pre-dispatch-cancellation.js";
 import { notifyDeferredExecutionWork } from "../../../services/deferred-execution-notifications.js";
 import { hasRequiredWorkspaceRecovery } from "../../../services/workspace-restore-recovery-state.js";
@@ -17,7 +18,7 @@ import { recordedUserStop, userStopBoundaryAt } from "../../../services/run-canc
 import { getExecutionBlocker } from "../../../services/execution-blocker.js";
 import { validateReconstructedWorkspaceDispatch } from "../../../services/native-runtime/native-workspace-reconstruction.js";
 import { getNativeReviewAssignment } from "../../../services/native-runtime/native-review-participant.js";
-import { and, asc, desc, eq, gte, inArray, isNull, lte, or, sql } from "drizzle-orm";
+import { and, asc, desc, eq, gte, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   agentWakeupRequests,
@@ -1111,6 +1112,9 @@ export function createPostgresRunDispatchAdapter(
       if (await parkWorkspaceBusyRetryInTx(tx, run, now)) {
         return { outcome: { outcome: "not_promoted" as const }, telemetryRun: null };
       }
+      if (issueId && (await holdStopUnverifiedRetryBehindLiveRunInTx(tx, run, issueId, now))) {
+        return { outcome: { outcome: "not_promoted" as const }, telemetryRun: null };
+      }
 
       const promoted = await promoteDueRetryInTx(tx as unknown as Db, {
         runId: input.runId,
@@ -1461,6 +1465,49 @@ export function createPostgresRunDispatchAdapter(
    * reconciliation of uncertain actions and native execution retain their gates.
    * Both callers hold the issue and run locks, in that order.
    */
+  // STUDIO-0046 (contract with the worker router, 14 Nov 2026): the transient
+  // retry of a run cut under router_provider_stop_unverified must reach the
+  // router alone on its ticket; the router refuses a dispatch while another
+  // run of the ticket is live (`other_live_run`), and that refusal is never
+  // retried. The responsible's run answering the router's card usually holds
+  // the ticket for a minute or two after the cut: keep the retry scheduled and
+  // look again in 15 s, for at most 10 min, then promote it anyway.
+  async function holdStopUnverifiedRetryBehindLiveRunInTx(tx: Db, run: HeartbeatRun, issueId: string, now: Date) {
+    if (run.status !== "scheduled_retry" || run.scheduledRetryReason !== "transient_failure" || !run.retryOfRunId) return false;
+    const [source] = await tx.select({ errorCode: heartbeatRuns.errorCode }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.id, run.retryOfRunId), eq(heartbeatRuns.companyId, run.companyId))).limit(1);
+    if (!isServerTransientRetryCode(source?.errorCode)) return false;
+    const previous = parseObject(run.resultJson?.liveRunWait);
+    const since = typeof previous.since === "string" ? new Date(previous.since) : now;
+    if (now.getTime() - since.getTime() >= 10 * 60_000) return false;
+    const [live] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(and(eq(heartbeatRuns.companyId, run.companyId), ne(heartbeatRuns.id, run.id),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
+        inArray(heartbeatRuns.status, ["running", "queued"])))
+      .limit(1);
+    if (!live) return false;
+    const scheduledRetryAt = new Date(now.getTime() + 15_000);
+    const liveRunWait = { issueId, runId: live.id, since: since.toISOString() };
+    await notifyScheduledRetryCancellation(tx, { companyId: run.companyId, runId: run.id });
+    const [held] = await tx.update(heartbeatRuns)
+      .set({
+        scheduledRetryAt, updatedAt: now,
+        contextSnapshot: { ...parseObject(run.contextSnapshot), scheduledRetryAt: scheduledRetryAt.toISOString() },
+        resultJson: { ...parseObject(run.resultJson), liveRunWait },
+      })
+      .where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.status, "scheduled_retry")))
+      .returning({ id: heartbeatRuns.id });
+    if (!held) return false;
+    if (previous.runId !== live.id) {
+      await appendHeartbeatRunEvent(tx, {
+        companyId: run.companyId, runId: run.id, agentId: run.agentId, eventType: "lifecycle", stream: "system", level: "info",
+        message: "Scheduled retry is waiting for another run of the task to finish, so the worker router sees it alone",
+        payload: { ...liveRunWait, scheduledRetryAttempt: run.scheduledRetryAttempt },
+      });
+    }
+    return true;
+  }
+
   async function deferRetryForCleanupInTx(
     tx: Db,
     run: HeartbeatRun,

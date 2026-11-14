@@ -105,6 +105,10 @@ export async function connectionContinuationPendingResponse(db: Db, task: Task, 
     const retired = interaction.status === "expired" && interaction.result?.outcome === "expired"
       && "connectionId" in interaction.result && typeof interaction.result.connectionId === "string";
     if (interaction.status !== "pending" && !retired) continue;
+    // STUDIO-0046: a card whose continuation policy is `none` never delivers a
+    // response to this conversation (for example the worker router's
+    // "executor interrupted" card to the responsible), so nothing waits for it.
+    if (interaction.status === "pending" && interaction.continuationPolicy === "none") continue;
     if (retired && (interaction.payload as { requestingAgentId?: string }).requestingAgentId !== task.assigneeAgentId) continue;
     if (interaction.addresseeUserId !== responsibleUserId) return "interaction";
     const connection = await findAvailableToolConnection(db, task, { ...interaction, status: "pending" }, policyRunId);

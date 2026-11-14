@@ -64,6 +64,18 @@ export const ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES: readonly string[] =
   "router_previous_dispatch_unsettled",
 ]);
 
+// STUDIO-0046: an unproven stop after a cut link is retried by the server on
+// the code alone (contract with the worker router, 14 Nov 2026): the adapter
+// declares no errorFamily, so that a Codex agent's retry keeps its normal
+// invocation (transient_upstream would switch it to the Codex fallback mode).
+export const SERVER_TRANSIENT_RETRY_CODES: readonly string[] = Object.freeze([
+  "router_provider_stop_unverified",
+]);
+
+export function isServerTransientRetryCode(code: string | null | undefined): boolean {
+  return Boolean(code && SERVER_TRANSIENT_RETRY_CODES.includes(code));
+}
+
 export function suppressesTransientRetry(code: string | null | undefined): boolean {
   return Boolean(code && ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES.includes(code));
 }
