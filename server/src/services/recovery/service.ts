@@ -996,6 +996,21 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
   }
 
+  async function getLatestStartedIssueRunForAgent(companyId: string, issueId: string, agentId: string) {
+    const [run] = await db
+      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
+      .from(heartbeatRuns)
+      .where(and(
+        eq(heartbeatRuns.companyId, companyId),
+        eq(heartbeatRuns.agentId, agentId),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        isNotNull(heartbeatRuns.startedAt),
+      ))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1);
+    return run ?? null;
+  }
+
   async function getLatestIssueRunForAgent(
     companyId: string,
     issueId: string,
@@ -1138,18 +1153,22 @@ export function recoveryService(
       .reduce((latest, at) => (at > latest ? at : latest));
   }
 
-  // Creation time of the oldest run in the latest consecutive series of this
-  // agent's runs on the issue that all failed under an adapter-declared wait
-  // code; null when the agent's latest run is not such a wait.
+  // End time (creation time if unfinished) of the oldest run in the latest
+  // consecutive series of this agent's runs on the issue that all failed under
+  // an adapter-declared wait code; null when the agent's latest run is not
+  // such a wait.
   async function readAdapterDeclaredWaitStart(
     companyId: string,
     issueId: string,
     agentId: string,
   ): Promise<Date | null> {
+    // STUDIO-0046: a run that never started (a retry cancelled by a gate
+    // before dispatch) neither breaks nor ends the series.
     const agentIssueRuns = and(
       eq(heartbeatRuns.companyId, companyId),
       eq(heartbeatRuns.agentId, agentId),
       sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+      isNotNull(heartbeatRuns.startedAt),
     );
     const waitRun = and(
       eq(heartbeatRuns.status, "failed"),
@@ -1162,7 +1181,7 @@ export function recoveryService(
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(1);
     const [first] = await db
-      .select({ createdAt: heartbeatRuns.createdAt })
+      .select({ createdAt: heartbeatRuns.createdAt, finishedAt: heartbeatRuns.finishedAt })
       .from(heartbeatRuns)
       .where(and(
         agentIssueRuns,
@@ -1171,7 +1190,11 @@ export function recoveryService(
       ))
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(1);
-    return first?.createdAt ?? null;
+    // STUDIO-0045: the wait begins when the first waiting run ENDED. Counted
+    // from its creation, a long run cut late kept little of its bound
+    // (production TR-834, 14 Nov 2026: created 12:03:16, cut 12:40:24, the
+    // 1 h bound of an unproven stop ran out at 13:03:16).
+    return first ? (first.finishedAt ?? first.createdAt) : null;
   }
 
   async function hasActiveExecutionPath(
@@ -5082,12 +5105,14 @@ export function recoveryService(
       // coordinating on its executor's issue during the wait): read the
       // assignee's own latest run on the issue then. `in_review` keeps its
       // review-path recovery, which follows the review participant's runs.
+      // STUDIO-0046: a retry cancelled before it started (response, approval
+      // or dependency gate) is not the assignee's latest run for this purpose.
       const assigneeLatestRun =
         issue.status === "in_review"
           ? null
-          : latestRun?.agentId === agentId
+          : latestRun?.agentId === agentId && latestRun.startedAt
             ? latestRun
-            : await getLatestIssueRunForAgent(issue.companyId, issue.id, agentId);
+            : await getLatestStartedIssueRunForAgent(issue.companyId, issue.id, agentId);
       if (isAdapterDeclaredWaitRun(assigneeLatestRun)) {
         const waitStart = await readAdapterDeclaredWaitBoundStart(
           issue.companyId,

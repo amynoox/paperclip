@@ -2676,6 +2676,19 @@ function runHttp2Gateway() {
     });
     session.on("close", () => {
       unavailable = true;
+      // STUDIO-0047: the host session rides this process's stdin/stdout, so a
+      // closed session never comes back (openSession keeps the dead session,
+      // and the host never reopens the channel of a run). Stop listening and
+      // exit, instead of leaving an orphan bound to the run's port on the
+      // worker after a cut link (production: Razer, PID 1463, run 44d28dd6).
+      diag("host session closed; the gateway stops");
+      try {
+        server.close();
+      } catch (error) {
+        diag("server close error: " + (error && error.message ? error.message : String(error)));
+      }
+      const exitTimer = setTimeout(() => process.exit(0), 250);
+      if (exitTimer && typeof exitTimer.unref === "function") exitTimer.unref();
     });
     session.on("goaway", (errorCode, lastStreamId) => {
       diag("host sent GOAWAY (errorCode=" + errorCode + ", lastStreamId=" + lastStreamId + ")");

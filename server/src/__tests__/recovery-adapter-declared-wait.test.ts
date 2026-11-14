@@ -11,11 +11,14 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
+import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapters/postgres.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
@@ -46,7 +49,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   const adapterType = "codex_local";
   const dispatched = new Set<string>();
   // Per-issue adapter outcome; default finishes the task.
-  const modes = new Map<string, "wait" | "wait-transient" | "other-transient" | "stop-transient" | "unsettled-transient">();
+  const modes = new Map<string, "wait" | "wait-transient" | "other-transient" | "stop-transient" | "unsettled-transient" | "stop-plain">();
   const oldHome = process.env.PAPERCLIP_HOME;
   let home: string;
   const WAIT = "router_waiting_for_resources";
@@ -68,9 +71,9 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
         if (mode) {
           return {
             exitCode: 1, signal: null, timedOut: false,
-            errorCode: mode === "other-transient" ? "codex_transient_upstream" : mode === "stop-transient" ? STOP : mode === "unsettled-transient" ? UNSETTLED : WAIT,
+            errorCode: mode === "other-transient" ? "codex_transient_upstream" : mode === "stop-transient" || mode === "stop-plain" ? STOP : mode === "unsettled-transient" ? UNSETTLED : WAIT,
             errorMessage: mode === "other-transient" ? "upstream unavailable" : "Waiting for a worker machine",
-            ...(mode === "wait" ? {} : { errorFamily: "transient_upstream" as const }),
+            ...(mode === "wait" || mode === "stop-plain" ? {} : { errorFamily: "transient_upstream" as const }),
           };
         }
         await db.update(issues).set({ status: "done" }).where(eq(issues.id, String(input.context.issueId)));
@@ -89,7 +92,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     if (home) await rm(home, { recursive: true, force: true });
   });
 
-  type PriorRun = { minutesAgo: number; errorCode: string | null; status?: string; retry?: boolean };
+  type PriorRun = { minutesAgo: number; errorCode: string | null; status?: string; retry?: boolean; durationMinutes?: number };
 
   async function seed(status: "todo" | "in_progress", prior: PriorRun[]) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
@@ -106,8 +109,8 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
         status: run.status ?? "failed",
         errorCode: run.errorCode,
         error: run.errorCode === WAIT ? "Waiting for a worker machine" : run.errorCode ? "run failed before issue advanced" : null,
-        createdAt, startedAt: createdAt, updatedAt: new Date(createdAt.getTime() + 7 * 60_000),
-        finishedAt: new Date(createdAt.getTime() + 7 * 60_000),
+        createdAt, startedAt: createdAt, updatedAt: new Date(createdAt.getTime() + (run.durationMinutes ?? 7) * 60_000),
+        finishedAt: new Date(createdAt.getTime() + (run.durationMinutes ?? 7) * 60_000),
         resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
         contextSnapshot: {
           issueId, taskId: issueId,
@@ -186,7 +189,8 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       expect(await commentsOf(f.issueId)).toHaveLength(0);
       expect(await actionsOf(f.issueId)).toHaveLength(0);
     }
-    const cutStart = (await runsOf(cut)).find(run => run.id === cut.runIds[0])!.createdAt.getTime();
+    // STUDIO-0045: the bound runs from the END of the first waiting run.
+    const cutStart = (await runsOf(cut)).find(run => run.id === cut.runIds[0])!.finishedAt!.getTime();
     expect(deadlines).toContain(cutStart + ADAPTER_DECLARED_STOP_WAIT_MAX_MS);
 
     const host = buildHostServices(db, "worker-router-test", "worker-router-test", {
@@ -207,13 +211,13 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   // alive, no trace from an older launcher): it opens its own incident ticket
   // at 10 minutes, and past 1 h normal escalation takes over.
   it("applies normal escalation once an unproven stop has outlasted 1 h, and keeps 12 h when the latest run waits for a machine", async () => {
-    const spent = await seed("todo", [{ minutesAgo: 65, errorCode: STOP }, { minutesAgo: 10, errorCode: UNSETTLED, retry: true }]);
+    const spent = await seed("todo", [{ minutesAgo: 72, errorCode: STOP }, { minutesAgo: 10, errorCode: UNSETTLED, retry: true }]);
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: spent.companyId });
     expect((await issueOf(spent.issueId)).status).toBe("blocked");
     expect((await actionsOf(spent.issueId))[0]).toMatchObject({ kind: "stranded_assigned_issue", status: "active" });
 
     // Once settled, the next run waits for a machine: the latest code decides, 12 h.
-    const machine = await seed("todo", [{ minutesAgo: 65, errorCode: STOP }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
+    const machine = await seed("todo", [{ minutesAgo: 72, errorCode: STOP }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: machine.companyId });
     expect((await issueOf(machine.issueId)).status).toBe("todo");
     expect(await actionsOf(machine.issueId)).toHaveLength(0);
@@ -246,7 +250,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       expect(await actionsOf(f.issueId)).toHaveLength(0);
     }
     // The sweep re-checks at the bound, counted from the first waiting run of the series.
-    const seriesStart = (await runsOf(series)).find(run => run.id === series.runIds[2])!.createdAt.getTime();
+    const seriesStart = (await runsOf(series)).find(run => run.id === series.runIds[2])!.finishedAt!.getTime();
     expect(deadlines).toContain(seriesStart + ADAPTER_DECLARED_WAIT_MAX_MS);
   }, 180_000);
 
@@ -277,7 +281,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   it("applies normal escalation once the wait has outlasted the bound", async () => {
     const bound = ADAPTER_DECLARED_WAIT_MAX_MS / 60_000;
     // Retry spent, wait older than the bound: blocked as before.
-    const spent = await seed("todo", [{ minutesAgo: bound + 5, errorCode: WAIT }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
+    const spent = await seed("todo", [{ minutesAgo: bound + 12, errorCode: WAIT }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: spent.companyId });
     expect((await issueOf(spent.issueId)).status).toBe("blocked");
     const [action] = await actionsOf(spent.issueId);
@@ -285,7 +289,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     expect((await commentsOf(spent.issueId))[0]?.body).toContain("no live execution path");
 
     // No retry yet, wait older than the bound: one recovery run as before.
-    const first = await seed("todo", [{ minutesAgo: bound + 1, errorCode: WAIT }]);
+    const first = await seed("todo", [{ minutesAgo: bound + 8, errorCode: WAIT }]);
     const result = await heartbeat.reconcileStrandedAssignedIssues({ companyId: first.companyId });
     expect(result.dispatchRequeued).toBe(1);
     expect((await runsOf(first)).find(run => !first.runIds.includes(run.id))).toMatchObject({ retryOfRunId: first.runIds[0] });
@@ -409,6 +413,177 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     const unreturned = await seed("todo", history());
     const result = await heartbeat.reconcileStrandedAssignedIssues({ companyId: unreturned.companyId });
     expect(result.dispatchRequeued + result.escalated).toBe(1);
+    await heartbeat.drainActiveRunExecutions();
+  }, 180_000);
+
+  // STUDIO-0045, production TR-834 (14 Nov 2026): run ae12db9b created 12:03:16
+  // and cut 12:40:24; counted from its creation, the 1 h bound of an unproven
+  // stop ran out 23 min after the cut. The bound now runs from the cut.
+  it("counts the bound from the end of a long run cut late", async () => {
+    const f = await seed("in_progress", [{ minutesAgo: 70, durationMinutes: 50, errorCode: STOP }]);
+    const deadlines: number[] = [];
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, onDeferredDeadline: at => deadlines.push(at) });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await issueOf(f.issueId)).status).toBe("in_progress");
+    expect((await runsOf(f)).map(run => run.id)).toEqual(f.runIds);
+    expect(await actionsOf(f.issueId)).toHaveLength(0);
+    const cut = (await runsOf(f))[0]!.finishedAt!.getTime();
+    expect(deadlines).toContain(cut + ADAPTER_DECLARED_STOP_WAIT_MAX_MS);
+  }, 180_000);
+
+  // STUDIO-0046, contract with the worker router (14 Nov 2026, TR-834): a run
+  // cut under router_provider_stop_unverified declares no errorFamily; the
+  // server retries it on the code alone, the router's "executor interrupted"
+  // card (continuation policy none) does not cancel that retry, and the retry
+  // waits for the responsible's run on the same ticket so the router sees it alone.
+  it("retries an unproven stop on the code alone, without an error family", async () => {
+    const f = await seed("todo", []);
+    modes.set(f.issueId, "stop-plain");
+    const run = await boardWake(f);
+    await heartbeat.drainActiveRunExecutions();
+    await expect.poll(async () => (await runsOf(f)).find(row => row.id === run.id)?.status, { timeout: 30_000 }).toBe("failed");
+    expect((await runsOf(f)).find(row => row.id === run.id)).toMatchObject({ errorCode: STOP });
+    expect((await runsOf(f)).find(row => row.id === run.id)?.resultJson?.errorFamily).toBeUndefined();
+    expect((await runsOf(f)).filter(row => row.retryOfRunId === run.id)).toEqual([
+      expect.objectContaining({ status: "scheduled_retry", scheduledRetryReason: "transient_failure" }),
+    ]);
+  }, 180_000);
+
+  type CardShape = "router" | "router-other-run" | "oauth" | "native-question" | "wake-assignee" | "none";
+  async function dueStopRetry(card: CardShape, opts: { sourceCode?: string; liveStatus?: "running" | "queued" } = {}) {
+    const f = await seed("in_progress", [{ minutesAgo: 2, durationMinutes: 1, errorCode: opts.sourceCode ?? STOP }]);
+    await db.update(issues).set({ checkoutRunId: null }).where(eq(issues.id, f.issueId));
+    const [retry] = await db.insert(heartbeatRuns).values({
+      companyId: f.companyId, agentId: f.agentId, invocationSource: "automation", triggerDetail: "system", status: "scheduled_retry",
+      runtimeMode: "legacy", retryOfRunId: f.runIds[0], scheduledRetryAt: new Date(Date.now() - 1_000), scheduledRetryAttempt: 1,
+      scheduledRetryReason: "transient_failure", resultJson: { conversationContinuation: "continue_conversation_v1" },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "transient_failure_retry", retryReason: "transient_failure" },
+    }).returning();
+    const [responsible] = await db.insert(agents).values({ companyId: f.companyId, name: "Responsible", adapterType, status: "running", adapterConfig: {} }).returning();
+    const confirm = { version: 1, prompt: "The executor was interrupted. Keep the current reservation while resuming on the same worker?" };
+    const cards: Record<Exclude<CardShape, "none">, Record<string, unknown>> = {
+      // The worker router's card for this very cut run (production key shape).
+      router: { kind: "request_confirmation", continuationPolicy: "none", addresseeAgentId: responsible.id,
+        idempotencyKey: `interruption/${randomUUID()}/${f.runIds[0]}`, payload: confirm },
+      "router-other-run": { kind: "request_confirmation", continuationPolicy: "none", addresseeAgentId: responsible.id,
+        idempotencyKey: `interruption/${randomUUID()}/${randomUUID()}`, payload: confirm },
+      // "Connect your account to continue" (tool-access OAuth): policy none, addressed to a person.
+      oauth: { kind: "request_confirmation", continuationPolicy: "none", addresseeUserId: "connection-owner",
+        idempotencyKey: `oauth-connect/${randomUUID()}`, payload: { version: 1, prompt: "Connect your Sentry account to continue." } },
+      // A native question (native question bridge): policy none, created by the agent's run.
+      "native-question": { kind: "ask_user_questions", continuationPolicy: "none", addresseeUserId: "connection-owner",
+        createdByAgentId: f.agentId, idempotencyKey: `native-question/${randomUUID()}`, payload: { version: 1, questions: [] } },
+      "wake-assignee": { kind: "request_confirmation", continuationPolicy: "wake_assignee", addresseeAgentId: responsible.id, payload: confirm },
+    };
+    if (card !== "none") await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId, status: "pending", ...cards[card] } as never);
+    const [live] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: responsible.id, invocationSource: "automation",
+      triggerDetail: "system", status: opts.liveStatus ?? "running", startedAt: opts.liveStatus === "queued" ? null : new Date(),
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "interaction_pending" } }).returning();
+    return { f, retry, live };
+  }
+
+  it("holds the retry behind the responsible's run, does not let the router's card cancel it, then promotes it", async () => {
+    const { f, retry, live } = await dueStopRetry("router");
+    const dispatch = createPostgresRunDispatchAdapter(db);
+    expect(await dispatch.promoteOrCancelDueRetry({ companyId: f.companyId, runId: retry.id, now: new Date() })).toMatchObject({ outcome: "not_promoted" });
+    const held = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retry.id)))[0]!;
+    expect(held).toMatchObject({ status: "scheduled_retry", resultJson: expect.objectContaining({ liveRunWait: expect.objectContaining({ runId: live.id }) }) });
+    expect(held.scheduledRetryAt!.getTime()).toBeGreaterThan(Date.now());
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, live.id));
+    expect(await dispatch.promoteOrCancelDueRetry({ companyId: f.companyId, runId: retry.id, now: new Date(Date.now() + 20_000) }))
+      .toMatchObject({ outcome: "promoted" });
+    // The gate before dispatch does not cancel it for the router's card either.
+    expect(await dispatch.cancelStaleQueuedRun({ companyId: f.companyId, runId: retry.id, expectedStatus: "queued", now: new Date(Date.now() + 21_000) }))
+      .toMatchObject({ outcome: "not_stale" });
+  }, 180_000);
+
+  it.each(["oauth", "native-question", "router-other-run"] as const)(
+    "keeps cancelling the retry for a pending %s card", async (card) => {
+      const { f, retry } = await dueStopRetry(card);
+      expect(await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({ companyId: f.companyId, runId: retry.id, now: new Date() }))
+        .toMatchObject({ outcome: "gate_suppressed", errorCode: "issue_waiting_for_response" });
+    }, 180_000);
+
+  it("does not hold the retry behind a queued run, nor the retry of a run cut under another code", async () => {
+    const queued = await dueStopRetry("none", { liveStatus: "queued" });
+    expect(await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({ companyId: queued.f.companyId, runId: queued.retry.id, now: new Date() }))
+      .toMatchObject({ outcome: "promoted" });
+    const other = await dueStopRetry("none", { sourceCode: "process_lost" });
+    expect(await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({ companyId: other.f.companyId, runId: other.retry.id, now: new Date() }))
+      .toMatchObject({ outcome: "promoted" });
+    expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, other.retry.id)))[0]!.resultJson?.liveRunWait).toBeUndefined();
+  }, 180_000);
+
+  it("keeps the declared wait when a retry of the cut run was cancelled before it started", async () => {
+    const f = await seed("in_progress", [{ minutesAgo: 20, durationMinutes: 1, errorCode: STOP }]);
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "automation", triggerDetail: "system",
+      status: "cancelled", errorCode: "issue_waiting_for_response", retryOfRunId: f.runIds[0], finishedAt: new Date(Date.now() - 18 * 60_000),
+      scheduledRetryReason: "transient_failure", contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "transient_failure_retry" } });
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await issueOf(f.issueId)).status).toBe("in_progress");
+    expect(await actionsOf(f.issueId)).toHaveLength(0);
+    expect((await runsOf(f)).filter(run => run.status !== "cancelled" && !f.runIds.includes(run.id))).toHaveLength(0);
+  }, 180_000);
+
+  it("counts the bound from the creation of a waiting run that has no end recorded", async () => {
+    const f = await seed("in_progress", [{ minutesAgo: 30, errorCode: STOP }]);
+    await db.update(heartbeatRuns).set({ finishedAt: null }).where(eq(heartbeatRuns.id, f.runIds[0]));
+    const deadlines: number[] = [];
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, onDeferredDeadline: at => deadlines.push(at) });
+    expect((await issueOf(f.issueId)).status).toBe("in_progress");
+    const created = (await runsOf(f))[0]!.createdAt.getTime();
+    expect(deadlines).toContain(created + ADAPTER_DECLARED_STOP_WAIT_MAX_MS);
+  }, 180_000);
+
+  it("still cancels the retry for a card that will resume the conversation", async () => {
+    const { f, retry } = await dueStopRetry("wake-assignee");
+    expect(await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({ companyId: f.companyId, runId: retry.id, now: new Date() }))
+      .toMatchObject({ outcome: "gate_suppressed", errorCode: "issue_waiting_for_response" });
+  }, 180_000);
+
+  // STUDIO-0046 under the real due-retry sweep: the retry is scheduled by the
+  // server itself from a real run end (as in production, with its dispatch
+  // notification), and the sweep is driven through the same two entry points
+  // the deadline worker calls (promoteDueScheduledRetries at the due time, then
+  // nextScheduledRetryAt to plan its next pass). Another role's run on the task
+  // (an addressee answering a card or a commenter: production shows such runs
+  // overlapping other agents' runs on the same task) is live when it falls due.
+  it("holds the retry under the real due-retry sweep while another role runs on the task, and keeps the 10 min bound", async () => {
+    const f = await seed("in_progress", []);
+    modes.set(f.issueId, "stop-plain");
+    const cut = await boardWake(f);
+    await heartbeat.drainActiveRunExecutions();
+    await expect.poll(async () => (await runsOf(f)).find(row => row.id === cut.id)?.status, { timeout: 30_000 }).toBe("failed");
+    const retry = (await runsOf(f)).find(row => row.retryOfRunId === cut.id)!;
+    expect(retry).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "transient_failure" });
+    const [responsible] = await db.insert(agents).values({ companyId: f.companyId, name: "Responsible", adapterType, status: "running", adapterConfig: {} }).returning();
+    const [live] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: responsible.id, invocationSource: "automation",
+      triggerDetail: "system", status: "running", startedAt: new Date(), contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "interaction_pending" } }).returning();
+    const row = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retry.id)))[0]!;
+
+    // First pass of the sweep at the due time: held, pushed back 15 s, traced.
+    const due = new Date(retry.scheduledRetryAt!.getTime() + 1_000);
+    expect((await heartbeat.promoteDueScheduledRetries(due)).runIds).not.toContain(retry.id);
+    const held = await row();
+    expect(held).toMatchObject({ status: "scheduled_retry", resultJson: expect.objectContaining({
+      liveRunWait: expect.objectContaining({ runId: live.id, since: due.toISOString() }) }) });
+    expect(held.scheduledRetryAt!.getTime()).toBe(due.getTime() + 15_000);
+    const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, retry.id));
+    expect(events.map(event => event.message)).toContain("Scheduled retry is waiting for another run of the task to finish, so the worker router sees it alone");
+    // Second pass at exactly the pushed-back deadline (the time the worker
+    // plans from nextScheduledRetryAt), the other run still live: held again,
+    // same start, one event only.
+    const second = new Date(held.scheduledRetryAt!.getTime());
+    expect((await heartbeat.promoteDueScheduledRetries(second)).runIds).not.toContain(retry.id);
+    expect((await row()).resultJson?.liveRunWait).toMatchObject({ since: due.toISOString() });
+    expect((await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, retry.id)))
+      .filter(event => event.message?.startsWith("Scheduled retry is waiting for another run"))).toHaveLength(1);
+
+    // Past the 10 min bound, counted from the first hold: promoted although the other run is still live.
+    const pastBound = new Date(due.getTime() + 10 * 60_000 + 20_000);
+    expect((await heartbeat.promoteDueScheduledRetries(pastBound)).runIds).toContain(retry.id);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, live.id));
     await heartbeat.drainActiveRunExecutions();
   }, 180_000);
 });

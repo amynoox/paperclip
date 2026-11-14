@@ -50,7 +50,7 @@ import { hasChatRunOwnedProviderInteraction } from "../chat-interaction-arbitrat
 import { conversationTurnPresentsAnswer } from "../native-runtime/native-governance.js";
 import { readAcceptedTaskContinuationSummary } from "../heartbeat-run-summary.js";
 import { SANDBOX_PROVIDER_PLUGIN_NOT_READY_REASON } from "../recovery/stranded-notice.js";
-import { suppressesTransientRetry } from "../recovery/adapter-declared-wait.js";
+import { isServerTransientRetryCode, suppressesTransientRetry } from "../recovery/adapter-declared-wait.js";
 import { MAX_TURN_CONTINUATION_RETRY_REASON, isResolvedInteractionContinuationWakeContext } from "../../modules/run-dispatch/index.js";
 import { redactCurrentUserText } from "../../log-redaction.js";
 import type { createHeartbeatLifecycle } from "./run-lifecycle.js";
@@ -976,13 +976,23 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         }
       } else if (
         outcome === "failed" &&
-        readTransientRecoveryContractFromRun(livenessRun) &&
+        // STUDIO-0046: router_provider_stop_unverified is retried on the code alone.
+        (readTransientRecoveryContractFromRun(livenessRun) || isServerTransientRetryCode(livenessRun.errorCode)) &&
         // An adapter-declared resource wait is woken by the resource's owner on
         // release; a transient retry would only repeat the same request (not
         // for router_provider_stop_unverified, see adapter-declared-wait.ts).
         !suppressesTransientRetry(livenessRun.errorCode)
       ) {
-        await scheduleBoundedRetryForRun(livenessRun, agent);
+        const transientRetry = await scheduleBoundedRetryForRun(livenessRun, agent);
+        // STUDIO-0046: once its bounded retries are spent, a cut run keeps the
+        // path it had before (interaction-continuation retry or its escalation).
+        if (
+          isServerTransientRetryCode(livenessRun.errorCode) &&
+          transientRetry?.outcome !== "scheduled" &&
+          !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))
+        ) {
+          await scheduleInteractionContinuationInfrastructureRetryIfEligible(livenessRun, agent);
+        }
       } else if (
         outcome === "failed" &&
         !(await legacyExecutionNeedsReconciliationWithEvidence(db, livenessRun))

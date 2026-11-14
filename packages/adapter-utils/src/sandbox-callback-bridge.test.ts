@@ -3384,6 +3384,54 @@ describe("sandbox callback bridge", () => {
     expect(stderr).toContain("Unsupported PAPERCLIP_API_BRIDGE_MODE: totally_unknown_mode");
   }, 15_000);
 
+  // STUDIO-0047, production (Razer, PID 1463, run 44d28dd6, 13 Nov 2026): after
+  // a cut link the relay's stdin ended, but it kept listening on the run's port
+  // for ever. A closed host session never comes back, so the relay must exit.
+  it("exits and frees its port once the host session on its stdin closes", async () => {
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-http2-exit-"));
+    cleanupDirs.push(rootDir);
+    const entrypoint = path.join(rootDir, "paperclip-bridge-server.mjs");
+    await writeFile(entrypoint, getSandboxCallbackBridgeServerSource(), "utf8");
+    const probe = createServer();
+    const assignedPort = await new Promise<number>((resolve, reject) => {
+      probe.once("error", reject);
+      probe.listen(0, "127.0.0.1", () => {
+        const address = probe.address();
+        if (!address || typeof address === "string") { reject(new Error("no port")); return; }
+        probe.close(() => resolve(address.port));
+      });
+    });
+    const child = spawn(process.execPath, [entrypoint], {
+      env: { ...process.env, PAPERCLIP_API_BRIDGE_MODE: "http2_v1", PAPERCLIP_BRIDGE_TOKEN: "test-token",
+        PAPERCLIP_BRIDGE_PORT: String(assignedPort), PAPERCLIP_BRIDGE_NONCE: "test-nonce-exit" },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    cleanupFns.push(async () => { child.kill(); });
+    let stderr = "";
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString("utf8"); });
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("no READY line. stderr: " + stderr)), 5000);
+      child.stdout.on("data", (chunk: Buffer) => {
+        if (chunk.includes(0x0a)) { clearTimeout(timer); resolve(); }
+      });
+      child.once("exit", (code) => { clearTimeout(timer); reject(new Error("exited early " + String(code))); });
+    });
+    // The ssh session drops: the relay's stdin ends.
+    child.stdin.end();
+    const code = await new Promise<number | null>((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error("the relay kept running after its stdin closed. stderr: " + stderr)), 5000);
+      child.once("exit", (exitCode) => { clearTimeout(timer); resolve(exitCode); });
+    });
+    expect(code).toBe(0);
+    expect(stderr).toContain("host session closed; the gateway stops");
+    // The run's port is free again on the worker.
+    const rebind = createServer();
+    await new Promise<void>((resolve, reject) => {
+      rebind.once("error", reject);
+      rebind.listen(assignedPort, "127.0.0.1", () => rebind.close(() => resolve()));
+    });
+  });
+
   it("test_http2_gateway_writes_no_frame_between_ready_and_the_preface", async () => {
     // Spawn the real generated gateway in http2_v1 mode and read its raw
     // stdout bytes. The only frame-codec write on this path is the READY

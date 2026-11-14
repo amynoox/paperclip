@@ -1157,7 +1157,7 @@
     {
       "id": "STUDIO-0043",
       "title": "A pause no longer stays pausing on runs cancelled before dispatch or cut over the built-in ssh driver",
-      "status": "implemented-locally-validated-not-deployed",
+      "status": "deployed",
       "problem": "Production, studio.15, 14 Nov 2026. At the resume of 08:56 the CTO, * Dev Unity and Resource Advisor stayed status paused, lifecycleState pausing; POST /resume answered 200 without effect (same cause as E230, E249). The pause stop proof (agentExecutionsHaveStopped) reads the agent's whole run history. Family R: five legacy conversation runs (6928a0e1, 7da491d8, a563815d, ecea3717, dd8c5c92) cancelled by the server before their adapter was entered (stale execution continuation; stale queued-run gate, dd8c5c92 also holding an ssh lease taken before the gate) waited for a process acknowledgement or a remote termination receipt that nothing could send. Family B: the CTO's runs a6d718c3 and f33b3f00, cancelled issue_reassigned after running over the built-in ssh environment driver: the local ssh client was gone and the lease expired, but that driver never writes a termination receipt. An operator repair (tools/repair-pausing-agents.py) was needed.",
       "reason": "Requested by Amyne (14 Nov 2026, V294): every unblocking gesture must be followed by the fix that makes it unnecessary.",
       "observedOnUpstream": "2026.1110.0",
@@ -1185,12 +1185,14 @@
       "rollback": "Switch cli/current back to the previous install folder; the marker key is then ignored and the old proof applies.",
       "retireWhen": "Pinned upstream records pre-dispatch cancellations for the stop proof and the ssh driver returns termination receipts, confirmed by the same cases.",
       "upgradeDecisions": [],
-      "commits": []
+      "commits": [],
+      "deployedAt": "2026-11-14T11:27:37Z",
+      "deployedIn": "2026.1110.0-studio.16"
     },
     {
       "id": "STUDIO-0044",
       "title": "A disposition repair addressed to the task's owner no longer carries the third-party recovery contract",
-      "status": "implemented-locally-validated-not-deployed",
+      "status": "deployed",
       "problem": "Production, studio.15, 14 Nov 2026, TR-825. At 10:49:51 a deliberate_wait_without_target action (bounded_owner_disposition_repair, attempt 1 of 2) opened on the Infra Manager's own task; its repair wake coalesced into the run created for a Quality Manager comment with a new instruction. Because the run's context named an active recovery action, the wake payload carried `recovery`, and the prompt added the recovery contract written for an agent recovering someone else's task: \"your job is to RECOVER this task, not to do the work\", \"hand it back to <original assignee>\" (the Infra Manager itself), fallback \"(4) convert to an explicit manual-review state for the board\". The role did no work and asked the Board for a manual review; a delegated answer was needed at 10:56:51.",
       "reason": "Requested by Amyne (14 Nov 2026, V294): every unblocking gesture must be followed by the fix that makes it unnecessary.",
       "observedOnUpstream": "2026.1110.0",
@@ -1210,6 +1212,85 @@
       "migration": "None. Applies when the run's recovery action is deliberate_wait_without_target and its ownerAgentId is the run's agent. The legacy repair instruction gains: \"You remain the owner of this task: if new comments or instructions arrived, do that work first, then record the disposition.\" Repair attempts, resolution and the Board escalation after the last attempt are unchanged.",
       "rollback": "Switch cli/current back to the previous install folder.",
       "retireWhen": "Pinned upstream gives the owner's disposition repair its own prompt contract, confirmed by the same cases.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "deployedAt": "2026-11-14T11:27:37Z",
+      "deployedIn": "2026.1110.0-studio.16"
+    },
+    {
+      "observedOnUpstream": "2026.1110.0",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "reason": "Requested by Amyne (14 Nov 2026, V303): prepare the next server batch, deploy only after the game PRs are merged.",
+      "id": "STUDIO-0045",
+      "title": "The adapter-declared wait bound runs from the end of the first waiting run",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, studio.16, 14 Nov 2026, TR-834. Run ae12db9b of * Dev Unity was created at 12:03:16 and cut at 12:40:24 (router_provider_stop_unverified). STUDIO-0042 counted its 1 h bound from the run's creation, so the bound ran out at 13:03:16, 23 minutes after the cut; a long run cut late kept little of its bound.",
+      "owner": "server recovery",
+      "paths": [
+        "server/src/services/recovery/service.ts",
+        "server/src/services/recovery/adapter-declared-wait.ts",
+        "server/src/__tests__/recovery-adapter-declared-wait.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "Studio-only bound (STUDIO-0042); no upstream counterpart.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. recovery-adapter-declared-wait.test.ts: the TR-834 case (run created 70 min ago, cut 20 min ago: still within the 1 h bound, re-check at cut + 1 h) and the existing cases with deadlines read from finishedAt. Negative control with the studio.16 service.ts: the TR-834 case and the two deadline cases fail.",
+      "migration": "None. readAdapterDeclaredWaitStart returns the finishedAt of the oldest run of the latest series (createdAt when unfinished); the Board-return restart is unchanged."
+    },
+    {
+      "observedOnUpstream": "2026.1110.0",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "reason": "Requested by Amyne (14 Nov 2026, V303): prepare the next server batch, deploy only after the game PRs are merged.",
+      "id": "STUDIO-0046",
+      "title": "A run cut under router_provider_stop_unverified is retried automatically, without waiting for the router's card to be answered",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, studio.16, 14 Nov 2026, TR-834, 12:40 and 12:47 UTC: two runs of * Dev Unity ended router_provider_stop_unverified and Paperclip created no retry; only the CTO's acceptance of the router's card 'The executor was interrupted…' and his comment restarted the executor (81 s, twice). Three causes: the transient retry needs errorFamily transient_upstream or provider_quota, which these runs do not declare; a due conversation retry is cancelled issue_waiting_for_response by any pending card not addressed to the responsible user, the router's card included (seen under studio.14: f4f6d582, 37879030, 0dbdfa4d, 7db4b703); and nothing keeps the retry from reaching the router while the responsible's run is live on the ticket, which the router refuses (other_live_run) and never retries.",
+      "owner": "server heartbeat retries and run dispatch",
+      "paths": [
+        "server/src/services/recovery/adapter-declared-wait.ts",
+        "server/src/services/heartbeat/run-completion.ts",
+        "server/src/services/satisfied-connection-intents.ts",
+        "server/src/modules/run-dispatch/adapters/postgres.ts",
+        "server/src/__tests__/recovery-adapter-declared-wait.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "Contract with the studio worker router (drafts/routeur-deux-moteurs/contrat-relance-coupure.md in the studio workspace); no upstream counterpart.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. recovery-adapter-declared-wait.test.ts, 15 cases with three new: an unproven stop without errorFamily gets the transient_failure retry; a due retry is held behind the responsible's live run (liveRunWait, re-check in 15 s), is not cancelled by a card with continuation policy none, and is promoted once that run ends; a card with continuation policy wake_assignee still cancels it (issue_waiting_for_response). With satisfied-connection-intents.test.ts and run-dispatch postgres.test.ts: 156 passed. heartbeat-retry-scheduling: 67 of 68, the pre-provider quota case failing as on studio.14. Negative controls (one studio.16 file swapped): run-completion.ts, the code-alone case fails; satisfied-connection-intents.ts and run-dispatch postgres.ts, the held-retry case fails. Under the real due-retry sweep (added after the bench, which wrote its rows in SQL and so never woke the sweep during the other run): the retry is scheduled by the server from a real run end, then heartbeat.promoteDueScheduledRetries (the call the deadline worker makes) at the due time holds it (liveRunWait, scheduled_retry_at pushed back 15 s, one waiting event), a second pass keeps the same start without a second event, and a pass past the 10 min bound promotes it although the other run is still live: 16 passed in the file; with the studio.16 run-dispatch postgres.ts both hold cases fail. Reachability: a scheduled retry takes the task's execution lock (retries.ts), so a wake of the responsible after the router's card waits behind it (seen under studio.14: the CTO's card run started only after each retry ended); the hold acts when a run that does not wait for that lock is live as the retry falls due (an addressee or commenter of another role: 6 overlapping runs of different agents on the same task in production since 12 Nov). After the independent review: 163 passed in the declared-wait, satisfied-connection-intents and run-dispatch postgres files, with new cases: the OAuth card, a native question and the router card of another run still cancel the retry (issue_waiting_for_response); the router card of the cut run passes both the retry gate and the gate before dispatch; a queued run does not hold the retry; the retry of a run cut under another code is not held; a retry cancelled before it started keeps the declared wait; a waiting run with no end recorded counts its bound from its creation. heartbeat-retry-scheduling plus the connection-intent files: 173 of 174, the pre-provider quota case failing as on studio.14. Negative controls with the previous head's files: satisfied-connection-intents.ts, the three card cases fail; service.ts, the unstarted-retry case fails; run-dispatch postgres.ts, the router-card hold and the queued cases fail.",
+      "migration": "None. Contract with the worker router (0.30.10 unchanged): the adapter declares no errorFamily (transient_upstream would also switch a codex_local agent's retry to the Codex fallback mode); the server schedules the existing bounded transient retry on the code (SERVER_TRANSIENT_RETRY_CODES: router_provider_stop_unverified), 2 attempts at most, 30 s then 60 s with jitter, counted in the retry chain (a run started by another wake starts a new count). Only the worker router's card for the cut run itself (request_confirmation, continuation policy none, addressed to an agent, created by the plugin, key interruption/<generation>/<cut run id>) no longer counts as a response to wait for, and only for the retry of that run (retry gate and gate before dispatch); every other card keeps holding a retry (the OAuth connection card and native questions, also policy none, included), and connection-intent delivery is unchanged. A due transient retry of such a run stays scheduled while another run of the same task is running (any agent; a queued run is not counted, it may itself wait for the execution lock the retry holds), re-checked every 15 s for at most 10 min (resultJson.liveRunWait), then promoted. The chain stops on success, on router_previous_dispatch_unsettled (never retried, STUDIO-0042), when the attempts are spent, or on the ordinary retry gates. Review corrections: a run that never started (a retry cancelled by a gate before dispatch) neither ends nor breaks the declared-wait series, so the 1 h bound holds across it; once the bounded retries of a cut run are spent, it takes the path it had before (interaction-continuation retry or its escalation). Each router wake starts a new run and so a new chain of 2 attempts; the router sends at most 2 wakes per reservation, so the total stays bounded."
+    },
+    {
+      "id": "STUDIO-0047",
+      "title": "The HTTP/2 callback relay on the worker exits once its host session closes",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, Razer, 14 Nov 2026: paperclip-bridge-server.mjs (PID 1463) still running from run 44d28dd6 of * Dev Unity, started 13 Nov around 23:09 and ended router_provider_stop_unverified at 23:30:28 (studio.13). In HTTP/2 mode the relay talks to the host over its ssh stdin/stdout; when the link is cut its stdin ends and the session is marked unavailable, but its local server keeps listening on the run's port: it exits only on SIGINT/SIGTERM or a failed bind. When the host cannot reach the worker at stop time (a cut link, the office line cuts being permanent, V292), the relay stays for ever, and a later run given the same port on that worker would fail to bind its own relay.",
+      "reason": "Requested by Amyne (14 Nov 2026, V303): prepare the next server batch, deploy only after the game PRs are merged. Prepared as a separate commit so it can leave the batch alone.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "adapter-utils sandbox callback bridge",
+      "paths": [
+        "packages/adapter-utils/src/sandbox-callback-bridge.ts",
+        "packages/adapter-utils/src/sandbox-callback-bridge.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found that stops the HTTP/2 gateway when its stdio session closes.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2. sandbox-callback-bridge.test.ts and http2-bridge-server.test.ts: 151 passed, with one new case spawning the real generated gateway in http2_v1 mode: after READY, its stdin is closed; it exits with code 0, logs 'host session closed; the gateway stops', and the port can be bound again. Negative control with the previous sandbox-callback-bridge.ts: the gateway keeps running and the case times out.",
+      "migration": "None. Why it breaks nothing: each run opens its own relay (host-reserved port, token and nonce, execution-target.ts); the host never reopens the channel of a run: a channel exit is recorded as a loss (channel_exit) and fails the run closed with duplex_channel_lost (execution-target.ts, run disposition seam); a closed session is never reopened by the relay itself (openSession keeps the dead session). So no run keeps a usable relay after its session closes, and a run relaunched after a cut gets its own new relay. The gateway source is synced to the worker at each run, so only relays started after deployment change; nothing to install on the workers. The relay already left on Razer is removed by hand (Infra role, on Amyne's agreement, at deployment).",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream stops the HTTP/2 gateway when its session closes, confirmed by the same case.",
       "upgradeDecisions": [],
       "commits": []
     }

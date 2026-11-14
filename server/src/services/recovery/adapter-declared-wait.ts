@@ -23,9 +23,9 @@ export const ADAPTER_DECLARED_WAIT_ERROR_CODES: readonly string[] = Object.freez
   "router_previous_dispatch_unsettled",
 ]);
 
-// Bound on such a wait, counted from the oldest run of the latest consecutive
-// series of the assignee's runs on the issue that all failed under a code
-// above (or from the Board's latest return of the issue, if later), and chosen
+// Bound on such a wait, counted from the END of the oldest run of the latest
+// consecutive series of the assignee's runs on the issue that all failed under
+// a code above (or from the Board's latest return of the issue, if later), and chosen
 // by the code of the latest run. Past it, normal stranded-work recovery
 // applies again.
 // Machine wait, 12 h: a machine wait depends on how long another task's reservation lasts,
@@ -63,6 +63,18 @@ export const ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES: readonly string[] =
   "router_waiting_for_resources",
   "router_previous_dispatch_unsettled",
 ]);
+
+// STUDIO-0046: an unproven stop after a cut link is retried by the server on
+// the code alone (contract with the worker router, 14 Nov 2026): the adapter
+// declares no errorFamily, so that a Codex agent's retry keeps its normal
+// invocation (transient_upstream would switch it to the Codex fallback mode).
+export const SERVER_TRANSIENT_RETRY_CODES: readonly string[] = Object.freeze([
+  "router_provider_stop_unverified",
+]);
+
+export function isServerTransientRetryCode(code: string | null | undefined): boolean {
+  return Boolean(code && SERVER_TRANSIENT_RETRY_CODES.includes(code));
+}
 
 export function suppressesTransientRetry(code: string | null | undefined): boolean {
   return Boolean(code && ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES.includes(code));
