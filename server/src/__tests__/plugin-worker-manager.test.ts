@@ -415,6 +415,35 @@ describe("plugin-worker-manager stderr failure context", () => {
     } finally { await handle.stop().catch(() => undefined); }
   });
 
+  it("STUDIO-0034: logs which rule refused a worker host call", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT, manifest: TEST_MANIFEST, config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" }, apiVersion: 1,
+      proactiveCompanyScopes: ["company-a"], hostHandlers: { "companies.get": vi.fn(async () => ({})) as never },
+    });
+    const refusals = () => vi.mocked(logger.error).mock.calls
+      .filter(([, message]) => message === "host handler error")
+      .map(([fields]) => (fields as { scopeRefusal?: unknown }).scopeRefusal);
+    try {
+      await handle.start();
+      vi.mocked(logger.error).mockClear();
+      const call = (mode: string, agentId?: string, requestedCompanyId = "company-a") => handle.call("executeTool", {
+        toolName: "probe", parameters: { mode, requestedCompanyId },
+        runContext: { companyId: "company-a", runId: "run-a", ...(agentId ? { agentId } : {}) },
+      } as HostToWorkerMethods["executeTool"][0]);
+      await expect(call("missing", "agent-a")).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED });
+      await expect(call("unknown", "agent-a")).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED });
+      // Without an agent, an id-less call naming a configured company is admitted proactively;
+      // one naming another company is refused because an invocation is active.
+      await expect(call("missing", undefined, "company-b")).rejects.toMatchObject({ code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED });
+      expect(refusals()).toEqual([
+        { reason: "no_invocation_id_during_agent_invocation", activeInvocations: 1, agentInvocations: 1 },
+        { reason: "unknown_invocation_id", activeInvocations: 1, agentInvocations: 1 },
+        { reason: "no_invocation_id_during_invocation", activeInvocations: 1, agentInvocations: 0 },
+      ]);
+    } finally { await handle.stop().catch(() => undefined); }
+  });
+
   it("registers an unrestricted invocation scope for runJob so nested worker host calls succeed", async () => {
     // Regression test for #9310: runJob dispatches previously derived no
     // invocation scope at all (no case in deriveInvocationScope), so a job's
