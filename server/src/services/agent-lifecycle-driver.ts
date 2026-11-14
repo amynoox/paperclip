@@ -1,6 +1,7 @@
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./heartbeat/recovery.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
+import { replayWakesMissedDuringPause } from "./pause-missed-wakes.js";
 import { agents, companies, environments, heartbeatRuns, plugins, pluginCompanySettings, type Db } from "@paperclipai/db";
 import { instanceSettingsService } from "./instance-settings.js";
 import { pluginHasAgentEnvironments, pluginServesAgentEnvironment } from "./plugin-environment-driver.js";
@@ -18,6 +19,10 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
     async onReady(agent) {
       await db.transaction(tx => promoteDeferredWorkIntents(tx, { companyId: agent.companyId, trigger: "pause_lifted" }));
       await heartbeat.resumeQueuedRunsForAgent(agent.companyId, agent.id);
+      // STUDIO-0028: wakes refused during the pause (not only people's
+      // comments) reach the agent once, per task it still owns.
+      await replayWakesMissedDuringPause(db, { companyId: agent.companyId, agentId: agent.id,
+        wakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts) });
     },
     async requiredPluginIds(agent) {
       const selected = agent.lifecycleRequiredPluginIds;
