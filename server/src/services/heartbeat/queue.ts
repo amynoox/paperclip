@@ -2258,6 +2258,95 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       });
     }
 
+    // STUDIO-0041: a wake deferred only because a terminal predecessor still
+    // owned a process or an environment lease (`execution_owner_active`, saved
+    // with `recoveryActionId: null`) has no recovery action whose resolution
+    // would release it, and the release drain below follows the task's latest
+    // run, which can be another agent's cancelled run that is never reconciled.
+    // Once the task has no execution blocker left, re-admit the wake through
+    // ordinary admission, which applies every gate again, and retire this copy.
+    const ownershipHeld = await db.select({ wake: agentWakeupRequests })
+      .from(agentWakeupRequests)
+      .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
+        sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
+        eq(issues.assigneeAgentId, agentWakeupRequests.agentId), isNull(issues.executionRunId),
+        notInArray(issues.status, ["done", "cancelled"])))
+      .innerJoin(companies, and(eq(companies.id, agentWakeupRequests.companyId), eq(companies.status, "active")))
+      .where(and(scope.companyId ? eq(agentWakeupRequests.companyId, scope.companyId) : undefined,
+        scope.requestId ? eq(agentWakeupRequests.id, scope.requestId) : undefined,
+        eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+        sql`${agentWakeupRequests.payload}->'adapterInteractionWait' is null`,
+        sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
+        sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'execution_recovery'`,
+        sql`jsonb_typeof(${agentWakeupRequests.payload}->'executionWait'->'recoveryActionId') = 'null'`,
+        sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
+        sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'stale-addressee-requeue:%'`,
+        // Unique whatever the status: a second row with the same key can never be inserted.
+        sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'task-retry:%'`,
+        sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-completion:%'`,
+        sql`exists (select 1 from agents held_agent where held_agent.id = ${agentWakeupRequests.agentId}
+          and held_agent.status not in ('paused', 'terminated', 'pending_approval'))`,
+        sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
+          WHERE live_issue_run.company_id = ${issues.companyId}
+            AND (live_issue_run.context_snapshot->>'issueId' = ${issues.id}::text
+              OR live_issue_run.native_issue_id = ${issues.id})
+            AND live_issue_run.status IN ('queued', 'running', 'scheduled_retry'))`,
+        cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
+      .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
+    const ownershipVisited = new Set<string>();
+    for (const { wake } of ownershipHeld) {
+      const heldIssueId = String(wake.payload?.issueId);
+      const issueKey = `${wake.companyId}:${heldIssueId}`;
+      if (ownershipVisited.has(issueKey)) continue;
+      ownershipVisited.add(issueKey);
+      try {
+        if (await getExecutionBlocker(db, wake.companyId, heldIssueId)) continue;
+        const context = parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]);
+        const { executionWait: _wait, [DEFERRED_WAKE_CONTEXT_KEY]: _context, ...payload } = parseObject(wake.payload);
+        // Retire the held row first: `skipped` is outside every partial unique
+        // index on (companyId, idempotencyKey) that has a status condition
+        // (`interaction:`, `question-response:`, `connection-intent:`,
+        // `tool-action-response:`, `tree-hold-resume:`, `issue_review_path_lost:`,
+        // `issue_disposition_repair:`, `issue_blocker_stalled:`), so the new
+        // admission below can reuse the same key. `task-retry:` and
+        // `chat-completion:` are unique whatever the status: the selection
+        // above leaves them out.
+        const retiredAt = new Date();
+        const [retired] = await db.update(agentWakeupRequests).set({ status: "skipped", finishedAt: retiredAt,
+          updatedAt: retiredAt, error: "Re-admitted after the previous execution owner stopped" })
+          .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)))
+          .returning({ id: agentWakeupRequests.id });
+        if (!retired) continue;
+        let readmitted = false;
+        try {
+          const run = await enqueueWakeup(wake.agentId, {
+            source: wake.source as WakeupOptions["source"], triggerDetail: wake.triggerDetail as WakeupOptions["triggerDetail"],
+            reason: wake.reason ?? undefined, payload, contextSnapshot: context,
+            requestedByActorType: wake.requestedByActorType as WakeupOptions["requestedByActorType"],
+            requestedByActorId: wake.requestedByActorId ?? undefined,
+            idempotencyKey: wake.idempotencyKey ?? undefined,
+          }, undefined, wake.payload?.interactionOrigin);
+          // Ordinary admission owns the wake once it started a run or wrote
+          // its own receipt (queued, held again, or refused with its reason).
+          const [receipt] = run ? [{ id: run.id }] : await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+            .where(and(eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.agentId, wake.agentId),
+              ne(agentWakeupRequests.id, wake.id), gte(agentWakeupRequests.createdAt, retiredAt),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${heldIssueId}`)).limit(1);
+          readmitted = Boolean(receipt);
+        } finally {
+          // Admission failed or wrote nothing: keep the held wake, never lose it.
+          if (!readmitted) await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", finishedAt: null,
+            error: null, updatedAt: new Date() }).where(and(eq(agentWakeupRequests.id, wake.id),
+            eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.status, "skipped"),
+            isNull(agentWakeupRequests.runId)));
+        }
+      } catch (err) {
+        scope.onError?.(err);
+        logger.warn({ err, requestId: wake.id }, "a wake held behind a stopped execution owner could not be re-admitted");
+      }
+    }
+
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.

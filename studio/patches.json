@@ -1099,6 +1099,60 @@
       "retireWhen": "Pinned upstream logs the refusing rule of an INVOCATION_SCOPE_DENIED host call, or the router's residual refusals are explained and gone.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0041",
+      "title": "A wake held behind a stopped execution owner is re-admitted once no execution blocker remains",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, studio.14, 14 Nov 2026, TR-702. At 04:09:25 the CTO's legacy run a6d718c3 was cancelled (issue_reassigned) when the CTO reassigned the task to * Dev Unity; its recovery action was cancelled at 04:09:27. At 04:09:28 * Dev Unity's issue_assigned wake was deferred (deferred_issue_execution, executionWait execution_recovery with recoveryActionId null): getConversationOwnershipBlocker still saw the cut run's process alive (execution_owner_active). Once that process was gone and no lease remained, nothing released the wake: the deferred-wake sweep follows the task's latest run, the CTO's cut run, and decidePreDrain returns released without promoting any wake for a cancelled legacy run that needs reconciliation or acknowledged a reassignment stop. The wake waited until a Board comment at 04:25:20 started a new run.",
+      "reason": "Requested by Amyne (14 Nov 2026, V290): fix the known server blockers and deploy them as soon as they are tested.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server heartbeat queue",
+      "paths": [
+        "server/src/services/heartbeat/queue.ts",
+        "server/src/__tests__/ownership-hold-readmission.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found that re-admits a wake deferred by the execution-owner (ownership) hold once the owner stopped.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. ownership-hold-readmission.test.ts (10 cases: the new assignee starts once the previous owner's process is gone; same once its lease is gone; a held wake keyed interaction:, tree-hold-resume: or issue_review_path_lost: is re-admitted with the same key; a held wake keyed task-retry: or chat-completion: is left deferred and untouched; a held wake on a task with an active recovery action stays held; on a task whose dependencies are unresolved ordinary admission refuses it and records its own receipt, no run starts; a wake held for another reason is untouched) with addressee-wake-recovery-hold, heartbeat-held-comment-wake and pause-missed-wakes: 52 passed. Negative controls (only queue.ts swapped): with the studio.14 queue.ts and with the first version of this fix, the release, interaction: and dependency cases fail; with the cancelled-retirement version (dd5edd9e), the tree-hold-resume: and issue_review_path_lost: cases fail on their unique index.",
+      "migration": "None. Applies at each deferred-wake sweep to wakes deferred with executionWait execution_recovery and recoveryActionId null, on a task with no live run and no execution blocker. The held row is first set to skipped, which is outside every partial unique index on companyId and idempotencyKey that has a status condition (interaction:, question-response:, connection-intent:, tool-action-response:, tree-hold-resume:, issue_review_path_lost:, issue_disposition_repair:, issue_blocker_stalled:), then re-admitted by ordinary admission with the same key; if admission neither starts a run nor writes its own receipt, the held row is put back to deferred_issue_execution. Not a single transaction: a process stop between the two steps loses the wake. Wakes keyed task-retry: or chat-completion: (unique whatever the status), chat-inbound: and stale-addressee-requeue: are left out of this sweep and keep their own paths.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream releases or re-admits a wake deferred by the execution-owner hold once the owner stopped, confirmed by the same cases.",
+      "upgradeDecisions": [],
+      "commits": []
+    },
+    {
+      "id": "STUDIO-0042",
+      "title": "A run that ends under an adapter-declared wait (machine wait, unproven stop after a cut link) is neither requeued nor blocked within a bounded time",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, studio.14, 14 Nov 2026 (TR-746, TR-740, TR-743). A run waiting for a worker machine ends failed with router_waiting_for_resources (the native-ssh adapter waits at most 10 min for the estimate, then 2 min for a machine); the worker router keeps the request and wakes the assignee with worker_router_group_ready when a machine is free. The server saw a failed run with no live path: release recovery, transient retries and the stranded-work sweep each requeued it, every retry failed at once, and at 04:26:25 the sweep moved the three tasks to blocked once the retry budget was spent. The router never serves a blocked task (placement skips its group, a request on it is refused), so no wake came back. Same morning, office line cuts at 06:01 and 06:27: four runs ended router_provider_stop_unverified, each retry router_previous_dispatch_unsettled, and recovery blocked TR-731 and TR-743 around 06:11; the worker router 0.30.10 proves the stop once the machine answers and wakes the assignee (worker_router_dispatch_settled), but never on a blocked task.",
+      "reason": "Requested by Amyne (14 Nov 2026, V290): fix the known server blockers and deploy them as soon as they are tested.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server recovery and heartbeat",
+      "paths": [
+        "server/src/services/recovery/adapter-declared-wait.ts",
+        "server/src/services/recovery/service.ts",
+        "server/src/modules/wake-queue/domain/policy.ts",
+        "server/src/modules/wake-queue/application/use-cases.ts",
+        "server/src/services/heartbeat/run-completion.ts",
+        "server/src/__tests__/recovery-adapter-declared-wait.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found that keeps a task served while its run waits for a resource declared by the adapter.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. recovery-adapter-declared-wait.test.ts, 11 cases: the closed list, the bounds and the no-retry list; machine wait within the bound (todo, in_progress, series restarted after another failure) over two sweeps: no run, comment or recovery action, re-check at the bound; cut link (stop unverified then dispatch unsettled) within 1 h: same, then the router's worker_router_dispatch_settled wake starts a run; past 1 h normal escalation, but 12 h when the latest run waits for a machine; another agent's successful run after the assignee's waiting run (todo and in_progress): no requeue, no block (this case also passes with the previous head, whose sweep already stands down there: it guards the gate, it does not reproduce a failure); machine wait past 12 h: normal escalation; another code: current behaviour; run completion: no transient retry for router_waiting_for_resources and router_previous_dispatch_unsettled, a transient retry kept for router_provider_stop_unverified and codex_transient_upstream; production race; bound restarted by a Board return. 11 passed. With wake-queue policy.test.ts and heartbeat-retry-scheduling: 151 of 152, the failure being the pre-provider quota case, which fails the same way on the studio.14 base (its run never finishes, before any code this patch changes). Earlier wider set on the first version (wake-queue module, heartbeat-issue-liveness-escalation, heartbeat-provider-limit-wait, issue-recovery-actions, heartbeat queue and run-control, refused-assignment-wake, paused-assignee-new-task, plugin-interaction-addressee-wake): all passed. Negative controls: base service.ts, 4 of 8 first cases fail; base run-completion.ts or policy.ts, the retry and race cases fail; previous head's service.ts (single 12 h bound), the two cut-link cases fail; previous head's run-completion.ts, the retry case fails.",
+      "migration": "None. Closed list: router_waiting_for_resources (bound 12 h), router_provider_stop_unverified and router_previous_dispatch_unsettled (bound 1 h; the router opens its own incident ticket when its proof fails for 10 min and then sends no wake). The bound runs from the start of the latest series of the assignee's runs ended under a listed code, restarted by a Board return (restored recovery-action resolution or a user's status change to todo), and is chosen by the code of the assignee's latest run on the issue (not the issue's latest run, which can be the responsible's). Past the bound, or if the router never wakes, the existing escalation applies (one recovery run, then blocked with a stranded_assigned_issue action). Run completion schedules no transient retry for router_waiting_for_resources and router_previous_dispatch_unsettled; router_provider_stop_unverified keeps it, since the retried run itself waits for the link (router 0.30.10). in_review issues are left out: their recovery follows the review participant's runs (review-path recovery), not the assignee's. Cost: for an issue whose assignee's latest run is a declared wait, the sweep reads the issue's restored recovery actions and its latest user status change in activity_log (index activity_log_company_entity_created_idx); when another agent's run is the issue's latest, one more indexed read of the assignee's latest run.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream treats an adapter-declared resource wait as a live execution path, confirmed by the same cases.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }

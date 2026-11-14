@@ -22,6 +22,11 @@ import { recoveryRunResultColumn } from "./run-result-read.js";
 import { readLegacyDispositionSource } from "./legacy-disposition-read.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
+import {
+  ADAPTER_DECLARED_WAIT_ERROR_CODES,
+  adapterDeclaredWaitMaxMs,
+  isAdapterDeclaredWaitErrorCode,
+} from "./adapter-declared-wait.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { RESTRICTED_WORKSPACE_SOURCE_REASON } from "../workspace-source-restriction.js";
 import { hasCommittedNativePlanWait } from "../native-runtime/native-plan-wait.js";
@@ -1080,6 +1085,93 @@ export function recoveryService(
       if (latestFinishedAt === null) latestFinishedAt = row.finishedAt ?? null;
     }
     return { consecutive, latestFinishedAt };
+  }
+
+  function isAdapterDeclaredWaitRun(
+    run: { status: string; errorCode: string | null } | null | undefined,
+  ) {
+    return Boolean(
+      run &&
+        run.status === "failed" &&
+        isAdapterDeclaredWaitErrorCode(run.errorCode),
+    );
+  }
+
+  // Start of an adapter-declared wait's bound: the later of the oldest run in
+  // the latest consecutive series of this agent's waiting runs on the issue,
+  // and the Board's latest return of the issue (a `restored` recovery-action
+  // resolution, or a user's status change to `todo`). Null without such runs.
+  async function readAdapterDeclaredWaitBoundStart(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+  ): Promise<Date | null> {
+    const seriesStart = await readAdapterDeclaredWaitStart(companyId, issueId, agentId);
+    if (!seriesStart) return null;
+    const [restored] = await db
+      .select({ at: issueRecoveryActions.resolvedAt })
+      .from(issueRecoveryActions)
+      .where(and(
+        eq(issueRecoveryActions.companyId, companyId),
+        eq(issueRecoveryActions.sourceIssueId, issueId),
+        eq(issueRecoveryActions.outcome, "restored"),
+        isNotNull(issueRecoveryActions.resolvedAt),
+      ))
+      .orderBy(desc(issueRecoveryActions.resolvedAt))
+      .limit(1);
+    const [returned] = await db
+      .select({ at: activityLog.createdAt })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.entityType, "issue"),
+        eq(activityLog.entityId, issueId),
+        eq(activityLog.actorType, "user"),
+        eq(activityLog.action, "issue.updated"),
+        sql`${activityLog.details} ->> 'status' = 'todo'`,
+        sql`coalesce(${activityLog.details} -> '_previous' ->> 'status', ${activityLog.details} -> 'changes' -> 'status' ->> 'from') is distinct from 'todo'`,
+      ))
+      .orderBy(desc(activityLog.createdAt))
+      .limit(1);
+    return [seriesStart, restored?.at ?? null, returned?.at ?? null]
+      .filter((at): at is Date => at instanceof Date)
+      .reduce((latest, at) => (at > latest ? at : latest));
+  }
+
+  // Creation time of the oldest run in the latest consecutive series of this
+  // agent's runs on the issue that all failed under an adapter-declared wait
+  // code; null when the agent's latest run is not such a wait.
+  async function readAdapterDeclaredWaitStart(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+  ): Promise<Date | null> {
+    const agentIssueRuns = and(
+      eq(heartbeatRuns.companyId, companyId),
+      eq(heartbeatRuns.agentId, agentId),
+      sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+    );
+    const waitRun = and(
+      eq(heartbeatRuns.status, "failed"),
+      inArray(heartbeatRuns.errorCode, [...ADAPTER_DECLARED_WAIT_ERROR_CODES]),
+    );
+    const [lastOther] = await db
+      .select({ createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns)
+      .where(and(agentIssueRuns, sql`not coalesce(${waitRun}, false)`))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1);
+    const [first] = await db
+      .select({ createdAt: heartbeatRuns.createdAt })
+      .from(heartbeatRuns)
+      .where(and(
+        agentIssueRuns,
+        waitRun,
+        lastOther ? gt(heartbeatRuns.createdAt, lastOther.createdAt) : undefined,
+      ))
+      .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
+      .limit(1);
+    return first?.createdAt ?? null;
   }
 
   async function hasActiveExecutionPath(
@@ -4980,6 +5072,36 @@ export function recoveryService(
       ) {
         result.skipped += 1;
         continue;
+      }
+      // The assignee's latest run ended because its adapter declared a wait
+      // for a resource it will hand out later, and wakes the assignee itself
+      // on release. That is a live wait, not a lost path: within the bound,
+      // neither requeue nor block (a blocked issue is no longer served by
+      // the router). Past the bound, normal recovery applies.
+      // The issue's latest run can be another agent's (the responsible
+      // coordinating on its executor's issue during the wait): read the
+      // assignee's own latest run on the issue then. `in_review` keeps its
+      // review-path recovery, which follows the review participant's runs.
+      const assigneeLatestRun =
+        issue.status === "in_review"
+          ? null
+          : latestRun?.agentId === agentId
+            ? latestRun
+            : await getLatestIssueRunForAgent(issue.companyId, issue.id, agentId);
+      if (isAdapterDeclaredWaitRun(assigneeLatestRun)) {
+        const waitStart = await readAdapterDeclaredWaitBoundStart(
+          issue.companyId,
+          issue.id,
+          agentId,
+        );
+        const waitDeadline = waitStart
+          ? waitStart.getTime() + adapterDeclaredWaitMaxMs(assigneeLatestRun!.errorCode)
+          : null;
+        if (waitDeadline !== null && recoveryNow.getTime() < waitDeadline) {
+          opts?.onDeferredDeadline?.(waitDeadline);
+          result.skipped += 1;
+          continue;
+        }
       }
       if (
         isStrandedIssueRecoveryIssue(issue) &&

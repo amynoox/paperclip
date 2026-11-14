@@ -227,6 +227,8 @@ export type ReleaseRecoveryImmediateFacts = {
   automaticRecoveryAlreadyFailed: boolean;
   /** Exact admitted-chat lineage or a non-retryable failure forbids generic continuation. */
   sourceRequiresExplicitRecovery?: boolean;
+  /** The run failed under an adapter-declared resource wait: the resource's owner wakes the assignee on release. */
+  isAdapterDeclaredWaitRun?: boolean;
 };
 
 export type ReleaseRecoveryFacts = {
@@ -408,6 +410,9 @@ export function decideReleaseRecovery(facts: ReleaseRecoveryFacts): ReleaseRecov
     return { kind: "released" };
   }
   if (shared.suppressedByPauseHold) return { kind: "released" };
+  // Neither requeue nor block a declared wait at release; the stranded-work
+  // sweep owns its bound.
+  if (immediate.isAdapterDeclaredWaitRun) return { kind: "released" };
   if (shared.isStrandedRecoveryOrigin) return { kind: "blocked_recovery_in_place" };
 
   const shouldBlockImmediately =
