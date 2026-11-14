@@ -802,6 +802,31 @@
       "commits": [
         "11a123505d6f23984a1034d9125b57710fdd2b79"
       ]
+    },
+    {
+      "id": "STUDIO-0026",
+      "title": "A plugin-created issue interaction wakes its addressee agent",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "The issue interaction route wakes the addressee agent of a new card (reason interaction_pending, idempotency key interaction-pending:<id>), but the plugin host createInteraction only stores the card and logs activity. A plugin cannot request that wake itself: plugin requestWakeup only targets the issue assignee. Production, 13 Nov 2026, TR-702: the Worker Router posted an 'Executor run interrupted' confirmation card addressed to the CTO at 23:30:30 UTC; the wake diagnostic read at 23:33:45 showed no wake for the CTO, so the card waited unseen.",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server plugin host services",
+      "paths": [
+        "server/src/__tests__/plugin-interaction-addressee-wake.test.ts",
+        "server/src/services/plugin-host-services.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found for waking the addressee of a plugin-created interaction (searches: plugin createInteraction addressee wake, plugin interaction addressee, requestConfirmation plugin wake addressee).",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. plugin-interaction-addressee-wake.test.ts (new) and agent-interaction-mutations.test.ts: 23 passed. Negative control on the base plugin-host-services.ts: the addressee case fails (no wake recorded).",
+      "migration": "None. Cards already pending stay unseen until another wake; a Board read of the queue shows them.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream wakes the addressee of plugin-created interactions with the same rule as the issue interaction route.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
