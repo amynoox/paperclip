@@ -11,6 +11,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -482,5 +483,52 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     const { f, retry } = await dueStopRetry("wake_assignee");
     expect(await createPostgresRunDispatchAdapter(db).promoteOrCancelDueRetry({ companyId: f.companyId, runId: retry.id, now: new Date() }))
       .toMatchObject({ outcome: "gate_suppressed", errorCode: "issue_waiting_for_response" });
+  }, 180_000);
+
+  // STUDIO-0046 under the real due-retry sweep: the retry is scheduled by the
+  // server itself from a real run end (as in production, with its dispatch
+  // notification), and the sweep is driven through the same two entry points
+  // the deadline worker calls (promoteDueScheduledRetries at the due time, then
+  // nextScheduledRetryAt to plan its next pass). Another role's run on the task
+  // (an addressee answering a card or a commenter: production shows such runs
+  // overlapping other agents' runs on the same task) is live when it falls due.
+  it("holds the retry under the real due-retry sweep while another role runs on the task, and keeps the 10 min bound", async () => {
+    const f = await seed("in_progress", []);
+    modes.set(f.issueId, "stop-plain");
+    const cut = await boardWake(f);
+    await heartbeat.drainActiveRunExecutions();
+    await expect.poll(async () => (await runsOf(f)).find(row => row.id === cut.id)?.status, { timeout: 30_000 }).toBe("failed");
+    const retry = (await runsOf(f)).find(row => row.retryOfRunId === cut.id)!;
+    expect(retry).toMatchObject({ status: "scheduled_retry", scheduledRetryReason: "transient_failure" });
+    const [responsible] = await db.insert(agents).values({ companyId: f.companyId, name: "Responsible", adapterType, status: "running", adapterConfig: {} }).returning();
+    const [live] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: responsible.id, invocationSource: "automation",
+      triggerDetail: "system", status: "running", startedAt: new Date(), contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "interaction_pending" } }).returning();
+    const row = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, retry.id)))[0]!;
+
+    // First pass of the sweep at the due time: held, pushed back 15 s, traced.
+    const due = new Date(retry.scheduledRetryAt!.getTime() + 1_000);
+    expect((await heartbeat.promoteDueScheduledRetries(due)).runIds).not.toContain(retry.id);
+    const held = await row();
+    expect(held).toMatchObject({ status: "scheduled_retry", resultJson: expect.objectContaining({
+      liveRunWait: expect.objectContaining({ runId: live.id, since: due.toISOString() }) }) });
+    expect(held.scheduledRetryAt!.getTime()).toBe(due.getTime() + 15_000);
+    const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, retry.id));
+    expect(events.map(event => event.message)).toContain("Scheduled retry is waiting for another run of the task to finish, so the worker router sees it alone");
+    // The worker plans its next pass from the pushed-back deadline (heartbeat's
+    // nextScheduledRetryAt wraps this read), no new notification needed.
+    expect(await createPostgresRunDispatchAdapter(db).nextScheduledRetryAt({ cutoff: null })).toBeLessThanOrEqual(held.scheduledRetryAt!.getTime());
+
+    // Second pass 16 s later, the other run still live: held again, same start, one event only.
+    const second = new Date(due.getTime() + 16_000);
+    expect((await heartbeat.promoteDueScheduledRetries(second)).runIds).not.toContain(retry.id);
+    expect((await row()).resultJson?.liveRunWait).toMatchObject({ since: due.toISOString() });
+    expect((await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, retry.id)))
+      .filter(event => event.message?.startsWith("Scheduled retry is waiting for another run"))).toHaveLength(1);
+
+    // Past the 10 min bound, counted from the first hold: promoted although the other run is still live.
+    const pastBound = new Date(due.getTime() + 10 * 60_000 + 20_000);
+    expect((await heartbeat.promoteDueScheduledRetries(pastBound)).runIds).toContain(retry.id);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, live.id));
+    await heartbeat.drainActiveRunExecutions();
   }, 180_000);
 });
