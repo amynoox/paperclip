@@ -771,6 +771,39 @@ describe("sandbox callback bridge", () => {
     expect(listCalls).toBeGreaterThan(3);
   });
 
+  it("issues no further poll once stopped during a transient-failure backoff", async () => {
+    // An unreachable worker keeps every poll failing. Stop must end the loop
+    // during its backoff wait, without one more sandbox exec.
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-stop-backoff-"));
+    cleanupDirs.push(rootDir);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let listCalls = 0;
+    const fsClient = createFileSystemSandboxCallbackBridgeQueueClient();
+    try {
+      const worker = await startSandboxCallbackBridgeWorker({
+        client: {
+          ...fsClient,
+          listJsonFiles: async (_remotePath, options) => {
+            // Poll-loop calls carry wait options; stop's own final listing does not.
+            if (options) listCalls += 1;
+            throw new Error("list requests failed with exit code 255: ssh: connect to host port 22: No route to host");
+          },
+        },
+        queueDir: path.join(rootDir, "queue"),
+        pollIntervalMs: 200,
+        authorizeRequest: async () => null,
+        handleRequest: async () => ({ status: 200, body: "{}" }),
+      });
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(listCalls).toBe(1);
+      await worker.stop({ drainTimeoutMs: 50 });
+      await new Promise((resolve) => setTimeout(resolve, 700));
+      expect(listCalls).toBe(1);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it("keeps the queue-directory setup on the startup step but resets the poll loop store", async () => {
     // The worker starts inside the measured `bridge.paperclip` step. Its awaited
     // queue-directory setup is startup work, so a `makeDir` `sandbox.exec` span

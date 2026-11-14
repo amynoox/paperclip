@@ -52,13 +52,13 @@ import {
   purgeStaleWorkspaceCompactionTrash,
   restoreWorkspaceDirsFromTrash,
 } from "./workspace-compaction.js";
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
-import { isDeepStrictEqual, promisify } from "node:util";
+import { isDeepStrictEqual } from "node:util";
 import { and, asc, desc, eq, gt, inArray, isNull, lte, ne, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { execFileText } from "@paperclipai/adapter-utils/short-command-launcher";
 import {
   executionWorkspaces,
   agents,
@@ -129,7 +129,6 @@ type ExecutionWorkspaceRow = typeof executionWorkspaces.$inferSelect;
 type WorkspaceRuntimeServiceRow = typeof workspaceRuntimeServices.$inferSelect;
 type RuntimeServiceReadDb = Pick<Db, "select">;
 type DbTransaction = Parameters<Parameters<Db["transaction"]>[0]>[0];
-const execFileAsync = promisify(execFile);
 const TERMINAL_ISSUE_STATUSES = new Set(["done", "cancelled"]);
 
 // Return the timestamp when an issue became terminal. A `done` issue uses
@@ -564,7 +563,8 @@ async function hasGitMarkerInPathOrAncestors(start: string) {
 }
 
 async function runGit(args: string[], cwd: string) {
-  return await execFileAsync("git", ["-C", cwd, ...args], { cwd });
+  // Same contract as the promisified execFile it replaces: no timeout, 1 MiB of output.
+  return await execFileText("git", ["-C", cwd, ...args], { cwd, timeout: 0, maxBuffer: 1024 * 1024 });
 }
 
 async function runExpensiveGitStatus(input: {
@@ -1001,32 +1001,46 @@ async function inspectGitCloseReadiness(workspace: ExecutionWorkspace): Promise<
     };
   }
 
+  // A plain directory (e.g. a local_fs shared workspace) has no git state to
+  // lose. Only treat it that way when no `.git` exists on the path, so a
+  // broken or unreadable repository still fails closed.
+  const plainDirectoryReadiness = () => ({
+    git: {
+      repoRoot: null,
+      workspacePath,
+      branchName: workspace.branchName,
+      baseRef: workspace.baseRef,
+      hasDirtyTrackedFiles: false,
+      hasUntrackedFiles: false,
+      dirtyEntryCount: 0,
+      untrackedEntryCount: 0,
+      aheadCount: null,
+      behindCount: null,
+      isMergedIntoBase: null,
+      createdByRuntime,
+    },
+    warnings,
+    statusInspectionSucceeded: true,
+  });
+  // Check the marker on disk before spawning git. The terminal workspace sweep
+  // inspects every terminal candidate on each rotation, and each git spawn
+  // forks the whole server process, so a plain directory must cost no process.
+  // An explicit GIT_DIR lets git find a repository without a marker; keep the
+  // git probe in that case.
+  if (
+    workspace.providerType !== "git_worktree"
+    && !process.env.GIT_DIR
+    && !(await hasGitMarkerInPathOrAncestors(workspacePath))
+  ) {
+    return plainDirectoryReadiness();
+  }
+
   let repoRoot: string | null = null;
   try {
     repoRoot = (await runGit(["rev-parse", "--show-toplevel"], workspacePath)).stdout.trim() || null;
   } catch (error) {
-    // A plain directory (e.g. a local_fs shared workspace) has no git state to
-    // lose. Only treat it that way when no `.git` exists on the path, so a
-    // broken or unreadable repository still fails closed.
     if (workspace.providerType !== "git_worktree" && !(await hasGitMarkerInPathOrAncestors(workspacePath))) {
-      return {
-        git: {
-          repoRoot: null,
-          workspacePath,
-          branchName: workspace.branchName,
-          baseRef: workspace.baseRef,
-          hasDirtyTrackedFiles: false,
-          hasUntrackedFiles: false,
-          dirtyEntryCount: 0,
-          untrackedEntryCount: 0,
-          aheadCount: null,
-          behindCount: null,
-          isMergedIntoBase: null,
-          createdByRuntime,
-        },
-        warnings,
-        statusInspectionSucceeded: true,
-      };
+      return plainDirectoryReadiness();
     }
     warnings.push(
       `Could not inspect git status for "${workspacePath}": ${error instanceof Error ? error.message : String(error)}`,

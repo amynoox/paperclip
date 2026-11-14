@@ -115,12 +115,8 @@ export function evaluateAgentInvokability(
   );
 }
 
-export async function evaluateAgentInvokabilityFromDb(
-  db: Db,
-  agent: AgentOrgRow | null | undefined,
-): Promise<AgentInvokability> {
-  if (!agent) return evaluateAgentInvokability(agent, []);
-  const companyAgents = await db
+function listCompanyAgents(db: Db, companyId: string): Promise<AgentOrgRow[]> {
+  return db
     .select({
       id: agents.id,
       companyId: agents.companyId,
@@ -129,8 +125,36 @@ export async function evaluateAgentInvokabilityFromDb(
       status: agents.status,
     })
     .from(agents)
-    .where(eq(agents.companyId, agent.companyId));
-  return evaluateAgentInvokability(agent, companyAgents);
+    .where(eq(agents.companyId, companyId));
+}
+
+export async function evaluateAgentInvokabilityFromDb(
+  db: Db,
+  agent: AgentOrgRow | null | undefined,
+): Promise<AgentInvokability> {
+  if (!agent) return evaluateAgentInvokability(agent, []);
+  return evaluateAgentInvokability(agent, await listCompanyAgents(db, agent.companyId));
+}
+
+/**
+ * STUDIO-0038: whether work may be addressed to the agent now and run later.
+ * An invokable agent qualifies, and so does a paused one whose reporting chain
+ * would be valid once it resumes. Status `paused` only covers reversible
+ * lifecycle states (preparing, verifying, pausing, paused, resuming; see
+ * `compatibilityStatus`), and the wake refused during the pause is replayed
+ * when it lifts (STUDIO-0028). A missing, terminated or pending-approval agent,
+ * or a broken reporting chain, stays refused with its own reason.
+ */
+export async function evaluateAgentAddressabilityFromDb(
+  db: Db,
+  agent: AgentOrgRow | null | undefined,
+): Promise<AgentInvokability> {
+  if (!agent) return evaluateAgentInvokability(agent, []);
+  const companyAgents = await listCompanyAgents(db, agent.companyId);
+  const current = evaluateAgentInvokability(agent, companyAgents);
+  if (current.invokable || current.reason !== "paused") return current;
+  // Judge the paused agent as it will be once resumed.
+  return evaluateAgentInvokability({ ...agent, status: "idle" }, companyAgents);
 }
 
 export function listInvalidOrgChainDescendantIds(
