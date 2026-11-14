@@ -108,9 +108,9 @@ const support = await getEmbeddedPostgresTestSupport();
   type Fixture = Awaited<ReturnType<typeof seed>>;
 
   // Same wake as the issue update route on a reassignment with a comment.
-  function assignmentWake(f: Fixture) {
+  function assignmentWake(f: Fixture, idempotencyKey?: string) {
     return heartbeat.wakeup(f.dev, {
-      source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      source: "assignment", triggerDetail: "system", reason: "issue_assigned", ...(idempotencyKey ? { idempotencyKey } : {}),
       payload: { issueId: f.issueId, commentId: f.commentId, mutation: "update", interruptedRunId: f.ctoRunId },
       requestedByActorType: "agent", requestedByActorId: f.cto,
       contextSnapshot: { issueId: f.issueId, taskId: f.issueId, commentId: f.commentId, wakeCommentId: f.commentId,
@@ -125,10 +125,12 @@ const support = await getEmbeddedPostgresTestSupport();
       eq(heartbeatRuns.invocationSource, "assignment")));
   const wakesOf = (f: Fixture, agentId: string) => db.select().from(agentWakeupRequests)
     .where(and(eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.agentId, agentId)));
+  const parseObjectWait = (row: { payload?: unknown } | undefined) =>
+    ((row?.payload as { executionWait?: { reason?: string } } | undefined)?.executionWait?.reason ?? null);
   const executionsOf = (agentId: string) => mockAdapterExecute.mock.calls.filter(([context]) => context?.agent.id === agentId);
 
-  async function heldWake(f: Fixture) {
-    expect(await assignmentWake(f)).toBeNull();
+  async function heldWake(f: Fixture, idempotencyKey?: string) {
+    expect(await assignmentWake(f, idempotencyKey)).toBeNull();
     const held = (await wakesOf(f, f.dev)).filter(wake => wake.status === "deferred_issue_execution");
     expect(held).toHaveLength(1);
     expect(held[0]).toMatchObject({ reason: "issue_assigned", runId: null,
@@ -155,13 +157,36 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(run).toMatchObject({ agentId: f.dev,
       contextSnapshot: expect.objectContaining({ issueId: f.issueId, wakeCommentId: f.commentId }) });
     expect(run.contextSnapshot).not.toHaveProperty("executionWait");
+    // The held copy was retired; ordinary admission wrote the run's own receipt.
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, held.id)))[0])
-      .toMatchObject({ status: "coalesced", runId: run.id });
+      .toMatchObject({ status: "cancelled", runId: null });
     expect(executionsOf(f.cto)).toHaveLength(0);
     // Delivered once: another sweep starts nothing.
     await heartbeat.resumeQueuedRuns();
     expect(await runsOf(f, f.dev)).toHaveLength(1);
     expect((await wakesOf(f, f.dev)).filter(wake => wake.status === "deferred_issue_execution")).toHaveLength(0);
+  });
+
+  // A held wake can carry a key covered by a partial unique index on
+  // (companyId, idempotencyKey), for example `interaction:`. Re-admission must
+  // reuse that row: inserting a second row with the same key would fail on
+  // every sweep and the wake would never be released.
+  it("re-admits a held wake whose idempotency key is unique (interaction:)", async () => {
+    const f = await seed("lease");
+    const key = `interaction:${randomUUID()}`;
+    const held = await heldWake(f, key);
+    expect(held.idempotencyKey).toBe(key);
+    await f.release();
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(async () => {
+      expect((await runsOf(f, f.dev)).map(run => run.status)).toEqual(["succeeded"]);
+    }, { timeout: 15_000, interval: 100 });
+    const [run] = await runsOf(f, f.dev);
+    await heartbeat.waitForRunExecutionDrain(run.id);
+    // The held copy is cancelled and the new admission reused the same key.
+    const rows = (await wakesOf(f, f.dev)).filter(wake => wake.idempotencyKey === key);
+    expect(rows.find(row => row.id === held.id)).toMatchObject({ status: "cancelled" });
+    expect(rows.filter(row => row.id !== held.id)).toHaveLength(1);
   });
 
   it("keeps the wake held while the task carries an active recovery action", async () => {
@@ -200,11 +225,11 @@ const support = await getEmbeddedPostgresTestSupport();
     await heartbeat.resumeQueuedRuns();
     expect(await runsOf(f, f.dev)).toHaveLength(0);
     expect(executionsOf(f.dev)).toHaveLength(0);
-    // Ordinary admission refused it on the dependency gate and recorded why.
+    // Ordinary admission refused it on the dependency gate and recorded why,
+    // in its own receipt; the held copy was retired.
     const wakes = await wakesOf(f, f.dev);
-    expect(wakes.find(wake => wake.id === held.id)).toMatchObject({ status: "skipped", runId: null });
-    expect(wakes.some(wake => wake.reason === "issue_dependencies_blocked" && wake.status === "skipped")).toBe(true);
-    expect(wakes.filter(wake => wake.status === "deferred_issue_execution")).toHaveLength(0);
+    expect(wakes.find(wake => wake.id === held.id)).toMatchObject({ status: "cancelled", runId: null });
+    expect(wakes.some(wake => wake.id !== held.id && ["skipped", "deferred_issue_execution"].includes(wake.status))).toBe(true);
   });
 
   it("leaves a wake held for another reason untouched", async () => {

@@ -2300,21 +2300,39 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (await getExecutionBlocker(db, wake.companyId, heldIssueId)) continue;
         const context = parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]);
         const { executionWait: _wait, [DEFERRED_WAKE_CONTEXT_KEY]: _context, ...payload } = parseObject(wake.payload);
-        const run = await enqueueWakeup(wake.agentId, {
-          source: wake.source as WakeupOptions["source"], triggerDetail: wake.triggerDetail as WakeupOptions["triggerDetail"],
-          reason: wake.reason ?? undefined, payload, contextSnapshot: context,
-          requestedByActorType: wake.requestedByActorType as WakeupOptions["requestedByActorType"],
-          requestedByActorId: wake.requestedByActorId ?? undefined,
-          idempotencyKey: wake.idempotencyKey ?? undefined,
-        }, undefined, wake.payload?.interactionOrigin);
-        // The new admission owns this wake; retire the held copy.
-        const now = new Date();
-        await db.update(agentWakeupRequests).set(run
-          ? { status: "coalesced", runId: run.id, finishedAt: now, updatedAt: now }
-          : { status: "skipped", finishedAt: now, updatedAt: now,
-              error: "Wake re-admitted after the previous execution owner stopped; its new admission owns it" })
+        // Retire the held row first: `cancelled` is outside every partial
+        // unique index on (companyId, idempotencyKey), so the new admission
+        // below can reuse the same key (`interaction:`, `question-response:`…).
+        const retiredAt = new Date();
+        const [retired] = await db.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: retiredAt,
+          updatedAt: retiredAt, error: "Re-admitted after the previous execution owner stopped" })
           .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
-            eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)));
+            eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)))
+          .returning({ id: agentWakeupRequests.id });
+        if (!retired) continue;
+        let readmitted = false;
+        try {
+          const run = await enqueueWakeup(wake.agentId, {
+            source: wake.source as WakeupOptions["source"], triggerDetail: wake.triggerDetail as WakeupOptions["triggerDetail"],
+            reason: wake.reason ?? undefined, payload, contextSnapshot: context,
+            requestedByActorType: wake.requestedByActorType as WakeupOptions["requestedByActorType"],
+            requestedByActorId: wake.requestedByActorId ?? undefined,
+            idempotencyKey: wake.idempotencyKey ?? undefined,
+          }, undefined, wake.payload?.interactionOrigin);
+          // Ordinary admission owns the wake once it started a run or wrote
+          // its own receipt (queued, held again, or refused with its reason).
+          const [receipt] = run ? [{ id: run.id }] : await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+            .where(and(eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.agentId, wake.agentId),
+              ne(agentWakeupRequests.id, wake.id), gte(agentWakeupRequests.createdAt, retiredAt),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${heldIssueId}`)).limit(1);
+          readmitted = Boolean(receipt);
+        } finally {
+          // Admission failed or wrote nothing: keep the held wake, never lose it.
+          if (!readmitted) await db.update(agentWakeupRequests).set({ status: "deferred_issue_execution", finishedAt: null,
+            error: null, updatedAt: new Date() }).where(and(eq(agentWakeupRequests.id, wake.id),
+            eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.status, "cancelled"),
+            isNull(agentWakeupRequests.runId)));
+        }
       } catch (err) {
         scope.onError?.(err);
         logger.warn({ err, requestId: wake.id }, "a wake held behind a stopped execution owner could not be re-admitted");
