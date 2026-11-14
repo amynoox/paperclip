@@ -1,6 +1,7 @@
 import { and, desc, eq, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, issueThreadInteractions, issues, type Db } from "@paperclipai/db";
 import { AGENT_LIFECYCLE_STOP_REASON, AGENT_PAUSE_STOP_REASON, BUDGET_PAUSE_STOP_REASON } from "./governance-pause-stop.js";
+import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-interaction-resolution.js";
 
 /**
  * STUDIO-0028: wakes lost to an agent pause.
@@ -25,6 +26,13 @@ import { AGENT_LIFECYCLE_STOP_REASON, AGENT_PAUSE_STOP_REASON, BUDGET_PAUSE_STOP
  * names the lost wake, so a repeated resume or a concurrent caller never
  * doubles the wake.
  *
+ * STUDIO-0038: a card may now be addressed to a paused agent. Its wake is
+ * refused like any other, but the queue keeps no row when the refused request
+ * came from a person (the route creating the card answers 201 and only logs
+ * the refusal), and a plugin-created card may have no wake at all. So a card
+ * still pending and addressed to the agent, with no wake recorded for it,
+ * counts as a lost card wake from the moment it was created.
+ *
  * Not covered: a wake that was never requested (no row), for example a task
  * whose recovery settled as blocked; there is nothing to replay.
  */
@@ -46,7 +54,8 @@ type Wakeup = (agentId: string, opts: {
   contextSnapshot: Record<string, unknown>;
 }) => Promise<unknown>;
 
-type Missed = { id: string; finishedAt: Date; interactionId: string | null };
+// `id` is the lost wake request; null for a card whose wake was never recorded.
+type Missed = { id: string | null; finishedAt: Date; interactionId: string | null };
 
 export async function replayWakesMissedDuringPause(db: Db, input: {
   companyId: string;
@@ -83,6 +92,44 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
     if (missed.interactionId && !latestCard.has(row.issueId)) latestCard.set(row.issueId, missed);
   }
 
+  // Pending cards addressed to the agent with no wake recorded for them (STUDIO-0038).
+  const cards = await db.select({
+    id: issueThreadInteractions.id,
+    issueId: issueThreadInteractions.issueId,
+    createdAt: issueThreadInteractions.createdAt,
+    createdByAgentId: issueThreadInteractions.createdByAgentId,
+    createdByUserId: issueThreadInteractions.createdByUserId,
+    sourceRunId: issueThreadInteractions.sourceRunId,
+    addresseeAgentId: issueThreadInteractions.addresseeAgentId,
+    addresseeUserId: issueThreadInteractions.addresseeUserId,
+    effectiveResolverPolicy: issueThreadInteractions.effectiveResolverPolicy,
+    effectiveResolverPolicySource: issueThreadInteractions.effectiveResolverPolicySource,
+    resolverPolicyProvenance: issueThreadInteractions.resolverPolicyProvenance,
+  }).from(issueThreadInteractions).where(and(
+    eq(issueThreadInteractions.companyId, input.companyId),
+    eq(issueThreadInteractions.addresseeAgentId, input.agentId),
+    eq(issueThreadInteractions.status, "pending"),
+    gt(issueThreadInteractions.createdAt, since),
+  )).orderBy(desc(issueThreadInteractions.createdAt));
+  if (cards.length > 0) {
+    const recorded = new Set((await db.select({
+      interactionId: sql<string | null>`${agentWakeupRequests.payload}->>'interactionId'`,
+    }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, input.companyId),
+      eq(agentWakeupRequests.agentId, input.agentId),
+      inArray(sql`${agentWakeupRequests.payload}->>'interactionId'`, cards.map(card => card.id)),
+    ))).map(row => row.interactionId));
+    for (const card of cards) {
+      // Same attention rule as the wake sent when the card is created.
+      if (recorded.has(card.id) || !issueThreadInteractionAttentionAgentAllowed({ agentId: input.agentId, interaction: card })) continue;
+      const missed = { id: null, finishedAt: card.createdAt, interactionId: card.id };
+      const known = latest.get(card.issueId);
+      if (!known || known.finishedAt < card.createdAt) latest.set(card.issueId, missed);
+      const knownCard = latestCard.get(card.issueId);
+      if (!knownCard || knownCard.finishedAt < card.createdAt) latestCard.set(card.issueId, missed);
+    }
+  }
+
   let woken = 0;
   for (const [issueId, last] of latest) {
     const [issue] = await db.select({ id: issues.id, status: issues.status, assigneeAgentId: issues.assigneeAgentId })
@@ -90,11 +137,12 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
     if (!issue || ["done", "cancelled", "backlog"].includes(issue.status)) continue;
     let missed: Missed | null = issue.assigneeAgentId === input.agentId ? last : null;
     let interactionId: string | null = null;
+    let interactionKind: string | null = null;
     if (!missed) {
       // Not the agent's task: replay only the wake of a card still pending and addressed to the agent.
       const card = latestCard.get(issueId);
       if (!card) continue;
-      const [pending] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+      const [pending] = await db.select({ id: issueThreadInteractions.id, kind: issueThreadInteractions.kind }).from(issueThreadInteractions).where(and(
         eq(issueThreadInteractions.companyId, input.companyId),
         eq(issueThreadInteractions.issueId, issueId),
         eq(issueThreadInteractions.id, card.interactionId!),
@@ -104,6 +152,7 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
       if (!pending) continue;
       missed = card;
       interactionId = card.interactionId;
+      interactionKind = pending.kind;
     }
     const [later] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, input.companyId),
@@ -124,17 +173,26 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
         source: "automation",
         triggerDetail: "system",
         reason: PAUSE_MISSED_WAKE_REASON,
-        payload: { issueId, mutation: "pause_lifted", missedWakeRequestId: missed.id, ...(interactionId ? { interactionId } : {}) },
-        idempotencyKey: `pause-missed:${input.agentId}:${issueId}:${missed.id}`,
+        // STUDIO-0038: a card wake keeps the shape of the wake sent when the card
+        // was created. The run context keeps the card only for an `interaction`
+        // mutation, and dispatch lets the addressee run on a task it does not
+        // own only for a verified `interaction_pending` wake
+        // (verifyAddresseeInteractionWake: the named card is still pending and
+        // addressed to it). Otherwise the queued run is cancelled as "issue
+        // assignee changed" and the card still waits.
+        payload: interactionId
+          ? { issueId, mutation: "interaction", interactionId, interactionKind, missedWakeRequestId: missed.id }
+          : { issueId, mutation: "pause_lifted", missedWakeRequestId: missed.id },
+        idempotencyKey: `pause-missed:${input.agentId}:${issueId}:${missed.id ?? missed.interactionId}`,
         requestedByActorType: "system",
         requestedByActorId: "pause-missed-wakes",
         contextSnapshot: {
           issueId,
           taskId: issueId,
-          wakeReason: PAUSE_MISSED_WAKE_REASON,
+          wakeReason: interactionId ? "interaction_pending" : PAUSE_MISSED_WAKE_REASON,
           source: "agent.pause_lifted",
           missedWakeRequestId: missed.id,
-          ...(interactionId ? { interactionId } : {}),
+          ...(interactionId ? { interactionId, interactionKind } : {}),
         },
       });
       woken += 1;
