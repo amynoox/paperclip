@@ -33,7 +33,7 @@ import {
   nativeRunFinalizations,
   projects,
 } from "@paperclipai/db";
-import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON, isUuidLike } from "@paperclipai/shared";
+import { ISSUE_DISPOSITION_REPAIR_RETRY_REASON, isUuidLike, type ExecutionBlocker } from "@paperclipai/shared";
 import { withOperationAccountingTransaction } from "../../../services/accounting-transaction.js";
 import { lockBudgetAdmissionControls } from "../../../services/budget-admission-controls.js";
 import type { ActivityPublication } from "../../../services/activity-log.js";
@@ -327,6 +327,25 @@ export async function verifyNonAssigneeAddresseeInteractionWake(
     .limit(1);
   if (!issue || issue.assigneeAgentId === input.agentId) return false;
   return verifyAddresseeInteractionWake(dbOrTx, input);
+}
+
+/**
+ * STUDIO-0040: true when `blocker` is a recovery hold (a recovery action that
+ * waits for reconciliation, such as a cancelled run kept "without replay") and
+ * the run context is a verified wake of a non-assignee responder (see
+ * `verifyNonAssigneeAddresseeInteractionWake`). The hold keeps the task's own
+ * execution from resuming; that responder answers its card and does not
+ * execute the task, and its answer is often what decides the reconciliation.
+ * Live execution authority (no recovery action) and a hold that needs
+ * workspace files recovered first still apply. The assignee keeps the hold.
+ */
+export async function addresseeWakePassesRecoveryHold(
+  dbOrTx: Db,
+  blocker: Pick<ExecutionBlocker, "recoveryActionId" | "workspaceRepairRequired"> | null,
+  input: AddresseeInteractionWakeInput,
+): Promise<boolean> {
+  if (!blocker?.recoveryActionId || blocker.workspaceRepairRequired) return false;
+  return verifyNonAssigneeAddresseeInteractionWake(dbOrTx, input);
 }
 
 export function createPostgresRunDispatchAdapter(
@@ -1401,7 +1420,11 @@ export function createPostgresRunDispatchAdapter(
         } };
       }
     }
-    const recovery = await getExecutionBlocker(tx, run.companyId, issueId, { conversationResetCommentId: deriveCommentId(contextSnapshot) });
+    const heldExecution = await getExecutionBlocker(tx, run.companyId, issueId, { conversationResetCommentId: deriveCommentId(contextSnapshot) });
+    // STUDIO-0040: the verified answer of a non-assignee responder is not the
+    // task's execution; the recovery hold does not cancel it at claim or dispatch.
+    const recovery = heldExecution && !(await addresseeWakePassesRecoveryHold(tx, heldExecution, {
+      companyId: run.companyId, issueId, agentId: run.agentId, contextSnapshot })) ? heldExecution : null;
     if (recovery) return { issueId, facts: null, executionBlocker: recovery, decision: { stale: true as const,
       errorCode: "execution_reconciliation_required" as const, reason: recovery.nextAction,
       details: { issueId, recoveryActionId: recovery.recoveryActionId,
