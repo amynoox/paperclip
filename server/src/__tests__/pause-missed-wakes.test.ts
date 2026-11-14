@@ -113,6 +113,23 @@ describe("wakes missed during an agent pause", () => {
     }));
   });
 
+  it("delivers the replayed card wake through the real queue to the addressee of another agent's task", async () => {
+    const f = await cardWakeCancelledByPause();
+    const heartbeat = heartbeatService(db);
+    const wakeup = (agentId: string, opts: Parameters<typeof heartbeat.wakeup>[1]) => heartbeat.wakeup(agentId, opts).catch(() => null);
+    await replayWakesMissedDuringPause(db, { companyId: f.companyId, agentId: f.agentId, wakeup: wakeup as never });
+    await new Promise(resolve => setTimeout(resolve, 500));
+    const replayed = (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.agentId, f.agentId)))).filter(w => w.reason === PAUSE_MISSED_WAKE_REASON);
+    expect(replayed).toHaveLength(1);
+    expect(replayed[0].payload).toMatchObject({ issueId: f.issueId, mutation: "interaction", interactionId: f.interactionId,
+      interactionKind: "ask_user_questions", missedWakeRequestId: f.cancelled.id });
+    // Not refused, and not cancelled by dispatch because the addressee does not own the task.
+    expect(replayed[0].status).not.toBe("skipped");
+    expect(replayed[0].error ?? "").not.toContain("assignee changed");
+    await heartbeat.drainActiveRunExecutions?.();
+  });
+
   it("does not wake the addressee once the card is answered", async () => {
     const f = await cardWakeCancelledByPause("answered");
     const wakeup = vi.fn().mockResolvedValue(null);

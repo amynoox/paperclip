@@ -90,11 +90,12 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
     if (!issue || ["done", "cancelled", "backlog"].includes(issue.status)) continue;
     let missed: Missed | null = issue.assigneeAgentId === input.agentId ? last : null;
     let interactionId: string | null = null;
+    let interactionKind: string | null = null;
     if (!missed) {
       // Not the agent's task: replay only the wake of a card still pending and addressed to the agent.
       const card = latestCard.get(issueId);
       if (!card) continue;
-      const [pending] = await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions).where(and(
+      const [pending] = await db.select({ id: issueThreadInteractions.id, kind: issueThreadInteractions.kind }).from(issueThreadInteractions).where(and(
         eq(issueThreadInteractions.companyId, input.companyId),
         eq(issueThreadInteractions.issueId, issueId),
         eq(issueThreadInteractions.id, card.interactionId!),
@@ -104,6 +105,7 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
       if (!pending) continue;
       missed = card;
       interactionId = card.interactionId;
+      interactionKind = pending.kind;
     }
     const [later] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
       eq(heartbeatRuns.companyId, input.companyId),
@@ -124,17 +126,25 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
         source: "automation",
         triggerDetail: "system",
         reason: PAUSE_MISSED_WAKE_REASON,
-        payload: { issueId, mutation: "pause_lifted", missedWakeRequestId: missed.id, ...(interactionId ? { interactionId } : {}) },
+        // A card wake keeps the shape of the wake sent when the card was created.
+        // Dispatch lets an addressee run on a task it does not own only for a
+        // verified `interaction_pending` wake that names a pending card addressed
+        // to it (run-dispatch verifyAddresseeInteractionWake); any other wake
+        // reason gets the queued run cancelled as "issue assignee changed", and
+        // the card still waits.
+        payload: interactionId
+          ? { issueId, mutation: "interaction", interactionId, interactionKind, missedWakeRequestId: missed.id }
+          : { issueId, mutation: "pause_lifted", missedWakeRequestId: missed.id },
         idempotencyKey: `pause-missed:${input.agentId}:${issueId}:${missed.id}`,
         requestedByActorType: "system",
         requestedByActorId: "pause-missed-wakes",
         contextSnapshot: {
           issueId,
           taskId: issueId,
-          wakeReason: PAUSE_MISSED_WAKE_REASON,
+          wakeReason: interactionId ? "interaction_pending" : PAUSE_MISSED_WAKE_REASON,
           source: "agent.pause_lifted",
           missedWakeRequestId: missed.id,
-          ...(interactionId ? { interactionId } : {}),
+          ...(interactionId ? { interactionId, interactionKind } : {}),
         },
       });
       woken += 1;
