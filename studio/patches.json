@@ -1099,6 +1099,31 @@
       "retireWhen": "Pinned upstream logs the refusing rule of an INVOCATION_SCOPE_DENIED host call, or the router's residual refusals are explained and gone.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0041",
+      "title": "A wake held behind a stopped execution owner is re-admitted once no execution blocker remains",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, studio.14, 14 Nov 2026, TR-702. At 04:09:25 the CTO's legacy run a6d718c3 was cancelled (issue_reassigned) when the CTO reassigned the task to * Dev Unity; its recovery action was cancelled at 04:09:27. At 04:09:28 * Dev Unity's issue_assigned wake was deferred (deferred_issue_execution, executionWait execution_recovery with recoveryActionId null): getConversationOwnershipBlocker still saw the cut run's process alive (execution_owner_active). Once that process was gone and no lease remained, nothing released the wake: the deferred-wake sweep follows the task's latest run, the CTO's cut run, and decidePreDrain returns released without promoting any wake for a cancelled legacy run that needs reconciliation or acknowledged a reassignment stop. The wake waited until a Board comment at 04:25:20 started a new run.",
+      "reason": "Requested by Amyne (14 Nov 2026, V290): fix the known server blockers and deploy them as soon as they are tested.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server heartbeat queue",
+      "paths": [
+        "server/src/services/heartbeat/queue.ts",
+        "server/src/__tests__/ownership-hold-readmission.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found that re-admits a wake deferred by the execution-owner (ownership) hold once the owner stopped.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. ownership-hold-readmission.test.ts (5 cases: the new assignee starts once the previous owner's process is gone; same once its lease is gone; a held wake re-admitted on a task whose dependencies are unresolved is refused by ordinary admission and no run starts; a wake held for another reason is untouched; plus the setup case) with addressee-wake-recovery-hold, heartbeat-held-comment-wake and pause-missed-wakes: 47 passed. Negative control with the studio.14 queue.ts: the two release cases fail (the wake stays deferred) and the dependency case fails on the absent re-admission.",
+      "migration": "None. Applies at each deferred-wake sweep to wakes deferred with executionWait execution_recovery and recoveryActionId null, on a task with no live run and no execution blocker.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream releases or re-admits a wake deferred by the execution-owner hold once the owner stopped, confirmed by the same cases.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
