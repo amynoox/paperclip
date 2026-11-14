@@ -1138,9 +1138,10 @@ export function recoveryService(
       .reduce((latest, at) => (at > latest ? at : latest));
   }
 
-  // Creation time of the oldest run in the latest consecutive series of this
-  // agent's runs on the issue that all failed under an adapter-declared wait
-  // code; null when the agent's latest run is not such a wait.
+  // End time (creation time if unfinished) of the oldest run in the latest
+  // consecutive series of this agent's runs on the issue that all failed under
+  // an adapter-declared wait code; null when the agent's latest run is not
+  // such a wait.
   async function readAdapterDeclaredWaitStart(
     companyId: string,
     issueId: string,
@@ -1162,7 +1163,7 @@ export function recoveryService(
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
       .limit(1);
     const [first] = await db
-      .select({ createdAt: heartbeatRuns.createdAt })
+      .select({ createdAt: heartbeatRuns.createdAt, finishedAt: heartbeatRuns.finishedAt })
       .from(heartbeatRuns)
       .where(and(
         agentIssueRuns,
@@ -1171,7 +1172,11 @@ export function recoveryService(
       ))
       .orderBy(asc(heartbeatRuns.createdAt), asc(heartbeatRuns.id))
       .limit(1);
-    return first?.createdAt ?? null;
+    // STUDIO-0045: the wait begins when the first waiting run ENDED. Counted
+    // from its creation, a long run cut late kept little of its bound
+    // (production TR-834, 14 Nov 2026: created 12:03:16, cut 12:40:24, the
+    // 1 h bound of an unproven stop ran out at 13:03:16).
+    return first ? (first.finishedAt ?? first.createdAt) : null;
   }
 
   async function hasActiveExecutionPath(

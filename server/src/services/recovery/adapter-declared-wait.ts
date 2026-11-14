@@ -23,9 +23,9 @@ export const ADAPTER_DECLARED_WAIT_ERROR_CODES: readonly string[] = Object.freez
   "router_previous_dispatch_unsettled",
 ]);
 
-// Bound on such a wait, counted from the oldest run of the latest consecutive
-// series of the assignee's runs on the issue that all failed under a code
-// above (or from the Board's latest return of the issue, if later), and chosen
+// Bound on such a wait, counted from the END of the oldest run of the latest
+// consecutive series of the assignee's runs on the issue that all failed under
+// a code above (or from the Board's latest return of the issue, if later), and chosen
 // by the code of the latest run. Past it, normal stranded-work recovery
 // applies again.
 // Machine wait, 12 h: a machine wait depends on how long another task's reservation lasts,

@@ -89,7 +89,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     if (home) await rm(home, { recursive: true, force: true });
   });
 
-  type PriorRun = { minutesAgo: number; errorCode: string | null; status?: string; retry?: boolean };
+  type PriorRun = { minutesAgo: number; errorCode: string | null; status?: string; retry?: boolean; durationMinutes?: number };
 
   async function seed(status: "todo" | "in_progress", prior: PriorRun[]) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
@@ -106,8 +106,8 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
         status: run.status ?? "failed",
         errorCode: run.errorCode,
         error: run.errorCode === WAIT ? "Waiting for a worker machine" : run.errorCode ? "run failed before issue advanced" : null,
-        createdAt, startedAt: createdAt, updatedAt: new Date(createdAt.getTime() + 7 * 60_000),
-        finishedAt: new Date(createdAt.getTime() + 7 * 60_000),
+        createdAt, startedAt: createdAt, updatedAt: new Date(createdAt.getTime() + (run.durationMinutes ?? 7) * 60_000),
+        finishedAt: new Date(createdAt.getTime() + (run.durationMinutes ?? 7) * 60_000),
         resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
         contextSnapshot: {
           issueId, taskId: issueId,
@@ -186,7 +186,8 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       expect(await commentsOf(f.issueId)).toHaveLength(0);
       expect(await actionsOf(f.issueId)).toHaveLength(0);
     }
-    const cutStart = (await runsOf(cut)).find(run => run.id === cut.runIds[0])!.createdAt.getTime();
+    // STUDIO-0045: the bound runs from the END of the first waiting run.
+    const cutStart = (await runsOf(cut)).find(run => run.id === cut.runIds[0])!.finishedAt!.getTime();
     expect(deadlines).toContain(cutStart + ADAPTER_DECLARED_STOP_WAIT_MAX_MS);
 
     const host = buildHostServices(db, "worker-router-test", "worker-router-test", {
@@ -207,13 +208,13 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   // alive, no trace from an older launcher): it opens its own incident ticket
   // at 10 minutes, and past 1 h normal escalation takes over.
   it("applies normal escalation once an unproven stop has outlasted 1 h, and keeps 12 h when the latest run waits for a machine", async () => {
-    const spent = await seed("todo", [{ minutesAgo: 65, errorCode: STOP }, { minutesAgo: 10, errorCode: UNSETTLED, retry: true }]);
+    const spent = await seed("todo", [{ minutesAgo: 72, errorCode: STOP }, { minutesAgo: 10, errorCode: UNSETTLED, retry: true }]);
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: spent.companyId });
     expect((await issueOf(spent.issueId)).status).toBe("blocked");
     expect((await actionsOf(spent.issueId))[0]).toMatchObject({ kind: "stranded_assigned_issue", status: "active" });
 
     // Once settled, the next run waits for a machine: the latest code decides, 12 h.
-    const machine = await seed("todo", [{ minutesAgo: 65, errorCode: STOP }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
+    const machine = await seed("todo", [{ minutesAgo: 72, errorCode: STOP }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: machine.companyId });
     expect((await issueOf(machine.issueId)).status).toBe("todo");
     expect(await actionsOf(machine.issueId)).toHaveLength(0);
@@ -246,7 +247,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       expect(await actionsOf(f.issueId)).toHaveLength(0);
     }
     // The sweep re-checks at the bound, counted from the first waiting run of the series.
-    const seriesStart = (await runsOf(series)).find(run => run.id === series.runIds[2])!.createdAt.getTime();
+    const seriesStart = (await runsOf(series)).find(run => run.id === series.runIds[2])!.finishedAt!.getTime();
     expect(deadlines).toContain(seriesStart + ADAPTER_DECLARED_WAIT_MAX_MS);
   }, 180_000);
 
@@ -277,7 +278,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   it("applies normal escalation once the wait has outlasted the bound", async () => {
     const bound = ADAPTER_DECLARED_WAIT_MAX_MS / 60_000;
     // Retry spent, wait older than the bound: blocked as before.
-    const spent = await seed("todo", [{ minutesAgo: bound + 5, errorCode: WAIT }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
+    const spent = await seed("todo", [{ minutesAgo: bound + 12, errorCode: WAIT }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: spent.companyId });
     expect((await issueOf(spent.issueId)).status).toBe("blocked");
     const [action] = await actionsOf(spent.issueId);
@@ -285,7 +286,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     expect((await commentsOf(spent.issueId))[0]?.body).toContain("no live execution path");
 
     // No retry yet, wait older than the bound: one recovery run as before.
-    const first = await seed("todo", [{ minutesAgo: bound + 1, errorCode: WAIT }]);
+    const first = await seed("todo", [{ minutesAgo: bound + 8, errorCode: WAIT }]);
     const result = await heartbeat.reconcileStrandedAssignedIssues({ companyId: first.companyId });
     expect(result.dispatchRequeued).toBe(1);
     expect((await runsOf(first)).find(run => !first.runIds.includes(run.id))).toMatchObject({ retryOfRunId: first.runIds[0] });
@@ -410,5 +411,20 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     const result = await heartbeat.reconcileStrandedAssignedIssues({ companyId: unreturned.companyId });
     expect(result.dispatchRequeued + result.escalated).toBe(1);
     await heartbeat.drainActiveRunExecutions();
+  }, 180_000);
+
+  // STUDIO-0045, production TR-834 (14 Nov 2026): run ae12db9b created 12:03:16
+  // and cut 12:40:24; counted from its creation, the 1 h bound of an unproven
+  // stop ran out 23 min after the cut. The bound now runs from the cut.
+  it("counts the bound from the end of a long run cut late", async () => {
+    const f = await seed("in_progress", [{ minutesAgo: 70, durationMinutes: 50, errorCode: STOP }]);
+    const deadlines: number[] = [];
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, onDeferredDeadline: at => deadlines.push(at) });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await issueOf(f.issueId)).status).toBe("in_progress");
+    expect((await runsOf(f)).map(run => run.id)).toEqual(f.runIds);
+    expect(await actionsOf(f.issueId)).toHaveLength(0);
+    const cut = (await runsOf(f))[0]!.finishedAt!.getTime();
+    expect(deadlines).toContain(cut + ADAPTER_DECLARED_STOP_WAIT_MAX_MS);
   }, 180_000);
 });
