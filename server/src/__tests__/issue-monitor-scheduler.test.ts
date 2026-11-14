@@ -20,6 +20,7 @@ import {
   issueRelations,
   issueRecoveryActions,
   issueDocuments,
+  issueThreadInteractions,
   issues,
   workspaceRuntimeServices,
 } from "@paperclipai/db";
@@ -123,6 +124,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     await waitForHeartbeatSideEffectsSettled();
     await db.delete(heartbeatRunEvents);
     await db.delete(issueRecoveryActions);
+    await db.delete(issueThreadInteractions);
     await db.delete(issueComments);
     await db.delete(documentRevisions);
     await db.delete(issueDocuments);
@@ -752,6 +754,124 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       assigneeAdapterOverrides: null,
     });
     expect(["todo", "in_progress"]).toContain(recoveryIssue?.status);
+  });
+
+  // STUDIO-0049, production 14 Nov 2026 (TR-915): the last allowed check ran,
+  // no further check can be scheduled, and the monitor ended without any
+  // comment, activity or wake, whatever its recovery policy.
+  async function seedExhaustedWithoutNextCheck(input: { recoveryPolicy: string; timeoutOnly?: boolean }) {
+    const fixture = await seedFixture({
+      monitorAttemptCount: 3,
+      monitor: { maxAttempts: 3, recoveryPolicy: input.recoveryPolicy, serviceName: "TeamCity Debug",
+        ...(input.timeoutOnly ? { maxAttempts: undefined, timeoutAt: "2026-04-11T12:20:00.000Z" } : {}) },
+    });
+    const [issue] = await db.select().from(issues).where(eq(issues.id, fixture.issueId));
+    const state = parseIssueExecutionState(issue!.executionState)!;
+    const triggeredAt = new Date("2026-04-11T12:10:00.000Z");
+    const { monitor: _monitor, ...policyWithoutMonitor } = issue!.executionPolicy as Record<string, unknown>;
+    await db.update(issues).set({
+      executionPolicy: policyWithoutMonitor,
+      executionState: { ...state, monitor: { ...state.monitor!, status: "triggered", nextCheckAt: null,
+        lastTriggeredAt: triggeredAt.toISOString(), attemptCount: input.timeoutOnly ? 1 : 3,
+        maxAttempts: input.timeoutOnly ? null : 3 } },
+      monitorNextCheckAt: null, monitorWakeRequestedAt: null, monitorLastTriggeredAt: triggeredAt,
+      monitorAttemptCount: input.timeoutOnly ? 1 : 3,
+    }).where(eq(issues.id, fixture.issueId));
+    return { ...fixture, triggeredAt };
+  }
+
+  const recoveryWakes = (agentId: string) => db.select().from(agentWakeupRequests)
+    .where(eq(agentWakeupRequests.agentId, agentId)).then(rows => rows.filter(row => row.reason === "issue_monitor_recovery"));
+
+  it.each(["escalate_to_board", "wake_owner"] as const)(
+    "settles a monitor whose last allowed check ran without a next check once (%s): comment, activity and one owner wake", async (recoveryPolicy) => {
+      const { issueId, agentId } = await seedExhaustedWithoutNextCheck({ recoveryPolicy });
+      const heartbeat = heartbeatService(db);
+      const tickAt = new Date("2026-04-11T12:31:00.000Z");
+      const result = await heartbeat.tickIssueMonitors(tickAt);
+      expect(result).toMatchObject({ exhausted: 1 });
+
+      const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then(rows => rows[0]!);
+      expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({ status: "cleared", clearReason: "max_attempts_exhausted" });
+      const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.body).toContain("its last allowed check ran (3/3)");
+      expect(comments[0]!.body).toContain("There is no Paperclip support to contact");
+      const wakes = await recoveryWakes(agentId);
+      expect(wakes).toHaveLength(1);
+      expect(wakes[0]!.payload).toMatchObject({ issueId, clearReason: "max_attempts_exhausted", maxAttempts: 3,
+        monitorExhaustedWithoutNextCheck: true });
+      const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId)).then(rows => rows.map(row => row.action));
+      expect(activity).toContain("issue.monitor_exhausted");
+      expect(activity).toContain("issue.monitor_recovery_wake_queued");
+      expect(activity.includes("issue.monitor_escalated_to_board")).toBe(recoveryPolicy === "escalate_to_board");
+
+      // Once per exhausted monitor: the role re-arms nothing, no second wake.
+      await heartbeat.drainActiveRunExecutions();
+      for (const run of await db.select().from(heartbeatRuns).where(sql`${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')`)) {
+        await heartbeat.cancelRun(run.id, "fixture", { suppressImmediateRecovery: true });
+      }
+      expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:40:00.000Z"))).toMatchObject({ exhausted: 0 });
+      expect(await recoveryWakes(agentId)).toHaveLength(1);
+      expect((await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(row => row.body.includes("Paperclip ended the external-service monitor"))).toHaveLength(1);
+    });
+
+  it("settles a timed-out monitor without a next check", async () => {
+    const { issueId, agentId } = await seedExhaustedWithoutNextCheck({ recoveryPolicy: "escalate_to_board", timeoutOnly: true });
+    expect(await heartbeatService(db).tickIssueMonitors(new Date("2026-04-11T12:31:00.000Z"))).toMatchObject({ exhausted: 1 });
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then(rows => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({ status: "cleared", clearReason: "timeout_exceeded" });
+    expect(await recoveryWakes(agentId)).toHaveLength(1);
+  });
+
+  it.each(["live run", "pending question"] as const)("leaves an exhausted monitor alone while the task has a %s, then settles it", async (blocker) => {
+    const { issueId, agentId, companyId } = await seedExhaustedWithoutNextCheck({ recoveryPolicy: "escalate_to_board" });
+    const heartbeat = heartbeatService(db);
+    if (blocker === "live run") {
+      await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "automation", status: "scheduled_retry",
+        scheduledRetryAt: new Date(Date.now() + 3_600_000), contextSnapshot: { issueId } });
+    } else {
+      await db.insert(issueThreadInteractions).values({ companyId, issueId, kind: "request_confirmation", status: "pending",
+        continuationPolicy: "wake_assignee", payload: { version: 1, prompt: "Extend the wait?" } } as never);
+    }
+    expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:31:00.000Z"))).toMatchObject({ exhausted: 0 });
+    expect(await recoveryWakes(agentId)).toHaveLength(0);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).toHaveLength(0);
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then(rows => rows[0]!);
+    expect(parseIssueExecutionState(issue.executionState)?.monitor).toMatchObject({ status: "triggered" });
+    if (blocker === "live run") await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.companyId, companyId));
+    else await db.update(issueThreadInteractions).set({ status: "answered" } as never).where(eq(issueThreadInteractions.issueId, issueId));
+    expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:32:00.000Z"))).toMatchObject({ exhausted: 1 });
+    expect(await recoveryWakes(agentId)).toHaveLength(1);
+  });
+
+  it("reaches the catch-up from a real final check: the third trigger leaves no next check, then the owner is woken once", async () => {
+    const { issueId, agentId } = await seedFixture({ monitorAttemptCount: 2,
+      monitor: { maxAttempts: 3, recoveryPolicy: "escalate_to_board", serviceName: "TeamCity Debug" } });
+    const heartbeat = heartbeatService(db);
+    expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:31:00.000Z"))).toMatchObject({ triggered: 1, exhausted: 0 });
+    const triggered = await db.select().from(issues).where(eq(issues.id, issueId)).then(rows => rows[0]!);
+    expect(triggered.monitorNextCheckAt).toBeNull();
+    expect(parseIssueExecutionState(triggered.executionState)?.monitor).toMatchObject({ status: "triggered", attemptCount: 3 });
+    // The no-op process fixture leaves no task disposition; settle its run like teardown does.
+    await heartbeat.drainActiveRunExecutions();
+    for (const run of await db.select().from(heartbeatRuns).where(sql`${heartbeatRuns.status} in ('queued', 'running', 'scheduled_retry')`)) {
+      await heartbeat.cancelRun(run.id, "fixture", { suppressImmediateRecovery: true });
+    }
+    await heartbeat.drainActiveRunExecutions();
+    // Without a disposition the fixture run leaves the task blocked; the real
+    // check run of TR-915 ended with the task still in progress.
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, issueId));
+    const settledRun = await db.select().from(issues).where(eq(issues.id, issueId)).then(rows => rows[0]!);
+    expect({ status: settledRun.status, assignee: settledRun.assigneeAgentId, next: settledRun.monitorNextCheckAt,
+      policyMonitor: (settledRun.executionPolicy as Record<string, unknown> | null)?.monitor ?? null,
+      monitor: parseIssueExecutionState(settledRun.executionState)?.monitor, count: settledRun.monitorAttemptCount })
+      .toMatchObject({ status: "in_progress", assignee: agentId, next: null, policyMonitor: null, count: 3,
+        monitor: { status: "triggered", maxAttempts: 3 } });
+    expect(await heartbeat.nextIssueMonitorAt()).not.toBeNull();
+    expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:45:00.000Z"))).toMatchObject({ exhausted: 1 });
+    expect(await recoveryWakes(agentId)).toHaveLength(1);
   });
 
   it("omits external monitor refs from wake payloads and activity details", async () => {
