@@ -27,7 +27,9 @@ export const LEGACY_DISPOSITION_REPAIR_INSTRUCTION =
   "The previous task run ended without a recorded disposition or an owned next execution path. " +
   "Re-read the current task state. Use Paperclip tools/API to record completion, a real blocker, " +
   "a question or approval request, or a supported next execution path. " +
-  "A final message alone does not record disposition. Respect Stop, pause, budget and approval gates.";
+  "A final message alone does not record disposition. Respect Stop, pause, budget and approval gates. " +
+  // STUDIO-0044: the owner stays responsible for the work.
+  "You remain the owner of this task: if new comments or instructions arrived, do that work first, then record the disposition.";
 
 function record(value: unknown): Record<string, unknown> {
   return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : {};
