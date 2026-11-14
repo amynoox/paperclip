@@ -287,6 +287,34 @@ describeEmbeddedPostgres("heartbeat run privacy routes", { concurrent: false }, 
     } finally { capture.flush(); await observed.$client.end(); }
   });
 
+  it("returns compact usage in run lists and the whole usage on request or by run id", async () => {
+    const f = await seedFixture();
+    const displayed = { inputTokens: 900, outputTokens: 40, cachedInputTokens: 300, provider: "example-provider", model: "example-model", costUsd: 0.02 };
+    const usage = {
+      ...displayed,
+      accountingReceiptSourceFences: Array.from({ length: 30 }, (_, index) => ({ sourceId: randomUUID(), sequence: index })),
+      usageByModel: { "example-model": { inputTokens: 900, outputTokens: 40 } },
+      budgetDispatch: { reservationId: randomUUID(), state: "settled" },
+    };
+    await db.update(heartbeatRuns).set({ usageJson: usage }).where(eq(heartbeatRuns.id, f.maintenanceRunId));
+    const app = createApp(f.companyId, f.otherAgentId);
+    const listPath = `/api/companies/${f.companyId}/heartbeat-runs`;
+
+    const compact = await request(app).get(listPath).expect(200);
+    const full = await request(app).get(`${listPath}?fullUsage=true`).expect(200);
+    const single = await request(app).get(`/api/heartbeat-runs/${f.maintenanceRunId}`).expect(200);
+
+    const compactRow = compact.body.find((run: { id: string }) => run.id === f.maintenanceRunId);
+    const fullRow = full.body.find((run: { id: string }) => run.id === f.maintenanceRunId);
+    expect(compactRow.usageJson).toEqual(displayed);
+    expect(compactRow.resultJson).toMatchObject({ summary: "Maintenance complete" });
+    expect(fullRow.usageJson).toEqual(usage);
+    expect(single.body.usageJson).toEqual(usage);
+    expect(JSON.stringify(compact.body).length).toBeLessThan(JSON.stringify(full.body).length - 2_000);
+    const privateStub = compact.body.find((run: { id: string }) => run.id === f.privateRunId);
+    expect(privateStub).toMatchObject({ redacted: true, usageJson: { inputTokens: 11, cachedInputTokens: 2, outputTokens: 7 } });
+  });
+
   it.each(["local_file", "s3_segments"])("returns 404 for private %s run content and metadata-only list stubs", async (logStore) => {
     const fixture = await seedFixture();
     await db.update(heartbeatRuns).set({ logStore }).where(eq(heartbeatRuns.id, fixture.privateRunId));

@@ -923,6 +923,13 @@ export interface PluginWorkerManager {
  *
  * @internal Exported for testing; consumers should use `createPluginWorkerManager`.
  */
+/** Why a worker→host call was refused for its invocation scope (log only). */
+type ScopeRefusal = {
+  reason: "unknown_invocation_id" | "company_outside_job_scope" | "no_invocation_id_during_agent_invocation" | "no_invocation_id_during_invocation";
+  activeInvocations: number;
+  agentInvocations: number;
+};
+
 export function createPluginWorkerHandle(
   pluginId: string,
   options: WorkerStartOptions,
@@ -2931,6 +2938,21 @@ export function createPluginWorkerHandle(
   }
 
   /**
+   * Studio (STUDIO-0034): which rule of contextForWorkerMessage refused a
+   * worker→host call, for the log only. The refusal itself is unchanged. Labels
+   * and counts only: no id, company or parameter value is copied.
+   */
+  function describeScopeRefusal(message: JsonRpcRequest | JsonRpcNotification): ScopeRefusal {
+    const entries = Array.from(activeInvocations.values());
+    const counts = { activeInvocations: entries.length, agentInvocations: entries.filter(entry => entry.scope.agentOrigin).length };
+    const invocationId = readNonEmptyString((message as { paperclipInvocationId?: unknown }).paperclipInvocationId);
+    if (invocationId) {
+      return { reason: activeInvocations.has(invocationId) ? "company_outside_job_scope" : "unknown_invocation_id", ...counts };
+    }
+    return { reason: counts.agentInvocations > 0 ? "no_invocation_id_during_agent_invocation" : "no_invocation_id_during_invocation", ...counts };
+  }
+
+  /**
    * Handle a JSON-RPC request from the worker (worker→host call).
    */
   async function handleWorkerRequest(request: JsonRpcRequest): Promise<void> {
@@ -2990,6 +3012,7 @@ export function createPluginWorkerHandle(
       const context = contextForWorkerMessage(request);
       if (context.invalidInvocationScope) throw Object.assign(new Error("Missing or unknown invocation scope"), {
         code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED,
+        scopeRefusal: describeScopeRefusal(request),
       });
       const source = context.invocationScope?.agentOrigin;
       const origin = source && context.invocationScope ? { ...source, companyId: context.invocationScope.companyId } : undefined;
@@ -3001,7 +3024,8 @@ export function createPluginWorkerHandle(
       });
     } catch (err) {
       const errorMessage = err instanceof Error ? err.message : String(err);
-      log.error({ method, err: errorMessage }, "host handler error");
+      const scopeRefusal = (err as { scopeRefusal?: ScopeRefusal } | null)?.scopeRefusal;
+      log.error({ method, err: errorMessage, ...(scopeRefusal ? { scopeRefusal } : {}) }, "host handler error");
       try {
         sendMessage(
           createErrorResponse(

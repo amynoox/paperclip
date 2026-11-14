@@ -48,6 +48,7 @@ import {
 import { buildPaperclipRuntimeMcpServers } from "../services/heartbeat.js";
 import { resolveNativeRuntimeMcpSnapshot } from "../services/native-runtime/runtime-context.js";
 import type { PluginToolDispatcher } from "../services/plugin-tool-dispatcher.js";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES } from "@paperclipai/plugin-sdk";
 import { createAssignedMcpTools } from "../services/native-runtime/assigned-mcp-tools.js";
 import { mcpGatewayProtocolRoutes, toolGatewayRoutes } from "../routes/tool-gateway.js";
 import { toolAccessService } from "../services/tool-access.js";
@@ -6676,6 +6677,47 @@ rl.on("line", (line) => {
       content: [{ type: "text", text: "ignored on failure" }],
       isError: true,
     });
+  });
+
+  it("STUDIO-0033: returns a plugin tool that throws as an MCP tool error, and keeps worker outages as failures", async () => {
+    const company = await createCompany(db);
+    const agent = await createAgent(db, company.id);
+    const { run } = await createIssueAndRun(db, company.id, agent.id);
+    const refusal = "ticket must be the Paperclip issue id (a UUID); received \"TR-702\".";
+    const failures: Record<string, JsonRpcCallError> = {
+      "demo-plugin:throwing": new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.WORKER_ERROR, message: refusal }),
+      "demo-plugin:scope_denied": new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.INVOCATION_SCOPE_DENIED, message: "Missing or unknown invocation scope" }),
+      "demo-plugin:worker_down": new JsonRpcCallError({ code: PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE, message: "Worker process exited" }),
+    };
+    const dispatcher = createPluginToolDispatcher(Object.fromEntries(Object.keys(failures).map(name => [name, {}])));
+    dispatcher.executeTool = async (tool) => { throw failures[tool]!; };
+    const gateway = createTestToolGatewayService(db, { pluginToolDispatcher: dispatcher });
+    const profile = await allowToolsForAgent(db, company.id, agent.id, Object.keys(failures));
+    const session = await gateway.createSession({ companyId: company.id, agentId: agent.id, runId: run.id });
+    const created = await gateway.createNamedGateway({
+      companyId: company.id,
+      body: { name: "Plugin failure surface", profileId: profile.id },
+    });
+    const app = createGatewayRouteApp(db, gateway);
+    const call = (id: number, name: string) => request(app)
+      .post(`/mcp/gateways/${created.gatewayPublicId}`)
+      .set("authorization", `Bearer ${session.token}`)
+      .send({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: {} } });
+
+    const throwing = await call(1, "demo-plugin:throwing").expect(200);
+    expect(throwing.body).toEqual({ jsonrpc: "2.0", id: 1, result: { content: [{ type: "text", text: refusal }], isError: true } });
+    const scopeDenied = await call(2, "demo-plugin:scope_denied").expect(200);
+    expect(scopeDenied.body.result).toEqual({ content: [{ type: "text", text: "Missing or unknown invocation scope" }], isError: true });
+    const workerDown = await call(3, "demo-plugin:worker_down");
+    expect(workerDown.status).toBe(500);
+    expect(workerDown.body).not.toHaveProperty("result");
+
+    const invocations = await db.select().from(toolInvocations).where(eq(toolInvocations.companyId, company.id));
+    expect(invocations.map(row => [row.toolName, row.status, row.errorCode]).sort()).toEqual([
+      ["demo-plugin:scope_denied", "failed", "tool_error"],
+      ["demo-plugin:throwing", "failed", "tool_error"],
+      ["demo-plugin:worker_down", "failed", "tool_execution_failed"],
+    ]);
   });
 
   describe.each([undefined, "on_demand"] as const)("assigned plugin tools for the native Runner (%s)", (delivery) => {

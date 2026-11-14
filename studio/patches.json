@@ -771,32 +771,6 @@
       "commits": []
     },
     {
-      "id": "STUDIO-0028",
-      "title": "Wakes lost to an agent pause reach the agent once when it is ready again",
-      "status": "implemented-locally-validated-not-deployed",
-      "problem": "While an agent is paused, only a person's comment is saved as a deferred message and replayed when the pause lifts (queue.ts canSaveDeferredMessage, pause-lift replay limited to requestedByActorType user). Every other wake for the paused agent (another agent's comment, a resolved dependency, an automatic signal) is recorded as skipped with reason agent.not_invokable and never replayed. Production, 13 Nov 2026: during the 19:20-20:08 pause the Quality Manager received three wakes on TR-29 (19:19:25, 19:19:29, 19:19:47, all skipped) and only resumed after an operator note at 20:11:13. Second case, 14 Nov 2026: a wake already waiting when the pause started is cancelled by the pause stop ('Agent lifecycle stop requested', run-control.ts cancelPendingWakeupsForAgentsInternal) and never replayed. At 00:28:23 the Game Tester addressed a question card on TR-699 (its own task) to the Quality Manager; the Quality Manager's wake was deferred behind the tester's run, cancelled at 00:28:51 by the pause, and the card was still pending after the resume of 00:41. Correction found after the first merge (14 Nov 2026): the replayed card wake carried wakeReason issue_wakes_missed_during_pause, so dispatch, which lets an addressee run on a task it does not own only for a verified interaction_pending wake naming a pending card addressed to it (run-dispatch verifyAddresseeInteractionWake), skipped it as 'issue assignee changed'. The card wake is now replayed in the shape of the original wake (mutation interaction, wakeReason interaction_pending, card id and kind).",
-      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers.",
-      "observedOnUpstream": "2026.1110.0",
-      "owner": "server agent lifecycle and heartbeat wakes",
-      "paths": [
-        "server/src/__tests__/pause-missed-wakes.test.ts",
-        "server/src/services/agent-lifecycle-driver.ts",
-        "server/src/services/pause-missed-wakes.ts"
-      ],
-      "upstreamSearch": {
-        "date": "2026-11-13",
-        "repository": "paperclipai/paperclip",
-        "details": "No upstream change found for replaying non-human wakes refused during an agent pause (searches: wake paused agent replay, skipped wake agent paused resume, pause lifted replay wakes agent).",
-        "selected": null
-      },
-      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. pause-missed-wakes.test.ts (10 cases: a real system wake refused by the pause is recorded skipped; one replay per task; exactly one replayed wake through the real queue across repeated resumes; replay from the lifecycle driver; the addressee of a pending card whose deferred wake the real pause stop cancelled is woken, with the card id; no wake once the card is answered; no wake when a wake for the task is still live; a queued wake of the agent's own task cancelled by the real pause stop is replayed, one cancelled by an operator is not; no replay for a finished task, a reassigned task, or a task already run after the loss) and heartbeat-held-comment-wake.test.ts: 36 passed, including the replayed card wake delivered through the real queue to the addressee of another agent's task. Negative controls: the base agent-lifecycle-driver.ts fails the driver case; the first version of pause-missed-wakes.ts fails the two pause-stop cases. Negative control for the correction: with the merged pause-missed-wakes.ts (studio/2026.1110.0 860d3d7c), the real-queue card case fails: the replayed wake is skipped with 'issue assignee changed'.",
-      "migration": "None. At each agent resume, looks back 24 hours of wakes skipped as agent.not_invokable or cancelled by a pause stop before any run. Limit: a wake that was never requested (no row) is not replayed; for example TR-710 on 14 Nov, whose recovery settled as blocked at 00:31:10, had no wake of the paused Game Tester to replay.",
-      "rollback": "Switch cli/current back to the previous install folder.",
-      "retireWhen": "Pinned upstream replays or keeps the wakes an agent pause refuses or cancels, confirmed by the same cases.",
-      "upgradeDecisions": [],
-      "commits": []
-    },
-    {
       "id": "STUDIO-0025",
       "title": "Short commands (ssh, git) start from a small helper process, not from the server process",
       "status": "implemented-locally-validated-not-deployed",
@@ -855,6 +829,32 @@
       "commits": []
     },
     {
+      "id": "STUDIO-0028",
+      "title": "Wakes lost to an agent pause reach the agent once when it is ready again",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "While an agent is paused, only a person's comment is saved as a deferred message and replayed when the pause lifts (queue.ts canSaveDeferredMessage, pause-lift replay limited to requestedByActorType user). Every other wake for the paused agent (another agent's comment, a resolved dependency, an automatic signal) is recorded as skipped with reason agent.not_invokable and never replayed. Production, 13 Nov 2026: during the 19:20-20:08 pause the Quality Manager received three wakes on TR-29 (19:19:25, 19:19:29, 19:19:47, all skipped) and only resumed after an operator note at 20:11:13. Second case, 14 Nov 2026: a wake already waiting when the pause started is cancelled by the pause stop ('Agent lifecycle stop requested', run-control.ts cancelPendingWakeupsForAgentsInternal) and never replayed. At 00:28:23 the Game Tester addressed a question card on TR-699 (its own task) to the Quality Manager; the Quality Manager's wake was deferred behind the tester's run, cancelled at 00:28:51 by the pause, and the card was still pending after the resume of 00:41. Correction found after the first merge (14 Nov 2026): the replayed card wake carried wakeReason issue_wakes_missed_during_pause, so dispatch, which lets an addressee run on a task it does not own only for a verified interaction_pending wake naming a pending card addressed to it (run-dispatch verifyAddresseeInteractionWake), skipped it as 'issue assignee changed'. The card wake is now replayed in the shape of the original wake (mutation interaction, wakeReason interaction_pending, card id and kind).",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server agent lifecycle and heartbeat wakes",
+      "paths": [
+        "server/src/__tests__/pause-missed-wakes.test.ts",
+        "server/src/services/agent-lifecycle-driver.ts",
+        "server/src/services/pause-missed-wakes.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found for replaying non-human wakes refused during an agent pause (searches: wake paused agent replay, skipped wake agent paused resume, pause lifted replay wakes agent).",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. pause-missed-wakes.test.ts (10 cases: a real system wake refused by the pause is recorded skipped; one replay per task; exactly one replayed wake through the real queue across repeated resumes; replay from the lifecycle driver; the addressee of a pending card whose deferred wake the real pause stop cancelled is woken, with the card id; no wake once the card is answered; no wake when a wake for the task is still live; a queued wake of the agent's own task cancelled by the real pause stop is replayed, one cancelled by an operator is not; no replay for a finished task, a reassigned task, or a task already run after the loss) and heartbeat-held-comment-wake.test.ts: 36 passed, including the replayed card wake delivered through the real queue to the addressee of another agent's task. Negative controls: the base agent-lifecycle-driver.ts fails the driver case; the first version of pause-missed-wakes.ts fails the two pause-stop cases. Negative control for the correction: with the merged pause-missed-wakes.ts (studio/2026.1110.0 860d3d7c), the real-queue card case fails: the replayed wake is skipped with 'issue assignee changed'.",
+      "migration": "None. At each agent resume, looks back 24 hours of wakes skipped as agent.not_invokable or cancelled by a pause stop before any run. Limit: a wake that was never requested (no row) is not replayed; for example TR-710 on 14 Nov, whose recovery settled as blocked at 00:31:10, had no wake of the paused Game Tester to replay.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream replays or keeps the wakes an agent pause refuses or cancels, confirmed by the same cases.",
+      "upgradeDecisions": [],
+      "commits": []
+    },
+    {
       "id": "STUDIO-0029",
       "title": "A cancelled blocker is handed back to the dependent's assignee, who may drop it and change the status in one update",
       "status": "implemented-locally-validated-not-deployed",
@@ -902,6 +902,33 @@
       "migration": "None.",
       "rollback": "Switch cli/current back to the previous install folder.",
       "retireWhen": "Pinned upstream answers close readiness for a directory without a .git marker without spawning git, confirmed by the same three cases, or the reaper stops re-inspecting plain directories.",
+      "upgradeDecisions": [],
+      "commits": []
+    },
+    {
+      "id": "STUDIO-0040",
+      "title": "A non-assignee responder's question wake passes the task's recovery hold",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "A recovery hold (a recovery action kept 'without replay', for example legacy_execution_requires_reconciliation with automaticRecovery.replay = blocked) holds every wake of its task: enqueue parks it as deferred_issue_execution with executionWait.reason = execution_recovery, the claim and dispatch gate cancels a queued run with execution_reconciliation_required, and a release keeps every deferred wake of a held task. The dependency gate and the claim already exempt a verified non-assignee responder (verifyNonAssigneeAddresseeInteractionWake: that responder answers the card and does not execute the task); the recovery hold did not. An 'Executor run interrupted' card is created exactly when a run is interrupted, so its responder could never be woken before the reconciliation its answer decides. Production, 14 Nov 2026, after studio.13: TR-702 (blocked, assigned to the Unity developer). The Board cancelled the developer's run around 01:40 UTC; its recovery action was resolved with replay = blocked. At 01:46:01 the Worker Router created card 3531672e addressed to the CTO. STUDIO-0026 recorded the CTO's interaction_pending wake, but it was parked as deferred_issue_execution behind that hold and never started; no run held the task (execution_run_id, checkout_run_id and execution_locked_at null).",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server heartbeat queue and run dispatch",
+      "paths": [
+        "server/src/__tests__/addressee-wake-recovery-hold.test.ts",
+        "server/src/modules/run-dispatch/adapters/postgres.ts",
+        "server/src/modules/run-dispatch/index.ts",
+        "server/src/services/heartbeat/queue.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "gh search prs --repo paperclipai/paperclip with: addressee recovery hold, interaction_pending execution recovery, non-assignee responder reconciliation, deferred_issue_execution addressee, execution blocker interaction wake, question responder blocked, reconciliation hold wake: no result. addressee wake: #17643, #16914, #18907, #14378 (open) and #13211 (closed) cover ownership, staleness and prompt checks for a non-assignee addressee, none the recovery hold.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. addressee-wake-recovery-hold.test.ts (new, 6 cases: plugin card, route card, already queued responder turn, wake already parked behind the hold, assignee still held, answered card still held): 6 passed. 31 neighbouring files (recovery hold, question wakes, run dispatch, wake queue, queued comments, task retry): 1589 passed, 12 failed, all in heartbeat-stale-queue-invalidation.test.ts; the same 12 fail on the base studio.13 tree in this environment (85 of 97 passed on both). Negative controls: with the base queue.ts, the plugin, route and parked cases fail (3 of 6); with queue.ts without the sweep re-admission, the parked case fails; with postgres.ts without the claim and dispatch exemption, 4 of 6 fail. tsc: no error in the changed files.",
+      "migration": "None. A question wake already parked behind a recovery hold is re-admitted by the deferred-wake sweep while its card is still pending and no run holds the task.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream lets a verified non-assignee responder's interaction_pending wake pass the execution recovery hold at enqueue, claim and dispatch, and re-admits one already parked behind it.",
       "upgradeDecisions": [],
       "commits": []
     },
@@ -962,6 +989,114 @@
       "migration": "None. Server code only; nothing to install on workers or in the router.",
       "rollback": "Switch cli/current back to the previous install folder.",
       "retireWhen": "Pinned upstream owns the prepared-process lifetime (STUDIO-0005, STUDIO-0011 retired) with an equivalent bounded stop of the callback bridge, or the router proves stop for every cancellation including an unreachable worker.",
+      "upgradeDecisions": [],
+      "commits": []
+    },
+    {
+      "id": "STUDIO-0031",
+      "title": "Heartbeat run lists return compact usage; the whole record stays on the single-run route",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "GET /api/companies/:companyId/heartbeat-runs returned each run's whole usageJson (accounting receipt fences, per-model usage, budget dispatch and exposure, pricing provenance). Production, 13 Nov 2026: 100 runs weighed 453 695 bytes in 2.8 s from the operator link, usageJson alone 239 812 bytes (53%); contextSnapshot and resultJson were already reduced by the list. The Board agent page polls this list without summary=true (default limit 200).",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server heartbeat run state, run list route",
+      "paths": [
+        "server/src/__tests__/heartbeat-list.test.ts",
+        "server/src/__tests__/heartbeat-run-privacy-routes.test.ts",
+        "server/src/routes/agents.ts",
+        "server/src/routes/openapi.ts",
+        "server/src/services/heartbeat/run-state.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "gh search prs for 'heartbeat-runs', 'heartbeat run list', 'usageJson', 'list runs summary', 'run history payload'. Found list bounding and paging work (#13802, #13962 closed; #15669, #16533 open) and column narrowing elsewhere (#20130, #9155 open), none reduces usageJson in the run list.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. 2 new cases: service list keeps only the displayed usage keys, fullUsage=true and getRun keep the whole record, summary still returns null; route list returns compact usage, ?fullUsage=true and GET /api/heartbeat-runs/:id return the whole record, redacted stubs unchanged. Negative control on the base run-state.ts: both new cases fail. heartbeat-list.test.ts, heartbeat-run-privacy-routes.test.ts and heartbeat/run-state.test.ts: 59 passed.",
+      "migration": "None. API: list rows keep usageJson keys inputTokens, input_tokens, outputTokens, output_tokens, cachedInputTokens, cached_input_tokens, cache_read_input_tokens, totalTokens, provider, model, billingType, accountingReceiptId, cacheAdjustedCostUsd, costUsdExact, costUsd, cost_usd, total_cost_usd; fullUsage=true restores the whole record.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream returns a reduced usage record in run lists, confirmed by the same two cases.",
+      "upgradeDecisions": [],
+      "commits": []
+    },
+    {
+      "id": "STUDIO-0032",
+      "title": "The project-tools MCP server lists its tools on npm installs: create_project's JSON Schema is built by the zod copy that built the schema",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "On the npm install, @paperclipai/server carries its own nested zod 4.4.3 (package-lock: node_modules/@paperclipai/server/node_modules/zod, inBundle) while @paperclipai/shared uses the hoisted zod 4.6.7. projectToolDefinitions() called the server's z.toJSONSchema() on the shared createProjectSchema; the 4.6.7 record processor pushes to ctx.deferred, which the 4.4.3 context lacks (TypeError: Cannot read properties of undefined (reading 'push'), json-schema-processors.js:640). Every tools/list (and server/discover) on POST /api/mcp/project-tools in standard and skill_test work mode answered 500: 3 354 errors on 13 Nov 2026 (3 328 tools/list, 26 server/discover), all with errorKind type_error and origin frame recordProcessor. Agents in those modes got none of the project and task tools (create_project, list_projects, create_task, set_task_title, get_task, read_task_document, respond_to_task_interaction...).",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server project-tools MCP route, shared project validators",
+      "paths": [
+        "packages/shared/src/index.ts",
+        "packages/shared/src/validators/index.ts",
+        "packages/shared/src/validators/project.ts",
+        "packages/shared/src/validators/project-tool-input.test.ts",
+        "server/src/services/project-tools.ts",
+        "server/src/__tests__/project-tools-pagination.test.ts",
+        "server/src/__tests__/project-tools-zod-copy.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "paperclipai/paperclip#18202 (open, fixes issue #18200, confirmed by other users on 2026.1106.0) is the same fix. Ported with one difference: the shared helper calls the schema's own toJSONSchema() method instead of the shared module's z.toJSONSchema(), so a test can emulate a foreign zod copy on the server's \"zod\" import. The code path is unchanged on upstream master 1140984b8.",
+        "selected": "paperclipai/paperclip#18202"
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL, server resolving the tree's own packages/shared. New project-tools-zod-copy.test.ts gives the server's zod import the foreign-copy behaviour on record fields: passes; negative control with the base project-tools.ts fails with the production error (TypeError: Cannot read properties of undefined (reading 'push')). project-tools-pagination.test.ts (with the upstream case), chat-project-tools.test.ts, task-title-routes.test.ts, assistant-connections-guidance.test.ts: 49 + 10 passed. Shared project-tool-input.test.ts: 2 passed, including equality with z.toJSONSchema() of the same schema (the advertised schema does not change). Standalone repro with the installed zod 4.4.3 and 4.6.7: 4.4.3 z.toJSONSchema() throws on a 4.6.7 record, the schema's own toJSONSchema() succeeds with identical output. tsc --noEmit on packages/shared: no error.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream contains paperclipai/paperclip#18202 or another change that converts shared schemas with their own zod copy, confirmed by project-tools-zod-copy.test.ts.",
+      "upgradeDecisions": [],
+      "commits": []
+    },
+    {
+      "id": "STUDIO-0033",
+      "title": "A plugin tool that throws is returned over the MCP gateway as a tool error with its message, not as an HTTP 500",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "When a plugin tool handler throws, the worker answers executeTool with a JSON-RPC error (WORKER_ERROR or the error's own code). executeTool in server/src/services/tool-gateway.ts recorded the invocation as failed (tool_execution_failed) and rethrew the raw JsonRpcCallError; the MCP route's sendGatewayError then answered HTTP 500 with a non JSON-RPC body {error}. Production, 13 Nov 2026: 62 `POST /mcp/gateways/gw_... 500` (gw_f5463e8c..., gw_22a720f9..., gw_99d27213...), every one a Worker Router tool refusing the call: resource_status (ticket must be the Paperclip issue id; Operation requires the current assigned ticket and live run; Unknown scoped reservation), designate_verifier (Existing qualified verifier required; End the attempt before designating its verifier), finish_task (Declare only resources verified on this reservation), registry_state, end_maintenance, maintenance_status. The agent got a transport error instead of the router's explanation, and each refusal was logged as a server error.",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server tool gateway, plugin tool dispatch",
+      "paths": [
+        "server/src/services/tool-gateway.ts",
+        "server/src/__tests__/tool-gateway.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change maps a throwing plugin tool to an MCP tool error. Related, not selected: paperclipai/paperclip#18257 and #17321 (open) make sendGatewayError log and conceal unknown errors behind a constant 500 (a plugin refusal would still be a 500, now without its message); #12775 (open) makes ToolGatewayHttpError extend HttpError; #10317 (open) unwraps the plugin tool envelope, already done in the fork; #20746 (open) raises the plugin tool default timeout.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. New tool-gateway.test.ts case: a plugin tool rejected with WORKER_ERROR and one with INVOCATION_SCOPE_DENIED answer HTTP 200 with an isError tool result carrying the plugin's message and record errorCode tool_error; a WORKER_UNAVAILABLE rejection stays HTTP 500 and tool_execution_failed. Negative control on the base tool-gateway.ts: fails (HTTP 500 instead of 200). tool-gateway.test.ts, tool-gateway-service.test.ts, heartbeat-runtime-plugin-mcp-servers.test.ts, prompt-injection-gateway.test.ts, native-runtime/assigned-mcp-tools.test.ts: 387 passed.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream returns a throwing plugin tool as an MCP isError result, confirmed by the same case.",
+      "upgradeDecisions": [],
+      "commits": []
+    },
+    {
+      "id": "STUDIO-0034",
+      "title": "A worker host call refused for its invocation scope is logged with the rule that refused it",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "The log of a refused worker→host call is only `host handler error {method}` with `err: \"Missing or unknown invocation scope\"`, which covers four rules of contextForWorkerMessage: an id the host no longer knows, a job scope naming an unconfigured company, no id while an agent-origin invocation is active, no id while another invocation is active. Production, 13 Nov 2026: 15 404 such refusals for the Worker Router (84fca1b9), down to a handful per hour after STUDIO-0017 (studio.10, 17:02 UTC): http.fetch at 17h, 20:36:37-42 and 23h, issues.summaries.getOrchestration at 20:36:51, config.get and db.query at 21h (db.query x3 at 21:24:50 during finish_task). Which rule refused them, and so what the router must change, cannot be read from the journal.",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server plugin worker manager, worker→host invocation scope",
+      "paths": [
+        "server/src/services/plugin-worker-manager.ts",
+        "server/src/__tests__/plugin-worker-manager.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change logs the refusing rule. Related, not selected: paperclipai/paperclip#8159 (open) keeps a settled invocation briefly so a nested call sent just before the response is not refused as unknown; #10580 (open) adds ctx.runtime.runProactively() to the SDK for long-lived callbacks that would otherwise echo an ended invocation id; issue #15765 (event scopes kept 15 minutes) is already covered in the fork by invocationSettled.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2. plugin-worker-manager.test.ts: new case drives the invocation-scope fixture worker through an agent tool call with a missing id, an unknown id, and a non-agent tool call naming an unconfigured company; the three log entries carry no_invocation_id_during_agent_invocation, unknown_invocation_id and no_invocation_id_during_invocation with the active counts. Negative control on the base plugin-worker-manager.ts: fails (no scopeRefusal field). Whole file: 98 passed.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream logs the refusing rule of an INVOCATION_SCOPE_DENIED host call, or the router's residual refusals are explained and gone.",
       "upgradeDecisions": [],
       "commits": []
     }

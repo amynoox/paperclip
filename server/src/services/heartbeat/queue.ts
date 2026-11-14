@@ -180,7 +180,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../execution-workspace-policy.js";
 import { readContinuationAttempt } from "../recovery/index.js";
-import { allowsDependencyBlockedWake, verifyAddresseeInteractionWake, verifyNonAssigneeAddresseeInteractionWake, requeueAdoptedCommentsForAssignee, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
+import { addresseeWakePassesRecoveryHold, allowsDependencyBlockedWake, verifyAddresseeInteractionWake, verifyNonAssigneeAddresseeInteractionWake, requeueAdoptedCommentsForAssignee, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
 import { withAgentStartLock } from "../agent-start-lock.js";
 import {
   evaluateAgentInvokability,
@@ -2371,6 +2371,40 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           continue;
         }
       }
+      // STUDIO-0040: a responder's question wake parked behind a recovery hold
+      // has no release left to promote it: a release keeps every wake of a held
+      // task. Re-admit it through ordinary admission, where the verified
+      // non-assignee answer passes the hold and the assignee stays held.
+      if (pendingAddresseeWake) {
+        const heldIssueId = String(wake.payload?.issueId);
+        const context = parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]);
+        const held = await getExecutionBlocker(db, wake.companyId, heldIssueId);
+        if (held && await addresseeWakePassesRecoveryHold(db, held, {
+          companyId: wake.companyId, issueId: heldIssueId, agentId: wake.agentId, contextSnapshot: context })) {
+          const { executionWait: _wait, [DEFERRED_WAKE_CONTEXT_KEY]: _context, ...payload } = parseObject(wake.payload);
+          try {
+            const run = await enqueueWakeup(wake.agentId, {
+              source: wake.source as WakeupOptions["source"], triggerDetail: wake.triggerDetail as WakeupOptions["triggerDetail"],
+              reason: wake.reason ?? undefined, payload, contextSnapshot: context,
+              requestedByActorType: wake.requestedByActorType as WakeupOptions["requestedByActorType"],
+              requestedByActorId: wake.requestedByActorId ?? undefined,
+              idempotencyKey: wake.idempotencyKey ?? undefined,
+            }, undefined, wake.payload?.interactionOrigin);
+            // The new admission owns this question; retire the parked copy.
+            const now = new Date();
+            await db.update(agentWakeupRequests).set(run
+              ? { status: "coalesced", runId: run.id, finishedAt: now, updatedAt: now }
+              : { status: "skipped", finishedAt: now, updatedAt: now,
+                  error: "Question re-admitted past the recovery hold; its new admission owns it" })
+              .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)));
+          } catch (err) {
+            scope.onError?.(err);
+            logger.warn({ err, requestId: wake.id }, "a question parked behind a recovery hold could not reach its responder");
+          }
+          continue;
+        }
+      }
       const [latest] = await db.select({
         id: heartbeatRuns.id,
         companyId: heartbeatRuns.companyId,
@@ -4098,10 +4132,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const verifiedConversationReset = Boolean(resetComment && isConversationReset(resetComment.body));
           if (wakeCommentId && opts.requestedByActorType === "user")
             await preserveTaskRemoteWorkspaceWriter(tx as unknown as Db, issue.companyId, issue.id);
-          const executionBlocker = await getExecutionBlocker(
+          const heldExecution = await getExecutionBlocker(
             tx as unknown as Db, issue.companyId, issue.id,
             { conversationResetCommentId: verifiedConversationReset ? wakeCommentId : null },
           );
+          // STUDIO-0040: a verified non-assignee responder answers its card and
+          // does not execute the task. The recovery hold keeps holding the
+          // assignee and every other wake; it does not hold back that answer.
+          const executionBlocker = heldExecution && !(await addresseeWakePassesRecoveryHold(tx as unknown as Db, heldExecution, {
+            companyId: issue.companyId, issueId: issue.id, agentId, contextSnapshot: enrichedContextSnapshot,
+          })) ? heldExecution : null;
           // Prove eligibility without retiring the hold. Later gates can still
           // decline this wake; hold retirement and successor creation stay atomic.
           // A bound chat request has already rechecked its current principal

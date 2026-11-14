@@ -7107,7 +7107,10 @@ export function agentRoutes(
       ? Math.max(1, Math.min(HEARTBEAT_RUN_LIST_MAX_LIMIT, parseInt(limitParam, 10) || HEARTBEAT_RUN_LIST_DEFAULT_LIMIT))
       : HEARTBEAT_RUN_LIST_DEFAULT_LIMIT;
     const summary = req.query.summary === "true" || req.query.summary === "1";
-    const recentRuns = await heartbeat.list(companyId, agentId, limit, { summary });
+    // List rows carry the usage fields the run lists read; `fullUsage` keeps the
+    // whole usage record for consumers that need it.
+    const fullUsage = req.query.fullUsage === "true" || req.query.fullUsage === "1";
+    const recentRuns = await heartbeat.list(companyId, agentId, limit, { summary, fullUsage });
     const runs = req.query.latestFailuresOnly === "true" ? latestFailedRunsByAgent(recentRuns) : recentRuns;
     const readDecisions = await getHeartbeatRunReadDecisions(db, access, req.actor, runs);
     res.json(await runRedactions.redactForRuns(companyId, runs.map((run, index) =>
