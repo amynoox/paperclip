@@ -2542,6 +2542,103 @@ describeEmbeddedPostgres("executionWorkspaceService.getCloseReadiness", () => {
     );
   });
 
+  // Record every git process the service spawns: a shim placed first on PATH
+  // logs its arguments, then runs the real git.
+  async function withGitSpawnLog<T>(run: () => Promise<T>): Promise<{ result: T; spawns: string[] }> {
+    const realGit = (await execFileAsync("sh", ["-c", "command -v git"])).stdout.trim();
+    const shimDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-git-shim-"));
+    tempDirs.add(shimDir);
+    const logFile = path.join(shimDir, "spawns.log");
+    await fs.writeFile(logFile, "", "utf8");
+    await fs.writeFile(
+      path.join(shimDir, "git"),
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${logFile}'\nexec '${realGit}' "$@"\n`,
+      { mode: 0o755 },
+    );
+    const previousPath = process.env.PATH;
+    process.env.PATH = `${shimDir}${path.delimiter}${previousPath ?? ""}`;
+    try {
+      const result = await run();
+      const spawns = (await fs.readFile(logFile, "utf8")).split("\n").filter(Boolean);
+      return { result, spawns };
+    } finally {
+      process.env.PATH = previousPath;
+    }
+  }
+
+  it.skipIf(process.platform === "win32")("answers close readiness for a plain directory without spawning git", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-non-git-probe-"));
+    tempDirs.add(workspaceDir);
+    await fs.writeFile(path.join(workspaceDir, "notes.txt"), "plain files\n", "utf8");
+    const { executionWorkspaceId } = await seedSharedLocalWorkspace(workspaceDir);
+
+    const { result: readiness, spawns } = await withGitSpawnLog(() => svc.getCloseReadiness(executionWorkspaceId));
+
+    expect(readiness).toMatchObject({
+      isDestructiveCloseAllowed: true,
+      git: { repoRoot: null, workspacePath: workspaceDir, hasDirtyTrackedFiles: false, hasUntrackedFiles: false },
+    });
+    expect(readiness?.blockingReasons).toEqual([]);
+    expect(spawns.filter((line) => line.includes(workspaceDir))).toEqual([]);
+  });
+
+  it.skipIf(process.platform === "win32")("still probes git when a .git marker exists on the path", async () => {
+    const parentDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-marker-probe-"));
+    tempDirs.add(parentDir);
+    await fs.writeFile(path.join(parentDir, ".git"), `gitdir: ${path.join(parentDir, "missing-git-dir")}\n`, "utf8");
+    const workspaceDir = path.join(parentDir, "nested", "task");
+    await fs.mkdir(workspaceDir, { recursive: true });
+    const { executionWorkspaceId } = await seedSharedLocalWorkspace(workspaceDir);
+
+    const { result: readiness, spawns } = await withGitSpawnLog(() => svc.getCloseReadiness(executionWorkspaceId));
+
+    expect(readiness).toMatchObject({ state: "blocked", isDestructiveCloseAllowed: false });
+    expect(spawns).toContain(`-C ${workspaceDir} rev-parse --show-toplevel`);
+  });
+
+  it.skipIf(process.platform === "win32")("sweeps terminal plain-directory workspaces without spawning git", async () => {
+    const companyId = randomUUID();
+    const projectId = randomUUID();
+    const issuePrefix = `N${companyId.slice(0, 8).toUpperCase()}`;
+    await db.insert(companies).values({ id: companyId, name: "Paperclip", issuePrefix, requireBoardApprovalForNewAgents: false });
+    await db.insert(projects).values({ id: projectId, companyId, name: "Plain task folders", status: "in_progress" });
+    const workspaceDirs: string[] = [];
+    for (let index = 0; index < 3; index += 1) {
+      const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-non-git-sweep-"));
+      tempDirs.add(workspaceDir);
+      workspaceDirs.push(workspaceDir);
+      const executionWorkspaceId = randomUUID();
+      const sourceIssueId = randomUUID();
+      await db.insert(executionWorkspaces).values({
+        id: executionWorkspaceId,
+        companyId,
+        projectId,
+        mode: "isolated_workspace",
+        strategyType: "local_fs",
+        name: `${issuePrefix}-${index}`,
+        status: "active",
+        providerType: "local_fs",
+        cwd: workspaceDir,
+      });
+      await db.insert(issues).values({
+        id: sourceIssueId,
+        companyId,
+        projectId,
+        identifier: `${issuePrefix}-${index}`,
+        title: `Finished ${index}`,
+        status: "done",
+        priority: "medium",
+        executionWorkspaceId,
+      });
+      await db.update(executionWorkspaces).set({ sourceIssueId }).where(eq(executionWorkspaces.id, executionWorkspaceId));
+    }
+
+    const { result: sweep, spawns } = await withGitSpawnLog(() => svc.sweepTerminalWorkspaces());
+
+    expect(sweep).toMatchObject({ checked: 3, archived: 0, skippedUndelivered: 3 });
+    expect(spawns.filter((line) => workspaceDirs.some((dir) => line.includes(dir)))).toEqual([]);
+  });
+
   it("clears matching environment selections transactionally without touching other workspaces", async () => {
     const companyId = randomUUID();
     const projectId = randomUUID();

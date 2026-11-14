@@ -8203,6 +8203,102 @@ export function issueService(db: Db) {
     return { comment, parent };
   }
 
+  /**
+   * STUDIO-0029, adapted from paperclipai/paperclip#19843: a cancelled blocker
+   * never resolves its dependents, so tell each assigned, open dependent once.
+   * The dependency stays unresolved; the comment asks the assignee to replace or
+   * remove it. One comment per dependent and cancellation (the marker names the
+   * cancellation time), serialized per dependent.
+   */
+  async function addCancelledBlockerHandoffComments(
+    blocker: typeof issues.$inferSelect,
+  ) {
+    if (blocker.status !== "cancelled") return [];
+    const dependents = await db
+      .select({
+        id: issues.id,
+        companyId: issues.companyId,
+        assigneeAgentId: issues.assigneeAgentId,
+        status: issues.status,
+      })
+      .from(issueRelations)
+      .innerJoin(
+        issues,
+        and(
+          eq(issueRelations.relatedIssueId, issues.id),
+          eq(issues.companyId, blocker.companyId),
+        ),
+      )
+      .where(
+        and(
+          eq(issueRelations.companyId, blocker.companyId),
+          eq(issueRelations.issueId, blocker.id),
+          eq(issueRelations.type, "blocks"),
+          isNotNull(issues.assigneeAgentId),
+          isNull(issues.conversationAgentId),
+          inArray(issues.status, ["todo", "in_progress", "in_review", "blocked"]),
+        ),
+      );
+    if (dependents.length === 0) return [];
+
+    const blockerIdentifier = blocker.identifier?.trim() || blocker.id;
+    const blockerPrefix = blockerIdentifier.split("-")[0] || "PAP";
+    const cancelledAt = blocker.cancelledAt
+      ? new Date(blocker.cancelledAt).toISOString()
+      : "unknown";
+    const body =
+      `System dependency handoff: [${blockerIdentifier}](/${blockerPrefix}/issues/${blockerIdentifier}) was cancelled. ` +
+      "A cancelled blocker never resolves, so this task stays blocked on it until its blocker set changes.\n\n" +
+      "As the assignee, reassess this dependency: replace it with the task that now carries the work, or remove it " +
+      "if nothing is left to wait for (set_dependencies, or `blockedByIssueIds` with the blockers to keep; the same " +
+      "update may also change the status). Keep the other blockers and human approvals intact.\n\n" +
+      `<!-- cancelled-blocker-handoff:${blocker.id}:${cancelledAt} -->`;
+
+    const handoffs: Array<{
+      comment: Awaited<ReturnType<typeof insertIssueComment>>[number];
+      dependent: (typeof dependents)[number] & { assigneeAgentId: string };
+    }> = [];
+    for (const dependent of dependents) {
+      const comment = await db.transaction(async (tx) => {
+        await tx.execute(
+          sql`select pg_advisory_xact_lock(hashtextextended(${`cancelled-blocker-handoff:${dependent.id}`}, 0))`,
+        );
+        const existing = await tx
+          .select({ id: issueComments.id })
+          .from(issueComments)
+          .where(
+            and(
+              eq(issueComments.companyId, dependent.companyId),
+              eq(issueComments.issueId, dependent.id),
+              eq(issueComments.authorType, "system"),
+              eq(issueComments.body, body),
+            ),
+          )
+          .limit(1)
+          .then((rows) => rows[0] ?? null);
+        if (existing) return null;
+        const [inserted] = await insertIssueComment(tx, {
+          companyId: dependent.companyId,
+          issueId: dependent.id,
+          authorType: "system",
+          body,
+        });
+        await tx
+          .update(issues)
+          .set({ updatedAt: new Date() })
+          .where(eq(issues.id, dependent.id));
+        return inserted ?? null;
+      });
+      if (comment && dependent.assigneeAgentId) {
+        handoffs.push({
+          comment,
+          dependent: { ...dependent, assigneeAgentId: dependent.assigneeAgentId },
+        });
+      }
+    }
+    return handoffs;
+  }
+
   async function archiveInbox(
     companyId: string,
     issueId: string,
@@ -8279,6 +8375,7 @@ export function issueService(db: Db) {
     clearExecutionRunIfTerminal,
     clearCheckoutRunIfTerminal,
     addStopRelayCommentIfNeeded,
+    addCancelledBlockerHandoffComments,
 
     unreadInboxIssueIds: async (companyId: string, userId: string, readCondition: SQL<boolean>) => {
       // Rank the visible Mine set before counting unread, just like the inbox.
