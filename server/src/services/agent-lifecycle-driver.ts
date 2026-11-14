@@ -85,7 +85,7 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
             sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? 'pauseStop')`));
         }
         if (!await heartbeat.stopInvocationsForAgents(ids, reason,
-          { preservePauseDeferred: agent.lifecycleState === "pausing" })) return "pending";
+          { preservePauseDeferred: agent.lifecycleState === "pausing", pauseStop: agent.lifecycleState === "pausing" })) return "pending";
       }
       return "complete";
     },

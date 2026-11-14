@@ -1153,6 +1153,39 @@
       "retireWhen": "Pinned upstream treats an adapter-declared resource wait as a live execution path, confirmed by the same cases.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0043",
+      "title": "A pause no longer stays pausing on runs cancelled before dispatch or cut over the built-in ssh driver",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, studio.15, 14 Nov 2026. At the resume of 08:56 the CTO, * Dev Unity and Resource Advisor stayed status paused, lifecycleState pausing; POST /resume answered 200 without effect (same cause as E230, E249). The pause stop proof (agentExecutionsHaveStopped) reads the agent's whole run history. Family R: five legacy conversation runs (6928a0e1, 7da491d8, a563815d, ecea3717, dd8c5c92) cancelled by the server before their adapter was entered (stale execution continuation; stale queued-run gate, dd8c5c92 also holding an ssh lease taken before the gate) waited for a process acknowledgement or a remote termination receipt that nothing could send. Family B: the CTO's runs a6d718c3 and f33b3f00, cancelled issue_reassigned after running over the built-in ssh environment driver: the local ssh client was gone and the lease expired, but that driver never writes a termination receipt. An operator repair (tools/repair-pausing-agents.py) was needed.",
+      "reason": "Requested by Amyne (14 Nov 2026, V294): every unblocking gesture must be followed by the fix that makes it unnecessary.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server agent lifecycle stop proof",
+      "paths": [
+        "server/src/services/pre-dispatch-cancellation.ts",
+        "server/src/services/agent-execution-stop.ts",
+        "server/src/modules/run-dispatch/adapters/postgres.ts",
+        "server/src/services/heartbeat.ts",
+        "server/src/services/heartbeat/run-control.ts",
+        "server/src/services/agent-lifecycle-driver.ts",
+        "server/src/__tests__/pause-pre-dispatch-cancellation.test.ts",
+        "server/src/modules/run-dispatch/adapters/postgres.test.ts",
+        "server/src/__tests__/heartbeat-held-comment-wake.test.ts",
+        "server/src/modules/agent-lifecycle/__tests__/driver-scope.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-14",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found that records a pre-dispatch cancellation for the stop proof or proves an ssh-driver run stopped; paperclipai/paperclip#20037 (fork PR #34, STUDIO-0036) only narrows the reads of the same proof.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. pause-pre-dispatch-cancellation.test.ts, 7 cases: a conversation run cancelled before dispatch is proven stopped with the marker and not without; same with an ssh lease taken before the gate; the marker never covers a live process nor a run that recorded a process on an ssh lease; a malformed marker is ignored; the CTO's cut ssh runs prove a pause 10 min after the run ended once the local ssh client is gone (absent or pid reused), and never a termination; no proof while the client lives, before the delay, without a recorded pid, or on another provider; the lifecycle driver completes the pause of an agent held by two cut runs and keeps its termination pending. With run-dispatch postgres.test.ts (marker written only by the locked dispatch gate), heartbeat-held-comment-wake (marker on the stale continuation, added to the run's existing result_json, an earlier key kept), driver-scope, agent-lifecycle lifecycle and resource-wait-stop: 239 passed. Negative controls (one file swapped for its studio.15 copy): agent-execution-stop.ts, the two pre-dispatch cases fail; run-dispatch postgres.ts, the gate case fails; heartbeat.ts, the stale continuation case fails; agent-execution-stop.ts without the bounded rule, the two cut-run pause cases fail.",
+      "migration": "None. New result_json key preDispatchCancellation {version 1, providerWorkStarted false, source, cancelledAt}, written only when the adapter was not entered (locked dispatch gate; stale execution continuation with neither legacy adapter entry nor native dispatch). Kept apart from executionCancellation: an acknowledged cancellation means an operator stop at release (held wakes not promoted), which this is not. The stop proof accepts it for a legacy run with no process id and no process group, with or without a remote lease. Bounded rule, pause only (lifecycle pausing passes pauseStop; terminating and cleaning_up keep the receipt requirement): a cancelled legacy run whose leases are all ssh, released or expired without failed cleanup, whose recorded local ssh client is absent or its pid reused, counts as stopped SSH_CLIENT_STOP_PAUSE_PROOF_DELAY_MS (10 min) after it finished. 10 min: the adapters keep the callback bridge of an unproven stop for at most 10 min (ORPHANED_BRIDGE_STOP_MAX_DELAY_MS) and close it at once on cancellation, so a surviving remote command has no route back to the server. Residual risk: a remote command that outlives its ssh client and keeps running on the worker. That risk is already taken today, without delay: the ownership hold (conversation-continuation.ts) releases the task to its next run once the local pid is gone and the lease released, with no remote receipt. agentExecutionsHaveStopped has a single caller, stopInvocationsForAgents, used only by the agent lifecycle driver (pausing, terminating, cleaning_up). For fork PR #34 (STUDIO-0036), which narrows the reads of agent-execution-stop.ts: its column list must add finished_at and its full-row fetch must also cover cancelled runs with a remote lease and no receipt (marker and bounded rule read result_json, process_pid, process_started_at, process_group_id, finished_at). A queued run cancelled before it started (started_at null, for example by the Board) already passes the proof: the loop skips a cancelled run without started_at, and such a run holds no lease or process.",
+      "rollback": "Switch cli/current back to the previous install folder; the marker key is then ignored and the old proof applies.",
+      "retireWhen": "Pinned upstream records pre-dispatch cancellations for the stop proof and the ssh driver returns termination receipts, confirmed by the same cases.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }

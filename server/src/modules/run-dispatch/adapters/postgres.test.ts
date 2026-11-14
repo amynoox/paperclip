@@ -463,6 +463,9 @@ describeEmbeddedPostgres("run-dispatch postgres adapter", () => {
       const [cancelled] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, replacementId));
       expect(cancelled).toMatchObject({ status: "cancelled", runtimeMode: "native", startedAt: null,
         resultJson: { stopReason: "issue_dependencies_blocked", timeoutSource: "stale_queued_run_gate" } });
+      // STUDIO-0043: only the locked dispatch gate proves the adapter was never entered.
+      expect(cancelled!.resultJson?.preDispatchCancellation ?? null).toEqual(mode === "queued" ? null
+        : expect.objectContaining({ version: 1, providerWorkStarted: false, source: "stale_queued_run_gate" }));
       expect(projectTaskInterruption({ id: issueId, companyId, status: "in_progress", assigneeAgentId: agentId, projectId: null }, {
         run: cancelled!, agent: { status: "idle", pauseReason: null }, paused: false, approval: false,
       })).toMatchObject({ state: "resolved", canRetry: false });

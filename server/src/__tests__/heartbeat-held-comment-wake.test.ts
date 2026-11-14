@@ -473,13 +473,18 @@ describePostgres("saved intents while another run's accounting is pending", () =
       contextSnapshot: { issueId: f.issueId, taskId: f.issueId, commentId: f.commentId, wakeCommentId: f.commentId,
         wakeCommentIds: [f.commentId], wakeReason: "issue_commented", source: "issue.comment" } }).returning();
     await db.update(agentWakeupRequests).set({ runId: stale.id }).where(eq(agentWakeupRequests.id, wake.id));
+    // STUDIO-0043: a key already on the run must survive the cancellation that adds the marker.
+    await db.update(heartbeatRuns).set({ resultJson: { studioProbe: "kept" } }).where(eq(heartbeatRuns.id, stale.id));
     // The first run, which started before the message, completed the task after it.
     await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() + 1_000) }).where(eq(heartbeatRuns.id, f.sourceRunId));
     await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, f.issueId));
     await closeByAgent(f);
     await settle(f); await settle(f);
     expect((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, stale.id)))[0]).toMatchObject({
-      status: "cancelled", errorCode: "continuation_task_ownership_changed" });
+      status: "cancelled", errorCode: "continuation_task_ownership_changed",
+      // STUDIO-0043: cancelled before its adapter was entered, recorded for the agent stop proof.
+      resultJson: { studioProbe: "kept",
+        preDispatchCancellation: { version: 1, providerWorkStarted: false, source: "stale_execution_continuation" } } });
     await db.update(agentWakeupRequests).set({ updatedAt: new Date(Date.now() - 60_000) })
       .where(and(eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
     await settle(f); await settle(f);

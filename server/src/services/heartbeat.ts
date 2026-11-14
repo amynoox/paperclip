@@ -325,6 +325,7 @@ import {
 import { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 export { buildHeartbeatRunStatusLiveEventPayload } from "./heartbeat-run-status-payload.js";
 import { StaleExecutionContinuationError } from "./execution-continuation.js";
+import { preDispatchCancellationResult } from "./pre-dispatch-cancellation.js";
 import { deferUndeliveredCommentsOfStaleRun } from "./heartbeat/stale-comment-continuation.js";
 import { renderPaperclipWakePrompt } from "@paperclipai/adapter-utils/server-utils";
 
@@ -3842,6 +3843,10 @@ export function heartbeatService(
           errorCode: outerErr.code,
           eventMessage: "stale execution continuation cancelled before dispatch",
           suppressImmediateRecovery: true,
+          // STUDIO-0043: no adapter was entered, so no process or remote
+          // command exists for the agent stop proof to wait for.
+          ...(!legacyAdapterEntered && !nativeDispatchStarted
+            ? { resultJson: preDispatchCancellationResult("stale_execution_continuation", new Date()) } : {}),
         });
       } else if (isWorkspaceBusyDeferral(outerErr)) {
         // Expected contention on a shared project workspace, not a
@@ -4214,7 +4219,7 @@ export function heartbeatService(
           agentId: run.agentId, status: run.status, providerResourceDisposition: "destroy" });
       }
     }
-    return agentExecutionsHaveStopped(db, agentIds);
+    return agentExecutionsHaveStopped(db, agentIds, { pauseStop: options.pauseStop === true });
   }
 
   return {
