@@ -4219,7 +4219,7 @@ export function heartbeatService(
           agentId: run.agentId, status: run.status, providerResourceDisposition: "destroy" });
       }
     }
-    return agentExecutionsHaveStopped(db, agentIds);
+    return agentExecutionsHaveStopped(db, agentIds, { pauseStop: options.pauseStop === true });
   }
 
   return {
