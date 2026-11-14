@@ -229,6 +229,68 @@ describeEmbeddedPostgres("heartbeat list", () => {
     });
   });
 
+  it("keeps only the displayed usage fields in list rows unless full usage is requested", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    const displayed = {
+      inputTokens: 40_178,
+      cachedInputTokens: 222_147,
+      outputTokens: 2_071,
+      provider: "openai",
+      model: "gpt-5",
+      billingType: "subscription_included",
+      accountingReceiptId: "receipt-1",
+      costUsd: 0,
+      costUsdExact: "0.0123",
+      cacheAdjustedCostUsd: null,
+    };
+    const fullUsage = {
+      ...displayed,
+      accountingReceiptSourceFences: Array.from({ length: 20 }, (_, index) => ({ sourceId: randomUUID(), sequence: index })),
+      usageByModel: { "gpt-5": { inputTokens: 40_178, outputTokens: 2_071, cachedInputTokens: 222_147 } },
+      budgetExposure: { windowUsd: 12.5, remainingUsd: 7.5 },
+      pricingProvenance: { table: "2026-11", source: "provider" },
+      providerRequestId: "request-1",
+    };
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "assignment",
+      status: "succeeded",
+      usageJson: fullUsage,
+    });
+    const service = heartbeatService(db);
+
+    const [listed] = await service.list(companyId, agentId, 5);
+    const [listedFull] = await service.list(companyId, agentId, 5, { fullUsage: true });
+    const [listedSummary] = await service.list(companyId, agentId, 5, { summary: true, fullUsage: true });
+
+    expect(listed?.usageJson).toEqual(displayed);
+    expect(JSON.stringify(listed).length).toBeLessThan(JSON.stringify(listedFull).length - 1_000);
+    expect(listedFull?.usageJson).toEqual(fullUsage);
+    expect(listedSummary?.usageJson).toBeNull();
+    expect((await service.getRun(runId))?.usageJson).toEqual(fullUsage);
+  });
+
   it("bounds oversized legacy result json payloads on getRun", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

@@ -991,6 +991,34 @@
       "retireWhen": "Pinned upstream owns the prepared-process lifetime (STUDIO-0005, STUDIO-0011 retired) with an equivalent bounded stop of the callback bridge, or the router proves stop for every cancellation including an unreachable worker.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0031",
+      "title": "Heartbeat run lists return compact usage; the whole record stays on the single-run route",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "GET /api/companies/:companyId/heartbeat-runs returned each run's whole usageJson (accounting receipt fences, per-model usage, budget dispatch and exposure, pricing provenance). Production, 13 Nov 2026: 100 runs weighed 453 695 bytes in 2.8 s from the operator link, usageJson alone 239 812 bytes (53%); contextSnapshot and resultJson were already reduced by the list. The Board agent page polls this list without summary=true (default limit 200).",
+      "reason": "Requested by Amyne on 13 Nov 2026 (23:40 UTC): fix all known server blockers",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server heartbeat run state, run list route",
+      "paths": [
+        "server/src/__tests__/heartbeat-list.test.ts",
+        "server/src/__tests__/heartbeat-run-privacy-routes.test.ts",
+        "server/src/routes/agents.ts",
+        "server/src/routes/openapi.ts",
+        "server/src/services/heartbeat/run-state.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-13",
+        "repository": "paperclipai/paperclip",
+        "details": "gh search prs for 'heartbeat-runs', 'heartbeat run list', 'usageJson', 'list runs summary', 'run history payload'. Found list bounding and paging work (#13802, #13962 closed; #15669, #16533 open) and column narrowing elsewhere (#20130, #9155 open), none reduces usageJson in the run list.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. 2 new cases: service list keeps only the displayed usage keys, fullUsage=true and getRun keep the whole record, summary still returns null; route list returns compact usage, ?fullUsage=true and GET /api/heartbeat-runs/:id return the whole record, redacted stubs unchanged. Negative control on the base run-state.ts: both new cases fail. heartbeat-list.test.ts, heartbeat-run-privacy-routes.test.ts and heartbeat/run-state.test.ts: 59 passed.",
+      "migration": "None. API: list rows keep usageJson keys inputTokens, input_tokens, outputTokens, output_tokens, cachedInputTokens, cached_input_tokens, cache_read_input_tokens, totalTokens, provider, model, billingType, accountingReceiptId, cacheAdjustedCostUsd, costUsdExact, costUsd, cost_usd, total_cost_usd; fullUsage=true restores the whole record.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Pinned upstream returns a reduced usage record in run lists, confirmed by the same two cases.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
