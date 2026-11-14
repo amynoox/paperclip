@@ -353,14 +353,24 @@ export async function addresseeWakePassesRecoveryHold(
 // STUDIO-0046: the cut run a retry comes from, when that run ended
 // router_provider_stop_unverified; only then may the router's card for that
 // very run be ignored by the retry's response gates.
-async function stopUnverifiedSourceRunId(db: Db, companyId: string, runId: string | null | undefined) {
-  if (!runId) return null;
-  const [retry] = await db.select({ retryOfRunId: heartbeatRuns.retryOfRunId }).from(heartbeatRuns)
+// The unbroken chain of cut runs behind this retry: a retry cut again leaves
+// its own router card, and the card of the first cut can still be pending. The
+// walk stops at the first link not cut under a server transient code, so it
+// matches the live-run hold, which requires the direct source to be one.
+async function stopUnverifiedSourceRunIds(db: Db, companyId: string, runId: string | null | undefined) {
+  const cutRunIds: string[] = [];
+  if (!runId) return cutRunIds;
+  const [start] = await db.select({ retryOfRunId: heartbeatRuns.retryOfRunId }).from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.id, runId), eq(heartbeatRuns.companyId, companyId))).limit(1);
-  if (!retry?.retryOfRunId) return null;
-  const [source] = await db.select({ id: heartbeatRuns.id, errorCode: heartbeatRuns.errorCode }).from(heartbeatRuns)
-    .where(and(eq(heartbeatRuns.id, retry.retryOfRunId), eq(heartbeatRuns.companyId, companyId))).limit(1);
-  return source && isServerTransientRetryCode(source.errorCode) ? source.id : null;
+  let sourceId = start?.retryOfRunId ?? null;
+  while (sourceId && cutRunIds.length < 16 && sourceId !== runId && !cutRunIds.includes(sourceId)) {
+    const [source] = await db.select({ id: heartbeatRuns.id, errorCode: heartbeatRuns.errorCode, retryOfRunId: heartbeatRuns.retryOfRunId })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.id, sourceId), eq(heartbeatRuns.companyId, companyId))).limit(1);
+    if (!source || !isServerTransientRetryCode(source.errorCode)) break;
+    cutRunIds.push(source.id);
+    sourceId = source.retryOfRunId;
+  }
+  return cutRunIds;
 }
 
 export function createPostgresRunDispatchAdapter(
@@ -571,7 +581,7 @@ export function createPostgresRunDispatchAdapter(
     if (input.conversationContinuation || retryReason === "interrupted_preparation") {
       facts.pendingResponse = await connectionContinuationPendingResponse(dbOrTx as unknown as Db,
         issue, input.responsibleUserId, input.runId,
-        { routerInterruptionOfRunId: await stopUnverifiedSourceRunId(dbOrTx as unknown as Db, input.companyId, input.runId) });
+        { routerInterruptionOfRunIds: await stopUnverifiedSourceRunIds(dbOrTx as unknown as Db, input.companyId, input.runId) });
     }
     facts.reviewParticipant = await readNativeReviewParticipantFacts(dbOrTx, {
       companyId: input.companyId, issueId, agentId: input.agentId,
@@ -840,7 +850,7 @@ export function createPostgresRunDispatchAdapter(
       } : null,
       pendingResponse: issue && (input.conversationContinuation || retryReason === "interrupted_preparation" || context.connectionIntentResolution === "existing_connection")
         ? await connectionContinuationPendingResponse(dbOrTx as unknown as Db, issue, input.responsibleUserId, input.runId,
-          { routerInterruptionOfRunId: await stopUnverifiedSourceRunId(dbOrTx as unknown as Db, input.companyId, input.runId) })
+          { routerInterruptionOfRunIds: await stopUnverifiedSourceRunIds(dbOrTx as unknown as Db, input.companyId, input.runId) })
         : null,
       issueFound: issue !== null,
       issueStatus: issue?.status ?? null,
@@ -1494,9 +1504,11 @@ export function createPostgresRunDispatchAdapter(
     const [live] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
       .where(and(eq(heartbeatRuns.companyId, run.companyId), ne(heartbeatRuns.id, run.id),
         sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
-        // Running only: a queued run of the task may itself wait for the
-        // execution lock this retry holds, and would never start before it.
-        eq(heartbeatRuns.status, "running")))
+        // Running, or queued for another agent (the router refuses to
+        // dispatch beside it). A queued run of this agent may itself wait for
+        // the execution lock this retry holds, and would never start before it.
+        or(eq(heartbeatRuns.status, "running"),
+          and(eq(heartbeatRuns.status, "queued"), ne(heartbeatRuns.agentId, run.agentId)))))
       .limit(1);
     if (!live) return false;
     const scheduledRetryAt = new Date(now.getTime() + 15_000);

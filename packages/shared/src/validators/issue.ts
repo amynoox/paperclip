@@ -707,6 +707,9 @@ export const resolveIssueRecoveryActionSchema = z
       // without changing task state. The route checks the exact locked source,
       // unchanged status, board authority, lease expiry, and cleanup evidence.
       if (value.executionReconciliation?.workspaceRepairEvidence || controllerContainment) return;
+      // STUDIO-0048: reconciling the exact hold of a task that stays blocked by
+      // its dependencies. The route requires an unresolved first-class blocker.
+      if (value.executionReconciliation && value.actionId && value.sourceIssueStatus === "blocked") return;
       if (
         value.sourceIssueStatus !== "todo" &&
         value.sourceIssueStatus !== "done" &&
