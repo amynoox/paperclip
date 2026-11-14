@@ -104,7 +104,7 @@ import {
   toolProfiles,
   toolStdioCommandTemplates,
 } from "@paperclipai/db";
-import type { ToolRunContext } from "@paperclipai/plugin-sdk";
+import { JsonRpcCallError, PLUGIN_RPC_ERROR_CODES, type ToolRunContext } from "@paperclipai/plugin-sdk";
 import type {
   CreateToolMcpGateway,
   CreateToolMcpGatewayToken,
@@ -1191,6 +1191,23 @@ const VIRTUAL_RUN_TOOL: ToolGatewayDescriptor = {
 };
 
 const VIRTUAL_TOOLS = [VIRTUAL_SEARCH_TOOLS, VIRTUAL_RUN_TOOL];
+
+/**
+ * Studio (STUDIO-0033): a plugin worker that answers `executeTool` with an
+ * error ran the tool, and the tool failed. The SDK sends a throwing tool
+ * handler back as a JSON-RPC error (WORKER_ERROR, or the error's own numeric
+ * code). That is a tool result for the calling agent, like a connected MCP tool
+ * error, not a gateway failure: the MCP route returns it as `isError` with the
+ * plugin's message instead of an HTTP 500. A worker that is not running or did
+ * not answer in time stays a gateway failure.
+ */
+function pluginToolFailureAsToolError(err: unknown): unknown {
+  if (!(err instanceof JsonRpcCallError)) return err;
+  if (err.code === PLUGIN_RPC_ERROR_CODES.WORKER_UNAVAILABLE || err.code === PLUGIN_RPC_ERROR_CODES.TIMEOUT) return err;
+  const failure = new ToolGatewayHttpError(502, err.message, "tool_error");
+  failure.stack = err.stack;
+  return failure;
+}
 
 export function createToolGatewayService(
   db: Db,
@@ -11398,7 +11415,9 @@ export function createToolGatewayService(
                     companyId: session.companyId,
                     projectId: session.projectId ?? "",
                   },
-                ),
+                ).catch((err: unknown) => {
+                  throw pluginToolFailureAsToolError(err);
+                }),
                 executionTimeoutMs,
               )).result
             : await runWithTimeout(
