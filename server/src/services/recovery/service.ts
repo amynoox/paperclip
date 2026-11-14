@@ -24,7 +24,7 @@ import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
 import {
   ADAPTER_DECLARED_WAIT_ERROR_CODES,
-  ADAPTER_DECLARED_WAIT_MAX_MS,
+  adapterDeclaredWaitMaxMs,
   isAdapterDeclaredWaitErrorCode,
 } from "./adapter-declared-wait.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
@@ -5089,7 +5089,7 @@ export function recoveryService(
           agentId,
         );
         const waitDeadline = waitStart
-          ? waitStart.getTime() + ADAPTER_DECLARED_WAIT_MAX_MS
+          ? waitStart.getTime() + adapterDeclaredWaitMaxMs(latestRun.errorCode)
           : null;
         if (waitDeadline !== null && recoveryNow.getTime() < waitDeadline) {
           opts?.onDeferredDeadline?.(waitDeadline);

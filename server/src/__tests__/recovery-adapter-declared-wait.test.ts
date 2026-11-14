@@ -20,8 +20,10 @@ import { registerServerAdapter, unregisterServerAdapter } from "../adapters/inde
 import { heartbeatService } from "../services/heartbeat.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import {
+  ADAPTER_DECLARED_STOP_WAIT_MAX_MS,
   ADAPTER_DECLARED_WAIT_ERROR_CODES,
   ADAPTER_DECLARED_WAIT_MAX_MS,
+  adapterDeclaredWaitMaxMs,
 } from "../services/recovery/adapter-declared-wait.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 
@@ -43,10 +45,13 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   const adapterType = "codex_local";
   const dispatched = new Set<string>();
   // Per-issue adapter outcome; default finishes the task.
-  const modes = new Map<string, "wait" | "wait-transient" | "other-transient">();
+  const modes = new Map<string, "wait" | "wait-transient" | "other-transient" | "stop-transient">();
   const oldHome = process.env.PAPERCLIP_HOME;
   let home: string;
   const WAIT = "router_waiting_for_resources";
+  // A cut link to the worker machine (router 0.30.10): the cut run, then the next run.
+  const STOP = "router_provider_stop_unverified";
+  const UNSETTLED = "router_previous_dispatch_unsettled";
 
   beforeAll(async () => {
     temporary = await startRecoveryPostgres("recovery-adapter-wait-");
@@ -62,7 +67,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
         if (mode) {
           return {
             exitCode: 1, signal: null, timedOut: false,
-            errorCode: mode === "other-transient" ? "codex_transient_upstream" : WAIT,
+            errorCode: mode === "other-transient" ? "codex_transient_upstream" : mode === "stop-transient" ? STOP : WAIT,
             errorMessage: mode === "other-transient" ? "upstream unavailable" : "Waiting for a worker machine",
             ...(mode === "wait" ? {} : { errorFamily: "transient_upstream" as const }),
           };
@@ -125,10 +130,69 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   const commentsOf = (issueId: string) => db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
   const actionsOf = (issueId: string) => db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
 
-  it("declares only the router wait code, with a 12 h bound", () => {
-    expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT]);
+  it("declares only the router's three codes: 12 h for a machine wait, 1 h for an unproven stop", () => {
+    expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT, STOP, UNSETTLED]);
     expect(ADAPTER_DECLARED_WAIT_MAX_MS).toBe(12 * 60 * 60_000);
+    expect(ADAPTER_DECLARED_STOP_WAIT_MAX_MS).toBe(60 * 60_000);
+    expect(adapterDeclaredWaitMaxMs(WAIT)).toBe(12 * 60 * 60_000);
+    expect(adapterDeclaredWaitMaxMs(STOP)).toBe(60 * 60_000);
+    expect(adapterDeclaredWaitMaxMs(UNSETTLED)).toBe(60 * 60_000);
   });
+
+  // Office line cut, 14 Nov 2026, 06:01 and 06:27 (TR-731, TR-743): the cut run
+  // ended `router_provider_stop_unverified`, each retry
+  // `router_previous_dispatch_unsettled`, and recovery blocked the issue after
+  // its retries, so the router's `worker_router_dispatch_settled` wake (sent
+  // once it proves the stop) could never reach it.
+  it("neither requeues nor blocks after a cut link within 1 h, and the router's settled wake starts a run", async () => {
+    const cut = await seed("todo", [{ minutesAgo: 20, errorCode: STOP }, { minutesAgo: 8, errorCode: UNSETTLED, retry: true }]);
+    const fresh = await seed("in_progress", [{ minutesAgo: 3, errorCode: STOP }]);
+    const deadlines: number[] = [];
+    for (let sweep = 0; sweep < 2; sweep += 1) {
+      for (const f of [cut, fresh]) {
+        await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, onDeferredDeadline: at => deadlines.push(at) });
+      }
+    }
+    await heartbeat.drainActiveRunExecutions();
+    for (const [f, status] of [[cut, "todo"], [fresh, "in_progress"]] as const) {
+      expect((await issueOf(f.issueId)).status).toBe(status);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+      expect(await commentsOf(f.issueId)).toHaveLength(0);
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+    }
+    const cutStart = (await runsOf(cut)).find(run => run.id === cut.runIds[0])!.createdAt.getTime();
+    expect(deadlines).toContain(cutStart + ADAPTER_DECLARED_STOP_WAIT_MAX_MS);
+
+    const host = buildHostServices(db, "worker-router-test", "worker-router-test", {
+      forPlugin: () => ({ emit: vi.fn(), subscribe: vi.fn(), clear: vi.fn() }),
+    } as any);
+    try {
+      const woken = await host.issues.requestWakeup({
+        companyId: cut.companyId, issueId: cut.issueId, reason: "worker_router_dispatch_settled",
+        idempotencyKey: `router-settled/${randomUUID()}`,
+      } as any);
+      expect(woken.queued).toBe(true);
+      await expect.poll(async () => (await runsOf(cut)).find(run => run.id === woken.runId)?.status, { timeout: 30_000 }).toBe("succeeded");
+      expect((await issueOf(cut.issueId)).status).toBe("done");
+    } finally { host.dispose(); }
+  }, 180_000);
+
+  // The router sends no wake when its proof fails (machine silent, engine
+  // alive, no trace from an older launcher): it opens its own incident ticket
+  // at 10 minutes, and past 1 h normal escalation takes over.
+  it("applies normal escalation once an unproven stop has outlasted 1 h, and keeps 12 h when the latest run waits for a machine", async () => {
+    const spent = await seed("todo", [{ minutesAgo: 65, errorCode: STOP }, { minutesAgo: 10, errorCode: UNSETTLED, retry: true }]);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: spent.companyId });
+    expect((await issueOf(spent.issueId)).status).toBe("blocked");
+    expect((await actionsOf(spent.issueId))[0]).toMatchObject({ kind: "stranded_assigned_issue", status: "active" });
+
+    // Once settled, the next run waits for a machine: the latest code decides, 12 h.
+    const machine = await seed("todo", [{ minutesAgo: 65, errorCode: STOP }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: machine.companyId });
+    expect((await issueOf(machine.issueId)).status).toBe("todo");
+    expect(await actionsOf(machine.issueId)).toHaveLength(0);
+    await heartbeat.drainActiveRunExecutions();
+  }, 180_000);
 
   it("neither requeues nor blocks an assigned issue while its machine wait is within the bound", async () => {
     // As in production: first run and an assignment_recovery retry, both waiting.
@@ -239,11 +303,17 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   it("schedules no transient retry for a run that ended in a declared wait, and keeps it for another transient code", async () => {
     const waiting = await seed("todo", []);
     const other = await seed("todo", []);
+    const stopped = await seed("todo", []);
     modes.set(waiting.issueId, "wait-transient");
     modes.set(other.issueId, "other-transient");
+    modes.set(stopped.issueId, "stop-transient");
     const waitRun = await boardWake(waiting);
     const otherRun = await boardWake(other);
+    const stopRun = await boardWake(stopped);
     await heartbeat.drainActiveRunExecutions();
+    await expect.poll(async () => (await runsOf(stopped)).find(run => run.id === stopRun.id)?.status, { timeout: 30_000 }).toBe("failed");
+    expect((await runsOf(stopped)).find(run => run.id === stopRun.id)).toMatchObject({ errorCode: STOP });
+    expect((await runsOf(stopped)).filter(run => run.retryOfRunId === stopRun.id)).toHaveLength(0);
     await expect.poll(async () => (await runsOf(waiting)).find(run => run.id === waitRun.id)?.status, { timeout: 30_000 }).toBe("failed");
     await expect.poll(async () => (await runsOf(other)).find(run => run.id === otherRun.id)?.status, { timeout: 30_000 }).toBe("failed");
     expect((await runsOf(waiting)).find(run => run.id === waitRun.id)).toMatchObject({ errorCode: WAIT });
