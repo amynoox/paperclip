@@ -938,6 +938,21 @@ export async function startSandboxCallbackBridgeWorker(input: {
   const settledPromise = new Promise<void>((resolve) => {
     settleResolve = resolve;
   });
+  // `stop()` wakes the loop's current backoff wait or idle long-poll listing, so
+  // the loop ends at once instead of issuing another sandbox exec. One waiter at
+  // a time; nothing stays attached between iterations.
+  let wakeOnStop: (() => void) | null = null;
+  const untilStopped = <T>(work: Promise<T>): Promise<T | "stopped"> =>
+    new Promise<T | "stopped">((resolve, reject) => {
+      if (stopping) {
+        resolve("stopped");
+        return;
+      }
+      wakeOnStop = () => resolve("stopped");
+      work.then(resolve, reject);
+    }).finally(() => {
+      wakeOnStop = null;
+    });
   const authorizeRequest = input.authorizeRequest ??
     ((request: SandboxCallbackBridgeRequest) => authorizeSandboxCallbackBridgeRequestWithRoutes(request));
   const buildWorkerFailureMessage = (error: unknown) =>
@@ -1566,11 +1581,18 @@ export async function startSandboxCallbackBridgeWorker(input: {
         const waitMs = !stopping && inFlightRequestGuards.size === 0 ? listWaitMs : 0;
         try {
           listWaitActive = waitMs > 0;
-          fileNames = await withTimeout(
+          const listing = withTimeout(
             input.client.listJsonFiles(directories.requestsDir, { waitMs, pollIntervalMs }),
             iterationTimeoutMs + waitMs,
             "Sandbox callback bridge list requests",
           );
+          // An idle long-poll serves nothing after stop (stop sets the deadline
+          // to now): leave it to settle on its own and end the loop.
+          const listed = waitMs > 0 ? await untilStopped(listing) : await listing;
+          if (listed === "stopped") {
+            break;
+          }
+          fileNames = listed;
           consecutivePollFailures = 0;
         } catch (error) {
           if (stopping) {
@@ -1589,7 +1611,17 @@ export async function startSandboxCallbackBridgeWorker(input: {
             pollIntervalMs * 2 ** consecutivePollFailures,
             MAX_TRANSIENT_ITERATION_BACKOFF_MS,
           );
-          await new Promise((resolve) => setTimeout(resolve, backoffMs));
+          let backoffTimer: ReturnType<typeof setTimeout> | undefined;
+          await untilStopped(
+            new Promise<void>((resolve) => {
+              backoffTimer = setTimeout(resolve, backoffMs);
+            }),
+          );
+          clearTimeout(backoffTimer);
+          // A failing channel must not get one more exec once the bridge is stopped.
+          if (stopping) {
+            break;
+          }
           continue;
         } finally {
           listWaitActive = false;
@@ -1685,6 +1717,7 @@ export async function startSandboxCallbackBridgeWorker(input: {
   return {
     stop: async (options = {}) => {
       stopping = true;
+      wakeOnStop?.();
       const drainMs = normalizeTimeoutMs(options.drainTimeoutMs, DEFAULT_BRIDGE_STOP_TIMEOUT_MS);
       stopDeadline = Date.now() + drainMs;
       if (listWaitActive) {

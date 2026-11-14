@@ -207,6 +207,35 @@ describe("claude prepared interactive process", () => {
     expect(restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
   });
 
+  it("stops the kept bridge when the run is cancelled without a provider stop receipt", async () => {
+    // Production case: the operator cancels, the wrapper raises without calling
+    // onProcessStopped (worker unreachable). The bridge must not keep polling.
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const controller = new AbortController();
+    const hook = vi.fn(async () => {
+      controller.abort(new Error("operator cancel"));
+      throw new Error("router_cancelled");
+    });
+    const ctx = { ...(await context({ hook })), signal: controller.signal };
+    await expect(execute(ctx)).rejects.toThrow(/router_cancelled/);
+    await vi.waitFor(() => expect(bridgeStop).toHaveBeenCalledTimes(1));
+    expect(restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
+  });
+
+  it("stops the kept bridge on a provider stop receipt that arrives after the call returned", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    let late: (() => void) | undefined;
+    const hook = vi.fn(async (prepared: ClaudePreparedProcessInput) => {
+      late = prepared.options.onProcessStopped;
+      return processResult();
+    });
+    const ctx = { ...(await context({ hook })), signal: new AbortController().signal };
+    await execute(ctx);
+    expect(bridgeStop).not.toHaveBeenCalled();
+    late?.();
+    await vi.waitFor(() => expect(bridgeStop).toHaveBeenCalledTimes(1));
+  });
+
   it.each([
     ["live steering is off", { liveSteering: false, owner: true }],
     ["the host owner is missing", { liveSteering: true, owner: false }],
