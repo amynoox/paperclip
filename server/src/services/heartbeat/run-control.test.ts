@@ -11,6 +11,8 @@ import {
   waitForAdapterStop,
 } from "../adapter-execution-control.js";
 import { AdapterStopTimeoutError } from "../adapter-stop-timeout.js";
+import { markCancelledBeforeProcessLaunch } from "../pre-dispatch-cancellation.js";
+import { agentExecutionsHaveStopped } from "../agent-execution-stop.js";
 import { HttpError } from "../../errors.js";
 import { captureException } from "../../sentry.js";
 import { terminateLocalService } from "../local-service-supervisor.js";
@@ -43,6 +45,10 @@ vi.mock("../adapter-execution-control.js", async (importOriginal) => {
     waitForAdapterStop: vi.fn(actual.waitForAdapterStop),
     reportAdapterStopIfUnsettled: vi.fn(actual.reportAdapterStopIfUnsettled),
   };
+});
+vi.mock("../pre-dispatch-cancellation.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../pre-dispatch-cancellation.js")>();
+  return { ...actual, markCancelledBeforeProcessLaunch: vi.fn(actual.markCancelledBeforeProcessLaunch) };
 });
 vi.mock("../local-service-supervisor.js", async (importOriginal) => ({
   ...await importOriginal<typeof import("../local-service-supervisor.js")>(),
@@ -1020,6 +1026,121 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
       control.finish();
       adapterExecutionControls.delete(run.id);
     }
+  });
+
+  // STUDIO-0053: production, 15 Nov 2026 (studio20 window). Runs d1389345 and f410e11a were stopped by the Board
+  // while still preparing their lease, before any process was launched: no process acknowledged the stop, nothing
+  // recorded that none had been launched, and the Quality Manager stayed `pausing`.
+  it("records that a stopped legacy run launched no process", async () => {
+    const { run, control } = await ownedAdapterRun();
+    const deps = callbacks(db);
+    try {
+      vi.mocked(waitForAdapterStop).mockResolvedValueOnce(undefined as never);
+      expect(await createHeartbeatRunControl(db, deps).cancelRunInternal(run.id)).toMatchObject({ status: "cancelled" });
+      const after = await deps.getRun(run.id);
+      expect(after?.resultJson).toMatchObject({
+        executionCancellation: { state: "requested" },
+        preDispatchCancellation: { version: 1, providerWorkStarted: false, source: "stopped_before_process_launch" },
+      });
+    } finally {
+      control.finish();
+      adapterExecutionControls.delete(run.id);
+    }
+  });
+
+  it.each(["adapter.invoke", "session.started", "provider.event"])("records nothing for a stopped run with a %s event", async (eventType) => {
+    const { run, control } = await ownedAdapterRun();
+    const deps = callbacks(db);
+    await deps.appendRunEvent(run, { eventType, stream: "system", level: "info", message: eventType });
+    try {
+      vi.mocked(waitForAdapterStop).mockResolvedValueOnce(undefined as never);
+      expect(await createHeartbeatRunControl(db, deps).cancelRunInternal(run.id)).toMatchObject({ status: "cancelled" });
+      const after = await deps.getRun(run.id);
+      expect(after?.resultJson).toMatchObject({ executionCancellation: { state: "requested" } });
+      expect(after?.resultJson).not.toHaveProperty("preDispatchCancellation");
+    } finally {
+      control.finish();
+      adapterExecutionControls.delete(run.id);
+    }
+  });
+
+  // Bench, lot 21 (A2): a real run stopped by the Board while it prepared its ssh lease has no adapter control yet
+  // (the control exists from onCancellationReady on), so neither immediate write applies; the pause records the
+  // stop once the run has been settled for two minutes.
+  it("lets a pause record the stop of a run stopped without any adapter control or process", async () => {
+    const { company, agent } = await fixture();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, status: "running",
+      runtimeMode: "legacy", runtimeModeResolvedAt: new Date(), startedAt: new Date() }).returning();
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Stopped while preparing its lease",
+      status: "in_progress", assigneeAgentId: agent.id, executionRunId: run.id }).returning();
+    await db.update(heartbeatRuns).set({ issueId: issue.id, contextSnapshot: { issueId: issue.id } }).where(eq(heartbeatRuns.id, run.id));
+    const deps = callbacks(db);
+    // The executor is still preparing the lease when the Board stops the run (no adapter control, no process).
+    deps.activeRunExecutions.add(run.id);
+    expect(await createHeartbeatRunControl(db, deps).cancelRunInternal(run.id, "Operator Stop",
+      { resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator" } })).toMatchObject({ status: "cancelled" });
+    deps.activeRunExecutions.delete(run.id);
+    const cancelled = (await deps.getRun(run.id))!;
+    expect(cancelled.resultJson).toMatchObject({ executionCancellation: { state: "requested" } });
+    expect(cancelled.resultJson).not.toHaveProperty("preDispatchCancellation");
+    // Right after the stop, nothing is recorded yet.
+    expect(await agentExecutionsHaveStopped(db, [agent.id], { pauseStop: true })).toBe(false);
+    // Two minutes after the run's end, the pause records the stop and completes.
+    const later = new Date(cancelled.finishedAt!.getTime() + 3 * 60_000);
+    expect(await agentExecutionsHaveStopped(db, [agent.id], { pauseStop: true, now: later })).toBe(true);
+    expect((await deps.getRun(run.id))?.resultJson).toMatchObject({ preDispatchCancellation: { source: "stopped_before_process_launch" } });
+  });
+
+  it("records the stop when the adapter itself ended the run during the stop wait", async () => {
+    const { run, control } = await ownedAdapterRun();
+    const deps = callbacks(db);
+    try {
+      vi.mocked(waitForAdapterStop).mockImplementationOnce(async () => {
+        await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run.id));
+      });
+      expect(await createHeartbeatRunControl(db, deps).cancelRunInternal(run.id)).toMatchObject({ status: "cancelled" });
+      expect((await deps.getRun(run.id))?.resultJson).toMatchObject({
+        executionCancellation: { state: "requested" }, preDispatchCancellation: { source: "stopped_before_process_launch" } });
+    } finally {
+      control.finish();
+      adapterExecutionControls.delete(run.id);
+    }
+  });
+
+  it("records nothing while the adapter is still settling", async () => {
+    const { run, control } = await ownedAdapterRun();
+    const deps = callbacks(db);
+    try {
+      vi.mocked(waitForAdapterStop).mockImplementationOnce(async () => { throw new AdapterStopTimeoutError(60_000, { runId: run.id }); });
+      await expect(createHeartbeatRunControl(db, deps).cancelRunInternal(run.id)).rejects.toMatchObject({ status: 409 });
+      expect((await deps.getRun(run.id))?.resultJson).not.toHaveProperty("preDispatchCancellation");
+    } finally {
+      control.finish();
+      adapterExecutionControls.delete(run.id);
+    }
+  });
+
+  it("keeps the end-of-run effects when the stop marker cannot be written", async () => {
+    const { run, control } = await ownedAdapterRun();
+    const deps = callbacks(db);
+    try {
+      vi.mocked(waitForAdapterStop).mockResolvedValueOnce(undefined as never);
+      vi.mocked(markCancelledBeforeProcessLaunch).mockRejectedValueOnce(new Error("database unavailable"));
+      expect(await createHeartbeatRunControl(db, deps).cancelRunInternal(run.id)).toMatchObject({ status: "cancelled" });
+      expect(deps.finalizeAgentStatus).toHaveBeenCalled();
+      expect((await deps.getRun(run.id))?.resultJson).not.toHaveProperty("preDispatchCancellation");
+    } finally {
+      control.finish();
+      adapterExecutionControls.delete(run.id);
+    }
+  });
+
+  it("records nothing for a stopped run with a live process", async () => {
+    const { company, agent } = await fixture();
+    const run = await liveRun(company.id, agent.id);
+    const deps = callbacks(db);
+    expect(await createHeartbeatRunControl(db, deps).cancelRunInternal(run.id)).toMatchObject({ status: "cancelled" });
+    expect((await deps.getRun(run.id))?.resultJson ?? {}).not.toHaveProperty("preDispatchCancellation");
   });
 
   it("deduplicates agent batches and cancels only unclaimed pending wakes", async () => {

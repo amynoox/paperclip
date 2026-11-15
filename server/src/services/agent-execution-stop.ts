@@ -5,7 +5,7 @@ import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } fro
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
-import { isPreDispatchCancellation } from "./pre-dispatch-cancellation.js";
+import { isPreDispatchCancellation, markSettledStopsBeforeProcessLaunch } from "./pre-dispatch-cancellation.js";
 
 // STUDIO-0043, pause only: a cancelled run that executed over the built-in
 // `ssh` environment driver gets no remote termination receipt (the driver has
@@ -30,6 +30,9 @@ export type AgentExecutionStopOptions = {
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], options: AgentExecutionStopOptions = {}) {
   if (!agentIds.length) return true;
+  // STUDIO-0053: a pause also records the stop of runs that settled without any process after the stop wait
+  // timed out, or across a server restart.
+  if (options.pauseStop) await markSettledStopsBeforeProcessLaunch(db, agentIds, options.now ?? new Date());
   const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
   const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
   const leases = await db.select().from(environmentLeases).where(or(
