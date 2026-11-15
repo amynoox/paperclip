@@ -95,6 +95,7 @@ import {
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { markCancelledBeforeProcessLaunch } from "../pre-dispatch-cancellation.js";
 import {
   type EnvironmentLeaseStatus,
 } from "@paperclipai/shared";
@@ -1548,6 +1549,15 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
                 parseObject(stopped.resultJson?.executionCancellation).state !==
                 "acknowledged"
               ) {
+                // STUDIO-0053: stopped while still preparing, before any process was launched:
+                // the stop is proven without a process acknowledgement.
+                const markedBeforeProcess = !running && await markCancelledBeforeProcessLaunch(db, run.id).catch((error: unknown) => {
+                  logger.warn({ err: error, runId: run.id }, "Could not record a stop before process launch");
+                  return false;
+                });
+                if (markedBeforeProcess) {
+                  return { run: (await getRun(run.id)) ?? stopped, updated: false };
+                }
                 throw conflict(
                   "Execution ended, but provider termination could not be verified. Inspect the stopped run before continuing.",
                 );
@@ -1655,7 +1665,16 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           }
         }
       })();
-      const cancelled = cancellation.run;
+      let cancelled = cancellation.run;
+      // STUDIO-0053: the server ended a stopped legacy run that had launched no process. A failure here must
+      // never skip the end-of-run effects below (ticket release, agent status, next queued run).
+      if (cancelled && control && !running && cancelled.status === "cancelled" && cancelled.runtimeMode === "legacy") {
+        try {
+          if (await markCancelledBeforeProcessLaunch(db, run.id)) cancelled = (await getRun(run.id)) ?? cancelled;
+        } catch (error) {
+          logger.warn({ err: error, runId: run.id }, "Could not record a stop before process launch");
+        }
+      }
 
       if (cancellation.updated && cancelled) {
         if (readNativeStartupCleanup(cancelled)) await acknowledgeNativeStartupCleanup(db, { companyId: cancelled.companyId, runId: cancelled.id });

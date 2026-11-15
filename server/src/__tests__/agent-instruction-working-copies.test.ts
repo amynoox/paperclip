@@ -16,6 +16,16 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+
+// STUDIO-0055 refuses an agent's own entry edits everywhere, this legacy single-file copy included. The cases of
+// this file cover the legacy copy and its collection worker (capture, retries, restart, drain, standby); they keep
+// the upstream self-edit as their payload, so the refusal is lifted here only. The refusal on this path is covered
+// by owner-chat-instruction-authority.test.ts (a legacy copy edit ends in conflict, AGENT_ENTRY_SELF_EDIT_REFUSED,
+// candidate preserved, AGENTS.md unchanged).
+vi.mock("../services/agent-instruction-authorization.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/agent-instruction-authorization.js")>()),
+  assertNotOwnEntryEdit: () => undefined,
+}));
 import { and, eq } from "drizzle-orm";
 import { activityLog, agents, companies, authUsers, companyMemberships, principalPermissionGrants, heartbeatRuns, agentInstructionWorkingCopies, createDb, withDedicatedDbConnection } from "@paperclipai/db";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -778,7 +788,7 @@ describe("registered run instruction copies", () => {
     } }).where(eq(agents.id, agentId));
     const denied = await copies.collectStopped({ companyId, runId: copy.runId });
     expect(denied?.state).toBe("conflict");
-    expect(denied?.errorMessage).toContain("This low-trust run cannot change persistent agent instructions, including AGENTS.md");
+    expect(denied?.errorMessage).toContain("This low-trust run cannot change persistent agent files");
     expect(denied?.candidateBase64).not.toBeNull();
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
   });

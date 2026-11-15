@@ -1409,6 +1409,164 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: ssh exit 255 connection failures get a network-code cause. Why: TR-999 blocked after one unreachable lease probe (15 Nov 2026). Origin: studio fork only; to re-apply, keep sshConnectFailureCode and withSshConnectFailureCause in packages/adapter-utils/src/ssh.ts and the try/catch around the ssh call in runSshCommand; run ssh-connect-failure.test.ts and the STUDIO-0052 case of environment-provider-unavailable-error.test.ts."
+    },
+    {
+      "id": "STUDIO-0057",
+      "title": "Task priority is shown and editable in the interface again, with a Priority filter on the Tasks page",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Upstream hid every task priority indicator and control behind one compile-time UI flag, SHOW_TASK_PRIORITY_UI = false (paperclipai/paperclip#11024, PAP-411, merged 6 Aug 2026), keeping the data model, API, validation and search language. The studio owner cannot see or change a task's priority, yet the server still orders an agent's queued runs by it (server/src/services/heartbeat/queue.ts issueRunPriorityRank, after the readiness rank).",
+      "reason": "Requested by the owner (journal V364, V365: shown everywhere, changeable in the interface by himself).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "web interface: ui/src/lib/ui-flags.ts",
+      "paths": [
+        "ui/src/lib/ui-flags.ts",
+        "ui/src/components/IssueProperties.test.tsx",
+        "ui/src/components/IssuesList.test.tsx",
+        "ui/src/components/IssueFiltersPopover.test.tsx",
+        "ui/src/pages/IssueDetail.test.tsx",
+        "ui/src/components/NewIssueDialog.test.tsx",
+        "ui/src/components/IssueFilterPanel.tsx",
+        "ui/src/pages/CoordinatorTasks.test.tsx"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "Hidden by #11024; open issue #11547 asks to make the flag configurable, no linked pull request; upstream master still has SHOW_TASK_PRIORITY_UI = false.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, TZ=UTC, whole UI vitest suite: 924 files, 11771 passed, 1 skipped, 0 failed; UI typecheck in the test tree: 22 errors, the same 22 as the base 2cb9e5cd (modules absent from that tree), none in a changed file. Upstream cases that asserted the hidden priority are turned into shown cases: the Properties row is shown with the task's priority (IssueProperties), the header priority control is rendered (IssueDetail), Sort and Group offer Priority (IssuesList), the filter popover has its Priority section (IssueFiltersPopover). NewIssueDialog keeps its assertions: the shared task composer (#15091) removed the dialog's priority control outright, so the flag does not bring it back (comment updated). Added by the studio (bench of the first head: the Tasks page had no priority at all): CoordinatorTasks.test.tsx shows the Priority group in the real filter panel; checking Critical keeps only the critical task, unchecking it brings the list back.",
+      "migration": "None. One line: SHOW_TASK_PRIORITY_UI = true in ui/src/lib/ui-flags.ts. It shows again, read from the existing gates: the task header priority control (ui/src/pages/IssueDetail.tsx, header seed and editable control), the Properties row (ui/src/components/issue-properties/IssueProperties.tsx, editable through PriorityIcon), the Kanban card icon (KanbanBoard.tsx), the suggested-task priority in thread cards (IssueThreadInteractionCard.tsx), the Priority option of Sort and Group in the task lists (IssuesList.tsx, LegacyIssuesList.tsx), the Priority filter section (IssueFiltersPopover.tsx), the search filter bar and sheet (search/SearchFilterBar.tsx, search/SearchFilterSheet.tsx), the 'Tasks by Priority' charts (Dashboard.tsx, AgentDetail.production.tsx), and the design guide page. Added by the studio, absent upstream: a Priority group in the filter panel of the Tasks page (ui/src/components/IssueFilterPanel.tsx, the 'refreshed' presentation built by upstream after PAP-411 without any priority element), behind the same flag, reusing the existing filter state and applyIssueFilters (priorities). Not shown again: on the Tasks page, a priority icon on the row and a priority column to sort by (the refreshed task table never had them; they touch its shared column grid); a priority control in the new-task dialog (removed upstream by #15091; new tasks keep the medium default, changeable afterwards in the Properties row or the header). Nothing changes on the server or for the roles: no server or package file reads the flag; API responses, chat publications and the run queue order are unchanged by the flag itself. Once the owner changes a priority in the interface, that value orders the agent's queued runs as it already did when set through the API. Delivery: server/ui-dist only (UI_DELTA_SHA in livrer.py), with the next server version.",
+      "rollback": "Set SHOW_TASK_PRIORITY_UI back to false (or switch cli/current back to the previous install folder). Stored priorities stay as they are.",
+      "retireWhen": "Upstream turns the priority UI back on or makes the flag configurable (#11547).",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: SHOW_TASK_PRIORITY_UI = true. Why: the owner wants to see and change task priority himself (V364, V365). Origin: studio fork only, reverting upstream #11024's default; to re-apply after an upstream update, set the flag to true in ui/src/lib/ui-flags.ts, put back by hand the Priority FilterGroup of ui/src/components/IssueFilterPanel.tsx (studio only, not an upstream gate), check that every reader still gates on it (git grep SHOW_TASK_PRIORITY_UI under ui/src), adapt the upstream tests that assert the hidden priority, and run the whole UI suite with TZ=UTC."
+    },
+    {
+      "id": "STUDIO-0054",
+      "title": "Question cards render their text as Markdown and keep their context once answered",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, 15 Nov 2026 (TR-723, 'PR #191 — décision après la reprise ciblée'): the owner could hardly read the questions addressed to him. A question's prompt and help text were plain text in a block: the role's line breaks collapsed, its bullet points ran into the sentence and Markdown links stayed raw ([Rapport complet](/TR/issues/TR-723#…)). Bench, lot 20: the question set's description (already Markdown on the pending form) was no longer shown anywhere once the card was answered.",
+      "reason": "Requested by the owner (15 Nov 2026): 'mettre un peu de mise en forme dans toutes les questions qui me sont adressées'.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "UI: issue thread interaction card, question form, compact interaction card",
+      "paths": [
+        "ui/src/components/IssueThreadInteractionCard.tsx",
+        "ui/src/components/task-chat/QuestionForm.tsx",
+        "ui/src/components/task-chat/TaskChatCompactInteractionCard.tsx",
+        "ui/src/components/IssueThreadInteractionCard.test.tsx",
+        "ui/src/components/coordinator/CoordinatorTaskCommitment.test.tsx",
+        "ui/src/components/task-chat/QuestionResponseSummary.test.tsx",
+        "ui/src/index.css"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: upstream renders question prompts and help text as plain text.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, jsdom (UI dependencies from an earlier UI build tree of the bench machine). IssueThreadInteractionCard.test.tsx, three new cases with the real MarkdownBody: a prompt with bold, a list and a link, and a help text with emphasis, render <strong>, <li>, <a href> and <em> on a pending card without a question set, on a pending card rendered by the question form (its description too), and on an answered card; the raw Markdown no longer shows. CoordinatorTaskCommitment.test.tsx, two new cases: an answered question in the coordinator timeline keeps its description under the receipt as a 'Question context' disclosure rendered as Markdown; without a description, the bare receipt as before. With QuestionForm.test.tsx and CoordinatorChatUpdates.test.tsx: 116 passed. Negative control: the three formatting cases fail on the previous components. Typecheck: no error in the changed files. Review fixes (15 Nov): question text inherits the size, line height and colour of its container (class paperclip-markdown-inherit; the help text stays small and muted, the decision prompt keeps its large size); relative ticket links stay in-app links in the question form (linkIssueReferences no longer turned off, the description included). New cases: file names with underscores and inline code stay literal; a javascript: link gives no link and raw HTML (b, img, script) is not rendered; a one-line prompt is a single paragraph; a relative ticket link in the form is a link; the resolved receipt renders the help text as Markdown; QuestionResponseSummary renders the prompt as Markdown. 122 passed.",
+      "migration": "None on the server and no change to what roles send. The prompt and help text of each question go through MarkdownBody (the same safe renderer as comments and as the question set's description; soft breaks on, media as references) on the pending card, the question form, the answered card and the resolved receipt; the question set's description of the resolved receipt too. In the coordinator timeline, an answered question with a description shows a 'Question context' disclosure under its receipt. A one-line prompt looks as before (its block keeps the prompt id used by aria-labelledby; the question form's focus target moves from a <p> to a <div>). Ships as UI assets (server/ui-dist), so with the next server install. Left as plain text on purpose: the card title and summary (one-line labels), the older protocol card (TaskChatProtocolCard), and the server-side notifications (Discord, chat), which have their own formatting. An HTML comment in the text is hidden, as in comments today (same renderer).",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Upstream renders question text as Markdown and keeps the answered context.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: question prompt and help text rendered by MarkdownBody; answered question keeps its question set description. Why: owner's request after TR-723 (15 Nov 2026) and bench lot 20. Origin: studio fork only; to re-apply, wrap question.prompt and question.helpText in MarkdownBody in IssueThreadInteractionCard.tsx (pending and answered), QuestionForm.tsx (form and answered summary) and TaskChatCompactInteractionCard.tsx (ReceiptDisclosure, and the coordinator timeline receipt branch with its 'Question context' disclosure); run the STUDIO-0054 cases of IssueThreadInteractionCard.test.tsx and CoordinatorTaskCommitment.test.tsx."
+    },
+    {
+      "id": "STUDIO-0058",
+      "title": "A secret resolution refused by the rate limit carries a stable code for the plugin",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "A plugin whose secrets.resolve call is refused by the host's rate limit (30 per minute per company and plugin) only gets the sentence 'Rate limit exceeded for secret resolution' with the generic JSON-RPC internal error code; the Worker Router recognises it by comparing that sentence (router review, lot 21).",
+      "reason": "Requested by the router's review through the studio setup session (single window of 15 Nov 2026).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "plugin host: secret resolution and worker host-call errors",
+      "paths": [
+        "server/src/services/plugin-secrets-handler.ts",
+        "server/src/services/plugin-worker-manager.ts",
+        "server/src/__tests__/plugin-secrets-handler.test.ts",
+        "server/src/__tests__/plugin-worker-manager.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: upstream sends host handler errors to the worker with a code and a message only.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. plugin-secrets-handler.test.ts: after 30 refused lookups, the 31st call is refused by the rate limit with the same name and sentence and rpcErrorData { code: 'secret_resolution_rate_limited' }. plugin-worker-manager.test.ts: a host handler error carrying rpcErrorData reaches the worker as JSON-RPC error data unchanged (through a real worker process). With studio-plugin-own-db-channel and tool-gateway: 229 passed. Typecheck of the whole server project in the test tree: 310 errors, the same as the base, none in a changed file.",
+      "migration": "None. The refusal keeps its name and sentence (a router matching the sentence keeps working) and now carries error data { code: 'secret_resolution_rate_limited' }, read on the plugin side as JsonRpcCallError.data.code. The worker manager passes error data only when a host handler attached rpcErrorData (an object); every other host error is sent as before (code and message, no data).",
+      "rollback": "Switch cli/current back to the previous install folder; the router falls back to the sentence.",
+      "retireWhen": "Upstream gives host-call refusals stable codes.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: rpcErrorData { code: 'secret_resolution_rate_limited' } on the rate-limit refusal, passed to the worker as JSON-RPC error data. Why: the router recognised the refusal by its sentence. Origin: studio fork only; to re-apply, keep SECRET_RESOLUTION_RATE_LIMITED and the Object.assign in plugin-secrets-handler.ts and errorDataForWorkerHostError in plugin-worker-manager.ts; run the two STUDIO-0058 cases."
+    },
+    {
+      "id": "STUDIO-0053",
+      "title": "A stopped legacy run that launched no process proves its own stop",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, 15 Nov 2026, studio20 window: the Board cancelled six Quality Manager runs. Two of them (d1389345, no lease; f410e11a, ssh lease) were still preparing their lease when stopped: started, no adapter.invoke event, no process identity, cancellation left 'requested'. The agent stop proof (agentExecutionsHaveStopped) then waited forever for a process acknowledgement (legacy rule) and for a remote termination receipt (ssh lease, no client pid for the ssh proof): the Quality Manager stayed 'pausing' until an operator acknowledged one run and wrote a receipt on the other lease.",
+      "reason": "Requested by the studio setup session (15 Nov 2026), after the studio20 window; follow-up of STUDIO-0043, which only covered runs cancelled by the server before dispatch.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "heartbeat run control (stop of a legacy run with an owned adapter and no process) and agent stop proof",
+      "paths": [
+        "server/src/services/pre-dispatch-cancellation.ts",
+        "server/src/services/heartbeat/run-control.ts",
+        "server/src/services/agent-execution-stop.ts",
+        "server/src/services/heartbeat/run-control.test.ts",
+        "server/src/__tests__/pause-pre-dispatch-cancellation.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: upstream acknowledges a cancellation only when it terminates a recorded process.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. run-control.test.ts, through cancelRunInternal (owned adapter control, no process): the stop writes preDispatchCancellation {version 1, providerWorkStarted false, source stopped_before_process_launch} and keeps executionCancellation 'requested'; the same when the adapter itself ended the run during the stop wait (site 1); nothing with an adapter.invoke, session.started or provider.event event, nothing while the adapter is still settling (stop wait timed out, 409), nothing for a run with a live process; a database error on the marker keeps the end-of-run effects (agent status finalized). pause-pre-dispatch-cancellation.test.ts: the marker proves the stop with and without an ssh lease and is written once; never with any execution-start event (adapter.invoke, process start or identity, harness.ready, session.started/resumed, turn.started, provider.event, provider.rpc_result, tool.execution.started), a process id, a process group, a session, an acknowledged cancellation, a native run or a run not cancelled; at pause time, a run that settled more than two minutes ago is marked and the pause completes, one that settled seconds ago is not. With the existing cases: 104 passed. Negative control (first version): on the previous run-control.ts the first case fails. Typecheck: no error in the changed files. Independent review of the first head (118b4508): D1 to D5 addressed. Second review pass (delta 118b4508..6e4b39d4, good after bench) retouches: the pause-time marker records the run's own end (finishedAt) as cancelledAt; a new case shows that at pause time only the paused agent's cancelled runs without process id, process group, session or execution event are marked: an old run with any of those, an old failed, timed_out or succeeded run, and another agent's run are left alone. Bench on 118b4508 (lot 21): a real run stopped while preparing its ssh lease has no adapter control yet (the control exists from onCancellationReady on), so neither immediate write applies and that head never records the stop. The pause-time marking added at 6e4b39d4 covers it: a new case goes through the real path (a running legacy run on a task, no adapter control, no process, stopped by a Board user through cancelRunInternal) and shows that the stop is requested, that a pause right after it does not complete, and that a pause two minutes after the run's end records the marker and completes. With the existing cases: 105 passed.",
+      "migration": "None. When a legacy run that has an owned adapter control and no registered process is stopped (Board, pause, reassignment, budget), the server waits for the adapter to settle as before; then, if the run is cancelled, recorded no process id, process group, process start time or session (sessionIdAfter), kept its cancellation 'requested', and has no execution-start event (executionStartedEventPredicate), it records the STUDIO-0043 marker with the source stopped_before_process_launch (conditional update, once; a failure is logged and never skips the end-of-run effects). Where the adapter had already ended the run, the stop answers success instead of 'provider termination could not be verified'. A pause (agents in 'pausing' only, after the in-memory adapter-control guard) also marks, with the same conditions and for cancelled runs only, the agent's runs finished more than two minutes ago, with no age bound and cancelledAt set to the run's end, (late settlement after the 60 s stop wait, or across a server restart). agentExecutionsHaveStopped accepts the marker for the legacy rule and for remote leases, so the pause completes. The proof rests on the absence of a recorded process: adapter.invoke alone proves nothing (ACP adapters write it after launching their engine). executionCancellation, the recovery hold and held-wake release are unchanged. Known limits (to watch on the bench): a warm ACP session reused by the run launches no process for it; the marker is written only if the run was stopped before any session, turn or provider event, so the warm engine had not started working for this run. A launch that would happen after the adapter settled (an abandoned ensureSession) records its pid later, which removes the proof (isPreDispatchCancellation requires no pid); a pause completed in between would not see it. Runs stuck before this patch are marked at their agent's next pause check.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Upstream records a stop proof for a run stopped before any process was launched.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: a stopped legacy run that launched no process records preDispatchCancellation (source stopped_before_process_launch), at the stop and at pause time. Why: the Quality Manager stayed pausing after the studio20 window (15 Nov 2026). Origin: studio fork only; to re-apply, keep markCancelledBeforeProcessLaunch and markSettledStopsBeforeProcessLaunch in server/src/services/pre-dispatch-cancellation.ts (conditions: no process identity, no session, no executionStartedEventPredicate event, cancellation requested), their two guarded calls in cancelRunInternal (run-control.ts) and the pause-time call in agentExecutionsHaveStopped; run the STUDIO-0053 cases of run-control.test.ts and pause-pre-dispatch-cancellation.test.ts."
+    },
+    {
+      "id": "STUDIO-0055",
+      "title": "An agent writes its own folder without rights over other agents, and never rewrites its own AGENTS.md",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Rights hardening (V329, bench 15 Nov 2026): removing agents:configure and agents:suggest-changes from the roles would stop their edits of other agents, but the file route then also refused an agent writing evidence files in its own folder (PUT instructions-bundle/file, 403 'Missing permission: agents:configure or agents:suggest-changes'), while the agent could still rewrite its own AGENTS.md (allow_self). The studio publishes each role's AGENTS.md from the Board; a role rewriting it would drift from the published version.",
+      "reason": "Requested by the studio setup session (lot 21, A4), from drafts/reveil-questions/durcissement/correctif-serveur-dossier-agent.md; to be put to the owner before the rights hardening steps 2 and 3.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "agent instruction files: route, file store, end-of-run folder save, instruction revisions",
+      "paths": [
+        "server/src/services/agent-instruction-authorization.ts",
+        "server/src/services/agent-instruction-revisions.ts",
+        "server/src/services/agent-file-store.ts",
+        "server/src/services/agent-directory-working-copies.ts",
+        "server/src/routes/agents.ts",
+        "server/src/services/agent-instruction-own-entry.test.ts",
+        "server/src/__tests__/agent-directory-working-copies.test.ts",
+        "server/src/services/agent-conversations.ts",
+        "server/src/services/authorization.ts",
+        "server/src/services/owner-chat-instruction-authority.ts",
+        "server/src/services/agent-instruction-working-copies.ts",
+        "server/src/__tests__/owner-chat-instruction-authority.test.ts",
+        "server/src/__tests__/heartbeat-instruction-working-copy.test.ts",
+        "server/src/__tests__/agent-instruction-working-copies.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: upstream lets an agent edit its own instruction entry and requires agents:configure for the other files of its folder through the route.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. Second version after the independent review of 321034d4. Real result of the first head on the suites the review named: 50 failed out of 263 (agent-instruction-working-copies 41, owner-chat-instruction-authority 7, heartbeat-instruction-working-copy 3); its record's 'no error' typecheck had not run on the whole project. Third version (second review of 073b8d07): 269 passed, 1 skipped, 0 failed on the seven suites; typecheck of the whole server project in the test tree: 310 errors, the same 310 as the base 2cb9e5cd in that tree, none in a changed file. agent-instruction-own-entry.test.ts: an agent rewriting its own entry is refused (403 AGENT_ENTRY_SELF_EDIT_REFUSED); another agent and the Board are left to the existing rules. agent-directory-working-copies.test.ts, through collectStopped and checkpointWarm (actor: the run's agent): evidence saved and entry edit set aside; entry replaced by a directory or by a link: put back, rest saved; a Board publication during the run is kept and not marked; a local warm copy whose run edited its entry stays reusable (the published entry is put back in the live copy before the capture); an oversized entry is set aside before the scan (state unchanged); a save that fails on another file keeps the mark. heartbeat-instruction-working-copy.test.ts, through the real heartbeat: the run's note is saved, its entry edit set aside, the next run reads the published entry. owner-chat-instruction-authority.test.ts: the owner-chat self-edit of AGENTS.md is refused (revision commit 403; legacy copy: conflict with the candidate preserved for the Board; directory copy: note saved, entry set aside); the low-trust rejection is shown on another file. agent-instruction-working-copies.test.ts covers the legacy single-file copy worker with the refusal lifted in that file only (vi.mock of assertNotOwnEntryEdit), so its upstream mechanics stay covered. Upstream cases changed on purpose: a warm run's edit of its loaded entry no longer reaches the next run, and the warm copy stays reusable; an oversized entry written by the agent is set aside instead of failing the whole save. Third version cases: entry deleted by the run (put back, rest saved); a file whose name differs from the entry only by case is an ordinary file (saved, entry untouched, not marked); no published entry (the run's own entry is removed, the rest saved). Not covered by a test: the route exemption (PUT/DELETE instructions-bundle/file by the agent) and the native tools (bench); a remote warm copy (its warm reuse lost when its run edits the entry); the parent-replacement race below. Typecheck of the whole server project: see the counts above.",
+      "migration": "None. (1) assertNotOwnEntryEdit: an agent writing its own entry file is refused (403 AGENT_ENTRY_SELF_EDIT_REFUSED) in the instruction revision commit (entry through the route) and in the file store's one-file write; peers keep the existing grant rules (agents:configure / agents:suggest-changes) and the Board is unchanged. (2) The save of the agent folder sets aside the run's change to its own entry file (edited, deleted, replaced by a directory or a link, oversized) and saves the rest (notes, evidence): agentFileStore.setOwnEntryAside puts the published entry back in the run's copy before it is scanned (local warm copy: the live directory, so the saved baseline matches the canonical files and the warm copy stays reusable; stopped copy, local or remote: the local copy after retrieval), and agentFileStore.apply sets aside any remaining change inside the lock (a Board publication during the run is not an edit). Without any published entry, the run's own entry is removed and the rest is saved. The copy receipt and the activity carry entryEditDiscarded, also when the save then fails, across retries. (3) PUT and DELETE /agents/:id/instructions-bundle/file no longer require agents:* rights when an agent writes or deletes a non-entry file of its own managed folder; the file store's own check (authorizeInstructionCommit: owner, low-trust and responsible-user rules) governs. External instruction roots keep the route check. Effect on the rights hardening: removing agents:configure and agents:suggest-changes from the roles keeps their evidence writes and still stops edits of other agents. The texts given to the agent say so (owner-chat paragraph, low-trust rejection, directory and legacy copy guidance). Known limits: an owner-chat request to an agent to edit its own AGENTS.md is refused too (the Board publishes it; pending the owner's choice, the alternative is to allow it in owner chat only); a legacy single-file copy edit ends in conflict with its candidate preserved for the Board; a remote warm copy cannot have its entry put back before the capture, so its warm reuse is lost when its run edits the entry (no data loss); the comparison of the entry name is exact (production disk ext4 without casefold, checked 15 Nov 2026; a case-only variant is shown to be an ordinary file by a test); putting the entry back in a local warm copy happens while the agent may still run: the parents of the entry path are checked again right before each removal, the bytes are written by materializeInstructionBytes (its own checks before the rename) and the mode is set on the opened file (O_NOFOLLOW), but an agent that replaces a parent directory by a link between that check and the removal could still redirect it outside its folder (a narrow race; the studio's entry AGENTS.md is at the top of the folder, so its only parent is the copy root; and a local warm copy is run by a process under the server's own system account, which could change those paths itself, so the race gives it nothing more); the native tool descriptions (packages/paperclip-runner/src/protocol-actions/update-agent-instructions.ts and restore-agent-instructions.ts) still do not mention the refusal for oneself: they are sources (not generated) but feed packages/paperclip-runner/generated/capability/semantic-tool-contracts.json and the runner build, which the studio delivery does not rebuild; the refusal carries its own message at call time; a role whose instructions tell it to keep notes inside AGENTS.md loses those edits (receipt only): check the published fiches before deploying and point such notes to another file of the folder.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Upstream protects an agent's instruction entry from the agent and separates its own folder from configure rights.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: an agent never rewrites its own AGENTS.md (refused or set aside), and writes the rest of its own managed folder without agents:* rights. Why: rights hardening of the studio roles (V329, 15 Nov 2026). Origin: studio fork only; to re-apply, keep assertNotOwnEntryEdit in agent-instruction-authorization.ts and its calls in agent-instruction-revisions.ts (commit) and agent-file-store.ts (write, setOwnEntryAside, and the entry set-aside in apply with entryEditDiscarded), the setOwnEntryAside calls and the receipt field in agent-directory-working-copies.ts, the texts in agent-conversations.ts, authorization.ts, owner-chat-instruction-authority.ts and agent-instruction-working-copies.ts, and the ownManagedFile / ownManagedDelete exemptions in routes/agents.ts; run agent-instruction-own-entry.test.ts, agent-directory-working-copies.test.ts, owner-chat-instruction-authority.test.ts, heartbeat-instruction-working-copy.test.ts and agent-instruction-working-copies.test.ts (refusal lifted there by vi.mock)."
     }
   ]
 }

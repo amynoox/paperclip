@@ -3711,7 +3711,8 @@ describe("IssueDetail", () => {
     expect(mockDecisionsApi.list).not.toHaveBeenCalled();
   });
 
-  it("updates status from the task header control and hides the priority control (PAP-411)", async () => {
+  // STUDIO-0057: the studio shows task priority again (SHOW_TASK_PRIORITY_UI on, upstream PAP-411 reverted).
+  it("updates status from the task header control and shows the priority control (STUDIO-0057)", async () => {
     const issue = createIssue({ status: "todo", priority: "medium" });
     mockIssuesApi.get.mockResolvedValue(issue);
     mockIssuesApi.update.mockImplementation(
@@ -3734,9 +3735,7 @@ describe("IssueDetail", () => {
       'button[aria-label="Change priority (current: medium)"]',
     );
     expect(statusButton).not.toBeNull();
-    // PAP-411: priority UI is hidden behind SHOW_TASK_PRIORITY_UI (off), so the header
-    // priority control must not render.
-    expect(priorityButton).toBeNull();
+    expect(priorityButton).not.toBeNull();
 
     await act(async () => {
       statusButton!.dispatchEvent(

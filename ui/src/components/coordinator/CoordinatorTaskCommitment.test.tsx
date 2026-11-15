@@ -5,8 +5,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { CoordinatorTaskMotion } from "./CoordinatorTaskCommitment";
 import { TaskChatCompactInteractionCard } from "../task-chat/TaskChatCompactInteractionCard";
-import { pendingSuggestedTasksInteraction } from "@/fixtures/issueThreadInteractionFixtures";
+import { answeredAskUserQuestionsInteraction, pendingSuggestedTasksInteraction } from "@/fixtures/issueThreadInteractionFixtures";
 import { TooltipProvider } from "../ui/tooltip";
+import { ThemeProvider } from "@/context/ThemeContext";
 
 vi.mock("@/hooks/useCoordinatorWorkspaceEnabled", () => ({ useCoordinatorWorkspaceEnabled: () => ({ enabled: true, loaded: true, userId: "viewer" }) }));
 vi.mock("@/lib/router", () => ({ Link: ({ to, children, ...props }: any) => <a href={to} {...props}>{children}</a> }));
@@ -144,5 +145,50 @@ describe("Coordinator task commitment", () => {
     await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
     const glyph = host.querySelector<SVGElement>(".coordinator-created-task svg[role='img']");
     expect(glyph?.style.color).toBe("var(--status-task-icon-in_queue)");
+  });
+});
+
+// STUDIO-0054: bench, lot 20 (15 Nov 2026). Once answered, a question shrank to its receipt and the question set's
+// description, the context the person read before answering, was no longer shown anywhere in the task.
+describe("answered question receipt", () => {
+  const withContext = (description?: string) => {
+    const base = answeredAskUserQuestionsInteraction;
+    return { ...base, payload: { ...base.payload, ...(description === undefined ? {} : { questionSet: {
+      schema: "paperclip.question_set.v1" as const, description,
+      questions: base.payload.questions.map((question) => ({ id: question.id, prompt: question.prompt, required: question.required ?? false,
+        answerMode: question.selectionMode === "multi" ? "multi_select" as const : "single_select" as const,
+        options: question.options.map((option) => ({ id: option.id, label: option.label })) })),
+    } }) } };
+  };
+  const paint = (interaction: unknown) => act(() => root.render(<QueryClientProvider client={client}><TooltipProvider><ThemeProvider>
+    <TaskChatCompactInteractionCard interaction={interaction as never} />
+  </ThemeProvider></TooltipProvider></QueryClientProvider>));
+
+  it("keeps the question's context readable under the receipt", async () => {
+    await paint(withContext("**Contexte** de la décision\n\n- point un\n- point deux"));
+    expect(host.querySelector(".coordinator-decision-receipt")).not.toBeNull();
+    const context = host.querySelector('[data-testid="answered-question-context"]');
+    expect(context?.querySelector("summary")?.textContent).toBe("Question context");
+    expect(context?.querySelector("strong")?.textContent).toBe("Contexte");
+    expect([...context!.querySelectorAll("li")].map((item) => item.textContent?.trim())).toEqual(["point un", "point deux"]);
+  });
+
+  it("shows the bare receipt when the question had no context", async () => {
+    await paint(withContext());
+    expect(host.querySelector(".coordinator-decision-receipt")).not.toBeNull();
+    expect(host.querySelector('[data-testid="answered-question-context"]')).toBeNull();
+  });
+
+  it("renders the resolved receipt's question and help text as Markdown", async () => {
+    const base = withContext("**Contexte**");
+    const interaction = { ...base, payload: { ...base.payload, questions: base.payload.questions.map((question, index) =>
+      index === 0 ? { ...question, helpText: "voir *aussi* la note" } : question) } };
+    interaction.payload.questionSet!.questions = interaction.payload.questionSet!.questions.map((question, index) =>
+      index === 0 ? { ...question, helpText: "voir *aussi* la note" } : question);
+    await act(() => root.render(<QueryClientProvider client={client}><TooltipProvider><ThemeProvider>
+      <TaskChatCompactInteractionCard interaction={interaction as never} presentation="takeover" />
+    </ThemeProvider></TooltipProvider></QueryClientProvider>));
+    expect([...host.querySelectorAll("em")].some((element) => element.textContent === "aussi")).toBe(true);
+    expect(host.textContent).not.toContain("*aussi*");
   });
 });

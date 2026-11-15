@@ -309,6 +309,22 @@ describe("plugin-worker-manager stderr failure context", () => {
     }
   });
 
+  // STUDIO-0058: structured data attached by a host handler to its error reaches the worker unchanged.
+  it("passes a host handler's error data to the worker", async () => {
+    const handle = createPluginWorkerHandle("test.plugin", {
+      entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT, manifest: TEST_MANIFEST, config: {},
+      instanceInfo: { instanceId: "instance-1", hostVersion: "1.0.0" }, apiVersion: 1,
+      hostHandlers: { "companies.get": (async () => {
+        throw Object.assign(new Error("Rate limit exceeded for secret resolution"), { rpcErrorData: { code: "secret_resolution_rate_limited" } });
+      }) as never },
+    });
+    try {
+      await handle.start();
+      await expect(handle.call("getData", { companyId: "company-a", key: "k", params: { mode: "echo", requestedCompanyId: "company-a" } } as never))
+        .rejects.toMatchObject({ message: "Rate limit exceeded for secret resolution", data: { code: "secret_resolution_rate_limited" } });
+    } finally { await handle.stop().catch(() => undefined); }
+  });
+
   it("mints project Git scope only for project lifecycle and workspace operations", async () => {
     const handle = createPluginWorkerHandle("test.plugin", {
       entrypointPath: INVOCATION_SCOPE_WORKER_ENTRYPOINT, manifest: TEST_MANIFEST, config: {},
