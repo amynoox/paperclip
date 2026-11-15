@@ -2496,6 +2496,13 @@ a.paperclip-mention-chip[data-mention-kind="agent"]::before {
   line-height: 1.6;
 }
 
+/* STUDIO-0054: question text keeps the size, line height and colour of its container. */
+.paperclip-markdown.paperclip-markdown-inherit {
+  color: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+
 .paperclip-markdown.paperclip-markdown-on-accent {
   color: inherit;
   --tw-prose-body: currentColor;

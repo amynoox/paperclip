@@ -220,9 +220,9 @@ export function QuestionResponseSummary({
                   {question.header}
                 </span>
               ) : null}
-              <span className="block text-sm text-foreground">
-                {question.prompt}
-              </span>
+              <div className="text-sm text-foreground">
+                <MarkdownBody className="paperclip-markdown-inherit" mediaMode="reference">{question.prompt}</MarkdownBody>
+              </div>
             </dt>
             <dd className="mt-0.5 text-foreground">
               {values.length > 0 ? values.join(", ") : "No answer"}
@@ -296,7 +296,7 @@ function QuestionFormForRequest({
   const [inputUploading, setInputUploading] = useState(false);
   const [error, setError] = useState<FormError | null>(null);
   const [attemptedQuestions, setAttemptedQuestions] = useState<Record<string, boolean>>({});
-  const promptRef = useRef<HTMLParagraphElement>(null);
+  const promptRef = useRef<HTMLDivElement>(null);
   const previousPage = useRef(page);
 
   useEffect(() => {
@@ -550,7 +550,7 @@ function QuestionFormForRequest({
           tabIndex={0}
           className="mb-3 max-h-96 overflow-auto text-sm text-muted-foreground"
         >
-          <MarkdownBody mediaMode="reference" linkIssueReferences={false}>{questionSet.description}</MarkdownBody>
+          <MarkdownBody className="paperclip-markdown-inherit" mediaMode="reference">{questionSet.description}</MarkdownBody>
         </div>
       ) : null}
       {question.answerMode === "text" && presentation !== "decision" ? (
@@ -575,19 +575,20 @@ function QuestionFormForRequest({
             {question.header}
           </p>
         ) : null}
-        <p
+        <div
           ref={promptRef}
           tabIndex={-1}
           id={`${id}-${question.id}-prompt`}
           data-decision-prompt={presentation === "decision" ? true : undefined}
           className={presentation === "decision" ? "text-lg font-medium leading-relaxed text-foreground" : "text-sm font-medium leading-5 text-foreground"}
         >
-          {question.prompt}
-        </p>
+          {/* STUDIO-0054: the role's line breaks, lists, emphasis and links stay readable. */}
+          <MarkdownBody className="paperclip-markdown-inherit" mediaMode="reference">{question.prompt}</MarkdownBody>
+        </div>
         {question.helpText ? (
-          <p className="mt-1 text-xs leading-4 text-muted-foreground">
-            {question.helpText}
-          </p>
+          <div className="mt-1 text-xs leading-4 text-muted-foreground">
+            <MarkdownBody className="paperclip-markdown-inherit" mediaMode="reference">{question.helpText}</MarkdownBody>
+          </div>
         ) : null}
       </div>
       {question.answerMode === "text" ? (

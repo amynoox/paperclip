@@ -6,8 +6,10 @@ import { Checkbox } from "./ui/checkbox";
 import { Input } from "./ui/input";
 import { FlyoutHeader } from "./ui/flyout";
 import { StatusIcon } from "./StatusIcon";
+import { PriorityIcon } from "./PriorityIcon";
 import { TruncatedText } from "./TruncatedText";
-import { issueFilterLabel, issueStatusOrder, searchIssueFilterOptions, toggleIssueFilterValue } from "@/lib/issue-filters";
+import { issueFilterLabel, issuePriorityOrder, issueStatusOrder, searchIssueFilterOptions, toggleIssueFilterValue } from "@/lib/issue-filters";
+import { SHOW_TASK_PRIORITY_UI } from "@/lib/ui-flags";
 
 type PanelProps = Pick<ComponentProps<typeof IssueFiltersPopover>, "state" | "onChange" | "activeFilterCount" | "agents" | "projects" | "labels" | "creators" | "currentUserId" | "enableRoutineTasksFilter" | "enableAgentCreatedVisibilityFilter" | "enableLiveRunsFilter"> & { onClear: () => void };
 
@@ -44,6 +46,10 @@ export function IssueFilterPanel({ state, onChange, activeFilterCount, agents = 
         <FilterGroup title="Status" optionsKey="statuses">
           {issueStatusOrder.map(status => <FilterRow key={status} label={issueFilterLabel(status)} checked={state.statuses.includes(status)} onToggle={() => onChange({ statuses: toggleIssueFilterValue(state.statuses, status) })} icon={<StatusIcon status={status} />} />)}
         </FilterGroup>
+        {/* STUDIO-0057: the studio adds the Priority filter to this panel (absent upstream), behind the same flag. */}
+        {SHOW_TASK_PRIORITY_UI ? <FilterGroup title="Priority" optionsKey="priorities">
+          {issuePriorityOrder.map(priority => <FilterRow key={priority} label={issueFilterLabel(priority)} checked={state.priorities.includes(priority)} onToggle={() => onChange({ priorities: toggleIssueFilterValue(state.priorities, priority) })} icon={<PriorityIcon priority={priority} />} />)}
+        </FilterGroup> : null}
         {enableLiveRunsFilter || enableAgentCreatedVisibilityFilter || enableRoutineTasksFilter ? <FilterGroup title="Visibility" optionsKey="visibility">
           {enableLiveRunsFilter ? <FilterRow label="Live runs only" checked={state.liveOnly === true} onToggle={() => onChange({ liveOnly: !state.liveOnly })} /> : null}
           {enableAgentCreatedVisibilityFilter ? <FilterRow label="Show agent-created tasks" checked={state.showAgentCreatedTasks} onToggle={() => onChange({ showAgentCreatedTasks: !state.showAgentCreatedTasks })} /> : null}
