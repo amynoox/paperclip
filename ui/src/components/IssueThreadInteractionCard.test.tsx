@@ -11,6 +11,7 @@ import { IssueThreadInteractionCard } from "./IssueThreadInteractionCard";
 import { ThemeProvider } from "../context/ThemeContext";
 import { TooltipProvider } from "./ui/tooltip";
 import {
+  answeredAskUserQuestionsInteraction,
   pendingAskUserQuestionsInteraction,
   pendingAskUserQuestionsWithFreeTextOption,
   commentExpiredAskUserQuestionsInteraction,
@@ -1901,3 +1902,93 @@ describe("IssueThreadInteractionCard resolver audience", () => {
     ).not.toBeNull();
   });
 });
+
+// STUDIO-0054: production, 15 Nov 2026 (TR-723). A question's text lost the role's line breaks, its bullet points
+// ran into the sentence and Markdown links stayed raw: the text was plain text in a block.
+describe("question text keeps its formatting", () => {
+  const prompt = "**Décision** sur la PR\n\n- premier point\n- second point\n\n[Rapport complet](https://example.com/rapport)";
+  const withPrompt = <T extends typeof pendingAskUserQuestionsInteraction>(base: T): T => ({
+    ...base,
+    payload: { ...base.payload, questions: base.payload.questions.map((question, index) =>
+      index === 0 ? { ...question, prompt, helpText: "voir *aussi* la note" } : question) },
+  });
+  function expectFormatted(node: HTMLElement, helpText = true) {
+    expect([...node.querySelectorAll("strong")].some((element) => element.textContent === "Décision")).toBe(true);
+    expect([...node.querySelectorAll("li")].map((element) => element.textContent?.trim())).toEqual(
+      expect.arrayContaining(["premier point", "second point"]));
+    expect([...node.querySelectorAll("a")].some((element) => element.textContent?.includes("Rapport complet")
+      && element.getAttribute("href") === "https://example.com/rapport")).toBe(true);
+    if (helpText) expect([...node.querySelectorAll("em")].some((element) => element.textContent === "aussi")).toBe(true);
+    expect(node.textContent).not.toContain("**Décision**");
+    expect(node.textContent).not.toContain("](https://example.com/rapport)");
+  }
+
+  it("on a pending card without a question set", () => {
+    expectFormatted(renderCard({ interaction: withPrompt(pendingAskUserQuestionsInteraction) }));
+  });
+
+  it("on a pending card rendered by the question form", () => {
+    const base = withPrompt(pendingAskUserQuestionsInteraction);
+    const questionSet = {
+      schema: "paperclip.question_set.v1" as const,
+      description: "**Contexte** de la décision",
+      questions: base.payload.questions.map((question) => ({
+        id: question.id, prompt: question.prompt, ...(question.helpText ? { helpText: question.helpText } : {}),
+        required: question.required ?? false, answerMode: question.selectionMode === "multi" ? "multi_select" as const : "single_select" as const,
+        options: question.options.map((option) => ({ id: option.id, label: option.label })),
+      })),
+    };
+    const node = renderCard({ interaction: { ...base, payload: { ...base.payload, questionSet } } as never, onSubmitInteractionAnswers: vi.fn() });
+    expectFormatted(node);
+    expect([...node.querySelectorAll("strong")].some((element) => element.textContent === "Contexte")).toBe(true);
+  });
+
+  it("on an answered card", () => {
+    expectFormatted(renderCard({ interaction: withPrompt(answeredAskUserQuestionsInteraction as never) }), false);
+  });
+});
+
+// STUDIO-0054, review of the first head: details and safety of the rendered question text.
+describe("question text details and safety", () => {
+  const cardWith = (prompt: string, helpText?: string) => renderCard({ interaction: {
+    ...pendingAskUserQuestionsInteraction,
+    payload: { ...pendingAskUserQuestionsInteraction.payload, questionSet: undefined, questions: pendingAskUserQuestionsInteraction.payload.questions.map(
+      (question, index) => index === 0 ? { ...question, prompt, helpText: helpText ?? null } : question) },
+  } as never });
+  const promptBlock = (node: HTMLElement) => node.querySelector<HTMLElement>('[id$="-prompt"]')!;
+
+  it("keeps file names with underscores and inline code literal", () => {
+    const node = cardWith("Voir Vehicle_PassangersManager.cs:309 et __x3200_y1200, puis `run_all.sh`");
+    const block = promptBlock(node);
+    expect(block.textContent).toContain("Vehicle_PassangersManager.cs:309");
+    expect(block.textContent).toContain("__x3200_y1200");
+    expect(block.querySelector("em, strong")).toBeNull();
+    expect(block.querySelector("code")?.textContent).toBe("run_all.sh");
+  });
+
+  it("never renders a javascript: link nor raw HTML", () => {
+    const node = cardWith("[clic](javascript:alert(1)) <b>gras</b> <img src=x onerror=alert(1)>");
+    const block = promptBlock(node);
+    expect([...block.querySelectorAll("a")].some((element) => (element.getAttribute("href") ?? "").startsWith("javascript:"))).toBe(false);
+    expect(block.querySelector("b, img, script")).toBeNull();
+    expect(block.textContent).toContain("clic");
+  });
+
+  it("renders a one-line prompt as a single paragraph", () => {
+    const block = promptBlock(cardWith("Que fait-on de la PR ?"));
+    expect(block.querySelectorAll("p")).toHaveLength(1);
+    expect(block.textContent?.trim()).toBe("Que fait-on de la PR ?");
+  });
+
+  it("keeps a relative ticket link as a link in the question form", () => {
+    const base = pendingAskUserQuestionsInteraction;
+    const prompt = "Lire [le rapport](/TR/issues/TR-723) avant de répondre";
+    const questions = base.payload.questions.map((question, index) => index === 0 ? { ...question, prompt } : question);
+    const questionSet = { schema: "paperclip.question_set.v1" as const, questions: questions.map((question) => ({ id: question.id, prompt: question.prompt,
+      required: question.required ?? false, answerMode: question.selectionMode === "multi" ? "multi_select" as const : "single_select" as const,
+      options: question.options.map((option) => ({ id: option.id, label: option.label })) })) };
+    const node = renderCard({ interaction: { ...base, payload: { ...base.payload, questions, questionSet } } as never, onSubmitInteractionAnswers: vi.fn() });
+    expect([...node.querySelectorAll("a")].some((element) => (element.getAttribute("href") ?? "").includes("TR-723"))).toBe(true);
+  });
+});
+

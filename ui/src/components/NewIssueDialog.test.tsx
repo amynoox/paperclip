@@ -2424,8 +2424,8 @@ describe("NewIssueDialog", () => {
     const { root } = renderDialog(container);
     await flush();
 
-    // PAP-411: priority UI is hidden behind SHOW_TASK_PRIORITY_UI (off). Neither the
-    // desktop priority chip nor the mobile overflow priority option should render.
+    // PAP-411 hid these behind SHOW_TASK_PRIORITY_UI; the shared task composer (#15091) then removed the dialog's
+    // priority control outright. STUDIO-0057 turns the flag on, which does not bring it back: still absent here.
     const priorityChip = container.querySelector('[data-testid="new-issue-priority-chip"]');
     expect(priorityChip).toBeNull();
 

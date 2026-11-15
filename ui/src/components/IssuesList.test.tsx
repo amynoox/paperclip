@@ -1150,7 +1150,8 @@ describe("IssuesList", () => {
     });
   });
 
-  it("hides the Priority option from the Sort and Group menus while priority UI is off (PAP-411)", async () => {
+  // STUDIO-0057: the studio shows task priority again (SHOW_TASK_PRIORITY_UI on, upstream PAP-411 reverted).
+  it("offers the Priority option in the Sort and Group menus (STUDIO-0057)", async () => {
     const { root } = renderWithQueryClient(
       <IssuesList
         issues={[createIssue({ id: "issue-1", identifier: "PAP-1", title: "Task one" })]}
@@ -1176,9 +1177,8 @@ describe("IssuesList", () => {
     });
     await waitForAssertion(() => {
       const labels = Array.from(document.body.querySelectorAll("button")).map((b) => b.textContent ?? "");
-      // Status sort option renders, but the Priority option is gated off (PAP-411).
       expect(labels.some((text) => text.includes("Status"))).toBe(true);
-      expect(labels.some((text) => text.includes("Priority"))).toBe(false);
+      expect(labels.some((text) => text.includes("Priority"))).toBe(true);
     });
 
     const groupButton = Array.from(container.querySelectorAll("button")).find(
@@ -1191,7 +1191,7 @@ describe("IssuesList", () => {
     await waitForAssertion(() => {
       const labels = Array.from(document.body.querySelectorAll("button")).map((b) => b.textContent ?? "");
       expect(labels.some((text) => text.includes("Status"))).toBe(true);
-      expect(labels.some((text) => text.includes("Priority"))).toBe(false);
+      expect(labels.some((text) => text.includes("Priority"))).toBe(true);
     });
 
     act(() => {

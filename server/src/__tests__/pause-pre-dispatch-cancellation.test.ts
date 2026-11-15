@@ -1,11 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { agents, companies, createDb, environmentLeases, heartbeatRuns, type Db } from "@paperclipai/db";
+import { agents, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentExecutionsHaveStopped, SSH_CLIENT_STOP_PAUSE_PROOF_DELAY_MS } from "../services/agent-execution-stop.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
-import { preDispatchCancellationResult } from "../services/pre-dispatch-cancellation.js";
+import { markCancelledBeforeProcessLaunch, preDispatchCancellationResult, SETTLED_STOP_MARK_DELAY_MS } from "../services/pre-dispatch-cancellation.js";
 
 // STUDIO-0043: production, 14 Nov 2026. After a pause, three agents stayed
 // `pausing`: five runs had been cancelled by the server before their adapter
@@ -134,5 +134,103 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await driver.runHost(agent as never)).toBe("complete");
     // The same runs keep a termination pending.
     expect(await driver.runHost({ ...agent, lifecycleState: "terminating" } as never)).toBe("pending");
+  });
+
+  // STUDIO-0053: production, 15 Nov 2026. d1389345 (no lease) and f410e11a (ssh lease, expired) were stopped by the
+  // Board during their preparation: started, no process identity, no execution event, cancellation "requested".
+  async function boardStopBeforeAdapter(input: { ssh: boolean; minutesAgo?: number }) {
+    const finishedAt = new Date(Date.now() - (input.minutesAgo ?? 1) * 60_000);
+    const f = await seed({ errorCode: "cancelled", startedAt: new Date(finishedAt.getTime() - 37_000), finishedAt,
+      resultJson: { conversationContinuation: "continue_conversation_v1", executionCancellation: { state: "requested", requestedAt: finishedAt.toISOString() } } });
+    if (input.ssh) await sshLease(f);
+    return f;
+  }
+
+  it("proves the stop of a run stopped before any process was launched, with or without an ssh lease", async () => {
+    for (const ssh of [false, true]) {
+      const f = await boardStopBeforeAdapter({ ssh });
+      expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(false);
+      expect(await markCancelledBeforeProcessLaunch(db, f.run.id)).toBe(true);
+      expect(await markCancelledBeforeProcessLaunch(db, f.run.id)).toBe(false);
+      expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(true);
+      expect(await agentExecutionsHaveStopped(db, [f.agentId])).toBe(true);
+    }
+  });
+
+  it("writes no marker once the adapter was invoked or a process was asked for or recorded", async () => {
+    for (const eventType of ["adapter.invoke", "native.process_start_requested", "native.process_identity_recorded", "tool.execution.started",
+      "harness.ready", "session.started", "session.resumed", "turn.started", "provider.event", "provider.rpc_result"]) {
+      const f = await boardStopBeforeAdapter({ ssh: true });
+      await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: f.run.id, agentId: f.agentId, seq: 1, eventType,
+        stream: "system", level: "info", message: eventType });
+      expect(await markCancelledBeforeProcessLaunch(db, f.run.id)).toBe(false);
+      expect(await agentExecutionsHaveStopped(db, [f.agentId])).toBe(false);
+    }
+    const withPid = await boardStopBeforeAdapter({ ssh: true });
+    await db.update(heartbeatRuns).set({ processPid: 2_000_000_002 }).where(eq(heartbeatRuns.id, withPid.run.id));
+    expect(await markCancelledBeforeProcessLaunch(db, withPid.run.id)).toBe(false);
+    const withGroup = await boardStopBeforeAdapter({ ssh: true });
+    await db.update(heartbeatRuns).set({ processGroupId: 2_000_000_003 }).where(eq(heartbeatRuns.id, withGroup.run.id));
+    expect(await markCancelledBeforeProcessLaunch(db, withGroup.run.id)).toBe(false);
+    const withSession = await boardStopBeforeAdapter({ ssh: true });
+    await db.update(heartbeatRuns).set({ sessionIdAfter: "session-1" }).where(eq(heartbeatRuns.id, withSession.run.id));
+    expect(await markCancelledBeforeProcessLaunch(db, withSession.run.id)).toBe(false);
+  });
+
+  it("writes no marker for a run that is not a requested legacy cancellation", async () => {
+    const acknowledged = await seed({ resultJson: { executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() } } });
+    expect(await markCancelledBeforeProcessLaunch(db, acknowledged.run.id)).toBe(false);
+    const nativeRun = await boardStopBeforeAdapter({ ssh: false });
+    await db.update(heartbeatRuns).set({ runtimeMode: "native" }).where(eq(heartbeatRuns.id, nativeRun.run.id));
+    expect(await markCancelledBeforeProcessLaunch(db, nativeRun.run.id)).toBe(false);
+    const stillRunning = await boardStopBeforeAdapter({ ssh: false });
+    await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, stillRunning.run.id));
+    expect(await markCancelledBeforeProcessLaunch(db, stillRunning.run.id)).toBe(false);
+  });
+
+  it("records at pause time the stop of a run that settled late or across a restart", async () => {
+    expect(SETTLED_STOP_MARK_DELAY_MS).toBe(2 * 60_000);
+    const settled = await boardStopBeforeAdapter({ ssh: true, minutesAgo: 5 });
+    expect(await agentExecutionsHaveStopped(db, [settled.agentId])).toBe(false);
+    expect(await agentExecutionsHaveStopped(db, [settled.agentId], { pauseStop: true })).toBe(true);
+    const [marked] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, settled.run.id));
+    expect(marked!.resultJson).toMatchObject({ preDispatchCancellation: { source: "stopped_before_process_launch" } });
+    // Settled a few seconds ago: the adapter may still be writing; nothing is recorded yet.
+    const fresh = await boardStopBeforeAdapter({ ssh: true, minutesAgo: 0.1 });
+    expect(await agentExecutionsHaveStopped(db, [fresh.agentId], { pauseStop: true })).toBe(false);
+  });
+
+  it("marks at pause time only the paused agent's cancelled runs without any process, session or execution event", async () => {
+    const stamp = async (f: { run: typeof heartbeatRuns.$inferSelect }, values: Partial<typeof heartbeatRuns.$inferInsert>) =>
+      db.update(heartbeatRuns).set(values).where(eq(heartbeatRuns.id, f.run.id));
+    const marker = async (f: { run: typeof heartbeatRuns.$inferSelect }) =>
+      ((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id)))[0]!.resultJson as Record<string, any> | null)?.preDispatchCancellation;
+    const target = await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 });
+    const others = {
+      pid: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+      group: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+      session: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+      event: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+      failed: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+      timedOut: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+      succeeded: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+    };
+    // Every run belongs to the target's agent, except one left on its own agent below.
+    for (const f of Object.values(others)) await stamp(f, { agentId: target.agentId, companyId: target.companyId });
+    await stamp(others.pid, { processPid: 2_000_000_010 });
+    await stamp(others.group, { processGroupId: 2_000_000_011 });
+    await stamp(others.session, { sessionIdAfter: "session-2" });
+    await db.insert(heartbeatRunEvents).values({ companyId: target.companyId, runId: others.event.run.id, agentId: target.agentId, seq: 1,
+      eventType: "provider.event", stream: "system", level: "info", message: "provider.event" });
+    await stamp(others.failed, { status: "failed" });
+    await stamp(others.timedOut, { status: "timed_out" });
+    await stamp(others.succeeded, { status: "succeeded" });
+    const elsewhere = await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 });
+    await agentExecutionsHaveStopped(db, [target.agentId], { pauseStop: true });
+    const marked = await marker(target);
+    expect(marked).toMatchObject({ source: "stopped_before_process_launch", providerWorkStarted: false });
+    expect(new Date(marked.cancelledAt).getTime()).toBe(target.run.finishedAt!.getTime());
+    for (const f of Object.values(others)) expect(await marker(f)).toBeUndefined();
+    expect(await marker(elsewhere)).toBeUndefined();
   });
 });
