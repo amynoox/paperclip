@@ -222,6 +222,43 @@ describe("persistent agent directories", () => {
       expect(await fs.readFile(path.join(root, "evidence.md"), "utf8")).toBe("kept evidence");
       expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
     });
+    it.each(["directory", "link"] as const)("puts the published entry back when the run replaced it by a %s, and saves the rest", async (kind) => {
+      const copy = await run();
+      await fs.writeFile(path.join(copy.localRoot, "evidence.md"), "kept evidence");
+      const entry = path.join(copy.localRoot, entryFile);
+      await fs.rm(entry);
+      if (kind === "directory") {
+        await fs.mkdir(entry);
+        await fs.writeFile(path.join(entry, "inside.md"), "not an entry");
+      } else await fs.symlink(path.join(copy.localRoot, "evidence.md"), entry);
+      expect(await copies.collectStopped({ companyId, runId: copy.runId })).toMatchObject({ state: "saved", receipt: { entryEditDiscarded: true } });
+      expect(await fs.readFile(path.join(root, "evidence.md"), "utf8")).toBe("kept evidence");
+      expect((await fs.lstat(path.join(root, entryFile))).isFile()).toBe(true);
+      expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
+    });
+    it("does not mark a Board publication made during the run", async () => {
+      const copy = await run();
+      const current = (await revisions.readCurrent(target(), board()))!;
+      await revisions.commit({ ...target(), entryFile, baseRevisionId: current.revision.id, content: "# Board update\n", source: "api" }, board());
+      await fs.writeFile(path.join(copy.localRoot, "evidence.md"), "kept evidence");
+      const saved = await copies.collectStopped({ companyId, runId: copy.runId });
+      expect(saved?.state).toBe("saved");
+      expect(saved?.receipt?.entryEditDiscarded).toBeUndefined();
+      expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe("# Board update\n");
+      expect(await fs.readFile(path.join(root, "evidence.md"), "utf8")).toBe("kept evidence");
+    });
+    it("keeps a local warm copy reusable after the run edited its own entry", async () => {
+      const copy = await run({ warm: true });
+      await fs.writeFile(path.join(copy.localRoot, entryFile), "rewritten by the agent");
+      await fs.writeFile(path.join(copy.localRoot, "memory.txt"), "turn 1");
+      expect(await copies.checkpointWarm({ companyId, runId: copy.runId })).toMatchObject({ state: "warm_saved", receipt: { entryEditDiscarded: true } });
+      expect(await fs.readFile(path.join(copy.localRoot, entryFile), "utf8")).toBe(initial);
+      expect(await fs.readFile(path.join(root, "memory.txt"), "utf8")).toBe("turn 1");
+      await copies.release(companyId, copy.runId);
+      expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(true);
+      const next = await run({ warm: true, reuseRunId: copy.runId });
+      expect(next.executionRoot).toBe(copy.executionRoot);
+    });
     it("retains a future cleanup deadline across restart without early file operations", async () => {
       const copy = await run(); clock(); const due = new Date(Date.now() + 90_000);
       await stopped(copy, due); const worker = coordinator();
@@ -748,6 +785,8 @@ describe("persistent agent directories", () => {
     expect(failed).toMatchObject({ state: "unavailable", errorCode: "AGENT_FILES_LIMIT_EXCEEDED", candidateHash: null, nextAttemptAt: null, attempts: 1 });
     expect(failed?.receipt?.storageWarning).toContain("Runs can continue");
     expect(failed?.errorMessage).toContain('"too-large.bin" exceeds the 256 MiB');
+    // STUDIO-0055: the run's entry edit was put back before the failure; the receipt still says so.
+    expect(failed?.receipt?.entryEditDiscarded).toBe(true);
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
     await expect(fs.stat(path.join(root, "too-large.bin"))).rejects.toMatchObject({ code: "ENOENT" });
     expect((await copies.reportUnavailable(companyId, copy.runId))?.errorCode).toBe("AGENT_FILES_LIMIT_EXCEEDED");
@@ -849,8 +888,8 @@ describe("persistent agent directories", () => {
     await fs.writeFile(path.join(copy.localRoot, entryFile), "a".repeat(1024 * 1024 + 1));
     const result = await copies.collectStopped({ companyId, runId: copy.runId });
     // STUDIO-0055 (deliberate change from upstream): the agent's own edit of its entry file, oversized or not, is
-    // set aside before the size check; the save goes through without it and the published entry stays intact.
-    expect(result).toMatchObject({ state: "saved", receipt: { entryEditDiscarded: true } });
+    // set aside before the scan; nothing else changed, and the published entry stays intact.
+    expect(result).toMatchObject({ state: "unchanged", receipt: { entryEditDiscarded: true } });
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
   });
 
@@ -1251,7 +1290,9 @@ describe("persistent agent directories", () => {
     const copy = await run({ warm: true });
     await fs.writeFile(path.join(copy.localRoot, entryFile), "# New loaded policy\n");
     expect((await copies.checkpointWarm({ companyId, runId: copy.runId }))?.state).toBe("warm_saved");
-    expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(false);
+    // STUDIO-0055 (deliberate change from upstream): the edit is set aside and the published entry put back in the
+    // live copy, so the loaded instructions did not change and the warm copy stays reusable.
+    expect(await copies.canReuseWarm(companyId, agentId, copy.runId)).toBe(true);
     await copies.collectStopped({ companyId, runId: copy.runId });
     const fresh = await run({ warm: true });
     expect(fresh.executionRoot).not.toBe(copy.executionRoot);

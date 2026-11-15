@@ -113,6 +113,61 @@ async function openAgentFile(root: string, relative: string) {
   } catch (error) { await handle.close(); throw error; }
 }
 
+/** STUDIO-0055: the parents of the entry path in a run's copy must be plain directories (never links). */
+async function entryParentsSafe(dir: string, entryPath: string) {
+  instructionPath(entryPath);
+  let current = dir;
+  for (const part of entryPath.split("/").slice(0, -1)) {
+    current = path.join(current, part);
+    const stat = await fs.lstat(current).catch((error: NodeJS.ErrnoException) => {
+      if (error.code === "ENOENT") return null;
+      throw error;
+    });
+    if (!stat) return;
+    if (stat.isSymbolicLink() || !stat.isDirectory()) throw unprocessable("Agent files must be regular files without links");
+  }
+}
+
+/**
+ * STUDIO-0055: whether a run left its own entry path different from both the run's baseline and the published entry:
+ * an edited file, a directory, a link, a special or oversized file. A missing entry counts when one was published.
+ */
+async function ownEntryLeftChanged(dir: string, entryPath: string, expected: Array<{ kind: string; hash?: string } | undefined>) {
+  await entryParentsSafe(dir, entryPath);
+  const stat = await fs.lstat(path.join(dir, ...entryPath.split("/"))).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  if (!stat) return expected.some(entry => entry !== undefined);
+  if (!stat.isFile() || stat.nlink !== 1 || stat.size > MAX_INSTRUCTION_BYTES) return true;
+  const hash = (await inspectAgentFile(dir, entryPath))?.hash;
+  return !expected.some(entry => entry?.kind === "file" && entry.hash === hash);
+}
+
+/** STUDIO-0055: the published entry's bytes and file mode (the copy must match the canonical file exactly). */
+async function readPublishedEntry(root: string, entryPath: string) {
+  const bytes = await readAgentFile(root, entryPath);
+  if (!bytes) return null;
+  const mode = (await fs.stat(await assertInstructionPathSafe(root, entryPath))).mode & 0o7777;
+  return { bytes, mode };
+}
+
+/** STUDIO-0055: replace whatever a run left at its entry path by the published entry (or remove it if none). */
+async function putPublishedEntryBack(dir: string, entryPath: string, published: { bytes: Buffer; mode: number } | null) {
+  await entryParentsSafe(dir, entryPath);
+  const absolute = path.join(dir, ...entryPath.split("/"));
+  const stat = await fs.lstat(absolute).catch((error: NodeJS.ErrnoException) => {
+    if (error.code === "ENOENT") return null;
+    throw error;
+  });
+  // A directory, a link or a special file is removed itself (a link is never followed).
+  if (stat && (!stat.isFile() || stat.nlink !== 1)) await fs.rm(absolute, { recursive: true, force: true });
+  if (published) {
+    await materializeInstructionBytes(dir, entryPath, published.bytes);
+    await fs.chmod(absolute, published.mode);
+  } else if (stat) await fs.rm(absolute, { recursive: true, force: true });
+}
+
 /** Hash large files incrementally. Only editor-sized content is retained in RAM. */
 export async function inspectAgentFile(root: string, relative: string, bufferLimit = MAX_INSTRUCTION_BYTES) {
   const opened = await openAgentFile(root, relative);
@@ -263,12 +318,28 @@ export function agentFileStore(db: Db) {
         await audit(tx, agent, bound, { path: relative, contentHash: incomingHash, created: previous === null && input.bytes !== null });
         return { contentHash: incomingHash, changed: true };
       }, input.bytes && input.bytes.length <= MAX_INSTRUCTION_BYTES ? [input.bytes.toString("utf8")] : []),
+    /**
+     * STUDIO-0055: before a run's own copy is scanned, put the published entry back if the run changed it (edited,
+     * replaced by a directory or a link, oversized). Returns whether something was set aside. Only for the agent's
+     * own run; the scan and the save of the rest of the folder then proceed as usual.
+     */
+    setOwnEntryAside: (input: { companyId: string; agentId: string; dir: string; baseline: DirectorySnapshot }, actor: AuthorizationActor) =>
+      locked(input.companyId, input.agentId, actor, false, async (_tx, agent, root, bound) => {
+        if (bound.type !== "agent" || bound.agentId !== agent.id) return false;
+        const entryPath = deriveBundleState(agent).entryFile;
+        const published = await inspectAgentFile(root, entryPath);
+        const publishedEntry = published ? { kind: "file" as const, hash: published.hash } : undefined;
+        if (!await ownEntryLeftChanged(input.dir, entryPath, [input.baseline.entries.get(entryPath), publishedEntry])) return false;
+        await putPublishedEntryBack(input.dir, entryPath, await readPublishedEntry(root, entryPath));
+        return true;
+      }),
     apply: async (input: { companyId: string; agentId: string; sourceDir: string; baseline: DirectorySnapshot; checkpoint?: AgentFileManifest }, actor: AuthorizationActor) => {
       const incoming = input.checkpoint ? checkpointSnapshot(input.checkpoint) : await snapshotAgentFiles(input.sourceDir);
       const [target] = await db.select().from(agents).where(and(eq(agents.companyId, input.companyId), eq(agents.id, input.agentId)));
       if (!target) throw notFound("Agent not found");
       const requestedEntry = deriveBundleState(target).entryFile;
       const changedMentions = new Map<string, { hash: string; text: string }>();
+      let entryEditDiscarded = false;
       if (actor.type === "agent" || currentPluginInteractionOrigin()) {
         for (const [name, entry] of incoming.entries) {
           if (entry.kind !== "file" || JSON.stringify(entry) === JSON.stringify(input.baseline.entries.get(name))) continue;
@@ -281,30 +352,37 @@ export function agentFileStore(db: Db) {
       return locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {
         if (deriveBundleState(agent).entryFile !== requestedEntry) throw conflict("Agent instructions entry changed; retry the file synchronization");
         const entryPath = deriveBundleState(agent).entryFile;
-        // STUDIO-0055: the agent's own run never rewrites its entry file (the Board publishes it); the rest of its
-        // folder (notes, evidence) is saved as usual and the receipt says the entry edit was set aside.
-        let entryEditDiscarded = false;
-        const baselineEntry = input.baseline.entries.get(entryPath);
-        if (bound.type === "agent" && bound.agentId === agent.id && baselineEntry
-          && JSON.stringify(incoming.entries.get(entryPath)) !== JSON.stringify(baselineEntry)) {
-          incoming.entries.set(entryPath, baselineEntry);
-          changedMentions.delete(entryPath);
-          entryEditDiscarded = true;
-          // The directory merge reads the run's copy on disk: put the published entry back into it, so the
-          // merge has nothing to bring over and a reused warm copy starts from the published entry too.
-          const published = await readAgentFile(root, entryPath);
-          if (published) await materializeInstructionBytes(input.sourceDir, entryPath, published);
-        }
-        if (incoming.entries.get(entryPath)?.kind !== "file") throw unprocessable("The configured instruction entry cannot be deleted");
-        if (!input.checkpoint || JSON.stringify(incoming.entries.get(entryPath)) !== JSON.stringify(input.baseline.entries.get(entryPath))) {
-          const entry = await readInstructionBytes(input.sourceDir, entryPath);
-          if (entry === null) throw unprocessable("The configured instruction entry cannot be deleted");
-          instructionBytes(entry);
-        }
         // Previously saved/imported bytes must remain readable, including when
         // over quota. Enforce limits on the incoming and resulting tree so a
         // run can delete files to recover instead of being locked out forever.
         const current = input.checkpoint ? checkpointSnapshot(await cachedAgentFileManifest(root)) : await snapshotAgentFiles(root, false);
+        // STUDIO-0055: the agent's own run never rewrites its entry file (the Board publishes it); the rest of its
+        // folder (notes, evidence) is saved as usual and the receipt says the entry edit was set aside. A Board
+        // publication during the run is not an edit: the run's copy then holds the published entry.
+        const baselineEntry = input.baseline.entries.get(entryPath);
+        const runEntry = JSON.stringify(incoming.entries.get(entryPath));
+        const ownRun = bound.type === "agent" && bound.agentId === agent.id;
+        if (ownRun && runEntry !== JSON.stringify(baselineEntry) && runEntry !== JSON.stringify(current.entries.get(entryPath))) {
+          const entries = new Map(incoming.entries);
+          for (const name of [...entries.keys()]) if (name.startsWith(`${entryPath}/`)) { entries.delete(name); changedMentions.delete(name); }
+          if (baselineEntry) entries.set(entryPath, baselineEntry); else entries.delete(entryPath);
+          incoming.entries = entries;
+          changedMentions.delete(entryPath);
+          entryEditDiscarded = true;
+          // The directory merge reads the run's copy on disk: put the published entry back into it, so the
+          // merge has nothing to bring over.
+          await putPublishedEntryBack(input.sourceDir, entryPath, await readPublishedEntry(root, entryPath));
+        }
+        // With no published entry at all, the agent's own run has no entry to keep (and may not create one).
+        const nothingPublished = ownRun && !baselineEntry && !current.entries.get(entryPath);
+        if (!entryEditDiscarded && !nothingPublished) {
+          if (incoming.entries.get(entryPath)?.kind !== "file") throw unprocessable("The configured instruction entry cannot be deleted");
+          if (!input.checkpoint || JSON.stringify(incoming.entries.get(entryPath)) !== JSON.stringify(input.baseline.entries.get(entryPath))) {
+            const entry = await readInstructionBytes(input.sourceDir, entryPath);
+            if (entry === null) throw unprocessable("The configured instruction entry cannot be deleted");
+            instructionBytes(entry);
+          }
+        }
         const texts = [...changedMentions].flatMap(([name, value]) => {
           const prior = current.entries.get(name);
           return prior?.kind === "file" && prior.hash === value.hash ? [] : [value.text];
@@ -361,7 +439,12 @@ export function agentFileStore(db: Db) {
         await audit(tx, agent, bound, { sourceRunId: currentPluginInteractionOrigin()?.runId ?? actor.runId, contract: AGENT_FILES_CONTRACT,
           ...(entryEditDiscarded ? { entryEditDiscarded: true } : {}) });
         return { storageWarning: storageWarning(total, finalEntries.size, fullFile), entryEditDiscarded };
-      }, [...changedMentions.values()].map(value => value.text));
+      }, [...changedMentions.values()].map(value => value.text)).catch((error: unknown) => {
+        // STUDIO-0055: the run's copy already holds the published entry; a retry would see no edit, so the failure
+        // carries the mark for the receipt.
+        if (entryEditDiscarded && error && typeof error === "object") Object.assign(error, { entryEditDiscarded: true });
+        throw error;
+      });
     },
   };
 }
