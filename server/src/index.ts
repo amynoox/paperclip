@@ -92,6 +92,7 @@ import { logNativeCleanupQuarantines } from "./services/native-runtime/native-cl
 import { embeddedPostgresOwnerPort } from "./embedded-postgres-owner.js";
 import { deliverExecutionStatuses } from "./services/execution-status-delivery.js";
 import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./services/execution-recovery-resolution.js";
+import { autoReconcileBoardCutRuns } from "./services/auto-execution-reconciliation.js";
 import { deliverPendingPauseResumes } from "./services/issue-tree-resume.js";
 import { deliverBudgetResumeContinuations, type BudgetResumeDelivery } from "./services/budget-resume-continuation.js";
 import { invalidateNativeReplacementDiscovery, reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
@@ -1412,6 +1413,9 @@ async function startServerWithDatabaseTeardown(
     ...(heartbeat ? [
       { queue: DELIVERY_QUEUES.executionReplacement, run: () => reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForAutomaticReplacement(db, run) }), next: executionSchedule.replacement, onSettled: () => invalidateNativeReplacementDiscovery(db), settleEmptyWhilePaused: true },
       { queue: DELIVERY_QUEUES.executionContinuation, run: async () => {
+        // STUDIO-0050: a Board-cut legacy run proven safe is reconciled first,
+        // then delivered below like any reconciled execution.
+        await autoReconcileBoardCutRuns(db);
         await deliverReconciledExecutions(db, heartbeat.wakeup);
         await deliverPendingPauseResumes(db, heartbeat.wakeup);
         await deliverBudgetResumeContinuations(db, { ...budgetResumeDelivery,

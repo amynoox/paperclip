@@ -41,6 +41,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
 import { deliverReconciledExecutions, markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
+import { autoReconcileBoardCutRuns, AUTO_RECONCILIATION_ACTOR_ID } from "../services/auto-execution-reconciliation.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -2268,6 +2269,150 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(projection).toMatchObject({ phase: "completed", label: "Reconciled" });
     expect(projection!.nextAction).toContain("a cancelled blocker must be removed or replaced first");
     void wakeBlockersResolved;
+  });
+
+  // STUDIO-0050 (V321): a legacy run cancelled by a Board operator, whose hold
+  // an operator lifted by hand four times on 14 Nov 2026 with facts the server
+  // already holds, is reconciled by the server itself when every guard is proven.
+  async function seedBoardCutHold(options: { childOpen?: boolean } = {}) {
+    const fixture = await seedCompany();
+    const { companyId, coderId, sourceIssueId, prefix } = fixture;
+    const responsibleUserId = randomUUID();
+    await db.insert(authUsers).values({ id: responsibleUserId, name: "Recovery operator",
+      email: `${responsibleUserId}@example.test`, emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
+    await db.update(companies).set({ defaultResponsibleUserId: responsibleUserId }).where(eq(companies.id, companyId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, coderId));
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId: randomUUID(), status: "running" });
+    if (options.childOpen) {
+      const childIssueId = randomUUID();
+      await db.insert(issues).values({ id: childIssueId, companyId, title: "Open child", status: "in_progress", priority: "medium",
+        assigneeAgentId: coderId, parentId: sourceIssueId, issueNumber: 2, identifier: `${prefix}-2` });
+      await db.insert(issueRelations).values({ companyId, issueId: childIssueId, relatedIssueId: sourceIssueId, type: "blocks" });
+    }
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const runId = randomUUID();
+    const cancelledAt = new Date(Date.now() - 60_000);
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId: coderId, invocationSource: "assignment", status: "cancelled", runtimeMode: "legacy",
+      errorCode: "cancelled", startedAt: new Date(Date.now() - 180_000), finishedAt: cancelledAt, issueId: sourceIssueId,
+      contextSnapshot: { issueId: sourceIssueId },
+      resultJson: {
+        stopReason: "cancelled",
+        cancellation: { reason: "Cancelled by a board operator", source: "operator", expected: true,
+          initiator: { id: responsibleUserId, type: "user" }, recordedAt: cancelledAt.toISOString() },
+        executionCancellation: { state: "requested", requestedAt: cancelledAt.toISOString() },
+      },
+    });
+    const [action] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked", ownerType: "board",
+      returnOwnerAgentId: coderId, cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+      nextAction: "Inspect the stopped provider and recorded actions, then reconcile their outcomes before continuing.",
+      evidence: { runId, originalFailureCode: "cancelled", adapterRecovery: "unsupported_or_unknown",
+        automaticRecovery: { policy: "preserve_without_replay_v1", runId, replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    return { ...fixture, runId, action: action!, responsibleUserId };
+  }
+
+  const autoActivity = (issueId: string) => db.select().from(activityLog).where(eq(activityLog.entityId, issueId))
+    .then(rows => rows.filter(row => row.action === "issue.execution_auto_reconciled"));
+
+  it("reconciles a Board-cut run by itself when every guard is proven, then delivers exactly one continuation", async () => {
+    const { companyId, sourceIssueId, runId, action } = await seedBoardCutHold();
+    expect(await autoReconcileBoardCutRuns(db)).toEqual({ reconciled: 1 });
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded).toMatchObject({ status: "resolved", outcome: "restored", evidence: {
+      continuationDelivery: "pending",
+      executionReconciliation: { runId, providerStopped: true, actionOutcome: "mixed", actorId: AUTO_RECONCILIATION_ACTOR_ID },
+    } });
+    expect(recorded!.evidence).not.toHaveProperty("automaticRecovery");
+    expect(String((recorded!.evidence.executionReconciliation as { outcomeEvidence: string }).outcomeEvidence))
+      .toContain("cancelled by a Board operator");
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("todo");
+    const activity = await autoActivity(sourceIssueId);
+    expect(activity).toHaveLength(1);
+    expect(activity[0]!.details).toMatchObject({ runId, path: "continuation", previousStatus: "blocked" });
+    // Never twice: a second pass finds nothing, delivery stays single.
+    expect(await autoReconcileBoardCutRuns(db)).toEqual({ reconciled: 0 });
+    const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+    await deliverReconciledExecutions(db, heartbeat.wakeup);
+    await deliverReconciledExecutions(db, heartbeat.wakeup);
+    const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, companyId))
+      .then(rows => rows.filter(row => row.idempotencyKey === `execution-reconciliation:${action.id}`));
+    expect(wakes).toHaveLength(1);
+    expect(await autoActivity(sourceIssueId)).toHaveLength(1);
+  });
+
+  it("takes the STUDIO-0048 path when the task is still blocked by an open child", async () => {
+    const { sourceIssueId, action } = await seedBoardCutHold({ childOpen: true });
+    expect(await autoReconcileBoardCutRuns(db)).toEqual({ reconciled: 1 });
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded).toMatchObject({ status: "resolved", outcome: "restored",
+      evidence: { continuationDelivery: "not_requested", dependencyBlockedReconciliation: true } });
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
+    expect((await autoActivity(sourceIssueId))[0]!.details).toMatchObject({ path: "dependency_blocked" });
+  });
+
+  it.each([
+    "cancelled by an agent", "run failed", "native runtime", "workspace restore failure", "task in review",
+    "user assignee", "live run on the task", "another active recovery action", "hold older than 24 h", "process still alive",
+    "environment lease not released",
+  ] as const)("leaves the hold when a guard is false: %s", async (guard) => {
+    const { companyId, coderId, sourceIssueId, runId, action, responsibleUserId } = await seedBoardCutHold();
+    const run = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)).then(rows => rows[0]!);
+    const result = run.resultJson as Record<string, unknown>;
+    if (guard === "cancelled by an agent") await db.update(heartbeatRuns).set({ resultJson: { ...result,
+      cancellation: { ...(result.cancellation as object), source: "agent", initiator: { id: coderId, type: "agent" } } } }).where(eq(heartbeatRuns.id, runId));
+    if (guard === "run failed") await db.update(heartbeatRuns).set({ status: "failed", errorCode: "process_lost" }).where(eq(heartbeatRuns.id, runId));
+    if (guard === "native runtime") await db.update(heartbeatRuns).set({ runtimeMode: "native" }).where(eq(heartbeatRuns.id, runId));
+    if (guard === "workspace restore failure") await db.update(heartbeatRuns).set({ resultJson: { ...result, workspaceRestoreFailure: "restore_unsafe_archive" } }).where(eq(heartbeatRuns.id, runId));
+    if (guard === "task in review") await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, sourceIssueId));
+    if (guard === "user assignee") await db.update(issues).set({ assigneeUserId: responsibleUserId } as never).where(eq(issues.id, sourceIssueId));
+    if (guard === "live run on the task") await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, invocationSource: "automation",
+      status: "queued", issueId: sourceIssueId, contextSnapshot: { issueId: sourceIssueId } });
+    if (guard === "another active recovery action") await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId,
+      kind: "stranded_assigned_issue", status: "active", ownerType: "board", returnOwnerAgentId: coderId, cause: "stranded_assigned_issue",
+      fingerprint: "other", nextAction: "Other incident.", evidence: {} });
+    if (guard === "hold older than 24 h") await db.update(issueRecoveryActions).set({ updatedAt: new Date(Date.now() - 25 * 3_600_000) }).where(eq(issueRecoveryActions.id, action.id));
+    if (guard === "process still alive") await db.update(heartbeatRuns).set({ processPid: process.pid }).where(eq(heartbeatRuns.id, runId));
+    if (guard === "environment lease not released") {
+      const [environment] = await db.insert(environments).values({ companyId, name: "ssh worker", driver: "ssh", config: {} } as never).returning();
+      await db.insert(environmentLeases).values({ companyId, environmentId: environment!.id, heartbeatRunId: runId, issueId: sourceIssueId,
+        provider: "ssh", status: "active", leasePolicy: "ephemeral" } as never);
+    }
+    const [before] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(await autoReconcileBoardCutRuns(db)).toEqual({ reconciled: 0 });
+    const [after] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(after).toEqual(before);
+    expect(after!.evidence).toMatchObject({ automaticRecovery: { replay: "blocked" } });
+    expect(await autoActivity(sourceIssueId)).toHaveLength(0);
+  });
+
+  it("changes nothing when the reconciliation is cut in the middle, and completes on the next pass", async () => {
+    const { sourceIssueId, action } = await seedBoardCutHold();
+    await db.execute(sql`create or replace function studio_0050_cut() returns trigger language plpgsql as $$
+      begin if new.action = 'issue.execution_auto_reconciled' then raise exception 'power cut'; end if; return new; end $$`);
+    await db.execute(sql`create trigger studio_0050_cut before insert on activity_log for each row execute function studio_0050_cut()`);
+    try {
+      expect(await autoReconcileBoardCutRuns(db)).toEqual({ reconciled: 0 });
+    } finally {
+      await db.execute(sql`drop trigger if exists studio_0050_cut on activity_log`);
+      await db.execute(sql`drop function if exists studio_0050_cut()`);
+    }
+    const [held] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(held).toMatchObject({ status: "resolved", outcome: "blocked", evidence: { automaticRecovery: { replay: "blocked" } } });
+    expect(held!.evidence).not.toHaveProperty("executionReconciliation");
+    expect((await db.select().from(issues).where(eq(issues.id, sourceIssueId)))[0]!.status).toBe("blocked");
+    expect(await autoReconcileBoardCutRuns(db)).toEqual({ reconciled: 1 });
+    expect(await autoActivity(sourceIssueId)).toHaveLength(1);
+  });
+
+  it("reconciles once when two server instances run the pass together", async () => {
+    const { sourceIssueId, action } = await seedBoardCutHold();
+    const results = await Promise.all([autoReconcileBoardCutRuns(db), autoReconcileBoardCutRuns(db)]);
+    expect(results.reduce((sum, result) => sum + result.reconciled, 0)).toBe(1);
+    expect(await autoActivity(sourceIssueId)).toHaveLength(1);
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded).toMatchObject({ status: "resolved", outcome: "restored" });
   });
 
   async function seedReconciledDelivery() {
