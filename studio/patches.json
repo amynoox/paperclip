@@ -1322,6 +1322,34 @@
       "retireWhen": "Upstream lets an execution reconciliation keep a dependency-blocked task blocked, or drops the legacy no-replay hold.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0050",
+      "title": "A legacy run cancelled by a Board operator is reconciled by the server when every guard is proven",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, 14 Nov 2026: a legacy run cancelled by the Board leaves a settled legacy_execution_requires_reconciliation hold (automaticRecovery preserve_without_replay_v1, replay blocked) because the adapter never acknowledged the cancellation. Only a Board reconciliation lifted it, with an operator-typed outcome and evidence; an operator did it four times that day (02:13, 11:37, 20:34, 21:00) with tools/reconcile-cut-run.mjs, always with the outcome mixed and facts the server already records (Board cancellation, process gone, environment lease released). Until then the task stayed blocked and every system wake was skipped.",
+      "reason": "Owner decision V321 (15 Nov 2026): reconciling a cut run must need neither an operator nor a chat; prepared for the next grouped update.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server execution recovery",
+      "paths": [
+        "server/src/services/auto-execution-reconciliation.ts",
+        "server/src/services/execution-control-work.ts",
+        "server/src/index.ts",
+        "server/src/__tests__/issue-recovery-actions.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "Upstream lifts a legacy no-replay hold only through the Board reconciliation; no automatic counterpart found.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. issue-recovery-actions.test.ts, 131 passed, with fifteen STUDIO-0050 cases. A legacy run cancelled by a Board operator (cancellation.source operator, initiator user, expected true; executionCancellation requested; no local process; no environment lease) on a task blocked by its hold is reconciled by the server: action resolved restored with executionReconciliation {providerStopped: true, actionOutcome: mixed, actorId system:auto-reconciliation}, evidence text naming the Board cancellation, continuationDelivery pending, task todo, one issue.execution_auto_reconciled with path continuation; a second pass finds nothing and two deliveries give one continuation wake. With an open child blocker it takes the STUDIO-0048 path (not_requested, dependencyBlockedReconciliation, task stays blocked). Eleven guards each leave the hold byte for byte unchanged and log nothing: cancelled by an agent, run failed, native runtime, workspace restore failure, task in review, user assignee, live run on the task, another active recovery action, hold older than 24 h, process still alive, environment lease not released. A failure inside the transaction (database trigger raising on the activity row, standing for a power cut) leaves the hold, its evidence and the task status as they were, and the next pass completes it. Two passes run together reconcile once. execution-control-work.test.ts: 15 passed and 12 failed, the same 12 failing on the studio.18 tree in this bench (environment: database work subscriptions require createDb). Negative control: on the studio.18 code the module does not exist, so every hold stays until an operator acts (the current production behaviour). Typecheck: no error in the changed files.",
+      "migration": "None. In the execution-continuation queue, before delivery, the server looks at settled legacy holds less than 24 h old whose run is legacy, cancelled with cancellation.source operator, initiator.type user and expected true, without retained workspace or restore failure, on a task blocked or todo assigned only to that run's agent, with no execution or checkout run, no other live run, no other active recovery action and no restricted chat binding. Under the task lock it re-reads those guards; a blocked task without open blockers must be blocked by this exact hold; then validateExecutionReconciliation (run terminal and owned, local process gone, no coordinator or successor, every environment lease released) with the decision {providerStopped: true, actionOutcome: mixed, outcomeEvidence: a factual server text}. It records the reconciliation as actor system:auto-reconciliation: without open blockers continuationDelivery pending and the task blocked -> todo (the existing delivery wakes the owner once, key execution-reconciliation:<action>, fresh session); with open blockers the STUDIO-0048 path (not_requested, session dropped, dependency wake later). The action is resolved restored and issue.execution_auto_reconciled lists the proofs. One transaction: a cut leaves everything as it was; the task lock makes a second instance find nothing. Every other case is unchanged: the hold stays, visible, for an operator. The queue is re-run every 15 s while a candidate passes the database guards (a run whose process or lease is not yet released is retried until the hold is 24 h old).",
+      "rollback": "Switch cli/current back to the previous install folder. Holds already reconciled stay reconciled; new holds wait for an operator again.",
+      "retireWhen": "Upstream reconciles an operator-cancelled legacy run itself, or the adapters acknowledge cancellation so no hold is set.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: automatic reconciliation of a Board-cancelled legacy run when every guard is proven. Why: owner decision V321, four manual reconciliations on 14 Nov 2026 with facts the server holds. Origin: studio fork only; to re-apply after an upstream update, keep services/auto-execution-reconciliation.ts, its call before deliverReconciledExecutions in index.ts and its term in the continuation schedule of execution-control-work.ts, then run the STUDIO-0050 cases of issue-recovery-actions.test.ts. Operator tool after install: tools/reconcile-cut-run.mjs stays the fallback for cases outside these guards."
     }
   ]
 }
