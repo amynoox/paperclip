@@ -236,6 +236,34 @@ describe("persistent agent directories", () => {
       expect((await fs.lstat(path.join(root, entryFile))).isFile()).toBe(true);
       expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
     });
+    it("puts the published entry back when the run deleted it, and saves the rest", async () => {
+      const copy = await run();
+      await fs.writeFile(path.join(copy.localRoot, "evidence.md"), "kept evidence");
+      await fs.rm(path.join(copy.localRoot, entryFile));
+      expect(await copies.collectStopped({ companyId, runId: copy.runId })).toMatchObject({ state: "saved", receipt: { entryEditDiscarded: true } });
+      expect(await fs.readFile(path.join(root, "evidence.md"), "utf8")).toBe("kept evidence");
+      expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
+    });
+    it("treats a file whose name differs from the entry only by case as an ordinary file", async () => {
+      const copy = await run();
+      const other = entryFile.replace("INSTRUCTIONS", "instructions");
+      await fs.writeFile(path.join(copy.localRoot, other), "a note with a similar name");
+      const saved = await copies.collectStopped({ companyId, runId: copy.runId });
+      expect(saved?.state).toBe("saved");
+      expect(saved?.receipt?.entryEditDiscarded).toBeUndefined();
+      expect(await fs.readFile(path.join(root, other), "utf8")).toBe("a note with a similar name");
+      expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
+    });
+    it("saves the rest and never lets the run create its entry when none is published", async () => {
+      await fs.rm(path.join(root, entryFile));
+      const copy = await run();
+      await fs.writeFile(path.join(copy.localRoot, "evidence.md"), "kept evidence");
+      await fs.mkdir(path.dirname(path.join(copy.localRoot, entryFile)), { recursive: true });
+      await fs.writeFile(path.join(copy.localRoot, entryFile), "created by the agent");
+      expect(await copies.collectStopped({ companyId, runId: copy.runId })).toMatchObject({ state: "saved", receipt: { entryEditDiscarded: true } });
+      expect(await fs.readFile(path.join(root, "evidence.md"), "utf8")).toBe("kept evidence");
+      await expect(fs.stat(path.join(root, entryFile))).rejects.toMatchObject({ code: "ENOENT" });
+    });
     it("does not mark a Board publication made during the run", async () => {
       const copy = await run();
       const current = (await revisions.readCurrent(target(), board()))!;

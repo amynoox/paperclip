@@ -132,7 +132,7 @@ async function entryParentsSafe(dir: string, entryPath: string) {
  * STUDIO-0055: whether a run left its own entry path different from both the run's baseline and the published entry:
  * an edited file, a directory, a link, a special or oversized file. A missing entry counts when one was published.
  */
-async function ownEntryLeftChanged(dir: string, entryPath: string, expected: Array<{ kind: string; hash?: string } | undefined>) {
+async function ownEntryLeftChanged(dir: string, entryPath: string, expected: Array<{ kind: string; hash?: string; mode?: number } | undefined>) {
   await entryParentsSafe(dir, entryPath);
   const stat = await fs.lstat(path.join(dir, ...entryPath.split("/"))).catch((error: NodeJS.ErrnoException) => {
     if (error.code === "ENOENT") return null;
@@ -141,7 +141,8 @@ async function ownEntryLeftChanged(dir: string, entryPath: string, expected: Arr
   if (!stat) return expected.some(entry => entry !== undefined);
   if (!stat.isFile() || stat.nlink !== 1 || stat.size > MAX_INSTRUCTION_BYTES) return true;
   const hash = (await inspectAgentFile(dir, entryPath))?.hash;
-  return !expected.some(entry => entry?.kind === "file" && entry.hash === hash);
+  // Same comparison as apply: content and mode.
+  return !expected.some(entry => entry?.kind === "file" && entry.hash === hash && entry.mode === stat.mode);
 }
 
 /** STUDIO-0055: the published entry's bytes and file mode (the copy must match the canonical file exactly). */
@@ -152,7 +153,12 @@ async function readPublishedEntry(root: string, entryPath: string) {
   return { bytes, mode };
 }
 
-/** STUDIO-0055: replace whatever a run left at its entry path by the published entry (or remove it if none). */
+/**
+ * STUDIO-0055: replace whatever a run left at its entry path by the published entry (or remove it if none). A warm
+ * run may still be running: the parents are checked again right before each removal, the bytes are written by
+ * materializeInstructionBytes (its own checks before the rename), and the mode is set on the opened file, never
+ * through a link.
+ */
 async function putPublishedEntryBack(dir: string, entryPath: string, published: { bytes: Buffer; mode: number } | null) {
   await entryParentsSafe(dir, entryPath);
   const absolute = path.join(dir, ...entryPath.split("/"));
@@ -161,11 +167,21 @@ async function putPublishedEntryBack(dir: string, entryPath: string, published: 
     throw error;
   });
   // A directory, a link or a special file is removed itself (a link is never followed).
-  if (stat && (!stat.isFile() || stat.nlink !== 1)) await fs.rm(absolute, { recursive: true, force: true });
+  if (stat && (!stat.isFile() || stat.nlink !== 1)) {
+    await entryParentsSafe(dir, entryPath);
+    await fs.rm(absolute, { recursive: true, force: true });
+  }
   if (published) {
     await materializeInstructionBytes(dir, entryPath, published.bytes);
-    await fs.chmod(absolute, published.mode);
-  } else if (stat) await fs.rm(absolute, { recursive: true, force: true });
+    const handle = await fs.open(await assertInstructionPathSafe(dir, entryPath), constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      if (!(await handle.stat()).isFile()) throw unprocessable("Agent files must be regular files without links");
+      await handle.chmod(published.mode);
+    } finally { await handle.close(); }
+  } else if (stat) {
+    await entryParentsSafe(dir, entryPath);
+    await fs.rm(absolute, { recursive: true, force: true });
+  }
 }
 
 /** Hash large files incrementally. Only editor-sized content is retained in RAM. */
@@ -328,7 +344,9 @@ export function agentFileStore(db: Db) {
         if (bound.type !== "agent" || bound.agentId !== agent.id) return false;
         const entryPath = deriveBundleState(agent).entryFile;
         const published = await inspectAgentFile(root, entryPath);
-        const publishedEntry = published ? { kind: "file" as const, hash: published.hash } : undefined;
+        const publishedEntry = published
+          ? { kind: "file" as const, hash: published.hash, mode: (await fs.lstat(await assertInstructionPathSafe(root, entryPath))).mode }
+          : undefined;
         if (!await ownEntryLeftChanged(input.dir, entryPath, [input.baseline.entries.get(entryPath), publishedEntry])) return false;
         await putPublishedEntryBack(input.dir, entryPath, await readPublishedEntry(root, entryPath));
         return true;
