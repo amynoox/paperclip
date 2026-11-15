@@ -9,6 +9,7 @@ import { hasPendingNativeReplacements } from "./native-runtime/native-safe-repla
 import { nextAbandonedNativeOwnerReleaseAt } from "./native-runtime/native-failed-run-owner-release.js";
 import { hasPendingPauseResume } from "./issue-tree-resume.js";
 import { hasPendingBudgetResume } from "./budget-resume-continuation.js";
+import { nextAwaitingReconciliationCheckAt } from "./execution-recovery-resolution.js";
 
 export function registerExecutionControlWork(
   coordinator: ReturnType<typeof createDeliveryWorkCoordinator>,
@@ -95,7 +96,9 @@ export function executionControlSchedule(db: Db) {
         eq(issueRecoveryActions.status, "resolved"),
         sql`${issueRecoveryActions.evidence}->>'continuationDelivery' = 'pending'`,
       )).limit(1);
-      return rows.length || await hasPendingPauseResume(db) || await hasPendingBudgetResume(db) ? retry() : null;
+      if (rows.length || await hasPendingPauseResume(db) || await hasPendingBudgetResume(db)) return retry();
+      // STUDIO-0051: a reconciled task still waiting on a person is looked at again later.
+      return nextAwaitingReconciliationCheckAt(db);
     },
     async status() {
       const rows = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)

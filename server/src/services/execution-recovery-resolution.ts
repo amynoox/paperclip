@@ -227,7 +227,9 @@ export async function markExecutionReconciliation(
   decision: ExecutionReconciliation,
   actorId: string,
   deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
-  options?: { workspaceRepairOnly?: boolean; controllerContainmentOnly?: boolean; dependencyBlockedOnly?: boolean },
+  options?: { workspaceRepairOnly?: boolean; controllerContainmentOnly?: boolean; dependencyBlockedOnly?: boolean;
+    /** STUDIO-0051: without continuation because a person's answer will wake the assignee. */
+    awaitingResponse?: boolean },
 ) {
   if (options?.controllerContainmentOnly && (!decision.controllerStopped || !decision.controllerAuthorityDigest || deliveryOwner))
     throw conflict("Controller containment records no automatic continuation.");
@@ -286,7 +288,9 @@ export async function markExecutionReconciliation(
           // continuation now; its dependency wake starts it once unblocked.
           continuationDelivery: options?.workspaceRepairOnly || options?.controllerContainmentOnly || options?.dependencyBlockedOnly ? "not_requested" : deliveryOwner ? "delegated" : "pending",
           ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
-          ...(options?.dependencyBlockedOnly ? { dependencyBlockedReconciliation: true } : {}),
+          ...(options?.dependencyBlockedOnly
+            ? options.awaitingResponse ? { awaitingResponseReconciliation: true } : { dependencyBlockedReconciliation: true }
+            : {}),
         },
       })
       .where(
@@ -368,6 +372,170 @@ export async function markExecutionReconciliation(
   });
 }
 
+// STUDIO-0051: a hold reconciled without a continuation because the task
+// waited on a person (a question or an approval). The continuation it spared
+// is due, once, when nothing will start the assignee any more:
+// - a proof that the wait was withdrawn after the reconciliation (the person's
+//   question cancelled, expired or replaced by a newer card, or the approval
+//   rejected, cancelled or sent back for revision, none of which wakes the
+//   assignee) and no answer since; or
+// - an answer since the reconciliation (an answered, accepted or rejected
+//   question, a question closed by the person's comment, an approval approved,
+//   or a comment by a person) whose wake was lost: the last answer is fifteen
+//   minutes old and no run followed it.
+// Never while a question or an approval is still pending, while a wake of the
+// assignee on the task is queued, claimed or held, or once the assignee ran on
+// the task since the reconciliation: an answer whose wake has not created a run
+// yet never gets a second run beside it.
+const RECONCILED_AT = sql`(${issueRecoveryActions.evidence}->'executionReconciliation'->>'recordedAt')::timestamptz`;
+
+function awaitingReconciliationOpen(delivery: "not_requested" | "pending" = "not_requested") {
+  return sql`${issueRecoveryActions.status} = 'resolved'
+    and ${issueRecoveryActions.evidence}->>'awaitingResponseReconciliation' = 'true'
+    and ${issueRecoveryActions.evidence}->>'continuationDelivery' = ${delivery}
+    and ${issueRecoveryActions.resolvedAt} > now() - interval '7 days'`;
+}
+
+function personAnswersSince(task: string) {
+  return sql.raw(`select coalesce(answer.resolved_at, answer.updated_at) as answered_at from issue_thread_interactions answer
+      where answer.company_id = ${task}.company_id and answer.issue_id = ${task}.id and answer.addressee_user_id is not null
+        and (answer.status in ('answered', 'accepted', 'rejected')
+          or answer.status = 'expired' and answer.result->>'outcome' = 'superseded_by_comment')
+    union all select decided.updated_at from issue_approvals decided_link join approvals decided
+        on decided.id = decided_link.approval_id and decided.company_id = decided_link.company_id
+      where decided_link.company_id = ${task}.company_id and decided_link.issue_id = ${task}.id
+        and decided.requested_by_agent_id = ${task}.assignee_agent_id and decided.status = 'approved'
+    union all select person_comment.created_at from issue_comments person_comment
+      where person_comment.company_id = ${task}.company_id and person_comment.issue_id = ${task}.id
+        and person_comment.author_user_id is not null
+        and not exists (select 1 from heartbeat_runs reading_run
+          where reading_run.company_id = person_comment.company_id and reading_run.agent_id = ${task}.assignee_agent_id
+            and reading_run.context_snapshot->>'issueId' = ${task}.id::text
+            and reading_run.started_at is not null and reading_run.started_at <= person_comment.created_at
+            and coalesce(reading_run.finished_at, 'infinity'::timestamptz) >= person_comment.created_at)`);
+}
+// A person's comment posted while a run of the assignee was working on the task is not an answer to wait for
+// (third review of lot 21): that run read it (steering), or the comment queued its own wake, which holds the
+// hand-offs while it is on its way (nothingPendingNorComing).
+
+// The assignee's run that answers the wait: it did provider work (started, and not cancelled before its adapter,
+// nor failed while preparing: bench lot 20 and review of lot 21), on this task, after the reconciliation and after
+// the last answer (a run started before the answer did not read it). The cut source run never counts.
+function laterAssigneeRun() {
+  return sql`select later_run.id from heartbeat_runs later_run
+    join issues run_task on run_task.id = ${issueRecoveryActions.sourceIssueId} and run_task.company_id = ${issueRecoveryActions.companyId}
+    where later_run.company_id = run_task.company_id and later_run.agent_id = run_task.assignee_agent_id
+      and later_run.context_snapshot->>'issueId' = run_task.id::text
+      and later_run.created_at >= greatest(${RECONCILED_AT},
+        coalesce((select max(answered.answered_at) from (${personAnswersSince("run_task")}) answered), ${RECONCILED_AT}))
+      and later_run.started_at is not null
+      and coalesce(later_run.result_json->'preDispatchCancellation'->>'providerWorkStarted', 'true') <> 'false'
+      and coalesce(later_run.result_json->'executionRecovery'->>'providerWorkStarted', 'true') <> 'false'
+      and later_run.id::text <> coalesce(${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId', '')
+    order by later_run.created_at asc limit 1`;
+}
+
+// Nothing is waiting on a person and nothing will start the assignee on its own: no pending question or approval,
+// no wake on its way, no live or scheduled run (a run that failed while preparing has its bounded retry).
+function nothingPendingNorComing(task: string) {
+  return sql.raw(`not exists (select 1 from issue_thread_interactions awaited_question
+          where awaited_question.company_id = ${task}.company_id and awaited_question.issue_id = ${task}.id
+            and awaited_question.addressee_user_id is not null
+            and awaited_question.status = 'pending' and awaited_question.continuation_policy = 'wake_assignee')
+        and not exists (select 1 from issue_approvals linked join approvals awaited_approval
+            on awaited_approval.id = linked.approval_id and awaited_approval.company_id = linked.company_id
+          where linked.company_id = ${task}.company_id and linked.issue_id = ${task}.id
+            and awaited_approval.requested_by_agent_id = ${task}.assignee_agent_id
+            and awaited_approval.status = 'pending')
+        and not exists (select 1 from agent_wakeup_requests coming_wake
+          where coming_wake.company_id = ${task}.company_id and coming_wake.agent_id = ${task}.assignee_agent_id
+            and coming_wake.status in ('queued', 'claimed', 'deferred_issue_execution')
+            and coming_wake.payload->>'issueId' = ${task}.id::text)
+        and not exists (select 1 from heartbeat_runs live_run
+          where live_run.company_id = ${task}.company_id and live_run.agent_id = ${task}.assignee_agent_id
+            and live_run.context_snapshot->>'issueId' = ${task}.id::text
+            and live_run.status in ('queued', 'running', 'scheduled_retry'))`);
+}
+
+function awaitingContinuationDue(delivery: "not_requested" | "pending") {
+  return sql`${awaitingReconciliationOpen(delivery)}
+    and not exists (${laterAssigneeRun()})
+    and exists (select 1 from issues waiting_task
+      where waiting_task.id = ${issueRecoveryActions.sourceIssueId} and waiting_task.company_id = ${issueRecoveryActions.companyId}
+        and waiting_task.status not in ('done', 'cancelled')
+        and waiting_task.assignee_agent_id = ${issueRecoveryActions.returnOwnerAgentId}
+        and ${nothingPendingNorComing("waiting_task")}
+        and ((not exists (select 1 from (${personAnswersSince("waiting_task")}) answered where answered.answered_at > ${RECONCILED_AT})
+            and (exists (select 1 from issue_thread_interactions withdrawn_question
+                where withdrawn_question.company_id = waiting_task.company_id and withdrawn_question.issue_id = waiting_task.id
+                  and withdrawn_question.addressee_user_id is not null
+                  and withdrawn_question.status in ('cancelled', 'expired')
+                  and coalesce(withdrawn_question.result->>'outcome', '') <> 'superseded_by_comment'
+                  and coalesce(withdrawn_question.resolved_at, withdrawn_question.updated_at) > ${RECONCILED_AT})
+              or exists (select 1 from issue_approvals linked join approvals withdrawn_approval
+                  on withdrawn_approval.id = linked.approval_id and withdrawn_approval.company_id = linked.company_id
+                where linked.company_id = waiting_task.company_id and linked.issue_id = waiting_task.id
+                  and withdrawn_approval.requested_by_agent_id = waiting_task.assignee_agent_id
+                  and withdrawn_approval.status in ('rejected', 'cancelled', 'revision_requested')
+                  and withdrawn_approval.updated_at > ${RECONCILED_AT})))
+          or (exists (select 1 from (${personAnswersSince("waiting_task")}) answered where answered.answered_at > ${RECONCILED_AT})
+            and not exists (select 1 from (${personAnswersSince("waiting_task")}) answered
+              where answered.answered_at > now() - interval '15 minutes'))))`;
+}
+
+/** STUDIO-0051: a pending awaiting-response continuation is delivered only if it is still due at delivery time. */
+export async function awaitingContinuationStillDue(db: Db | Parameters<Parameters<Db["transaction"]>[0]>[0], companyId: string, actionId: string) {
+  const [row] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
+    .where(and(eq(issueRecoveryActions.companyId, companyId), eq(issueRecoveryActions.id, actionId), awaitingContinuationDue("pending")))
+    .limit(1);
+  return Boolean(row);
+}
+
+/**
+ * Hands a withdrawn wait (or an answer whose wake was lost) to the ordinary continuation delivery (pending, once),
+ * and closes the wait as satisfied once a run of the assignee that did provider work followed the last answer and
+ * nothing is pending any more (no more checks, no continuation promised).
+ */
+export async function resumeWithdrawnAwaitingReconciliations(db: Db) {
+  return db.transaction(async tx => {
+    await tx.update(issueRecoveryActions).set({
+      evidence: sql`${issueRecoveryActions.evidence} || jsonb_build_object('continuationDelivery', 'satisfied',
+        'awaitingResponseSatisfiedByRunId', (${laterAssigneeRun()}), 'awaitingResponseSatisfiedAt', to_jsonb(now()))`,
+      updatedAt: new Date(),
+    }).where(sql`${awaitingReconciliationOpen()} and exists (${laterAssigneeRun()})
+      and exists (select 1 from issues satisfied_task
+        where satisfied_task.id = ${issueRecoveryActions.sourceIssueId} and satisfied_task.company_id = ${issueRecoveryActions.companyId}
+          and not exists (select 1 from issue_thread_interactions open_question
+            where open_question.company_id = satisfied_task.company_id and open_question.issue_id = satisfied_task.id
+              and open_question.addressee_user_id is not null and open_question.status = 'pending'
+              and open_question.continuation_policy = 'wake_assignee')
+          and not exists (select 1 from issue_approvals open_link join approvals open_approval
+              on open_approval.id = open_link.approval_id and open_approval.company_id = open_link.company_id
+            where open_link.company_id = satisfied_task.company_id and open_link.issue_id = satisfied_task.id
+              and open_approval.requested_by_agent_id = satisfied_task.assignee_agent_id and open_approval.status = 'pending'))`);
+    const rows = await tx.update(issueRecoveryActions).set({
+      evidence: sql`${issueRecoveryActions.evidence} || jsonb_build_object('continuationDelivery', 'pending',
+        'awaitingResponseWithdrawnAt', to_jsonb(now()))`,
+      updatedAt: new Date(),
+    }).where(awaitingContinuationDue("not_requested")).returning({ id: issueRecoveryActions.id });
+    if (rows.length) await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
+    return rows.length;
+  });
+}
+
+/**
+ * Still waiting on a person behind a reconciled hold: look again in five minutes. Only while the task is open and
+ * still assigned to the role the wait returns to (third review of lot 21).
+ */
+export async function nextAwaitingReconciliationCheckAt(db: Db) {
+  const [row] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(sql`${awaitingReconciliationOpen()}
+    and exists (select 1 from issues open_task
+      where open_task.id = ${issueRecoveryActions.sourceIssueId} and open_task.company_id = ${issueRecoveryActions.companyId}
+        and open_task.status not in ('done', 'cancelled')
+        and open_task.assignee_agent_id = ${issueRecoveryActions.returnOwnerAgentId})`).limit(1);
+  return row ? Date.now() + 5 * 60_000 : null;
+}
+
 export async function deliverReconciledExecutions(
   db: Db,
   wake: ReturnType<typeof import("./heartbeat.js").heartbeatService>["wakeup"],
@@ -403,6 +571,16 @@ export async function deliverReconciledExecutions(
             eq(issues.id, action.sourceIssueId),
           ),
         );
+      // STUDIO-0051: an awaiting-response continuation set pending earlier is re-checked; if an answer, a wake or
+      // a run came meanwhile, it goes back to not_requested instead of starting a second run.
+      if (task && action.evidence.awaitingResponseReconciliation === true
+        && !(await awaitingContinuationStillDue(db, action.companyId, action.id))) {
+        await db.update(issueRecoveryActions).set({
+          evidence: sql`${issueRecoveryActions.evidence} || jsonb_build_object('continuationDelivery', 'not_requested',
+            'awaitingResponseRedeliveryWithdrawnAt', to_jsonb(now()))`,
+        }).where(pendingDecision);
+        continue;
+      }
       if (
         !task ||
         task.assigneeAgentId !== action.returnOwnerAgentId ||

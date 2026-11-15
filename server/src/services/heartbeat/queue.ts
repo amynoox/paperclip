@@ -2278,7 +2278,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         sql`${agentWakeupRequests.payload}->'adapterInteractionWait' is null`,
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'execution_recovery'`,
-        sql`jsonb_typeof(${agentWakeupRequests.payload}->'executionWait'->'recoveryActionId') = 'null'`,
+        // STUDIO-0051: also a wake held behind a hold that the Board reconciled
+        // without a continuation because the task waits on a person: no
+        // continuation run will adopt it, so it is re-admitted here once the
+        // blocker is gone. Only that path: behind a dependency-blocked
+        // reconciliation (STUDIO-0048) admission would refuse it while a blocker
+        // is open and consume it; workspace repair and containment keep theirs.
+        sql`(jsonb_typeof(${agentWakeupRequests.payload}->'executionWait'->'recoveryActionId') = 'null'
+          or exists (select 1 from issue_recovery_actions reconciled_hold
+            where reconciled_hold.company_id = ${agentWakeupRequests.companyId}
+              and reconciled_hold.id::text = ${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId'
+              and reconciled_hold.status = 'resolved'
+              and reconciled_hold.evidence ? 'executionReconciliation'
+              and reconciled_hold.evidence->>'continuationDelivery' in ('not_requested', 'satisfied')
+              and reconciled_hold.evidence->>'awaitingResponseReconciliation' = 'true'))`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'stale-addressee-requeue:%'`,
         // Unique whatever the status: a second row with the same key can never be inserted.
@@ -2301,6 +2314,28 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       ownershipVisited.add(issueKey);
       try {
         if (await getExecutionBlocker(db, wake.companyId, heldIssueId)) continue;
+        // STUDIO-0051: behind a reconciled hold, a blocker added after the
+        // reconciliation would make admission consume the wake; keep it held
+        // until the task's dependencies are ready.
+        if (readNonEmptyString(parseObject(wake.payload?.executionWait).recoveryActionId)) {
+          const readiness = (await issuesSvc.listDependencyReadiness(wake.companyId, [heldIssueId])).get(heldIssueId);
+          if (readiness && !readiness.isDependencyReady) continue;
+          // STUDIO-0051 (bench, lot 20, Q6): a wake of the same role on the same task is queued (the dependency wake,
+          // for example) and its run has not started yet: that run reads the answer in the thread, so the held copy is
+          // retired instead of starting a second run. Never into a claimed wake, whose run may already have read the
+          // thread. If that run never starts, the lost-answer hand-off still delivers one.
+          const [coming] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+            .where(and(eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.agentId, wake.agentId),
+              eq(agentWakeupRequests.status, "queued"), ne(agentWakeupRequests.id, wake.id),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${heldIssueId}`)).limit(1);
+          if (coming) {
+            const coalescedAt = new Date();
+            await db.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: coalescedAt, updatedAt: coalescedAt,
+              error: `Coalesced into wake ${coming.id} of the same task, which reads the held answer` })
+              .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+            continue;
+          }
+        }
         const context = parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]);
         const { executionWait: _wait, [DEFERRED_WAKE_CONTEXT_KEY]: _context, ...payload } = parseObject(wake.payload);
         // Retire the held row first: `skipped` is outside every partial unique

@@ -10514,6 +10514,12 @@ export function issueRoutes(
           tx,
         );
         let dependencyBlockedReconciliation = false;
+        let awaitingResponseReconciliation = false;
+        // STUDIO-0051 (bench, lot 20): an answer's wake only starts on a task in progress, so a task waiting on a
+        // person's question (or holding an answer behind this hold) goes back to in_progress, the state its cut run
+        // would have left; stranded-work recovery skips a task with a pending question that wakes the assignee.
+        // A task waiting on an approval stays blocked (the approval decision wakes the requester or is withdrawn).
+        let awaitingPersonAnswer = false;
         if (
           actionId &&
           (!activeRecoveryAction || activeRecoveryAction.id !== actionId)
@@ -10547,11 +10553,50 @@ export function issueRoutes(
               // the evidence is recorded and the hold lifted, no continuation is
               // delivered, and the dependency wake starts the task once unblocked
               // (production, 14 Nov 2026: TR-724, TR-723, TR-698).
-              dependencyBlockedReconciliation = sourceIssueStatus === "blocked" &&
+              // STUDIO-0051: the same path for a task that waits on a person's
+              // answer whose resolution wakes the assignee: a pending question
+              // addressed to a user with continuation policy wake_assignee, a
+              // pending approval the assignee requested, or an answer already
+              // set aside behind this hold. A question addressed
+              // to an agent does not count (the worker router's interruption
+              // card is one; its answer does not wake the assignee).
+              const withoutContinuationCandidate = sourceIssueStatus === "blocked" &&
                 lockedIssue.status === "blocked" && outcome === "restored" &&
                 // Native causes keep their fresh-session continuation: todo only.
-                settled.cause === "legacy_execution_requires_reconciliation" &&
-                (await svc.getDependencyReadiness(lockedIssue.id, tx)).unresolvedBlockerCount > 0;
+                settled.cause === "legacy_execution_requires_reconciliation";
+              if (withoutContinuationCandidate) {
+                dependencyBlockedReconciliation =
+                  (await svc.getDependencyReadiness(lockedIssue.id, tx)).unresolvedBlockerCount > 0;
+                if (!dependencyBlockedReconciliation && lockedIssue.assigneeAgentId) {
+                  const [question] = await tx.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions)
+                    .where(and(eq(issueThreadInteractions.companyId, lockedIssue.companyId),
+                      eq(issueThreadInteractions.issueId, lockedIssue.id), eq(issueThreadInteractions.status, "pending"),
+                      sql`${issueThreadInteractions.addresseeUserId} is not null`,
+                      eq(issueThreadInteractions.continuationPolicy, "wake_assignee")))
+                    .limit(1);
+                  const [approval] = question ? [] : await tx.select({ id: approvals.id }).from(issueApprovals)
+                    .innerJoin(approvals, and(eq(approvals.id, issueApprovals.approvalId), eq(approvals.companyId, issueApprovals.companyId)))
+                    .where(and(eq(issueApprovals.companyId, lockedIssue.companyId), eq(issueApprovals.issueId, lockedIssue.id),
+                      // Approval only wakes the requester; a rejection is handled by
+                      // the withdrawn-wait hand-off; revision_requested waits on the agent.
+                      eq(approvals.status, "pending"),
+                      eq(approvals.requestedByAgentId, lockedIssue.assigneeAgentId)))
+                    .limit(1);
+                  // An answer or message already set aside behind this hold is
+                  // released once it is lifted: a continuation on top would
+                  // start the role twice.
+                  const [heldAnswer] = question ? [] : await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+                    .where(and(eq(agentWakeupRequests.companyId, lockedIssue.companyId),
+                      eq(agentWakeupRequests.agentId, lockedIssue.assigneeAgentId),
+                      eq(agentWakeupRequests.status, "deferred_issue_execution"),
+                      sql`${agentWakeupRequests.payload} ->> 'issueId' = ${lockedIssue.id}`,
+                      sql`${agentWakeupRequests.payload} -> 'executionWait' ->> 'recoveryActionId' = ${settled.id}`))
+                    .limit(1);
+                  awaitingResponseReconciliation = Boolean(question || approval || heldAnswer);
+                  awaitingPersonAnswer = Boolean(question || heldAnswer);
+                  dependencyBlockedReconciliation = awaitingResponseReconciliation;
+                }
+              }
               if (
                 activeRecoveryAction ||
                 (sourceIssueStatus !== "todo" && !dependencyBlockedReconciliation) ||
@@ -10831,11 +10876,14 @@ export function issueRoutes(
               ? { kind: "chat_failed_run_retry", actionId: chatRetry.actionId }
               : undefined,
             controllerContainment ? { controllerContainmentOnly: true }
-              : dependencyBlockedReconciliation ? { dependencyBlockedOnly: true } : undefined,
+              : dependencyBlockedReconciliation
+                ? { dependencyBlockedOnly: true, ...(awaitingResponseReconciliation ? { awaitingResponse: true } : {}) }
+                : undefined,
           );
         }
         let issue = lockedIssue;
-        const sourceStatusChanged = sourceIssueStatus !== lockedIssue.status;
+        const targetSourceStatus = awaitingPersonAnswer ? "in_progress" : sourceIssueStatus;
+        const sourceStatusChanged = targetSourceStatus !== lockedIssue.status;
         if (outcome === "blocked" && sourceStatusChanged) {
           const unresolvedBlockers = await tx
             .select({ id: issueRows.id })
@@ -10858,10 +10906,10 @@ export function issueRoutes(
         }
 
         if (sourceStatusChanged) {
-          await assertNativeRunKeepsOwnExecutionLock(req, lockedIssue, sourceIssueStatus);
+          await assertNativeRunKeepsOwnExecutionLock(req, lockedIssue, targetSourceStatus);
           // The source row is locked in this transaction, so the check holds until the write.
           await assertAgentStatusChangeKeepsLiveRunBound(req, lockedIssue, {
-            requestedStatus: sourceIssueStatus,
+            requestedStatus: targetSourceStatus,
             assigneeWillChange: false,
             stopsGoalOnCompletion: false,
             refreshLock: false,
@@ -10904,7 +10952,7 @@ export function issueRoutes(
           }
 
           const updateFields: Record<string, unknown> = {
-            status: sourceIssueStatus,
+            status: targetSourceStatus,
             ...(repairedWorkspaceSettings ? { executionWorkspaceSettings: repairedWorkspaceSettings } : {}),
           };
           if (!safeHandBack) {
@@ -10923,7 +10971,7 @@ export function issueRoutes(
               issue: lockedIssue,
               policy: executionPolicy,
               previousPolicy: executionPolicy,
-              requestedStatus: sourceIssueStatus,
+              requestedStatus: targetSourceStatus,
               requestedAssigneePatch: {},
               actor: {
                 agentId: actor.agentId ?? null,
