@@ -2320,12 +2320,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (readNonEmptyString(parseObject(wake.payload?.executionWait).recoveryActionId)) {
           const readiness = (await issuesSvc.listDependencyReadiness(wake.companyId, [heldIssueId])).get(heldIssueId);
           if (readiness && !readiness.isDependencyReady) continue;
-          // STUDIO-0051 (bench, lot 20, Q6): a wake of the same role on the same task is already on its way (the
-          // dependency wake, for example): that run reads the answer in the thread, so the held copy is retired
-          // instead of starting a second run. If that run never starts, the lost-answer hand-off still delivers one.
+          // STUDIO-0051 (bench, lot 20, Q6): a wake of the same role on the same task is queued (the dependency wake,
+          // for example) and its run has not started yet: that run reads the answer in the thread, so the held copy is
+          // retired instead of starting a second run. Never into a claimed wake, whose run may already have read the
+          // thread. If that run never starts, the lost-answer hand-off still delivers one.
           const [coming] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
             .where(and(eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.agentId, wake.agentId),
-              inArray(agentWakeupRequests.status, ["queued", "claimed"]), ne(agentWakeupRequests.id, wake.id),
+              eq(agentWakeupRequests.status, "queued"), ne(agentWakeupRequests.id, wake.id),
               sql`${agentWakeupRequests.payload}->>'issueId' = ${heldIssueId}`)).limit(1);
           if (coming) {
             const coalescedAt = new Date();

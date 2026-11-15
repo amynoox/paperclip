@@ -10585,7 +10585,7 @@ export function issueRoutes(
                   // An answer or message already set aside behind this hold is
                   // released once it is lifted: a continuation on top would
                   // start the role twice.
-                  const [heldAnswer] = question || approval ? [] : await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+                  const [heldAnswer] = question ? [] : await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
                     .where(and(eq(agentWakeupRequests.companyId, lockedIssue.companyId),
                       eq(agentWakeupRequests.agentId, lockedIssue.assigneeAgentId),
                       eq(agentWakeupRequests.status, "deferred_issue_execution"),

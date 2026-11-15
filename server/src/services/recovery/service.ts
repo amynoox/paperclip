@@ -4867,6 +4867,13 @@ export function recoveryService(
         result.skipped += 1;
         continue;
       }
+      // STUDIO-0051: a task waiting on a person's question keeps its status while its assignee is not invokable
+      // (an agent in error, for example): the answer wakes the assignee once it is back, and that wake only starts
+      // on a task in progress, so escalating to blocked here would lose it.
+      if (issue.status !== "in_review" && !agentInvokable && await hasPendingWakeInteraction(issue.companyId, issue.id)) {
+        result.skipped += 1;
+        continue;
+      }
       if (issue.status !== "in_review" && !agentInvokable) {
         const classification = classifyContinuationFailure(latestRun);
         if (

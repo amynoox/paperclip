@@ -2362,7 +2362,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     }, { timeout: 15_000 });
     const [dispatched] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, answerRun!.id));
     expect(dispatched!.errorCode).not.toBe("issue_not_in_progress");
+    expect(dispatched!.status).not.toBe("cancelled");
     expect(dispatched!.startedAt).not.toBeNull();
+    expect(dispatched!.resultJson ?? {}).not.toHaveProperty("preDispatchCancellation");
     // Answered and started: the withdrawn-wait hand-off never fires, and the wait is closed
     // as satisfied by the answer's run (no more checks, no continuation promised).
     expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
@@ -2466,6 +2468,106 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
     expect(recorded!.evidence).toMatchObject({ continuationDelivery: "pending" });
     expect(recorded!.evidence).not.toHaveProperty("awaitingResponseSatisfiedByRunId");
+  });
+
+  it.each(["cancelled at the dispatcher's second gate", "failed while preparing, retry scheduled"] as const)(
+    "never closes the wait with a run that did no provider work (%s)", async (kind) => {
+      const { companyId, coderId, sourceIssueId, action, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
+      await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+      await db.update(issueThreadInteractions).set({ status: "answered", resolvedByUserId: responsibleUserId, resolvedAt: new Date(), updatedAt: new Date() } as never)
+        .where(eq(issueThreadInteractions.id, interactionId!));
+      const at = new Date(Date.now() + 1000);
+      if (kind === "cancelled at the dispatcher's second gate") {
+        await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, invocationSource: "automation", triggerDetail: "system",
+          status: "cancelled", errorCode: "issue_waiting_for_response", startedAt: at, finishedAt: at, createdAt: at,
+          resultJson: { preDispatchCancellation: { version: 1, providerWorkStarted: false, source: "stale_queued_run_gate" } },
+          contextSnapshot: { issueId: sourceIssueId } } as never);
+      } else {
+        await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, invocationSource: "automation", triggerDetail: "system",
+          status: "failed", errorCode: "environment_provider_unavailable", startedAt: at, finishedAt: at, createdAt: at,
+          resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+          contextSnapshot: { issueId: sourceIssueId } } as never);
+        await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, invocationSource: "automation", triggerDetail: "system",
+          status: "scheduled_retry", createdAt: at, contextSnapshot: { issueId: sourceIssueId } } as never);
+      }
+      expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
+      const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+      expect(recorded!.evidence).toMatchObject({ continuationDelivery: "not_requested" });
+    });
+
+  it("does not close the wait with a run that started before the answer", async () => {
+    const { companyId, coderId, sourceIssueId, action, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
+    await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    const before = new Date(Date.now() + 500);
+    await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, invocationSource: "automation", triggerDetail: "system",
+      status: "succeeded", startedAt: before, finishedAt: before, createdAt: before, contextSnapshot: { issueId: sourceIssueId } } as never);
+    const answeredAt = new Date(Date.now() + 2000);
+    await db.update(issueThreadInteractions).set({ status: "answered", resolvedByUserId: responsibleUserId, resolvedAt: answeredAt, updatedAt: answeredAt } as never)
+      .where(eq(issueThreadInteractions.id, interactionId!));
+    expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded!.evidence).toMatchObject({ continuationDelivery: "not_requested" });
+  });
+
+  it("moves the task in progress when an approval is pending and an answer is held behind the hold", async () => {
+    const { companyId, coderId, sourceIssueId, action, body, approvalId } = await seedAwaitingResponseHold("approval");
+    try {
+      await db.insert(agentWakeupRequests).values({ companyId, agentId: coderId, source: "on_demand", triggerDetail: "manual",
+        reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "board-user",
+        payload: { issueId: sourceIssueId, executionWait: { recoveryActionId: action.id, reason: "execution_recovery", message: "saved" } } } as never);
+      const resolved = await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+      expect(resolved.body.issue.status).toBe("in_progress");
+    } finally {
+      await db.delete(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, coderId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      await dropApproval(approvalId);
+    }
+  });
+
+  it("keeps a task waiting on a person's question in progress while its assignee is not invokable", async () => {
+    const { coderId, sourceIssueId, body } = await seedAwaitingResponseHold("person question");
+    await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(and(eq(heartbeatRuns.agentId, coderId), eq(heartbeatRuns.status, "running")));
+    await db.update(agents).set({ status: "error" }).where(eq(agents.id, coderId));
+    try {
+      await heartbeatService(db, { runtimeEnv: {} }).reconcileStrandedAssignedIssues();
+      const [task] = await db.select().from(issues).where(eq(issues.id, sourceIssueId));
+      expect(task!.status).toBe("in_progress");
+    } finally {
+      await db.update(agents).set({ status: "idle" }).where(eq(agents.id, coderId));
+    }
+  });
+
+  it("re-checks a pending continuation at delivery and withdraws it when a question is pending again", async () => {
+    const { companyId, coderId, managerId, sourceIssueId, action, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
+    void managerId;
+    await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    await db.update(issueThreadInteractions).set({ status: "cancelled", resolvedAt: new Date(), updatedAt: new Date() } as never)
+      .where(eq(issueThreadInteractions.id, interactionId!));
+    await db.delete(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, coderId), sql`${agentWakeupRequests.payload}->>'issueId' = ${sourceIssueId}`));
+    expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(1);
+    // Before delivery, the role asks the person again.
+    await db.insert(issueThreadInteractions).values({ companyId, issueId: sourceIssueId, kind: "request_confirmation", status: "pending",
+      continuationPolicy: "wake_assignee", addresseeUserId: responsibleUserId, createdByAgentId: coderId,
+      payload: { version: 1, prompt: "Still extend the wait?" } } as never);
+    await deliverReconciledExecutions(db, heartbeatService(db, { runtimeEnv: {} }).wakeup);
+    expect((await coderWakes(companyId, coderId)).filter(row => row.idempotencyKey === `execution-reconciliation:${action.id}`)).toHaveLength(0);
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded!.evidence).toMatchObject({ continuationDelivery: "not_requested" });
+    expect(recorded!.evidence).toHaveProperty("awaitingResponseRedeliveryWithdrawnAt");
+  });
+
+  it("never merges an answer held behind the hold into a claimed wake", async () => {
+    const { companyId, coderId, sourceIssueId, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
+    const app = createApp({ type: "board", source: "local_implicit", userId: responsibleUserId });
+    await request(app).post(`/api/issues/${sourceIssueId}/interactions/${interactionId}/accept`).send({}).expect(200);
+    const held = (await coderWakes(companyId, coderId)).filter(row => row.status === "deferred_issue_execution");
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    await db.insert(agentWakeupRequests).values({ companyId, agentId: coderId, source: "automation", triggerDetail: "system",
+      reason: "issue_blockers_resolved", status: "claimed", payload: { issueId: sourceIssueId } } as never);
+    await heartbeatService(db, { runtimeEnv: {} }).resumeQueuedRuns();
+    const [kept] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, held[0]!.id));
+    expect(kept!.status).not.toBe("coalesced");
   });
 
   it("merges an answer held behind the hold into a wake of the same task already queued (bench, lot 20, Q6)", async () => {
