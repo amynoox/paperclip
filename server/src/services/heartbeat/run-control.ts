@@ -95,7 +95,7 @@ import {
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { markCancelledBeforeAdapterInvoke } from "../pre-dispatch-cancellation.js";
+import { markCancelledBeforeProcessLaunch } from "../pre-dispatch-cancellation.js";
 import {
   type EnvironmentLeaseStatus,
 } from "@paperclipai/shared";
@@ -1549,9 +1549,13 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
                 parseObject(stopped.resultJson?.executionCancellation).state !==
                 "acknowledged"
               ) {
-                // STUDIO-0053: stopped while still preparing, before its adapter was invoked:
-                // no engine was launched, so the stop is proven without a process acknowledgement.
-                if (!running && await markCancelledBeforeAdapterInvoke(db, run.id)) {
+                // STUDIO-0053: stopped while still preparing, before any process was launched:
+                // the stop is proven without a process acknowledgement.
+                const markedBeforeProcess = !running && await markCancelledBeforeProcessLaunch(db, run.id).catch((error: unknown) => {
+                  logger.warn({ err: error, runId: run.id }, "Could not record a stop before process launch");
+                  return false;
+                });
+                if (markedBeforeProcess) {
                   return { run: (await getRun(run.id)) ?? stopped, updated: false };
                 }
                 throw conflict(
@@ -1662,10 +1666,14 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         }
       })();
       let cancelled = cancellation.run;
-      // STUDIO-0053: the server ended a Board-stopped legacy run whose adapter had not been invoked yet.
-      if (cancelled && control && !running && cancelled.status === "cancelled" && cancelled.runtimeMode === "legacy"
-        && await markCancelledBeforeAdapterInvoke(db, run.id)) {
-        cancelled = (await getRun(run.id)) ?? cancelled;
+      // STUDIO-0053: the server ended a stopped legacy run that had launched no process. A failure here must
+      // never skip the end-of-run effects below (ticket release, agent status, next queued run).
+      if (cancelled && control && !running && cancelled.status === "cancelled" && cancelled.runtimeMode === "legacy") {
+        try {
+          if (await markCancelledBeforeProcessLaunch(db, run.id)) cancelled = (await getRun(run.id)) ?? cancelled;
+        } catch (error) {
+          logger.warn({ err: error, runId: run.id }, "Could not record a stop before process launch");
+        }
       }
 
       if (cancellation.updated && cancelled) {

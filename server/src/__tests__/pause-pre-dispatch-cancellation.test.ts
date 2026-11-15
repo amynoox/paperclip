@@ -5,7 +5,7 @@ import { agents, companies, createDb, environmentLeases, heartbeatRunEvents, hea
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentExecutionsHaveStopped, SSH_CLIENT_STOP_PAUSE_PROOF_DELAY_MS } from "../services/agent-execution-stop.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
-import { markCancelledBeforeAdapterInvoke, preDispatchCancellationResult } from "../services/pre-dispatch-cancellation.js";
+import { markCancelledBeforeProcessLaunch, preDispatchCancellationResult, SETTLED_STOP_MARK_DELAY_MS } from "../services/pre-dispatch-cancellation.js";
 
 // STUDIO-0043: production, 14 Nov 2026. After a pause, three agents stayed
 // `pausing`: five runs had been cancelled by the server before their adapter
@@ -137,47 +137,66 @@ const support = await getEmbeddedPostgresTestSupport();
   });
 
   // STUDIO-0053: production, 15 Nov 2026. d1389345 (no lease) and f410e11a (ssh lease, expired) were stopped by the
-  // Board during their preparation: started, no adapter invocation, no process identity, cancellation "requested".
-  async function boardStopBeforeAdapter(input: { ssh: boolean }) {
-    const finishedAt = new Date(Date.now() - 60_000);
+  // Board during their preparation: started, no process identity, no execution event, cancellation "requested".
+  async function boardStopBeforeAdapter(input: { ssh: boolean; minutesAgo?: number }) {
+    const finishedAt = new Date(Date.now() - (input.minutesAgo ?? 1) * 60_000);
     const f = await seed({ errorCode: "cancelled", startedAt: new Date(finishedAt.getTime() - 37_000), finishedAt,
       resultJson: { conversationContinuation: "continue_conversation_v1", executionCancellation: { state: "requested", requestedAt: finishedAt.toISOString() } } });
     if (input.ssh) await sshLease(f);
     return f;
   }
 
-  it("proves the stop of a run the Board stopped before its adapter was invoked, with or without an ssh lease", async () => {
+  it("proves the stop of a run stopped before any process was launched, with or without an ssh lease", async () => {
     for (const ssh of [false, true]) {
       const f = await boardStopBeforeAdapter({ ssh });
       expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(false);
-      expect(await markCancelledBeforeAdapterInvoke(db, f.run.id)).toBe(true);
-      expect(await markCancelledBeforeAdapterInvoke(db, f.run.id)).toBe(false);
+      expect(await markCancelledBeforeProcessLaunch(db, f.run.id)).toBe(true);
+      expect(await markCancelledBeforeProcessLaunch(db, f.run.id)).toBe(false);
       expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(true);
       expect(await agentExecutionsHaveStopped(db, [f.agentId])).toBe(true);
     }
   });
 
   it("writes no marker once the adapter was invoked or a process was asked for or recorded", async () => {
-    for (const eventType of ["adapter.invoke", "native.process_start_requested", "native.process_identity_recorded", "tool.execution.started"]) {
+    for (const eventType of ["adapter.invoke", "native.process_start_requested", "native.process_identity_recorded", "tool.execution.started",
+      "harness.ready", "session.started", "session.resumed", "turn.started", "provider.event", "provider.rpc_result"]) {
       const f = await boardStopBeforeAdapter({ ssh: true });
       await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: f.run.id, agentId: f.agentId, seq: 1, eventType,
         stream: "system", level: "info", message: eventType });
-      expect(await markCancelledBeforeAdapterInvoke(db, f.run.id)).toBe(false);
+      expect(await markCancelledBeforeProcessLaunch(db, f.run.id)).toBe(false);
       expect(await agentExecutionsHaveStopped(db, [f.agentId])).toBe(false);
     }
     const withPid = await boardStopBeforeAdapter({ ssh: true });
     await db.update(heartbeatRuns).set({ processPid: 2_000_000_002 }).where(eq(heartbeatRuns.id, withPid.run.id));
-    expect(await markCancelledBeforeAdapterInvoke(db, withPid.run.id)).toBe(false);
+    expect(await markCancelledBeforeProcessLaunch(db, withPid.run.id)).toBe(false);
+    const withGroup = await boardStopBeforeAdapter({ ssh: true });
+    await db.update(heartbeatRuns).set({ processGroupId: 2_000_000_003 }).where(eq(heartbeatRuns.id, withGroup.run.id));
+    expect(await markCancelledBeforeProcessLaunch(db, withGroup.run.id)).toBe(false);
+    const withSession = await boardStopBeforeAdapter({ ssh: true });
+    await db.update(heartbeatRuns).set({ sessionIdAfter: "session-1" }).where(eq(heartbeatRuns.id, withSession.run.id));
+    expect(await markCancelledBeforeProcessLaunch(db, withSession.run.id)).toBe(false);
   });
 
   it("writes no marker for a run that is not a requested legacy cancellation", async () => {
     const acknowledged = await seed({ resultJson: { executionCancellation: { state: "acknowledged", acknowledgedAt: new Date().toISOString() } } });
-    expect(await markCancelledBeforeAdapterInvoke(db, acknowledged.run.id)).toBe(false);
+    expect(await markCancelledBeforeProcessLaunch(db, acknowledged.run.id)).toBe(false);
     const nativeRun = await boardStopBeforeAdapter({ ssh: false });
     await db.update(heartbeatRuns).set({ runtimeMode: "native" }).where(eq(heartbeatRuns.id, nativeRun.run.id));
-    expect(await markCancelledBeforeAdapterInvoke(db, nativeRun.run.id)).toBe(false);
+    expect(await markCancelledBeforeProcessLaunch(db, nativeRun.run.id)).toBe(false);
     const stillRunning = await boardStopBeforeAdapter({ ssh: false });
     await db.update(heartbeatRuns).set({ status: "running" }).where(eq(heartbeatRuns.id, stillRunning.run.id));
-    expect(await markCancelledBeforeAdapterInvoke(db, stillRunning.run.id)).toBe(false);
+    expect(await markCancelledBeforeProcessLaunch(db, stillRunning.run.id)).toBe(false);
+  });
+
+  it("records at pause time the stop of a run that settled late or across a restart", async () => {
+    expect(SETTLED_STOP_MARK_DELAY_MS).toBe(2 * 60_000);
+    const settled = await boardStopBeforeAdapter({ ssh: true, minutesAgo: 5 });
+    expect(await agentExecutionsHaveStopped(db, [settled.agentId])).toBe(false);
+    expect(await agentExecutionsHaveStopped(db, [settled.agentId], { pauseStop: true })).toBe(true);
+    const [marked] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, settled.run.id));
+    expect(marked!.resultJson).toMatchObject({ preDispatchCancellation: { source: "stopped_before_process_launch" } });
+    // Settled a few seconds ago: the adapter may still be writing; nothing is recorded yet.
+    const fresh = await boardStopBeforeAdapter({ ssh: true, minutesAgo: 0.1 });
+    expect(await agentExecutionsHaveStopped(db, [fresh.agentId], { pauseStop: true })).toBe(false);
   });
 });
