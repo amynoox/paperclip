@@ -1322,6 +1322,35 @@
       "retireWhen": "Upstream lets an execution reconciliation keep a dependency-blocked task blocked, or drops the legacy no-replay hold.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0051",
+      "title": "A legacy hold on a task waiting on a person's answer is reconciled without a continuation; the answer wakes the assignee",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "At an update window, several cut tickets wait on a question to the owner. The operator tool refused them, and the server could reconcile a blocked task without a continuation only when it had an open first-class blocker (STUDIO-0048); the todo path would deliver a continuation while the role waits for an answer. Meanwhile the owner's answer was set aside behind the hold (deferred_issue_execution, executionWait execution_recovery) and the task stayed stopped until someone reconciled again. A wake held behind a hold reconciled without a continuation was also never re-admitted: the release pass took only holds without a recovery action.",
+      "reason": "Requested by the studio setup session (15 Nov 2026, after V321): the update window reconciles what it cancelled without an extra operator gesture.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server issue recovery actions and deferred wake release",
+      "paths": [
+        "server/src/routes/issues.ts",
+        "server/src/services/execution-recovery-resolution.ts",
+        "server/src/services/execution-projection.ts",
+        "server/src/services/heartbeat/queue.ts",
+        "server/src/__tests__/issue-recovery-actions.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: upstream reconciles a legacy hold to todo only.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. issue-recovery-actions.test.ts, six new cases: a blocked task (blocked by the role itself, no legacyCancellationBlock receipt) with a pending question to the Board user (wake_assignee) is reconciled through the Board route with sourceIssueStatus blocked: 200, status unchanged, continuationDelivery not_requested, awaitingResponseReconciliation, task session dropped, no continuation run; the answer then gives exactly one admitted wake and nothing set aside. An answer given during the hold is set aside (deferred_issue_execution); the reconciliation takes the same path (no continuation) and the release pass re-admits the set-aside answer once: one run for the task. A pending approval requested by the assignee takes the same path. Refused with 409, hold unchanged: a question addressed to an agent only, a cancelled question, a question replaced by an agent-addressed card. With ownership-hold-readmission, deferred-execution-receipt-work, heartbeat-undispatched-execution-wait and execution-projection: 248 passed. Negative control (new cases on studio.18, 73b4ede7): the three reconciliation cases fail; the three refusals pass there too (existing behaviour). Typecheck: no error in the changed files.",
+      "migration": "None. Board route only, no automatic path. The STUDIO-0048 no-continuation path also applies when the blocked task has no open blocker but waits on a person: a pending question addressed to a user with continuation policy wake_assignee, a pending or revision-requested approval linked to the task and requested by the assignee, or an answer already set aside behind this hold (deferred_issue_execution with executionWait.recoveryActionId of this action). Evidence awaitingResponseReconciliation true; projection 'Reconciled', starts again when the answer comes. A question addressed to an agent does not count (the worker router's interruption card is one; its acceptance does not wake the assignee), nor a question to a person with policy none or wake_assignee_on_accept (a decline would leave the task stopped): such a task keeps the hold. The deferred-receipt release now also re-admits, once, a wake held behind an action reconciled with continuationDelivery not_requested, once the task has no execution blocker (same retire-then-readmit as for ownership holds); this also covers messages held behind a STUDIO-0048 reconciliation.",
+      "rollback": "Switch cli/current back to the previous install folder. Holds already reconciled stay reconciled; a wake still held behind one waits for the next run of the task, as before.",
+      "retireWhen": "Upstream reconciles a waiting task without a continuation, or releases held wakes on any reconciliation.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: no-continuation reconciliation for a task waiting on a person, and release of wakes held behind such a reconciliation. Why: update windows cut tickets that wait on the owner's answer (V321 follow-up). Origin: studio fork only; to re-apply, keep the awaiting-response block next to the STUDIO-0048 condition in routes/issues.ts, the awaitingResponse option in markExecutionReconciliation, its projection branch, and the reconciled-hold term in the ownership-held selection of resumeDeferredExecutionReceipts; run the STUDIO-0051 cases of issue-recovery-actions.test.ts."
     }
   ]
 }
