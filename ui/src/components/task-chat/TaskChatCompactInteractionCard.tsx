@@ -412,7 +412,7 @@ function ReceiptDisclosure({
       <div className="grid gap-3">
         {questionSet.description ? (
           <div className="text-sm text-muted-foreground" data-testid="answered-question-context">
-            <MarkdownBody externalReferences={externalReferences} mediaMode="reference">{questionSet.description}</MarkdownBody>
+            <MarkdownBody className="paperclip-markdown-inherit" externalReferences={externalReferences} mediaMode="reference">{questionSet.description}</MarkdownBody>
           </div>
         ) : null}
         {questionSet.questions.map((question) => {
@@ -433,11 +433,11 @@ function ReceiptDisclosure({
                 </p>
               ) : null}
               <div className="text-sm text-foreground">
-                <MarkdownBody externalReferences={externalReferences} mediaMode="reference">{question.prompt}</MarkdownBody>
+                <MarkdownBody className="paperclip-markdown-inherit" externalReferences={externalReferences} mediaMode="reference">{question.prompt}</MarkdownBody>
               </div>
               {question.helpText ? (
                 <div className="mt-0.5 text-xs text-muted-foreground">
-                  <MarkdownBody externalReferences={externalReferences} mediaMode="reference">{question.helpText}</MarkdownBody>
+                  <MarkdownBody className="paperclip-markdown-inherit" externalReferences={externalReferences} mediaMode="reference">{question.helpText}</MarkdownBody>
                 </div>
               ) : null}
               <p className="mt-1 text-sm font-medium text-foreground">
@@ -1986,7 +1986,7 @@ export function TaskChatCompactInteractionCard({
       <details className="px-1" data-testid="answered-question-context">
         <summary className="cursor-pointer text-xs font-medium text-muted-foreground">Question context</summary>
         <div className="mt-1 text-sm text-muted-foreground">
-          <MarkdownBody externalReferences={externalReferences} mediaMode="reference">{answeredContext}</MarkdownBody>
+          <MarkdownBody className="paperclip-markdown-inherit" externalReferences={externalReferences} mediaMode="reference">{answeredContext}</MarkdownBody>
         </div>
       </details>
     </div>;

@@ -221,7 +221,7 @@ export function QuestionResponseSummary({
                 </span>
               ) : null}
               <div className="text-sm text-foreground">
-                <MarkdownBody mediaMode="reference" linkIssueReferences={false}>{question.prompt}</MarkdownBody>
+                <MarkdownBody className="paperclip-markdown-inherit" mediaMode="reference">{question.prompt}</MarkdownBody>
               </div>
             </dt>
             <dd className="mt-0.5 text-foreground">
@@ -550,7 +550,7 @@ function QuestionFormForRequest({
           tabIndex={0}
           className="mb-3 max-h-96 overflow-auto text-sm text-muted-foreground"
         >
-          <MarkdownBody mediaMode="reference" linkIssueReferences={false}>{questionSet.description}</MarkdownBody>
+          <MarkdownBody className="paperclip-markdown-inherit" mediaMode="reference">{questionSet.description}</MarkdownBody>
         </div>
       ) : null}
       {question.answerMode === "text" && presentation !== "decision" ? (
@@ -583,11 +583,11 @@ function QuestionFormForRequest({
           className={presentation === "decision" ? "text-lg font-medium leading-relaxed text-foreground" : "text-sm font-medium leading-5 text-foreground"}
         >
           {/* STUDIO-0054: the role's line breaks, lists, emphasis and links stay readable. */}
-          <MarkdownBody className={presentation === "decision" ? "text-lg" : undefined} mediaMode="reference" linkIssueReferences={false}>{question.prompt}</MarkdownBody>
+          <MarkdownBody className="paperclip-markdown-inherit" mediaMode="reference">{question.prompt}</MarkdownBody>
         </div>
         {question.helpText ? (
           <div className="mt-1 text-xs leading-4 text-muted-foreground">
-            <MarkdownBody mediaMode="reference" linkIssueReferences={false}>{question.helpText}</MarkdownBody>
+            <MarkdownBody className="paperclip-markdown-inherit" mediaMode="reference">{question.helpText}</MarkdownBody>
           </div>
         ) : null}
       </div>

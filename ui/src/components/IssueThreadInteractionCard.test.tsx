@@ -1947,3 +1947,48 @@ describe("question text keeps its formatting", () => {
     expectFormatted(renderCard({ interaction: withPrompt(answeredAskUserQuestionsInteraction as never) }), false);
   });
 });
+
+// STUDIO-0054, review of the first head: details and safety of the rendered question text.
+describe("question text details and safety", () => {
+  const cardWith = (prompt: string, helpText?: string) => renderCard({ interaction: {
+    ...pendingAskUserQuestionsInteraction,
+    payload: { ...pendingAskUserQuestionsInteraction.payload, questionSet: undefined, questions: pendingAskUserQuestionsInteraction.payload.questions.map(
+      (question, index) => index === 0 ? { ...question, prompt, helpText: helpText ?? null } : question) },
+  } as never });
+  const promptBlock = (node: HTMLElement) => node.querySelector<HTMLElement>('[id$="-prompt"]')!;
+
+  it("keeps file names with underscores and inline code literal", () => {
+    const node = cardWith("Voir Vehicle_PassangersManager.cs:309 et __x3200_y1200, puis `run_all.sh`");
+    const block = promptBlock(node);
+    expect(block.textContent).toContain("Vehicle_PassangersManager.cs:309");
+    expect(block.textContent).toContain("__x3200_y1200");
+    expect(block.querySelector("em, strong")).toBeNull();
+    expect(block.querySelector("code")?.textContent).toBe("run_all.sh");
+  });
+
+  it("never renders a javascript: link nor raw HTML", () => {
+    const node = cardWith("[clic](javascript:alert(1)) <b>gras</b> <img src=x onerror=alert(1)>");
+    const block = promptBlock(node);
+    expect([...block.querySelectorAll("a")].some((element) => (element.getAttribute("href") ?? "").startsWith("javascript:"))).toBe(false);
+    expect(block.querySelector("b, img, script")).toBeNull();
+    expect(block.textContent).toContain("clic");
+  });
+
+  it("renders a one-line prompt as a single paragraph", () => {
+    const block = promptBlock(cardWith("Que fait-on de la PR ?"));
+    expect(block.querySelectorAll("p")).toHaveLength(1);
+    expect(block.textContent?.trim()).toBe("Que fait-on de la PR ?");
+  });
+
+  it("keeps a relative ticket link as a link in the question form", () => {
+    const base = pendingAskUserQuestionsInteraction;
+    const prompt = "Lire [le rapport](/TR/issues/TR-723) avant de répondre";
+    const questions = base.payload.questions.map((question, index) => index === 0 ? { ...question, prompt } : question);
+    const questionSet = { schema: "paperclip.question_set.v1" as const, questions: questions.map((question) => ({ id: question.id, prompt: question.prompt,
+      required: question.required ?? false, answerMode: question.selectionMode === "multi" ? "multi_select" as const : "single_select" as const,
+      options: question.options.map((option) => ({ id: option.id, label: option.label })) })) };
+    const node = renderCard({ interaction: { ...base, payload: { ...base.payload, questions, questionSet } } as never, onSubmitInteractionAnswers: vi.fn() });
+    expect([...node.querySelectorAll("a")].some((element) => (element.getAttribute("href") ?? "").includes("TR-723"))).toBe(true);
+  });
+});
+

@@ -1292,13 +1292,13 @@ function AskUserQuestionsCard({
                     className={compact ? "text-lg font-medium leading-relaxed text-foreground" : "mt-1 text-sm font-semibold text-foreground"}
                   >
                     {/* STUDIO-0054: the role's line breaks, lists, emphasis and links stay readable. */}
-                    <MarkdownBody className={compact ? "text-lg" : undefined} externalReferences={externalReferences} mediaMode="reference">
+                    <MarkdownBody className="paperclip-markdown-inherit" externalReferences={externalReferences} mediaMode="reference">
                       {question.prompt}
                     </MarkdownBody>
                   </div>
                   {question.helpText ? (
                     <div className="mt-1 text-sm leading-6 text-muted-foreground">
-                      <MarkdownBody externalReferences={externalReferences} mediaMode="reference">{question.helpText}</MarkdownBody>
+                      <MarkdownBody className="paperclip-markdown-inherit" externalReferences={externalReferences} mediaMode="reference">{question.helpText}</MarkdownBody>
                     </div>
                   ) : null}
                 </div>
@@ -1494,7 +1494,7 @@ function AskUserQuestionsCard({
                 className="rounded-2xl border border-border/70 bg-background/82 p-4"
               >
                 <div className="text-sm font-semibold text-foreground">
-                  <MarkdownBody externalReferences={externalReferences} mediaMode="reference">{question.prompt}</MarkdownBody>
+                  <MarkdownBody className="paperclip-markdown-inherit" externalReferences={externalReferences} mediaMode="reference">{question.prompt}</MarkdownBody>
                 </div>
                 <div className="mt-2 flex flex-wrap gap-2">
                   {labels.length > 0 ? (

@@ -178,4 +178,17 @@ describe("answered question receipt", () => {
     expect(host.querySelector(".coordinator-decision-receipt")).not.toBeNull();
     expect(host.querySelector('[data-testid="answered-question-context"]')).toBeNull();
   });
+
+  it("renders the resolved receipt's question and help text as Markdown", async () => {
+    const base = withContext("**Contexte**");
+    const interaction = { ...base, payload: { ...base.payload, questions: base.payload.questions.map((question, index) =>
+      index === 0 ? { ...question, helpText: "voir *aussi* la note" } : question) } };
+    interaction.payload.questionSet!.questions = interaction.payload.questionSet!.questions.map((question, index) =>
+      index === 0 ? { ...question, helpText: "voir *aussi* la note" } : question);
+    await act(() => root.render(<QueryClientProvider client={client}><TooltipProvider><ThemeProvider>
+      <TaskChatCompactInteractionCard interaction={interaction as never} presentation="takeover" />
+    </ThemeProvider></TooltipProvider></QueryClientProvider>));
+    expect([...host.querySelectorAll("em")].some((element) => element.textContent === "aussi")).toBe(true);
+    expect(host.textContent).not.toContain("*aussi*");
+  });
 });
