@@ -95,6 +95,7 @@ import {
   sql,
 } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import { markCancelledBeforeAdapterInvoke } from "../pre-dispatch-cancellation.js";
 import {
   type EnvironmentLeaseStatus,
 } from "@paperclipai/shared";
@@ -1548,6 +1549,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
                 parseObject(stopped.resultJson?.executionCancellation).state !==
                 "acknowledged"
               ) {
+                // STUDIO-0053: stopped while still preparing, before its adapter was invoked:
+                // no engine was launched, so the stop is proven without a process acknowledgement.
+                if (!running && await markCancelledBeforeAdapterInvoke(db, run.id)) {
+                  return { run: (await getRun(run.id)) ?? stopped, updated: false };
+                }
                 throw conflict(
                   "Execution ended, but provider termination could not be verified. Inspect the stopped run before continuing.",
                 );
@@ -1655,7 +1661,12 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
           }
         }
       })();
-      const cancelled = cancellation.run;
+      let cancelled = cancellation.run;
+      // STUDIO-0053: the server ended a Board-stopped legacy run whose adapter had not been invoked yet.
+      if (cancelled && control && !running && cancelled.status === "cancelled" && cancelled.runtimeMode === "legacy"
+        && await markCancelledBeforeAdapterInvoke(db, run.id)) {
+        cancelled = (await getRun(run.id)) ?? cancelled;
+      }
 
       if (cancellation.updated && cancelled) {
         if (readNativeStartupCleanup(cancelled)) await acknowledgeNativeStartupCleanup(db, { companyId: cancelled.companyId, runId: cancelled.id });

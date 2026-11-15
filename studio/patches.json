@@ -1377,6 +1377,34 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: ssh exit 255 connection failures get a network-code cause. Why: TR-999 blocked after one unreachable lease probe (15 Nov 2026). Origin: studio fork only; to re-apply, keep sshConnectFailureCode and withSshConnectFailureCause in packages/adapter-utils/src/ssh.ts and the try/catch around the ssh call in runSshCommand; run ssh-connect-failure.test.ts and the STUDIO-0052 case of environment-provider-unavailable-error.test.ts."
+    },
+    {
+      "id": "STUDIO-0053",
+      "title": "A Board-stopped legacy run that never reached its adapter proves its own stop",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, 15 Nov 2026, studio20 window: the Board cancelled six Quality Manager runs. Two of them (d1389345, no lease; f410e11a, ssh lease) were still preparing their lease when stopped: started, no adapter.invoke event, no process identity, cancellation left 'requested'. The agent stop proof (agentExecutionsHaveStopped) then waited forever for a process acknowledgement (legacy rule) and for a remote termination receipt (ssh lease, no client pid for the ssh proof): the Quality Manager stayed 'pausing' until an operator acknowledged one run and wrote a receipt on the other lease.",
+      "reason": "Requested by the studio setup session (15 Nov 2026), after the studio20 window; follow-up of STUDIO-0043, which only covered runs cancelled by the server before dispatch.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "heartbeat run control (Board stop of a legacy run with an owned adapter and no process)",
+      "paths": [
+        "server/src/services/pre-dispatch-cancellation.ts",
+        "server/src/services/heartbeat/run-control.ts",
+        "server/src/services/heartbeat/run-control.test.ts",
+        "server/src/__tests__/pause-pre-dispatch-cancellation.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: upstream acknowledges a cancellation only when it terminates a recorded process.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. run-control.test.ts, two new cases through the real cancel path (owned adapter control, no process): the Board stop writes preDispatchCancellation {version 1, providerWorkStarted false, source operator_before_adapter_invoke} and keeps executionCancellation 'requested'; with an adapter.invoke event recorded before the stop, nothing is written. pause-pre-dispatch-cancellation.test.ts, three new cases: the marker proves the stop with and without an ssh lease (pause and termination), is written once; never written after adapter.invoke, native.process_start_requested, native.process_identity_recorded or tool.execution.started, nor with a process id, an acknowledged cancellation, a native run or a run not cancelled. With the existing cases: 96 passed. Negative control: on the previous run-control.ts the first new case fails (no marker). Typecheck: no error in the changed files.",
+      "migration": "None. When the Board stops a legacy run that has an owned adapter control and no registered process, the server waits for the adapter to settle as before; then, if the run is cancelled, recorded no process identity, kept its cancellation 'requested' and has no adapter or process event (adapter.invoke, native.process_start_requested, native.process_identity_recorded, tool.execution.started), it records the STUDIO-0043 marker with the new source operator_before_adapter_invoke (conditional update, once). agentExecutionsHaveStopped already accepts that marker for the legacy rule and for remote leases, so the pause completes. Where the adapter had already ended the run, the stop answers success instead of 'provider termination could not be verified'. executionCancellation, the recovery hold (legacy_execution_requires_reconciliation) and held-wake release are unchanged. Runs already stuck before this patch still need the operator gesture (tools/repair-pausing-agents.py).",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Upstream records a stop proof for a run stopped before its adapter was invoked.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: a Board stop of a legacy run before adapter invocation records preDispatchCancellation (source operator_before_adapter_invoke). Why: the Quality Manager stayed pausing after the studio20 window (15 Nov 2026). Origin: studio fork only; to re-apply, keep markCancelledBeforeAdapterInvoke in server/src/services/pre-dispatch-cancellation.ts and its two calls in cancelRunInternal (run-control.ts: before the 'provider termination could not be verified' conflict, and after the cancellation IIFE); run the STUDIO-0053 cases of run-control.test.ts and pause-pre-dispatch-cancellation.test.ts."
     }
   ]
 }

@@ -1022,6 +1022,42 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
     }
   });
 
+  // STUDIO-0053: production, 15 Nov 2026 (studio20 window). Runs d1389345 and f410e11a were stopped by the Board
+  // while still preparing their lease, before their adapter was invoked: no process acknowledged the stop, nothing
+  // recorded that none had been launched, and the Quality Manager stayed `pausing`.
+  it("records that a Board-stopped legacy run never reached its adapter", async () => {
+    const { run, control } = await ownedAdapterRun();
+    const deps = callbacks(db);
+    try {
+      vi.mocked(waitForAdapterStop).mockResolvedValueOnce(undefined as never);
+      expect(await createHeartbeatRunControl(db, deps).cancelRunInternal(run.id)).toMatchObject({ status: "cancelled" });
+      const after = await deps.getRun(run.id);
+      expect(after?.resultJson).toMatchObject({
+        executionCancellation: { state: "requested" },
+        preDispatchCancellation: { version: 1, providerWorkStarted: false, source: "operator_before_adapter_invoke" },
+      });
+    } finally {
+      control.finish();
+      adapterExecutionControls.delete(run.id);
+    }
+  });
+
+  it("records nothing for a Board-stopped run whose adapter was invoked", async () => {
+    const { run, control } = await ownedAdapterRun();
+    const deps = callbacks(db);
+    await deps.appendRunEvent(run, { eventType: "adapter.invoke", stream: "system", level: "info", message: "adapter invocation" });
+    try {
+      vi.mocked(waitForAdapterStop).mockResolvedValueOnce(undefined as never);
+      expect(await createHeartbeatRunControl(db, deps).cancelRunInternal(run.id)).toMatchObject({ status: "cancelled" });
+      const after = await deps.getRun(run.id);
+      expect(after?.resultJson).toMatchObject({ executionCancellation: { state: "requested" } });
+      expect(after?.resultJson).not.toHaveProperty("preDispatchCancellation");
+    } finally {
+      control.finish();
+      adapterExecutionControls.delete(run.id);
+    }
+  });
+
   it("deduplicates agent batches and cancels only unclaimed pending wakes", async () => {
     const { company, agent } = await fixture();
     const [otherAgent] = await db.insert(agents).values({ companyId: company.id, name: "Other agent" }).returning();
