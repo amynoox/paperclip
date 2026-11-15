@@ -199,4 +199,38 @@ const support = await getEmbeddedPostgresTestSupport();
     const fresh = await boardStopBeforeAdapter({ ssh: true, minutesAgo: 0.1 });
     expect(await agentExecutionsHaveStopped(db, [fresh.agentId], { pauseStop: true })).toBe(false);
   });
+
+  it("marks at pause time only the paused agent's cancelled runs without any process, session or execution event", async () => {
+    const stamp = async (f: { run: typeof heartbeatRuns.$inferSelect }, values: Partial<typeof heartbeatRuns.$inferInsert>) =>
+      db.update(heartbeatRuns).set(values).where(eq(heartbeatRuns.id, f.run.id));
+    const marker = async (f: { run: typeof heartbeatRuns.$inferSelect }) =>
+      ((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id)))[0]!.resultJson as Record<string, any> | null)?.preDispatchCancellation;
+    const target = await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 });
+    const others = {
+      pid: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+      group: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+      session: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+      event: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+      failed: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+      timedOut: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+      succeeded: await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 }),
+    };
+    // Every run belongs to the target's agent, except one left on its own agent below.
+    for (const f of Object.values(others)) await stamp(f, { agentId: target.agentId, companyId: target.companyId });
+    await stamp(others.pid, { processPid: 2_000_000_010 });
+    await stamp(others.group, { processGroupId: 2_000_000_011 });
+    await stamp(others.session, { sessionIdAfter: "session-2" });
+    await db.insert(heartbeatRunEvents).values({ companyId: target.companyId, runId: others.event.run.id, agentId: target.agentId, seq: 1,
+      eventType: "provider.event", stream: "system", level: "info", message: "provider.event" });
+    await stamp(others.failed, { status: "failed" });
+    await stamp(others.timedOut, { status: "timed_out" });
+    await stamp(others.succeeded, { status: "succeeded" });
+    const elsewhere = await boardStopBeforeAdapter({ ssh: false, minutesAgo: 5 });
+    await agentExecutionsHaveStopped(db, [target.agentId], { pauseStop: true });
+    const marked = await marker(target);
+    expect(marked).toMatchObject({ source: "stopped_before_process_launch", providerWorkStarted: false });
+    expect(new Date(marked.cancelledAt).getTime()).toBe(target.run.finishedAt!.getTime());
+    for (const f of Object.values(others)) expect(await marker(f)).toBeUndefined();
+    expect(await marker(elsewhere)).toBeUndefined();
+  });
 });

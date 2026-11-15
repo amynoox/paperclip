@@ -57,11 +57,18 @@ export const SETTLED_STOP_MARK_DELAY_MS = 2 * 60_000;
 
 /**
  * STUDIO-0053: the same marker for the agents' runs that settled after the stop wait timed out, or across a server
- * restart, so a pause can still complete. Same conditions, on runs finished more than two minutes ago.
+ * restart, so a pause can still complete. Same conditions (cancelled runs only), on runs finished more than two
+ * minutes ago; called only for agents being paused; no age bound (older stuck runs are repaired the same way).
  */
 export async function markSettledStopsBeforeProcessLaunch(db: Db, agentIds: string[], at = new Date()): Promise<number> {
   if (!agentIds.length) return 0;
-  const rows = await db.update(heartbeatRuns).set({ resultJson: markerSql(at), updatedAt: at })
+  // cancelledAt is the run's own end, not the time of this check.
+  const marker = sql`jsonb_build_object('version', 1, 'providerWorkStarted', false, 'source', 'stopped_before_process_launch',
+    'cancelledAt', to_jsonb(${heartbeatRuns.finishedAt}))`;
+  const rows = await db.update(heartbeatRuns).set({
+    resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || jsonb_build_object(${PRE_DISPATCH_CANCELLATION_KEY}::text, ${marker})`,
+    updatedAt: at,
+  })
     .where(and(inArray(heartbeatRuns.agentId, agentIds), lt(heartbeatRuns.finishedAt, new Date(at.getTime() - SETTLED_STOP_MARK_DELAY_MS)),
       stoppedBeforeProcessLaunchCondition(db)))
     .returning({ id: heartbeatRuns.id });
