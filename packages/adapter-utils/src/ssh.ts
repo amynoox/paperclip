@@ -1236,20 +1236,19 @@ export async function runSshCommand(
       `sh -c ${shellQuote(remoteScript)}`,
     );
 
-    // STUDIO-0052: ssh's own diagnostics in English, so the connection patterns hold whatever the server locale.
-    const env = { ...process.env, LC_ALL: "C" };
+    // STUDIO-0052: the environment is left as is. Forcing a locale here would be
+    // forwarded to the machine (the default client config sends LANG and LC_*), and
+    // OpenSSH sets only LC_CTYPE itself, so its connection diagnostics stay in English.
     try {
       return options.stdin != null
         ? await spawnText("ssh", sshArgs, {
             stdin: options.stdin,
             timeout: options.timeoutMs ?? 15_000,
             maxBuffer: options.maxBuffer ?? 1024 * 128,
-            env,
           })
         : await execFileText("ssh", sshArgs, {
             timeout: options.timeoutMs ?? 15_000,
             maxBuffer: options.maxBuffer ?? 1024 * 128,
-            env,
           });
     } catch (error) {
       throw withSshConnectFailureCause(error);
