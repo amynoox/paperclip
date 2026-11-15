@@ -372,6 +372,61 @@ export async function markExecutionReconciliation(
   });
 }
 
+// STUDIO-0051: a hold reconciled without a continuation because the task
+// waited on a person (a question, an approval, or an answer set aside) whose
+// wait is gone without any run of the assignee on the task since then (the
+// question was cancelled, withdrawn, expired or replaced by an agent-addressed
+// card): the continuation the reconciliation spared is now due, once.
+function withdrawnAwaitingReconciliation() {
+  return sql`${issueRecoveryActions.status} = 'resolved'
+    and ${issueRecoveryActions.evidence}->>'awaitingResponseReconciliation' = 'true'
+    and ${issueRecoveryActions.evidence}->>'continuationDelivery' = 'not_requested'
+    and ${issueRecoveryActions.resolvedAt} > now() - interval '7 days'
+    and exists (select 1 from issues waiting_task
+      where waiting_task.id = ${issueRecoveryActions.sourceIssueId} and waiting_task.company_id = ${issueRecoveryActions.companyId}
+        and waiting_task.status not in ('done', 'cancelled')
+        and waiting_task.assignee_agent_id = ${issueRecoveryActions.returnOwnerAgentId}
+        and not exists (select 1 from issue_thread_interactions awaited_question
+          where awaited_question.company_id = waiting_task.company_id and awaited_question.issue_id = waiting_task.id
+            and awaited_question.status = 'pending' and awaited_question.addressee_user_id is not null
+            and awaited_question.continuation_policy = 'wake_assignee')
+        and not exists (select 1 from issue_approvals linked join approvals awaited_approval
+            on awaited_approval.id = linked.approval_id and awaited_approval.company_id = linked.company_id
+          where linked.company_id = waiting_task.company_id and linked.issue_id = waiting_task.id
+            and awaited_approval.status = 'pending'
+            and awaited_approval.requested_by_agent_id = waiting_task.assignee_agent_id)
+        and not exists (select 1 from agent_wakeup_requests held_answer
+          where held_answer.company_id = waiting_task.company_id and held_answer.status = 'deferred_issue_execution'
+            and held_answer.payload->>'issueId' = waiting_task.id::text
+            and held_answer.payload->'executionWait'->>'recoveryActionId' = ${issueRecoveryActions.id}::text)
+        and not exists (select 1 from heartbeat_runs later_run
+          where later_run.company_id = waiting_task.company_id and later_run.agent_id = waiting_task.assignee_agent_id
+            and later_run.context_snapshot->>'issueId' = waiting_task.id::text
+            and later_run.created_at >= (${issueRecoveryActions.evidence}->'executionReconciliation'->>'recordedAt')::timestamptz))`;
+}
+
+/** Hands a withdrawn wait to the ordinary continuation delivery (pending, once). */
+export async function resumeWithdrawnAwaitingReconciliations(db: Db) {
+  return db.transaction(async tx => {
+    const rows = await tx.update(issueRecoveryActions).set({
+      evidence: sql`${issueRecoveryActions.evidence} || jsonb_build_object('continuationDelivery', 'pending',
+        'awaitingResponseWithdrawnAt', to_jsonb(now()))`,
+      updatedAt: new Date(),
+    }).where(withdrawnAwaitingReconciliation()).returning({ id: issueRecoveryActions.id });
+    if (rows.length) await notifyDeliveryWork(tx, DELIVERY_QUEUES.executionContinuation);
+    return rows.length;
+  });
+}
+
+/** Still waiting on a person behind a reconciled hold: look again in five minutes. */
+export async function nextAwaitingReconciliationCheckAt(db: Db) {
+  const [row] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(sql`${issueRecoveryActions.status} = 'resolved'
+    and ${issueRecoveryActions.evidence}->>'awaitingResponseReconciliation' = 'true'
+    and ${issueRecoveryActions.evidence}->>'continuationDelivery' = 'not_requested'
+    and ${issueRecoveryActions.resolvedAt} > now() - interval '7 days'`).limit(1);
+  return row ? Date.now() + 5 * 60_000 : null;
+}
+
 export async function deliverReconciledExecutions(
   db: Db,
   wake: ReturnType<typeof import("./heartbeat.js").heartbeatService>["wakeup"],

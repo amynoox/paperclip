@@ -2279,15 +2279,19 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'execution_recovery'`,
         // STUDIO-0051: also a wake held behind a hold that the Board reconciled
-        // without a continuation (STUDIO-0048/0051 paths): no continuation run
-        // will adopt it, so it is re-admitted here once the blocker is gone.
+        // without a continuation because the task waits on a person: no
+        // continuation run will adopt it, so it is re-admitted here once the
+        // blocker is gone. Only that path: behind a dependency-blocked
+        // reconciliation (STUDIO-0048) admission would refuse it while a blocker
+        // is open and consume it; workspace repair and containment keep theirs.
         sql`(jsonb_typeof(${agentWakeupRequests.payload}->'executionWait'->'recoveryActionId') = 'null'
           or exists (select 1 from issue_recovery_actions reconciled_hold
             where reconciled_hold.company_id = ${agentWakeupRequests.companyId}
               and reconciled_hold.id::text = ${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId'
               and reconciled_hold.status = 'resolved'
               and reconciled_hold.evidence ? 'executionReconciliation'
-              and reconciled_hold.evidence->>'continuationDelivery' = 'not_requested'))`,
+              and reconciled_hold.evidence->>'continuationDelivery' = 'not_requested'
+              and reconciled_hold.evidence->>'awaitingResponseReconciliation' = 'true'))`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'stale-addressee-requeue:%'`,
         // Unique whatever the status: a second row with the same key can never be inserted.

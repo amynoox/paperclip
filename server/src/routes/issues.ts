@@ -10572,7 +10572,9 @@ export function issueRoutes(
                   const [approval] = question ? [] : await tx.select({ id: approvals.id }).from(issueApprovals)
                     .innerJoin(approvals, and(eq(approvals.id, issueApprovals.approvalId), eq(approvals.companyId, issueApprovals.companyId)))
                     .where(and(eq(issueApprovals.companyId, lockedIssue.companyId), eq(issueApprovals.issueId, lockedIssue.id),
-                      inArray(approvals.status, ["pending", "revision_requested"]),
+                      // Approval only wakes the requester; a rejection is handled by
+                      // the withdrawn-wait hand-off; revision_requested waits on the agent.
+                      eq(approvals.status, "pending"),
                       eq(approvals.requestedByAgentId, lockedIssue.assigneeAgentId)))
                     .limit(1);
                   // An answer or message already set aside behind this hold is

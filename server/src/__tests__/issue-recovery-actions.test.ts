@@ -40,7 +40,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
-import { deliverReconciledExecutions, markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
+import { deliverReconciledExecutions, markExecutionReconciliation, resumeWithdrawnAwaitingReconciliations } from "../services/execution-recovery-resolution.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -2341,7 +2341,49 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const wakes = (await coderWakes(companyId, coderId)).slice(before);
     expect(wakes.filter(row => row.status !== "skipped")).toHaveLength(1);
     expect(wakes.filter(row => row.status === "deferred_issue_execution")).toHaveLength(0);
+    // The run starts in a fresh session (the cut session was dropped) and its wake
+    // names the answered question, so the role reads the question and its answer.
+    const [answerRun] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, coderId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${sourceIssueId}`, sql`${heartbeatRuns.id} <> ${cutRunId}`));
+    expect(answerRun!.contextSnapshot).toMatchObject({ interactionId });
+    // Answered: the withdrawn-wait hand-off never fires.
+    expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
   });
+
+  it.each(["cancelled", "replaced by an agent card"] as const)(
+    "delivers the spared continuation once when the awaited question is %s after the reconciliation", async (kind) => {
+      const { companyId, coderId, managerId, sourceIssueId, action, body, interactionId } = await seedAwaitingResponseHold("person question");
+      await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+      expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
+      await db.update(issueThreadInteractions).set({ status: "cancelled" } as never).where(eq(issueThreadInteractions.id, interactionId!));
+      if (kind === "replaced by an agent card") await db.insert(issueThreadInteractions).values({ companyId, issueId: sourceIssueId,
+        kind: "request_confirmation", status: "pending", continuationPolicy: "none", addresseeAgentId: managerId,
+        createdByAgentId: coderId, payload: { version: 1, prompt: "Executor interrupted." } } as never);
+      expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(1);
+      expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
+      const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      await deliverReconciledExecutions(db, heartbeat.wakeup);
+      const delivered = (await coderWakes(companyId, coderId)).filter(row => row.idempotencyKey === `execution-reconciliation:${action.id}`);
+      expect(delivered).toHaveLength(1);
+      const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+      expect(recorded!.evidence).toMatchObject({ awaitingResponseReconciliation: true });
+      expect(recorded!.evidence).toHaveProperty("awaitingResponseWithdrawnAt");
+    });
+
+  it("does not release a message held behind a dependency-blocked reconciliation while the blocker is open", async () => {
+    const { companyId, coderId, sourceIssueId, action, body, wakeBlockersResolved } = await seedDependencyBlockedLegacyHold("in_progress");
+    void wakeBlockersResolved;
+    // A user's message saved behind the hold.
+    const [held] = await db.insert(agentWakeupRequests).values({ companyId, agentId: coderId, source: "on_demand", triggerDetail: "manual",
+      reason: "issue_commented", status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "board-user",
+      payload: { issueId: sourceIssueId, executionWait: { recoveryActionId: action.id, reason: "execution_recovery", message: "saved" } } } as never).returning();
+    await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    await heartbeatService(db, { runtimeEnv: {} }).resumeQueuedRuns();
+    const [still] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, held!.id));
+    expect(still!.status).toBe("deferred_issue_execution");
+  });
+
 
   it("releases an answer set aside during the hold once, without a continuation on top", async () => {
     const { companyId, coderId, sourceIssueId, cutRunId, action, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");

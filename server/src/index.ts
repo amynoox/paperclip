@@ -91,7 +91,7 @@ import { registerNativeCleanupReleaseWake } from "./services/native-runtime/nati
 import { logNativeCleanupQuarantines } from "./services/native-runtime/native-cleanup-quarantine-log.js";
 import { embeddedPostgresOwnerPort } from "./embedded-postgres-owner.js";
 import { deliverExecutionStatuses } from "./services/execution-status-delivery.js";
-import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./services/execution-recovery-resolution.js";
+import { deliverReconciledExecutions, resumeWithdrawnAwaitingReconciliations, settleUnrecoverableExecutions } from "./services/execution-recovery-resolution.js";
 import { deliverPendingPauseResumes } from "./services/issue-tree-resume.js";
 import { deliverBudgetResumeContinuations, type BudgetResumeDelivery } from "./services/budget-resume-continuation.js";
 import { invalidateNativeReplacementDiscovery, reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
@@ -1412,6 +1412,8 @@ async function startServerWithDatabaseTeardown(
     ...(heartbeat ? [
       { queue: DELIVERY_QUEUES.executionReplacement, run: () => reconcileSafeNativeReplacements(db, new Date(), { verifyStoppedSession: run => verifyStoppedNativeSessionForAutomaticReplacement(db, run) }), next: executionSchedule.replacement, onSettled: () => invalidateNativeReplacementDiscovery(db), settleEmptyWhilePaused: true },
       { queue: DELIVERY_QUEUES.executionContinuation, run: async () => {
+        await resumeWithdrawnAwaitingReconciliations(db).catch(err =>
+          logger.warn({ err }, "withdrawn awaiting reconciliations could not be handed to delivery"));
         await deliverReconciledExecutions(db, heartbeat.wakeup);
         await deliverPendingPauseResumes(db, heartbeat.wakeup);
         await deliverBudgetResumeContinuations(db, { ...budgetResumeDelivery,
