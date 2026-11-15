@@ -11,6 +11,7 @@ import { IssueThreadInteractionCard } from "./IssueThreadInteractionCard";
 import { ThemeProvider } from "../context/ThemeContext";
 import { TooltipProvider } from "./ui/tooltip";
 import {
+  answeredAskUserQuestionsInteraction,
   pendingAskUserQuestionsInteraction,
   pendingAskUserQuestionsWithFreeTextOption,
   commentExpiredAskUserQuestionsInteraction,
@@ -1899,5 +1900,50 @@ describe("IssueThreadInteractionCard resolver audience", () => {
     expect(
       footer?.querySelector('[data-testid="interaction-resolved-by-agent-chip"]'),
     ).not.toBeNull();
+  });
+});
+
+// STUDIO-0054: production, 15 Nov 2026 (TR-723). A question's text lost the role's line breaks, its bullet points
+// ran into the sentence and Markdown links stayed raw: the text was plain text in a block.
+describe("question text keeps its formatting", () => {
+  const prompt = "**Décision** sur la PR\n\n- premier point\n- second point\n\n[Rapport complet](https://example.com/rapport)";
+  const withPrompt = <T extends typeof pendingAskUserQuestionsInteraction>(base: T): T => ({
+    ...base,
+    payload: { ...base.payload, questions: base.payload.questions.map((question, index) =>
+      index === 0 ? { ...question, prompt, helpText: "voir *aussi* la note" } : question) },
+  });
+  function expectFormatted(node: HTMLElement, helpText = true) {
+    expect([...node.querySelectorAll("strong")].some((element) => element.textContent === "Décision")).toBe(true);
+    expect([...node.querySelectorAll("li")].map((element) => element.textContent?.trim())).toEqual(
+      expect.arrayContaining(["premier point", "second point"]));
+    expect([...node.querySelectorAll("a")].some((element) => element.textContent?.includes("Rapport complet")
+      && element.getAttribute("href") === "https://example.com/rapport")).toBe(true);
+    if (helpText) expect([...node.querySelectorAll("em")].some((element) => element.textContent === "aussi")).toBe(true);
+    expect(node.textContent).not.toContain("**Décision**");
+    expect(node.textContent).not.toContain("](https://example.com/rapport)");
+  }
+
+  it("on a pending card without a question set", () => {
+    expectFormatted(renderCard({ interaction: withPrompt(pendingAskUserQuestionsInteraction) }));
+  });
+
+  it("on a pending card rendered by the question form", () => {
+    const base = withPrompt(pendingAskUserQuestionsInteraction);
+    const questionSet = {
+      schema: "paperclip.question_set.v1" as const,
+      description: "**Contexte** de la décision",
+      questions: base.payload.questions.map((question) => ({
+        id: question.id, prompt: question.prompt, ...(question.helpText ? { helpText: question.helpText } : {}),
+        required: question.required ?? false, answerMode: question.selectionMode === "multi" ? "multi_select" as const : "single_select" as const,
+        options: question.options.map((option) => ({ id: option.id, label: option.label })),
+      })),
+    };
+    const node = renderCard({ interaction: { ...base, payload: { ...base.payload, questionSet } } as never, onSubmitInteractionAnswers: vi.fn() });
+    expectFormatted(node);
+    expect([...node.querySelectorAll("strong")].some((element) => element.textContent === "Contexte")).toBe(true);
+  });
+
+  it("on an answered card", () => {
+    expectFormatted(renderCard({ interaction: withPrompt(answeredAskUserQuestionsInteraction as never) }), false);
   });
 });
