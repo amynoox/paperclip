@@ -18,7 +18,8 @@ vi.mock("node:child_process", async (importOriginal) => {
   };
 });
 
-import { createSshCommandManagedRuntimeRunner } from "./ssh.js";
+import * as childProcess from "node:child_process";
+import { createSshCommandManagedRuntimeRunner, runSshCommand } from "./ssh.js";
 
 const roots: string[] = [];
 afterEach(async () => {
@@ -38,6 +39,31 @@ async function runner() {
 }
 
 describe("SSH command-managed argv", () => {
+  it.each([false, true])("leaves the caller's locale to the remote command (stdin=%s)", async (withStdin) => {
+    // STUDIO-0052: ssh receives the server's environment unchanged, so what the
+    // client config forwards (SendEnv LANG LC_*) is what it forwarded before.
+    const saved = { LC_ALL: process.env.LC_ALL, LANG: process.env.LANG };
+    process.env.LC_ALL = "fr_FR.UTF-8";
+    process.env.LANG = "fr_FR.UTF-8";
+    try {
+      const cwd = await mkdtemp(path.join(os.tmpdir(), "ssh-locale-"));
+      roots.push(cwd);
+      const result = await runSshCommand({ host: "fixture.invalid", username: "fixture", port: 22,
+        remoteWorkspacePath: cwd, privateKey: null, knownHosts: null, strictHostKeyChecking: true },
+        "printf done", { ...(withStdin ? { stdin: "" } : {}), timeoutMs: 5000 });
+      expect(result.stdout).toBe("done");
+      const launcher = vi.mocked(withStdin ? childProcess.spawn : childProcess.execFile);
+      const options = launcher.mock.calls.at(-1)![2] as { env?: NodeJS.ProcessEnv };
+      const env = options.env ?? process.env;
+      expect([env.LC_ALL, env.LANG]).toEqual(["fr_FR.UTF-8", "fr_FR.UTF-8"]);
+    } finally {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it("rejects environment keys that could be interpreted as env options", async () => {
     await expect((await runner()).execute({ command: "true", env: { "-u": "PATH" } }))
       .rejects.toThrow("Invalid SSH environment variable key");

@@ -5778,7 +5778,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       message: "Daytona sandbox creation failed (HTTP 502); cleanup could not be confirmed for paperclip-create-05f81d77",
       data: { schema: "paperclip/environment-acquire-error/v1", providerDiagnostic: { httpStatus: 502 } } });
 
-    function failLeaseAcquisition(times: number) {
+    function failLeaseAcquisition(times: number, refusal: () => Error = daytonaCreate502) {
       let remaining = times;
       const acquisitions = { refused: 0, delegated: 0 };
       const originalFactory = environmentOrchestrator.environmentRunOrchestrator;
@@ -5788,7 +5788,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
           if (remaining > 0) {
             remaining -= 1;
             acquisitions.refused += 1;
-            throw daytonaCreate502();
+            throw refusal();
           }
           acquisitions.delegated += 1;
           return runtime.acquireRunLease(input);
@@ -5812,6 +5812,34 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       await heartbeat.drainActiveRunExecutions();
       return scheduled[0]!;
     }
+
+    // STUDIO-0052 (TR-999): the ssh lease probe could not connect (exit 255, ssh's own
+    // diagnostic, nothing printed remotely). It is retried, then the successor runs.
+    it("retries an ssh lease probe that could not connect, then runs one successful successor", async () => {
+      const { withSshConnectFailureCause } = await import("@paperclipai/adapter-utils/ssh");
+      const sshTimedOut = () => withSshConnectFailureCause(Object.assign(new Error("Command failed: ssh -o BatchMode=yes ..."), {
+        code: 255, stdout: "", stderr: "ssh: connect to host 100.121.114.90 port 22: Connection timed out\n" })) as Error;
+      const { agentId, runId, issueId } = await seedQueuedIssueRunFixture();
+      const lease = failLeaseAcquisition(1, sshTimedOut);
+      try {
+        const heartbeat = heartbeatService(db);
+        await heartbeat.resumeQueuedRuns();
+        await heartbeat.drainActiveRunExecutions();
+        const afterFailure = await runsFor(agentId);
+        expect(afterFailure.map(run => run.status)).toEqual(["failed", "scheduled_retry"]);
+        expect(afterFailure[0]).toMatchObject({ id: runId, errorCode: "environment_provider_unavailable" });
+        expect(afterFailure[1]).toMatchObject({ retryOfRunId: runId, scheduledRetryAttempt: 1 });
+        await promoteLatestScheduledRetry(heartbeat, agentId);
+        const successors = (await runsFor(agentId)).filter(run => run.retryOfRunId === runId);
+        expect(successors).toHaveLength(1);
+        expect(successors[0]).toMatchObject({ id: afterFailure[1]!.id, status: "succeeded" });
+        expect(lease.acquisitions.refused).toBe(1);
+        const [done] = await db.select().from(issues).where(eq(issues.id, issueId));
+        expect(done!.status).not.toBe("blocked");
+      } finally {
+        lease.restore();
+      }
+    });
 
     it("retries automatically and runs exactly one successful successor without user action", async () => {
       const { companyId, agentId, runId, issueId } = await seedQueuedIssueRunFixture();

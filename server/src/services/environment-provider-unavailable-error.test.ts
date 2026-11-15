@@ -49,6 +49,16 @@ describe("readTransientEnvironmentProviderFailure", () => {
     expect(readTransientEnvironmentProviderFailure(rpcError)).toEqual({ httpStatus: 429 });
   });
 
+  it("treats an ssh lease probe that could not connect as transient (STUDIO-0052, TR-999)", async () => {
+    const { withSshConnectFailureCause } = await import("@paperclipai/adapter-utils/ssh");
+    const probe = withSshConnectFailureCause(Object.assign(new Error("Command failed: ssh -o BatchMode=yes ..."), {
+      code: 255, stderr: "ssh: connect to host 100.121.114.90 port 22: Connection timed out\n" }));
+    expect(readTransientEnvironmentProviderFailure(probe)).toEqual({ errorCode: "ETIMEDOUT" });
+    const denied = withSshConnectFailureCause(Object.assign(new Error("Command failed: ssh ..."), {
+      code: 255, stderr: "codex@host: Permission denied (publickey).\n" }));
+    expect(readTransientEnvironmentProviderFailure(denied)).toBeNull();
+  });
+
   it("never parses message text", () => {
     expect(readTransientEnvironmentProviderFailure(new Error("HTTP 502 Bad Gateway ECONNRESET"))).toBeNull();
   });
