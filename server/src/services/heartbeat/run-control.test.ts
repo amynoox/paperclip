@@ -12,6 +12,7 @@ import {
 } from "../adapter-execution-control.js";
 import { AdapterStopTimeoutError } from "../adapter-stop-timeout.js";
 import { markCancelledBeforeProcessLaunch } from "../pre-dispatch-cancellation.js";
+import { agentExecutionsHaveStopped } from "../agent-execution-stop.js";
 import { HttpError } from "../../errors.js";
 import { captureException } from "../../sentry.js";
 import { terminateLocalService } from "../local-service-supervisor.js";
@@ -1061,6 +1062,33 @@ describe.skipIf(!runControlPostgresSupport.supported)("heartbeat run-control dat
       control.finish();
       adapterExecutionControls.delete(run.id);
     }
+  });
+
+  // Bench, lot 21 (A2): a real run stopped by the Board while it prepared its ssh lease has no adapter control yet
+  // (the control exists from onCancellationReady on), so neither immediate write applies; the pause records the
+  // stop once the run has been settled for two minutes.
+  it("lets a pause record the stop of a run stopped without any adapter control or process", async () => {
+    const { company, agent } = await fixture();
+    const [run] = await db.insert(heartbeatRuns).values({ companyId: company.id, agentId: agent.id, status: "running",
+      runtimeMode: "legacy", runtimeModeResolvedAt: new Date(), startedAt: new Date() }).returning();
+    const [issue] = await db.insert(issues).values({ companyId: company.id, title: "Stopped while preparing its lease",
+      status: "in_progress", assigneeAgentId: agent.id, executionRunId: run.id }).returning();
+    await db.update(heartbeatRuns).set({ issueId: issue.id, contextSnapshot: { issueId: issue.id } }).where(eq(heartbeatRuns.id, run.id));
+    const deps = callbacks(db);
+    // The executor is still preparing the lease when the Board stops the run (no adapter control, no process).
+    deps.activeRunExecutions.add(run.id);
+    expect(await createHeartbeatRunControl(db, deps).cancelRunInternal(run.id, "Operator Stop",
+      { resultJson: { cancelledByActorType: "user", cancelledByUserId: "operator" } })).toMatchObject({ status: "cancelled" });
+    deps.activeRunExecutions.delete(run.id);
+    const cancelled = (await deps.getRun(run.id))!;
+    expect(cancelled.resultJson).toMatchObject({ executionCancellation: { state: "requested" } });
+    expect(cancelled.resultJson).not.toHaveProperty("preDispatchCancellation");
+    // Right after the stop, nothing is recorded yet.
+    expect(await agentExecutionsHaveStopped(db, [agent.id], { pauseStop: true })).toBe(false);
+    // Two minutes after the run's end, the pause records the stop and completes.
+    const later = new Date(cancelled.finishedAt!.getTime() + 3 * 60_000);
+    expect(await agentExecutionsHaveStopped(db, [agent.id], { pauseStop: true, now: later })).toBe(true);
+    expect((await deps.getRun(run.id))?.resultJson).toMatchObject({ preDispatchCancellation: { source: "stopped_before_process_launch" } });
   });
 
   it("records the stop when the adapter itself ended the run during the stop wait", async () => {
