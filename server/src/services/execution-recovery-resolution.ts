@@ -407,8 +407,16 @@ function personAnswersSince(task: string) {
         and decided.requested_by_agent_id = ${task}.assignee_agent_id and decided.status = 'approved'
     union all select person_comment.created_at from issue_comments person_comment
       where person_comment.company_id = ${task}.company_id and person_comment.issue_id = ${task}.id
-        and person_comment.author_user_id is not null`);
+        and person_comment.author_user_id is not null
+        and not exists (select 1 from heartbeat_runs reading_run
+          where reading_run.company_id = person_comment.company_id and reading_run.agent_id = ${task}.assignee_agent_id
+            and reading_run.context_snapshot->>'issueId' = ${task}.id::text
+            and reading_run.started_at is not null and reading_run.started_at <= person_comment.created_at
+            and coalesce(reading_run.finished_at, 'infinity'::timestamptz) >= person_comment.created_at)`);
 }
+// A person's comment posted while a run of the assignee was working on the task is not an answer to wait for
+// (third review of lot 21): that run read it (steering), or the comment queued its own wake, which holds the
+// hand-offs while it is on its way (nothingPendingNorComing).
 
 // The assignee's run that answers the wait: it did provider work (started, and not cancelled before its adapter,
 // nor failed while preparing: bench lot 20 and review of lot 21), on this task, after the reconciliation and after
@@ -515,9 +523,16 @@ export async function resumeWithdrawnAwaitingReconciliations(db: Db) {
   });
 }
 
-/** Still waiting on a person behind a reconciled hold: look again in five minutes. */
+/**
+ * Still waiting on a person behind a reconciled hold: look again in five minutes. Only while the task is open and
+ * still assigned to the role the wait returns to (third review of lot 21).
+ */
 export async function nextAwaitingReconciliationCheckAt(db: Db) {
-  const [row] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(awaitingReconciliationOpen()).limit(1);
+  const [row] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(sql`${awaitingReconciliationOpen()}
+    and exists (select 1 from issues open_task
+      where open_task.id = ${issueRecoveryActions.sourceIssueId} and open_task.company_id = ${issueRecoveryActions.companyId}
+        and open_task.status not in ('done', 'cancelled')
+        and open_task.assignee_agent_id = ${issueRecoveryActions.returnOwnerAgentId})`).limit(1);
   return row ? Date.now() + 5 * 60_000 : null;
 }
 

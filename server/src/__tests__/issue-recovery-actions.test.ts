@@ -40,7 +40,7 @@ import {
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { buildPaperclipWakePayload, heartbeatService } from "../services/heartbeat.js";
-import { deliverReconciledExecutions, markExecutionReconciliation, resumeWithdrawnAwaitingReconciliations } from "../services/execution-recovery-resolution.js";
+import { deliverReconciledExecutions, markExecutionReconciliation, nextAwaitingReconciliationCheckAt, resumeWithdrawnAwaitingReconciliations } from "../services/execution-recovery-resolution.js";
 import { workspaceOperationService, isNativeWorkspaceFinalizationOperationActive } from "../services/workspace-operations.js";
 import { issueRecoveryActionService } from "../services/issue-recovery-actions.js";
 import { recoveryService } from "../services/recovery/service.js";
@@ -2494,6 +2494,31 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
       expect(recorded!.evidence).toMatchObject({ continuationDelivery: "not_requested" });
     });
+
+  // Third review of lot 21: a person's comment posted while the assignee's run was working on the task is not an
+  // answer to wait for; that run closes the wait.
+  it("does not count a person's comment posted during the assignee's run as an answer", async () => {
+    const { companyId, coderId, sourceIssueId, action, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
+    await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    await db.update(issueThreadInteractions).set({ status: "cancelled", resolvedAt: new Date(), updatedAt: new Date() } as never)
+      .where(eq(issueThreadInteractions.id, interactionId!));
+    const started = new Date(Date.now() + 1000), during = new Date(Date.now() + 2000), finished = new Date(Date.now() + 3000);
+    const [reading] = await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, invocationSource: "automation", triggerDetail: "system",
+      status: "succeeded", startedAt: started, finishedAt: finished, createdAt: started, contextSnapshot: { issueId: sourceIssueId } } as never).returning();
+    await db.insert(issueComments).values({ companyId, issueId: sourceIssueId, authorUserId: responsibleUserId, body: "Also check the import step.",
+      createdAt: during } as never);
+    expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded!.evidence).toMatchObject({ continuationDelivery: "satisfied", awaitingResponseSatisfiedByRunId: reading!.id });
+  });
+
+  it("stops the five-minute checks once the task of an open wait is closed", async () => {
+    const { sourceIssueId, body } = await seedAwaitingResponseHold("person question");
+    await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    expect(await nextAwaitingReconciliationCheckAt(db)).not.toBeNull();
+    await db.update(issues).set({ status: "done" }).where(eq(issues.id, sourceIssueId));
+    expect(await nextAwaitingReconciliationCheckAt(db)).toBeNull();
+  });
 
   it("does not close the wait with a run that started before the answer", async () => {
     const { companyId, coderId, sourceIssueId, action, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
