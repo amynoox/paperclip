@@ -669,7 +669,7 @@ describe.skipIf(!postgres.supported)("heartbeat scheduling database boundary", (
       expect(await heartbeat.nextIssueMonitorAt()).toBe(dueAt.getTime());
       await settings.updateExperimental({ enableWorktreeRunExecution: false });
       expect(await heartbeat.nextIssueMonitorAt()).toBeNull();
-      expect(await heartbeat.tickIssueMonitors()).toEqual({ checked: 0, triggered: 0, skipped: 0 });
+      expect(await heartbeat.tickIssueMonitors()).toEqual({ checked: 0, triggered: 0, skipped: 0, exhausted: 0 });
       expect((await readIssue(f.issue.id)).monitorNextCheckAt).toEqual(dueAt);
     });
 
