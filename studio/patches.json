@@ -1377,6 +1377,36 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: ssh exit 255 connection failures get a network-code cause. Why: TR-999 blocked after one unreachable lease probe (15 Nov 2026). Origin: studio fork only; to re-apply, keep sshConnectFailureCode and withSshConnectFailureCause in packages/adapter-utils/src/ssh.ts and the try/catch around the ssh call in runSshCommand; run ssh-connect-failure.test.ts and the STUDIO-0052 case of environment-provider-unavailable-error.test.ts."
+    },
+    {
+      "id": "STUDIO-0057",
+      "title": "Task priority is shown and editable in the interface again",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Upstream hid every task priority indicator and control behind one compile-time UI flag, SHOW_TASK_PRIORITY_UI = false (paperclipai/paperclip#11024, PAP-411, merged 6 Aug 2026), keeping the data model, API, validation and search language. The studio owner cannot see or change a task's priority, yet the server still orders an agent's queued runs by it (server/src/services/heartbeat/queue.ts issueRunPriorityRank, after the readiness rank).",
+      "reason": "Requested by the owner (journal V364, V365: shown everywhere, changeable in the interface by himself).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "web interface: ui/src/lib/ui-flags.ts",
+      "paths": [
+        "ui/src/lib/ui-flags.ts",
+        "ui/src/components/IssueProperties.test.tsx",
+        "ui/src/components/IssuesList.test.tsx",
+        "ui/src/components/IssueFiltersPopover.test.tsx",
+        "ui/src/pages/IssueDetail.test.tsx",
+        "ui/src/components/NewIssueDialog.test.tsx"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "Hidden by #11024; open issue #11547 asks to make the flag configurable, no linked pull request; upstream master still has SHOW_TASK_PRIORITY_UI = false.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, TZ=UTC, whole UI vitest suite: 924 files, 11770 passed, 1 skipped, 0 failed (one earlier full run had AgentActionButtons fail once under load; that file does not read the flag and passes alone, 39 of 39, as on the base); UI typecheck in the test tree: 22 errors, the same 22 as the base 2cb9e5cd (modules absent from that tree), none in a changed file. Upstream cases that asserted the hidden priority are turned into shown cases: the Properties row is shown with the task's priority (IssueProperties), the header priority control is rendered (IssueDetail), Sort and Group offer Priority (IssuesList), the filter popover has its Priority section (IssueFiltersPopover). NewIssueDialog keeps its assertions: the shared task composer (#15091) removed the dialog's priority control outright, so the flag does not bring it back (comment updated).",
+      "migration": "None. One line: SHOW_TASK_PRIORITY_UI = true in ui/src/lib/ui-flags.ts. It shows again, read from the existing gates: the task header priority control (ui/src/pages/IssueDetail.tsx, header seed and editable control), the Properties row (ui/src/components/issue-properties/IssueProperties.tsx, editable through PriorityIcon), the Kanban card icon (KanbanBoard.tsx), the suggested-task priority in thread cards (IssueThreadInteractionCard.tsx), the Priority option of Sort and Group in the task lists (IssuesList.tsx, LegacyIssuesList.tsx), the Priority filter section (IssueFiltersPopover.tsx), the search filter bar and sheet (search/SearchFilterBar.tsx, search/SearchFilterSheet.tsx), the 'Tasks by Priority' charts (Dashboard.tsx, AgentDetail.production.tsx), and the design guide page. Not shown again: a priority control in the new-task dialog (removed upstream by #15091; new tasks keep the medium default, changeable afterwards in the Properties row or the header). Nothing changes on the server or for the roles: no server or package file reads the flag; API responses, chat publications and the run queue order are unchanged by the flag itself. Once the owner changes a priority in the interface, that value orders the agent's queued runs as it already did when set through the API. Delivery: server/ui-dist only (UI_DELTA_SHA in livrer.py), with the next server version.",
+      "rollback": "Set SHOW_TASK_PRIORITY_UI back to false (or switch cli/current back to the previous install folder). Stored priorities stay as they are.",
+      "retireWhen": "Upstream turns the priority UI back on or makes the flag configurable (#11547).",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: SHOW_TASK_PRIORITY_UI = true. Why: the owner wants to see and change task priority himself (V364, V365). Origin: studio fork only, reverting upstream #11024's default; to re-apply after an upstream update, set the flag to true in ui/src/lib/ui-flags.ts, check that every reader still gates on it (git grep SHOW_TASK_PRIORITY_UI under ui/src), adapt the upstream tests that assert the hidden priority, and run the whole UI suite with TZ=UTC."
     }
   ]
 }
