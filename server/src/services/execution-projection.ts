@@ -366,6 +366,13 @@ export function projectExecution(
       projection.nextAction = "The original execution was contained and its action outcomes reviewed. Use Retry to request another attempt.";
       return set("failed", "Execution contained");
     }
+    if (recoveryAction.evidence.awaitingResponseReconciliation === true
+      && recoveryAction.evidence.continuationDelivery === "not_requested") {
+      // STUDIO-0051: reconciled while waiting on a person's answer.
+      projection.cause = null;
+      projection.nextAction = "The previous execution is reconciled. The task starts again when the pending question or approval is answered.";
+      return set("completed", "Reconciled");
+    }
     if (recoveryAction.evidence.dependencyBlockedReconciliation === true
       && recoveryAction.evidence.continuationDelivery === "not_requested") {
       // STUDIO-0048: reconciled while blocked; the dependency wake restarts it.

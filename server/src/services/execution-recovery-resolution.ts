@@ -227,7 +227,9 @@ export async function markExecutionReconciliation(
   decision: ExecutionReconciliation,
   actorId: string,
   deliveryOwner?: { kind: "chat_failed_run_retry"; actionId: string },
-  options?: { workspaceRepairOnly?: boolean; controllerContainmentOnly?: boolean; dependencyBlockedOnly?: boolean },
+  options?: { workspaceRepairOnly?: boolean; controllerContainmentOnly?: boolean; dependencyBlockedOnly?: boolean;
+    /** STUDIO-0051: without continuation because a person's answer will wake the assignee. */
+    awaitingResponse?: boolean },
 ) {
   if (options?.controllerContainmentOnly && (!decision.controllerStopped || !decision.controllerAuthorityDigest || deliveryOwner))
     throw conflict("Controller containment records no automatic continuation.");
@@ -286,7 +288,9 @@ export async function markExecutionReconciliation(
           // continuation now; its dependency wake starts it once unblocked.
           continuationDelivery: options?.workspaceRepairOnly || options?.controllerContainmentOnly || options?.dependencyBlockedOnly ? "not_requested" : deliveryOwner ? "delegated" : "pending",
           ...(deliveryOwner ? { continuationDeliveryOwner: deliveryOwner } : {}),
-          ...(options?.dependencyBlockedOnly ? { dependencyBlockedReconciliation: true } : {}),
+          ...(options?.dependencyBlockedOnly
+            ? options.awaitingResponse ? { awaitingResponseReconciliation: true } : { dependencyBlockedReconciliation: true }
+            : {}),
         },
       })
       .where(

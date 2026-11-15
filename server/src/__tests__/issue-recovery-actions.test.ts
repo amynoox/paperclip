@@ -2270,6 +2270,125 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     void wakeBlockersResolved;
   });
 
+  // STUDIO-0051: a legacy hold on a task that waits on a person's answer is
+  // reconciled without a continuation; the answer then wakes the assignee.
+  async function seedAwaitingResponseHold(wait: "person question" | "agent question" | "approval" | "none") {
+    const fixture = await seedCompany();
+    const { companyId, coderId, managerId, sourceIssueId } = fixture;
+    const responsibleUserId = randomUUID();
+    await db.insert(authUsers).values({ id: responsibleUserId, name: "Board", email: `${responsibleUserId}@example.test`,
+      emailVerified: true, createdAt: new Date(), updatedAt: new Date() });
+    await db.update(companies).set({ defaultResponsibleUserId: responsibleUserId }).where(eq(companies.id, companyId));
+    await db.update(agents).set({ runtimeConfig: { heartbeat: { maxConcurrentRuns: 1 } } }).where(eq(agents.id, coderId));
+    await seedHeartbeatRun({ companyId, agentId: coderId, runId: randomUUID(), status: "running" });
+    // Blocked by the role itself (no legacyCancellationBlock receipt): the path keeps the status.
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, sourceIssueId));
+    const cutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: cutRunId, companyId, agentId: coderId, invocationSource: "assignment",
+      status: "cancelled", runtimeMode: "legacy", errorCode: "cancelled", startedAt: new Date(Date.now() - 120_000),
+      finishedAt: new Date(Date.now() - 60_000), contextSnapshot: { issueId: sourceIssueId } });
+    const [action] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId, kind: "active_run_watchdog",
+      status: "resolved", outcome: "blocked", ownerType: "board", returnOwnerAgentId: coderId,
+      cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${cutRunId}`,
+      nextAction: "Automatic recovery stopped.",
+      evidence: { runId: cutRunId, automaticRecovery: { policy: "preserve_without_replay_v1", runId: cutRunId, replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    await db.insert(agentTaskSessions).values({ companyId, agentId: coderId, adapterType: "codex_local", taskKey: sourceIssueId,
+      sessionParamsJson: { sessionId: "cut-thread" }, sessionDisplayId: "cut-thread", lastRunId: cutRunId });
+    let interactionId: string | null = null;
+    if (wait === "person question" || wait === "agent question") {
+      const [interaction] = await db.insert(issueThreadInteractions).values({ companyId, issueId: sourceIssueId,
+        kind: "request_confirmation", status: "pending", continuationPolicy: wait === "person question" ? "wake_assignee" : "none",
+        ...(wait === "person question" ? { addresseeUserId: responsibleUserId } : { addresseeAgentId: managerId }),
+        createdByAgentId: coderId, payload: { version: 1, prompt: "Extend the wait by one hour?" } } as never).returning();
+      interactionId = interaction!.id;
+    }
+    let approvalId: string | null = null;
+    if (wait === "approval") {
+      approvalId = randomUUID();
+      await db.execute(sql`insert into approvals (id, company_id, type, status, payload, requested_by_agent_id)
+        values (${approvalId}, ${companyId}, 'hire_agent', 'pending', '{}'::jsonb, ${coderId})`);
+      await db.execute(sql`insert into issue_approvals (company_id, issue_id, approval_id) values (${companyId}, ${sourceIssueId}, ${approvalId})`);
+    }
+    const body = { actionId: action!.id, outcome: "restored", sourceIssueStatus: "blocked",
+      executionReconciliation: { runId: cutRunId, providerStopped: true, actionOutcome: "mixed",
+        outcomeEvidence: "The Board cancelled the run for the update window; the operator checked the machine." } } as const;
+    return { ...fixture, cutRunId, action: action!, body, interactionId, approvalId, responsibleUserId };
+  }
+
+  const coderWakes = (companyId: string, coderId: string) => db.select().from(agentWakeupRequests)
+    .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, coderId)));
+  async function dropApproval(approvalId: string | null) {
+    if (!approvalId) return;
+    await db.execute(sql`delete from issue_approvals where approval_id = ${approvalId}`);
+    await db.execute(sql`delete from approvals where id = ${approvalId}`);
+  }
+
+  it("reconciles a hold on a task waiting on a person's question without a continuation; the answer wakes the role once", async () => {
+    const { companyId, coderId, sourceIssueId, cutRunId, action, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
+    const app = createApp({ type: "board", source: "local_implicit", userId: responsibleUserId });
+    const resolved = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    expect(resolved.body.issue.status).toBe("blocked");
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded).toMatchObject({ status: "resolved", outcome: "restored",
+      evidence: { continuationDelivery: "not_requested", awaitingResponseReconciliation: true } });
+    expect(recorded!.evidence).not.toHaveProperty("dependencyBlockedReconciliation");
+    expect(await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.taskKey, sourceIssueId))).toEqual([]);
+    await deliverReconciledExecutions(db, heartbeatService(db, { runtimeEnv: {} }).wakeup);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, cutRunId))).toEqual([]);
+    const before = (await coderWakes(companyId, coderId)).length;
+    await request(app).post(`/api/issues/${sourceIssueId}/interactions/${interactionId}/accept`).send({}).expect(200);
+    const wakes = (await coderWakes(companyId, coderId)).slice(before);
+    expect(wakes.filter(row => row.status !== "skipped")).toHaveLength(1);
+    expect(wakes.filter(row => row.status === "deferred_issue_execution")).toHaveLength(0);
+  });
+
+  it("releases an answer set aside during the hold once, without a continuation on top", async () => {
+    const { companyId, coderId, sourceIssueId, cutRunId, action, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
+    const app = createApp({ type: "board", source: "local_implicit", userId: responsibleUserId });
+    await request(app).post(`/api/issues/${sourceIssueId}/interactions/${interactionId}/accept`).send({}).expect(200);
+    const held = (await coderWakes(companyId, coderId)).filter(row => row.status === "deferred_issue_execution");
+    expect(held).toHaveLength(1);
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded!.evidence).toMatchObject({ continuationDelivery: "not_requested", awaitingResponseReconciliation: true });
+    await deliverReconciledExecutions(db, heartbeatService(db, { runtimeEnv: {} }).wakeup);
+    expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, cutRunId))).toEqual([]);
+    // Free the agent's only slot (held by another task in this fixture), then release.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(and(eq(heartbeatRuns.agentId, coderId), eq(heartbeatRuns.status, "running")));
+    await heartbeatService(db, { runtimeEnv: {} }).resumeQueuedRuns();
+    const [released] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, held[0]!.id));
+    expect(released!.status).not.toBe("deferred_issue_execution");
+    const issueRuns = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.agentId, coderId)));
+    expect(issueRuns.filter(run => run.id !== cutRunId && (run.contextSnapshot as Record<string, unknown> | null)?.issueId === sourceIssueId)).toHaveLength(1);
+  });
+
+  it("reconciles without a continuation while an approval requested by the assignee is pending", async () => {
+    const { sourceIssueId, action, body, approvalId } = await seedAwaitingResponseHold("approval");
+    try {
+      await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+      const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+      expect(recorded!.evidence).toMatchObject({ continuationDelivery: "not_requested", awaitingResponseReconciliation: true });
+    } finally {
+      await dropApproval(approvalId);
+    }
+  });
+
+  it.each(["agent question", "cancelled question", "replaced by an agent question"] as const)(
+    "keeps the hold when the task does not wait on a person (%s)", async (kind) => {
+      const seeded = await seedAwaitingResponseHold(kind === "agent question" ? "agent question" : "person question");
+      const { companyId, coderId, managerId, sourceIssueId, action, body, interactionId } = seeded;
+      if (kind !== "agent question") await db.update(issueThreadInteractions).set({ status: "cancelled" } as never)
+        .where(eq(issueThreadInteractions.id, interactionId!));
+      if (kind === "replaced by an agent question") await db.insert(issueThreadInteractions).values({ companyId, issueId: sourceIssueId,
+        kind: "request_confirmation", status: "pending", continuationPolicy: "none", addresseeAgentId: managerId,
+        createdByAgentId: coderId, payload: { version: 1, prompt: "Executor interrupted." } } as never);
+      await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(409);
+      const [unchanged] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+      expect(unchanged).toMatchObject({ status: "resolved", outcome: "blocked", evidence: { automaticRecovery: { replay: "blocked" } } });
+    });
+
   async function seedReconciledDelivery() {
     const fixture = await seedCompany();
     const { companyId, coderId, sourceIssueId } = fixture;
