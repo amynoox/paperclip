@@ -1409,6 +1409,37 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: SHOW_TASK_PRIORITY_UI = true. Why: the owner wants to see and change task priority himself (V364, V365). Origin: studio fork only, reverting upstream #11024's default; to re-apply after an upstream update, set the flag to true in ui/src/lib/ui-flags.ts, put back by hand the Priority FilterGroup of ui/src/components/IssueFilterPanel.tsx (studio only, not an upstream gate), check that every reader still gates on it (git grep SHOW_TASK_PRIORITY_UI under ui/src), adapt the upstream tests that assert the hidden priority, and run the whole UI suite with TZ=UTC."
+    },
+    {
+      "id": "STUDIO-0054",
+      "title": "Question cards render their text as Markdown and keep their context once answered",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, 15 Nov 2026 (TR-723, 'PR #191 — décision après la reprise ciblée'): the owner could hardly read the questions addressed to him. A question's prompt and help text were plain text in a block: the role's line breaks collapsed, its bullet points ran into the sentence and Markdown links stayed raw ([Rapport complet](/TR/issues/TR-723#…)). Bench, lot 20: the question set's description (already Markdown on the pending form) was no longer shown anywhere once the card was answered.",
+      "reason": "Requested by the owner (15 Nov 2026): 'mettre un peu de mise en forme dans toutes les questions qui me sont adressées'.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "UI: issue thread interaction card, question form, compact interaction card",
+      "paths": [
+        "ui/src/components/IssueThreadInteractionCard.tsx",
+        "ui/src/components/task-chat/QuestionForm.tsx",
+        "ui/src/components/task-chat/TaskChatCompactInteractionCard.tsx",
+        "ui/src/components/IssueThreadInteractionCard.test.tsx",
+        "ui/src/components/coordinator/CoordinatorTaskCommitment.test.tsx",
+        "ui/src/components/task-chat/QuestionResponseSummary.test.tsx",
+        "ui/src/index.css"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: upstream renders question prompts and help text as plain text.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, jsdom (UI dependencies from an earlier UI build tree of the bench machine). IssueThreadInteractionCard.test.tsx, three new cases with the real MarkdownBody: a prompt with bold, a list and a link, and a help text with emphasis, render <strong>, <li>, <a href> and <em> on a pending card without a question set, on a pending card rendered by the question form (its description too), and on an answered card; the raw Markdown no longer shows. CoordinatorTaskCommitment.test.tsx, two new cases: an answered question in the coordinator timeline keeps its description under the receipt as a 'Question context' disclosure rendered as Markdown; without a description, the bare receipt as before. With QuestionForm.test.tsx and CoordinatorChatUpdates.test.tsx: 116 passed. Negative control: the three formatting cases fail on the previous components. Typecheck: no error in the changed files. Review fixes (15 Nov): question text inherits the size, line height and colour of its container (class paperclip-markdown-inherit; the help text stays small and muted, the decision prompt keeps its large size); relative ticket links stay in-app links in the question form (linkIssueReferences no longer turned off, the description included). New cases: file names with underscores and inline code stay literal; a javascript: link gives no link and raw HTML (b, img, script) is not rendered; a one-line prompt is a single paragraph; a relative ticket link in the form is a link; the resolved receipt renders the help text as Markdown; QuestionResponseSummary renders the prompt as Markdown. 122 passed.",
+      "migration": "None on the server and no change to what roles send. The prompt and help text of each question go through MarkdownBody (the same safe renderer as comments and as the question set's description; soft breaks on, media as references) on the pending card, the question form, the answered card and the resolved receipt; the question set's description of the resolved receipt too. In the coordinator timeline, an answered question with a description shows a 'Question context' disclosure under its receipt. A one-line prompt looks as before (its block keeps the prompt id used by aria-labelledby; the question form's focus target moves from a <p> to a <div>). Ships as UI assets (server/ui-dist), so with the next server install. Left as plain text on purpose: the card title and summary (one-line labels), the older protocol card (TaskChatProtocolCard), and the server-side notifications (Discord, chat), which have their own formatting. An HTML comment in the text is hidden, as in comments today (same renderer).",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Upstream renders question text as Markdown and keeps the answered context.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: question prompt and help text rendered by MarkdownBody; answered question keeps its question set description. Why: owner's request after TR-723 (15 Nov 2026) and bench lot 20. Origin: studio fork only; to re-apply, wrap question.prompt and question.helpText in MarkdownBody in IssueThreadInteractionCard.tsx (pending and answered), QuestionForm.tsx (form and answered summary) and TaskChatCompactInteractionCard.tsx (ReceiptDisclosure, and the coordinator timeline receipt branch with its 'Question context' disclosure); run the STUDIO-0054 cases of IssueThreadInteractionCard.test.tsx and CoordinatorTaskCommitment.test.tsx."
     }
   ]
 }

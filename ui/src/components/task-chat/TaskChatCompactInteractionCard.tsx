@@ -411,9 +411,9 @@ function ReceiptDisclosure({
     request = (
       <div className="grid gap-3">
         {questionSet.description ? (
-          <p className="text-sm text-muted-foreground">
-            {questionSet.description}
-          </p>
+          <div className="text-sm text-muted-foreground" data-testid="answered-question-context">
+            <MarkdownBody className="paperclip-markdown-inherit" externalReferences={externalReferences} mediaMode="reference">{questionSet.description}</MarkdownBody>
+          </div>
         ) : null}
         {questionSet.questions.map((question) => {
           const answer = response?.answers[question.id];
@@ -432,11 +432,13 @@ function ReceiptDisclosure({
                   {question.header}
                 </p>
               ) : null}
-              <p className="text-sm text-foreground">{question.prompt}</p>
+              <div className="text-sm text-foreground">
+                <MarkdownBody className="paperclip-markdown-inherit" externalReferences={externalReferences} mediaMode="reference">{question.prompt}</MarkdownBody>
+              </div>
               {question.helpText ? (
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  {question.helpText}
-                </p>
+                <div className="mt-0.5 text-xs text-muted-foreground">
+                  <MarkdownBody className="paperclip-markdown-inherit" externalReferences={externalReferences} mediaMode="reference">{question.helpText}</MarkdownBody>
+                </div>
               ) : null}
               <p className="mt-1 text-sm font-medium text-foreground">
                 Answer: {values.length > 0 ? values.join(", ") : "No answer"}
@@ -1975,7 +1977,19 @@ export function TaskChatCompactInteractionCard({
     && interaction.kind !== "connection_intent"
     && interaction.kind !== "request_item_verdicts"
     && !(interaction.kind === "request_confirmation" && (interaction.payload.toolAction || interaction.payload.secretProposal || interaction.payload.connectionAuthorization))) {
-    return <CoordinatorInteractionReceipt interaction={interaction} />;
+    // STUDIO-0054: an answered question keeps its context readable under the receipt.
+    const answeredContext = interaction.kind === "ask_user_questions" && interaction.status === "answered"
+      ? interaction.payload.questionSet?.description?.trim() : null;
+    if (!answeredContext) return <CoordinatorInteractionReceipt interaction={interaction} />;
+    return <div className="grid gap-1">
+      <CoordinatorInteractionReceipt interaction={interaction} />
+      <details className="px-1" data-testid="answered-question-context">
+        <summary className="cursor-pointer text-xs font-medium text-muted-foreground">Question context</summary>
+        <div className="mt-1 text-sm text-muted-foreground">
+          <MarkdownBody className="paperclip-markdown-inherit" externalReferences={externalReferences} mediaMode="reference">{answeredContext}</MarkdownBody>
+        </div>
+      </details>
+    </div>;
   }
 
   if (interaction.kind === "connection_intent") {
