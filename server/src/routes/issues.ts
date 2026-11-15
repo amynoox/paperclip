@@ -10515,6 +10515,11 @@ export function issueRoutes(
         );
         let dependencyBlockedReconciliation = false;
         let awaitingResponseReconciliation = false;
+        // STUDIO-0051 (bench, lot 20): an answer's wake only starts on a task in progress, so a task waiting on a
+        // person's question (or holding an answer behind this hold) goes back to in_progress, the state its cut run
+        // would have left; stranded-work recovery skips a task with a pending question that wakes the assignee.
+        // A task waiting on an approval stays blocked (the approval decision wakes the requester or is withdrawn).
+        let awaitingPersonAnswer = false;
         if (
           actionId &&
           (!activeRecoveryAction || activeRecoveryAction.id !== actionId)
@@ -10588,6 +10593,7 @@ export function issueRoutes(
                       sql`${agentWakeupRequests.payload} -> 'executionWait' ->> 'recoveryActionId' = ${settled.id}`))
                     .limit(1);
                   awaitingResponseReconciliation = Boolean(question || approval || heldAnswer);
+                  awaitingPersonAnswer = Boolean(question || heldAnswer);
                   dependencyBlockedReconciliation = awaitingResponseReconciliation;
                 }
               }
@@ -10876,7 +10882,8 @@ export function issueRoutes(
           );
         }
         let issue = lockedIssue;
-        const sourceStatusChanged = sourceIssueStatus !== lockedIssue.status;
+        const targetSourceStatus = awaitingPersonAnswer ? "in_progress" : sourceIssueStatus;
+        const sourceStatusChanged = targetSourceStatus !== lockedIssue.status;
         if (outcome === "blocked" && sourceStatusChanged) {
           const unresolvedBlockers = await tx
             .select({ id: issueRows.id })
@@ -10899,10 +10906,10 @@ export function issueRoutes(
         }
 
         if (sourceStatusChanged) {
-          await assertNativeRunKeepsOwnExecutionLock(req, lockedIssue, sourceIssueStatus);
+          await assertNativeRunKeepsOwnExecutionLock(req, lockedIssue, targetSourceStatus);
           // The source row is locked in this transaction, so the check holds until the write.
           await assertAgentStatusChangeKeepsLiveRunBound(req, lockedIssue, {
-            requestedStatus: sourceIssueStatus,
+            requestedStatus: targetSourceStatus,
             assigneeWillChange: false,
             stopsGoalOnCompletion: false,
             refreshLock: false,
@@ -10945,7 +10952,7 @@ export function issueRoutes(
           }
 
           const updateFields: Record<string, unknown> = {
-            status: sourceIssueStatus,
+            status: targetSourceStatus,
             ...(repairedWorkspaceSettings ? { executionWorkspaceSettings: repairedWorkspaceSettings } : {}),
           };
           if (!safeHandBack) {
@@ -10964,7 +10971,7 @@ export function issueRoutes(
               issue: lockedIssue,
               policy: executionPolicy,
               previousPolicy: executionPolicy,
-              requestedStatus: sourceIssueStatus,
+              requestedStatus: targetSourceStatus,
               requestedAssigneePatch: {},
               actor: {
                 agentId: actor.agentId ?? null,

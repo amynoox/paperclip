@@ -2320,6 +2320,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         if (readNonEmptyString(parseObject(wake.payload?.executionWait).recoveryActionId)) {
           const readiness = (await issuesSvc.listDependencyReadiness(wake.companyId, [heldIssueId])).get(heldIssueId);
           if (readiness && !readiness.isDependencyReady) continue;
+          // STUDIO-0051 (bench, lot 20, Q6): a wake of the same role on the same task is already on its way (the
+          // dependency wake, for example): that run reads the answer in the thread, so the held copy is retired
+          // instead of starting a second run. If that run never starts, the lost-answer hand-off still delivers one.
+          const [coming] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+            .where(and(eq(agentWakeupRequests.companyId, wake.companyId), eq(agentWakeupRequests.agentId, wake.agentId),
+              inArray(agentWakeupRequests.status, ["queued", "claimed"]), ne(agentWakeupRequests.id, wake.id),
+              sql`${agentWakeupRequests.payload}->>'issueId' = ${heldIssueId}`)).limit(1);
+          if (coming) {
+            const coalescedAt = new Date();
+            await db.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: coalescedAt, updatedAt: coalescedAt,
+              error: `Coalesced into wake ${coming.id} of the same task, which reads the held answer` })
+              .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+            continue;
+          }
         }
         const context = parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]);
         const { executionWait: _wait, [DEFERRED_WAKE_CONTEXT_KEY]: _context, ...payload } = parseObject(wake.payload);

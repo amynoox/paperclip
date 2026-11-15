@@ -402,6 +402,8 @@ function laterAssigneeRun() {
     where later_run.company_id = run_task.company_id and later_run.agent_id = run_task.assignee_agent_id
       and later_run.context_snapshot->>'issueId' = run_task.id::text
       and later_run.created_at >= ${RECONCILED_AT}
+      -- STUDIO-0051 (bench, lot 20): a run cancelled before it started (issue_not_in_progress) is not the answer's run.
+      and later_run.started_at is not null
       and later_run.id::text <> coalesce(${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId', '')
     order by later_run.created_at asc limit 1`;
 }

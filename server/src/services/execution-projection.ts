@@ -370,7 +370,7 @@ export function projectExecution(
       && recoveryAction.evidence.continuationDelivery === "not_requested") {
       // STUDIO-0051: reconciled while waiting on a person's answer.
       projection.cause = null;
-      projection.nextAction = "The previous execution is reconciled. The task starts again when the pending question or approval is answered; if that wait is withdrawn, or no run follows the answer within fifteen minutes, one continuation is delivered instead.";
+      projection.nextAction = "The previous execution is reconciled. The task waits for the pending question or approval: its answer starts the assignee again; if that wait is withdrawn, or no run starts within fifteen minutes of the answer, one continuation is delivered instead.";
       return set("completed", "Reconciled");
     }
     if (recoveryAction.evidence.awaitingResponseReconciliation === true

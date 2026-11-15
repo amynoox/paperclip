@@ -2328,7 +2328,8 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const { companyId, coderId, sourceIssueId, cutRunId, action, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
     const app = createApp({ type: "board", source: "local_implicit", userId: responsibleUserId });
     const resolved = await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
-    expect(resolved.body.issue.status).toBe("blocked");
+    // Bench, lot 20: an answer's wake only starts on a task in progress; the task goes back to in_progress.
+    expect(resolved.body.issue.status).toBe("in_progress");
     const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
     expect(recorded).toMatchObject({ status: "resolved", outcome: "restored",
       evidence: { continuationDelivery: "not_requested", awaitingResponseReconciliation: true } });
@@ -2346,7 +2347,23 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [answerRun] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, coderId),
       sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${sourceIssueId}`, sql`${heartbeatRuns.id} <> ${cutRunId}`));
     expect(answerRun!.contextSnapshot).toMatchObject({ interactionId });
-    // Answered: the withdrawn-wait hand-off never fires, and the wait is closed
+    // Not started yet (the agent's only slot is busy): the wait is not closed by a queued run.
+    expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
+    const [stillOpen] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(stillOpen!.evidence).toMatchObject({ continuationDelivery: "not_requested" });
+    // Through the real dispatcher (bench, lot 20, Q1): the answer's run starts; it is not cancelled
+    // issue_not_in_progress as it was on a task left blocked.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(and(eq(heartbeatRuns.agentId, coderId), eq(heartbeatRuns.status, "running"), sql`${heartbeatRuns.id} <> ${answerRun!.id}`));
+    await heartbeatService(db, { runtimeEnv: {} }).resumeQueuedRuns();
+    await vi.waitFor(async () => {
+      const [current] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, answerRun!.id));
+      expect(current!.status).not.toBe("queued");
+    }, { timeout: 15_000 });
+    const [dispatched] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, answerRun!.id));
+    expect(dispatched!.errorCode).not.toBe("issue_not_in_progress");
+    expect(dispatched!.startedAt).not.toBeNull();
+    // Answered and started: the withdrawn-wait hand-off never fires, and the wait is closed
     // as satisfied by the answer's run (no more checks, no continuation promised).
     expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
     const [satisfied] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
@@ -2430,6 +2447,41 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     await heartbeatService(db, { runtimeEnv: {} }).resumeQueuedRuns();
     const [still] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, held[0]!.id));
     expect(still!.status).toBe("deferred_issue_execution");
+  });
+
+  it("never takes a run cancelled before it started for the answer's run (bench, lot 20, Q1)", async () => {
+    const { companyId, coderId, sourceIssueId, action, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
+    await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    await db.execute(sql`update issue_recovery_actions set evidence = jsonb_set(evidence, '{executionReconciliation,recordedAt}',
+      to_jsonb((now() - interval '30 minutes')::text)) where id = ${action.id}`);
+    // The answer's run was cancelled before it started (the task was not in progress then).
+    await db.insert(heartbeatRuns).values({ companyId, agentId: coderId, invocationSource: "automation", triggerDetail: "system",
+      status: "cancelled", errorCode: "issue_not_in_progress", startedAt: null, finishedAt: new Date(Date.now() - 19 * 60_000),
+      createdAt: new Date(Date.now() - 20 * 60_000), contextSnapshot: { issueId: sourceIssueId } } as never);
+    const answeredAt = new Date(Date.now() - 20 * 60_000);
+    await db.update(issueThreadInteractions).set({ status: "answered", resolvedByUserId: responsibleUserId, resolvedAt: answeredAt, updatedAt: answeredAt } as never)
+      .where(eq(issueThreadInteractions.id, interactionId!));
+    // Not satisfied by that run; the lost-answer hand-off delivers one continuation.
+    expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(1);
+    const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(recorded!.evidence).toMatchObject({ continuationDelivery: "pending" });
+    expect(recorded!.evidence).not.toHaveProperty("awaitingResponseSatisfiedByRunId");
+  });
+
+  it("merges an answer held behind the hold into a wake of the same task already queued (bench, lot 20, Q6)", async () => {
+    const { companyId, coderId, sourceIssueId, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
+    const app = createApp({ type: "board", source: "local_implicit", userId: responsibleUserId });
+    await request(app).post(`/api/issues/${sourceIssueId}/interactions/${interactionId}/accept`).send({}).expect(200);
+    const held = (await coderWakes(companyId, coderId)).filter(row => row.status === "deferred_issue_execution");
+    expect(held).toHaveLength(1);
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    // A wake of the same role on the same task is already queued (the dependency wake, for example).
+    const [queued] = await db.insert(agentWakeupRequests).values({ companyId, agentId: coderId, source: "automation", triggerDetail: "system",
+      reason: "issue_blockers_resolved", status: "queued", payload: { issueId: sourceIssueId } } as never).returning();
+    await heartbeatService(db, { runtimeEnv: {} }).resumeQueuedRuns();
+    const [merged] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, held[0]!.id));
+    expect(merged!.status).toBe("coalesced");
+    expect(merged!.error).toContain(queued!.id);
   });
 
   it("does not release a message held behind a dependency-blocked reconciliation while the blocker is open", async () => {
