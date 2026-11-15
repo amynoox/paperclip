@@ -19,4 +19,4 @@
  * Typed as `boolean` (not the literal `false`) on purpose: this keeps
  * TypeScript and lint from flagging the gated branches as unreachable/dead code.
  */
-export const SHOW_TASK_PRIORITY_UI: boolean = false;
+export const SHOW_TASK_PRIORITY_UI: boolean = true;

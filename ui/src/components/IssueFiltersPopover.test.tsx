@@ -105,7 +105,8 @@ describe("IssueFiltersPopover", () => {
     expect(popoverContent).not.toBeNull();
 
     expect(popoverContent?.textContent).toContain("Status");
-    expect(popoverContent?.textContent).not.toContain("Priority");
+    // STUDIO-0057: the Priority filter section is shown again (SHOW_TASK_PRIORITY_UI on).
+    expect(popoverContent?.textContent).toContain("Priority");
     expect(popoverContent?.querySelector('[data-filter-options="workspaces"]')).toBeNull();
     expect(popoverContent?.textContent).not.toContain("Workspace");
     expect(popoverContent?.className).toContain("overflow-y-auto");
