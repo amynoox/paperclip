@@ -1153,6 +1153,37 @@ export function buildKnownHostsEntry(input: {
   return `[${input.host}]:${input.port} ${input.publicKey.trim()}`;
 }
 
+// STUDIO-0052 (TR-999, 15 Nov 2026): `ssh` exits 255 when it cannot connect,
+// with no structured error code, so a lease probe to a sleeping or briefly
+// unreachable machine was classified as a permanent setup failure. Only here,
+// where the command is known to be `ssh`, its own connection diagnostics are
+// read and mapped to the network code they mean. Authentication, host key and
+// name resolution failures keep no code (never retried).
+const SSH_CONNECT_FAILURES: Array<[RegExp, "ETIMEDOUT" | "ECONNREFUSED" | "ENETUNREACH"]> = [
+  [/^ssh: connect to host \S+ port \d+: (Connection|Operation) timed out$/m, "ETIMEDOUT"],
+  [/^Connection timed out during banner exchange$/m, "ETIMEDOUT"],
+  [/^ssh: connect to host \S+ port \d+: Connection refused$/m, "ECONNREFUSED"],
+  [/^ssh: connect to host \S+ port \d+: (No route to host|Network is unreachable)$/m, "ENETUNREACH"],
+];
+
+/** The network code an `ssh` exit 255 stands for, when its stderr says the connection never happened. */
+export function sshConnectFailureCode(error: unknown): "ETIMEDOUT" | "ECONNREFUSED" | "ENETUNREACH" | null {
+  const failure = error as { code?: unknown; stdout?: unknown; stderr?: unknown } | null;
+  if (!failure || failure.code !== 255 || typeof failure.stderr !== "string") return null;
+  // Nothing may have run remotely: a remote command that printed anything is never retried.
+  if (typeof failure.stdout === "string" && failure.stdout !== "") return null;
+  for (const [pattern, code] of SSH_CONNECT_FAILURES) if (pattern.test(failure.stderr)) return code;
+  return null;
+}
+
+export function withSshConnectFailureCause(error: unknown) {
+  const code = sshConnectFailureCode(error);
+  if (code && error instanceof Error && error.cause === undefined) {
+    error.cause = Object.assign(new Error(`ssh could not connect (${code})`), { code });
+  }
+  return error;
+}
+
 export async function runSshCommand(
   config: SshConnectionConfig,
   remoteCommand: string,
@@ -1205,16 +1236,23 @@ export async function runSshCommand(
       `sh -c ${shellQuote(remoteScript)}`,
     );
 
-    return options.stdin != null
-      ? await spawnText("ssh", sshArgs, {
-          stdin: options.stdin,
-          timeout: options.timeoutMs ?? 15_000,
-          maxBuffer: options.maxBuffer ?? 1024 * 128,
-        })
-      : await execFileText("ssh", sshArgs, {
-          timeout: options.timeoutMs ?? 15_000,
-          maxBuffer: options.maxBuffer ?? 1024 * 128,
-        });
+    // STUDIO-0052: the environment is left as is. Forcing a locale here would be
+    // forwarded to the machine (the default client config sends LANG and LC_*), and
+    // OpenSSH sets only LC_CTYPE itself, so its connection diagnostics stay in English.
+    try {
+      return options.stdin != null
+        ? await spawnText("ssh", sshArgs, {
+            stdin: options.stdin,
+            timeout: options.timeoutMs ?? 15_000,
+            maxBuffer: options.maxBuffer ?? 1024 * 128,
+          })
+        : await execFileText("ssh", sshArgs, {
+            timeout: options.timeoutMs ?? 15_000,
+            maxBuffer: options.maxBuffer ?? 1024 * 128,
+          });
+    } catch (error) {
+      throw withSshConnectFailureCause(error);
+    }
   } finally {
     await cleanup();
   }

@@ -1378,6 +1378,34 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: settle a monitor whose bounds are used up without a next check (one owner wake first, then comment, activity and clearing). Why: the recovery policy was unreachable after the last allowed check (TR-915, 14 Nov 2026). Origin: studio fork only; to re-apply after an upstream update, keep exhaustedIssueMonitorCondition, exhaustedIssueMonitorIdleCondition, wakeExhaustedMonitorOwner, deferExhaustedIssueMonitor, settleExhaustedIssueMonitor and tickExhaustedIssueMonitors in heartbeat/scheduling.ts, their call in tickIssueMonitors and the two extra terms in nextIssueMonitorAt, then run the STUDIO-0049 cases of issue-monitor-scheduler.test.ts (13 cases) and scheduling.test.ts."
+    },
+    {
+      "id": "STUDIO-0052",
+      "title": "An ssh lease probe that cannot connect is a transient environment failure, retried with the existing budget",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, 15 Nov 2026, TR-999: the Feedback Manager's assignment run (server ssh environment QA-C) failed in 12 s with setup_failed, 'Failed to acquire lease for environment \"QA-C\" (ssh)', ssh stderr 'ssh: connect to host 100.121.114.90 port 22: Connection timed out', before any provider work; the stranded-task recovery blocked the task one second later. The bounded retry of transient lease failures (environment_provider_unavailable) only reads structured evidence (HTTP status or a network errno); ssh exits 255 with no code, so a briefly unreachable machine was a permanent setup failure.",
+      "reason": "Requested by the studio setup session (15 Nov 2026), after the TR-999 analysis.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "adapter-utils ssh command runner",
+      "paths": [
+        "packages/adapter-utils/src/ssh.ts",
+        "packages/adapter-utils/src/ssh-connect-failure.test.ts",
+        "server/src/services/environment-provider-unavailable-error.test.ts",
+        "server/src/__tests__/heartbeat-process-recovery.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: upstream treats any ssh exit 255 during lease acquisition as a setup failure.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2. adapter-utils: ssh-connect-failure.test.ts (the TR-999 stderr and five other connection failures map to ETIMEDOUT, ECONNREFUSED or ENETUNREACH; permission denied, host key verification, name resolution and connection reset keep no code; the code needs ssh's exit 255) with ssh-command-managed and ssh-fixture: 44 passed (review retouch: a failure after the remote command printed something keeps no code). server: environment-provider-unavailable-error.test.ts, 39 passed, with a new case: an ssh lease probe error carrying the attached cause is read as transient (ETIMEDOUT), a permission-denied one is not. Negative control: the new adapter-utils cases fail on the studio.18 ssh.ts (function absent). Typecheck adapter-utils: no error. Review retouch (15 Nov): heartbeat-process-recovery.test.ts, new case: an ssh lease probe that could not connect is retried once (scheduled bootstrap retry), then the successor run succeeds; with the two neighbouring lease-retry cases, 3 passed. Second retouch: ssh-command-managed.test.ts checks that runSshCommand hands ssh the caller's LANG and LC_ALL unchanged (with and without stdin); adapter-utils ssh-connect-failure, ssh-command-managed, ssh-fixture and execution-target: 68 passed. Typecheck adapter-utils and server: no error.",
+      "migration": "None. runSshCommand (used by ensureSshWorkspaceReady, the ssh lease probe) attaches, to an ssh failure with exit 255, an empty stdout (nothing ran remotely, so a remote command that already started is never retried) and a stderr line says the connection never happened, a cause with the matching network code (connect timed out / operation timed out / banner exchange timed out -> ETIMEDOUT; connection refused -> ECONNREFUSED; no route to host / network unreachable -> ENETUNREACH). The existing classifier (readTransientEnvironmentProviderFailure, which walks causes) then makes it environment_provider_unavailable, retried with the bounded bootstrap budget and, if still failing, blocked with the 'provider temporarily unavailable, no agent work started' card. Authentication, host key and name resolution failures are unchanged (not retried). The error message itself is unchanged. The ssh environment is left unchanged (no forced locale): the default client config of the Paperclip server sends LANG and LC_* (/etc/ssh/ssh_config, SendEnv LANG LC_*) and macOS machines accept them, so a forced LC_ALL would reach the remote command; OpenSSH sets only LC_CTYPE itself, and the server has only the C, C.utf8, POSIX and en_US.utf8 locales, so the connection diagnostics stay in English. The retry budget is unchanged (2 attempts, 30 s then 60 s): a machine asleep longer ends on the 'provider unavailable, no work started' card, and waking it is an infrastructure matter.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Upstream classifies ssh connection failures structurally.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: ssh exit 255 connection failures get a network-code cause. Why: TR-999 blocked after one unreachable lease probe (15 Nov 2026). Origin: studio fork only; to re-apply, keep sshConnectFailureCode and withSshConnectFailureCause in packages/adapter-utils/src/ssh.ts and the try/catch around the ssh call in runSshCommand; run ssh-connect-failure.test.ts and the STUDIO-0052 case of environment-provider-unavailable-error.test.ts."
     }
   ]
 }
