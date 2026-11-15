@@ -419,16 +419,19 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         const snapshot = checkpointSnapshot(captured.manifest);
         const nextHash = directorySnapshotSha256(snapshot);
         const changed = nextHash !== row.baseHash;
-        const { storageWarning } = changed
+        const { storageWarning, entryEditDiscarded } = changed
           ? await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured.directory, "files"), baseline: baseline(row), checkpoint: captured.manifest }, actor(row))
           : await store.locked(row.companyId, row.agentId, actor(row), true, async () => ({
             storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null,
+            entryEditDiscarded: false,
           }));
         row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
           ...(stopped ? { processStoppedAt: new Date() } : {}),
           receipt: { ...row.receipt, baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: captured.manifest,
-            checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning } });
+            checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning,
+            // STUDIO-0055: the run's edit of its own entry file was set aside; the rest was saved.
+            ...(entryEditDiscarded ? { entryEditDiscarded: true } : {}) } });
         return row;
       } catch (error) {
         failure = error;
@@ -475,13 +478,15 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         const { snapshot } = inspected;
         const candidateHash = directorySnapshotSha256(snapshot);
         let storageWarning = inspected.storageWarning;
+        let entryEditDiscarded = false;
         if (candidateHash === row.baseHash) {
           row = await patch(row, { state: "unchanged", errorCode: null, errorMessage: null, nextAttemptAt: null });
         } else {
-          ({ storageWarning } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
+          ({ storageWarning, entryEditDiscarded } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
           row = await patch(row, { state: "saved", candidateHash, errorCode: null, errorMessage: null, nextAttemptAt: null });
         }
-        row = await patch(row, { receipt: { ...row.receipt, storageWarning } });
+        // STUDIO-0055: the run's edit of its own entry file was set aside; the rest was saved.
+        row = await patch(row, { receipt: { ...row.receipt, storageWarning, ...(entryEditDiscarded ? { entryEditDiscarded: true } : {}) } });
         break;
       } catch (error) {
         const retryable = !(error instanceof HttpError) || error.status >= 500;
@@ -555,6 +560,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
         materializationRunId: row.receipt?.materializationRunId ?? row.runId,
         ...(row.receipt?.directoryRunId ? { directoryRunId: row.receipt.directoryRunId } : {}),
+        ...(row.receipt?.entryEditDiscarded ? { entryEditDiscarded: true } : {}),
         ...(cleanupPending ? { cleanup: row.receipt?.cleanup, ...(destroyedOnly ? { cleanupDestroyedOnly: true } : {}) } : {}) },
         nextAttemptAt: cleanupPending ? new Date(Date.now() + 30_000) : null });
     }

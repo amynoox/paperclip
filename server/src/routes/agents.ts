@@ -5334,7 +5334,11 @@ export function agentRoutes(
       res.json(await instructionFileDetail(existing, receipt, receipt));
       return;
     }
-    await assertCanManageInstructionsPath(req, existing);
+    // STUDIO-0055: an agent writes the other files of its own managed folder (notes, evidence) without any right
+    // over other agents; the file store's own check (authorizeInstructionCommit, owner and low-trust rules) governs.
+    const ownManagedFile = req.actor.type === "agent" && req.actor.agentId === existing.id
+      && agentInstructionsBundleMode(existing) === "managed" && req.body.path !== "promptTemplate.legacy.md";
+    if (!ownManagedFile) await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
     if (agentInstructionsBundleMode(existing) === "managed" && req.body.path !== "promptTemplate.legacy.md") {
@@ -5450,7 +5454,10 @@ export function agentRoutes(
     const id = req.params.id as string;
     const existing = await getAccessibleResource(req, res, svc.getById(id), "Agent not found");
     if (!existing) return;
-    await assertCanManageInstructionsPath(req, existing);
+    // STUDIO-0055: same rule as the write: the agent's own managed folder is governed by the file store's check.
+    const ownManagedDelete = req.actor.type === "agent" && req.actor.agentId === existing.id
+      && agentInstructionsBundleMode(existing) === "managed";
+    if (!ownManagedDelete) await assertCanManageInstructionsPath(req, existing);
     assertExternalInstructionsAdmin(req, existing);
 
     const relativePath = typeof req.query.path === "string" ? req.query.path : "";

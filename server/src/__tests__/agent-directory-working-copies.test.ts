@@ -212,6 +212,16 @@ describe("persistent agent directories", () => {
         await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
       } finally { await worker.stop(); }
     });
+    // STUDIO-0055: the run's edit of its own entry file (AGENTS.md, published by the Board) is set aside; the rest
+    // of the agent folder (notes, evidence) is saved as before.
+    it("sets aside the run's edit of its own entry file and saves the rest of the folder", async () => {
+      const copy = await run();
+      await fs.writeFile(path.join(copy.localRoot, "evidence.md"), "kept evidence");
+      await fs.writeFile(path.join(copy.localRoot, entryFile), "rewritten by the agent");
+      expect(await copies.collectStopped({ companyId, runId: copy.runId })).toMatchObject({ state: "saved", receipt: { entryEditDiscarded: true } });
+      expect(await fs.readFile(path.join(root, "evidence.md"), "utf8")).toBe("kept evidence");
+      expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
+    });
     it("retains a future cleanup deadline across restart without early file operations", async () => {
       const copy = await run(); clock(); const due = new Date(Date.now() + 90_000);
       await stopped(copy, due); const worker = coordinator();
@@ -838,9 +848,9 @@ describe("persistent agent directories", () => {
     const copy = await run();
     await fs.writeFile(path.join(copy.localRoot, entryFile), "a".repeat(1024 * 1024 + 1));
     const result = await copies.collectStopped({ companyId, runId: copy.runId });
-    expect(result?.state).toBe("unavailable");
-    await expect(fs.stat(copy.localRoot)).rejects.toMatchObject({ code: "ENOENT" });
-    expect(result?.errorMessage).toContain("at most 1 MiB");
+    // STUDIO-0055 (deliberate change from upstream): the agent's own edit of its entry file, oversized or not, is
+    // set aside before the size check; the save goes through without it and the published entry stays intact.
+    expect(result).toMatchObject({ state: "saved", receipt: { entryEditDiscarded: true } });
     expect(await fs.readFile(path.join(root, entryFile), "utf8")).toBe(initial);
   });
 
@@ -1245,7 +1255,9 @@ describe("persistent agent directories", () => {
     await copies.collectStopped({ companyId, runId: copy.runId });
     const fresh = await run({ warm: true });
     expect(fresh.executionRoot).not.toBe(copy.executionRoot);
-    expect(await fs.readFile(path.join(fresh.localRoot, entryFile), "utf8")).toBe("# New loaded policy\n");
+    // STUDIO-0055 (deliberate change from upstream): the agent's own edit of its entry file is set aside; the
+    // next run gets the published entry back.
+    expect(await fs.readFile(path.join(fresh.localRoot, entryFile), "utf8")).toBe(initial);
   });
   it("refreshes after editor changes and preserves concurrent unrelated files", async () => {
     const copy = await run({ warm: true });

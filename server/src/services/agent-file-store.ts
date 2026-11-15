@@ -11,7 +11,7 @@ import { and, desc, eq, isNull, sql } from "drizzle-orm";
 import { agents, activityLog, agentInstructionHeads, agentInstructionRevisions, resourceLifecycleEvents, fileStorageDb, type Db } from "@paperclipai/db";
 import { captureDirectorySnapshot, mergeDirectoryWithBaseline, type DirectorySnapshot } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { HttpError, conflict, notFound, unprocessable } from "../errors.js";
-import { authorizeInstructionCommit, authorizeInstructionRead } from "./agent-instruction-authorization.js";
+import { assertNotOwnEntryEdit, authorizeInstructionCommit, authorizeInstructionRead } from "./agent-instruction-authorization.js";
 import { assertInstructionPathSafe, instructionPath, instructionBytes, materializeInstructionBytes, readInstructionBytes, MAX_INSTRUCTION_BYTES } from "./agent-instruction-files.js";
 import { agentInstructionsBundleMode, deriveBundleState, resolveManagedInstructionsRoot } from "./agent-instructions.js";
 import type { AuthorizationActor } from "./authorization.js";
@@ -234,6 +234,7 @@ export function agentFileStore(db: Db) {
     write: (input: { companyId: string; agentId: string; path: string; bytes: Buffer | null; baseHash: string | null }, actor: AuthorizationActor) =>
       locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {
         const relative = agentFilePath(input.path);
+        if (relative === deriveBundleState(agent).entryFile) assertNotOwnEntryEdit(bound, agent.id);
         if (input.bytes) assertFileSize(input.bytes.length, relative);
         const previous = await inspectAgentFile(root, relative);
         const currentHash = previous?.hash ?? null;
@@ -280,6 +281,20 @@ export function agentFileStore(db: Db) {
       return locked(input.companyId, input.agentId, actor, true, async (tx, agent, root, bound) => {
         if (deriveBundleState(agent).entryFile !== requestedEntry) throw conflict("Agent instructions entry changed; retry the file synchronization");
         const entryPath = deriveBundleState(agent).entryFile;
+        // STUDIO-0055: the agent's own run never rewrites its entry file (the Board publishes it); the rest of its
+        // folder (notes, evidence) is saved as usual and the receipt says the entry edit was set aside.
+        let entryEditDiscarded = false;
+        const baselineEntry = input.baseline.entries.get(entryPath);
+        if (bound.type === "agent" && bound.agentId === agent.id && baselineEntry
+          && JSON.stringify(incoming.entries.get(entryPath)) !== JSON.stringify(baselineEntry)) {
+          incoming.entries.set(entryPath, baselineEntry);
+          changedMentions.delete(entryPath);
+          entryEditDiscarded = true;
+          // The directory merge reads the run's copy on disk: put the published entry back into it, so the
+          // merge has nothing to bring over and a reused warm copy starts from the published entry too.
+          const published = await readAgentFile(root, entryPath);
+          if (published) await materializeInstructionBytes(input.sourceDir, entryPath, published);
+        }
         if (incoming.entries.get(entryPath)?.kind !== "file") throw unprocessable("The configured instruction entry cannot be deleted");
         if (!input.checkpoint || JSON.stringify(incoming.entries.get(entryPath)) !== JSON.stringify(input.baseline.entries.get(entryPath))) {
           const entry = await readInstructionBytes(input.sourceDir, entryPath);
@@ -343,8 +358,9 @@ export function agentFileStore(db: Db) {
         assertDirectorySize(total, finalEntries.size);
         await mergeDirectoryWithBaseline({ ...input, baseline: applyBaseline, targetDir: root,
           ...(input.checkpoint ? { snapshots: { source: incoming, current } } : {}) });
-        await audit(tx, agent, bound, { sourceRunId: currentPluginInteractionOrigin()?.runId ?? actor.runId, contract: AGENT_FILES_CONTRACT });
-        return { storageWarning: storageWarning(total, finalEntries.size, fullFile) };
+        await audit(tx, agent, bound, { sourceRunId: currentPluginInteractionOrigin()?.runId ?? actor.runId, contract: AGENT_FILES_CONTRACT,
+          ...(entryEditDiscarded ? { entryEditDiscarded: true } : {}) });
+        return { storageWarning: storageWarning(total, finalEntries.size, fullFile), entryEditDiscarded };
       }, [...changedMentions.values()].map(value => value.text));
     },
   };

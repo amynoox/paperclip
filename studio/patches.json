@@ -1377,6 +1377,37 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: ssh exit 255 connection failures get a network-code cause. Why: TR-999 blocked after one unreachable lease probe (15 Nov 2026). Origin: studio fork only; to re-apply, keep sshConnectFailureCode and withSshConnectFailureCause in packages/adapter-utils/src/ssh.ts and the try/catch around the ssh call in runSshCommand; run ssh-connect-failure.test.ts and the STUDIO-0052 case of environment-provider-unavailable-error.test.ts."
+    },
+    {
+      "id": "STUDIO-0055",
+      "title": "An agent writes its own folder without rights over other agents, and never rewrites its own AGENTS.md",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Rights hardening (V329, bench 15 Nov 2026): removing agents:configure and agents:suggest-changes from the roles would stop their edits of other agents, but the file route then also refused an agent writing evidence files in its own folder (PUT instructions-bundle/file, 403 'Missing permission: agents:configure or agents:suggest-changes'), while the agent could still rewrite its own AGENTS.md (allow_self). The studio publishes each role's AGENTS.md from the Board; a role rewriting it would drift from the published version.",
+      "reason": "Requested by the studio setup session (lot 21, A4), from drafts/reveil-questions/durcissement/correctif-serveur-dossier-agent.md; to be put to the owner before the rights hardening steps 2 and 3.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "agent instruction files: route, file store, end-of-run folder save, instruction revisions",
+      "paths": [
+        "server/src/services/agent-instruction-authorization.ts",
+        "server/src/services/agent-instruction-revisions.ts",
+        "server/src/services/agent-file-store.ts",
+        "server/src/services/agent-directory-working-copies.ts",
+        "server/src/routes/agents.ts",
+        "server/src/services/agent-instruction-own-entry.test.ts",
+        "server/src/__tests__/agent-directory-working-copies.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: upstream lets an agent edit its own instruction entry and requires agents:configure for the other files of its folder through the route.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. agent-instruction-own-entry.test.ts: an agent rewriting its own entry is refused (403 AGENT_ENTRY_SELF_EDIT_REFUSED); another agent and the Board are left to the existing rules. agent-directory-working-copies.test.ts, end to end through collectStopped (actor: the run's agent): a run that writes evidence.md and rewrites its entry file is saved with the evidence and without the entry edit (published entry intact, receipt entryEditDiscarded, kept by the release that rebuilds the receipt). Two upstream cases change on purpose and are adapted: a warm run's edit of its loaded entry no longer reaches the next run (it gets the published entry back); an oversized entry written by the agent is set aside instead of failing the whole save (the 1 MiB limit still applies to the Board's writes). agent-directory-working-copies and the unit file: 123 passed. agent-instruction-revisions, agent-instructions-routes and agent-file-durability passed on the previous state of the change (185 passed then); the last change only touches the end-of-run save. Not covered by a test: the route exemption for an agent's own non-entry file (PUT/DELETE instructions-bundle/file) and the revision-commit refusal through the route (bench). Typecheck: no error in the changed files.",
+      "migration": "None. (1) assertNotOwnEntryEdit: an agent writing its own entry file is refused (403 AGENT_ENTRY_SELF_EDIT_REFUSED) in the instruction revision commit (entry through the route) and in the file store's one-file write; peers keep the existing grant rules (agents:configure / agents:suggest-changes) and the Board is unchanged. (2) The end-of-run save of the agent folder (agentFileStore.apply, from agent-directory-working-copies) sets aside the run's change to its own entry file and saves the rest (notes, evidence); the copy receipt and the activity carry entryEditDiscarded. (3) PUT and DELETE /agents/:id/instructions-bundle/file no longer require agents:* rights when an agent writes or deletes a non-entry file of its own managed folder; the file store's own check (authorizeInstructionCommit: owner, low-trust and responsible-user rules) governs. External instruction roots keep the route check. Effect on the rights hardening: removing agents:configure and agents:suggest-changes from the roles keeps their evidence writes and still stops edits of other agents. Known limits: an owner-chat request to an agent to edit its own AGENTS.md is refused too (the Board publishes it); a role whose instructions tell it to keep notes inside AGENTS.md loses those edits (receipt only): check the published fiches before deploying and point such notes to another file of the folder.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Upstream protects an agent's instruction entry from the agent and separates its own folder from configure rights.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: an agent never rewrites its own AGENTS.md (refused or set aside), and writes the rest of its own managed folder without agents:* rights. Why: rights hardening of the studio roles (V329, 15 Nov 2026). Origin: studio fork only; to re-apply, keep assertNotOwnEntryEdit in agent-instruction-authorization.ts and its calls in agent-instruction-revisions.ts (commit) and agent-file-store.ts (write, and the entry set-aside in apply with entryEditDiscarded), the receipt field in agent-directory-working-copies.ts, and the ownManagedFile / ownManagedDelete exemptions in routes/agents.ts; run agent-instruction-own-entry.test.ts and the STUDIO-0055 case of agent-directory-working-copies.test.ts."
     }
   ]
 }
