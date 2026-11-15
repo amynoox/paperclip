@@ -63,6 +63,9 @@ function assertSecretRefBinding(
   return parsed;
 }
 
+/** STUDIO-0058: JSON-RPC error data code of a secret resolution refused by the rate limit. */
+export const SECRET_RESOLUTION_RATE_LIMITED = "secret_resolution_rate_limited";
+
 export interface PluginConfigSecretRefBinding {
   secretId: string;
   configPath: string;
@@ -233,7 +236,8 @@ export function createPluginSecretsHandler(
       if (!rateLimiter.check(`${companyId}:${pluginId}`)) {
         const err = new Error("Rate limit exceeded for secret resolution");
         err.name = "RateLimitExceededError";
-        throw err;
+        // STUDIO-0058: a stable code the plugin reads in the JSON-RPC error data, instead of matching the sentence.
+        throw Object.assign(err, { rpcErrorData: { code: SECRET_RESOLUTION_RATE_LIMITED } });
       }
 
       const versionSelector = bindingRef.version ?? "latest";
