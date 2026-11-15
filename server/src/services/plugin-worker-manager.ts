@@ -1165,6 +1165,12 @@ export function createPluginWorkerHandle(
     childProcess.stdin.write(serialized);
   }
 
+  /** STUDIO-0058: structured data a host handler attached to its error (a stable code), passed to the worker. */
+  function errorDataForWorkerHostError(err: unknown): Record<string, unknown> | undefined {
+    const data = (err as { rpcErrorData?: unknown } | null)?.rpcErrorData;
+    return data && typeof data === "object" && !Array.isArray(data) ? data as Record<string, unknown> : undefined;
+  }
+
   function errorCodeForWorkerHostError(err: unknown): number {
     const code = (err as { code?: unknown } | null)?.code;
     const pluginErrorCodes: readonly number[] = Object.values(PLUGIN_RPC_ERROR_CODES);
@@ -3032,6 +3038,7 @@ export function createPluginWorkerHandle(
             request.id,
             errorCodeForWorkerHostError(err),
             errorMessage,
+            errorDataForWorkerHostError(err),
           ),
         );
       } catch {

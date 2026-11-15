@@ -1379,6 +1379,97 @@
       "origin": "What: ssh exit 255 connection failures get a network-code cause. Why: TR-999 blocked after one unreachable lease probe (15 Nov 2026). Origin: studio fork only; to re-apply, keep sshConnectFailureCode and withSshConnectFailureCause in packages/adapter-utils/src/ssh.ts and the try/catch around the ssh call in runSshCommand; run ssh-connect-failure.test.ts and the STUDIO-0052 case of environment-provider-unavailable-error.test.ts."
     },
     {
+      "id": "STUDIO-0057",
+      "title": "Task priority is shown and editable in the interface again, with a Priority filter on the Tasks page",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Upstream hid every task priority indicator and control behind one compile-time UI flag, SHOW_TASK_PRIORITY_UI = false (paperclipai/paperclip#11024, PAP-411, merged 6 Aug 2026), keeping the data model, API, validation and search language. The studio owner cannot see or change a task's priority, yet the server still orders an agent's queued runs by it (server/src/services/heartbeat/queue.ts issueRunPriorityRank, after the readiness rank).",
+      "reason": "Requested by the owner (journal V364, V365: shown everywhere, changeable in the interface by himself).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "web interface: ui/src/lib/ui-flags.ts",
+      "paths": [
+        "ui/src/lib/ui-flags.ts",
+        "ui/src/components/IssueProperties.test.tsx",
+        "ui/src/components/IssuesList.test.tsx",
+        "ui/src/components/IssueFiltersPopover.test.tsx",
+        "ui/src/pages/IssueDetail.test.tsx",
+        "ui/src/components/NewIssueDialog.test.tsx",
+        "ui/src/components/IssueFilterPanel.tsx",
+        "ui/src/pages/CoordinatorTasks.test.tsx"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "Hidden by #11024; open issue #11547 asks to make the flag configurable, no linked pull request; upstream master still has SHOW_TASK_PRIORITY_UI = false.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, TZ=UTC, whole UI vitest suite: 924 files, 11771 passed, 1 skipped, 0 failed; UI typecheck in the test tree: 22 errors, the same 22 as the base 2cb9e5cd (modules absent from that tree), none in a changed file. Upstream cases that asserted the hidden priority are turned into shown cases: the Properties row is shown with the task's priority (IssueProperties), the header priority control is rendered (IssueDetail), Sort and Group offer Priority (IssuesList), the filter popover has its Priority section (IssueFiltersPopover). NewIssueDialog keeps its assertions: the shared task composer (#15091) removed the dialog's priority control outright, so the flag does not bring it back (comment updated). Added by the studio (bench of the first head: the Tasks page had no priority at all): CoordinatorTasks.test.tsx shows the Priority group in the real filter panel; checking Critical keeps only the critical task, unchecking it brings the list back.",
+      "migration": "None. One line: SHOW_TASK_PRIORITY_UI = true in ui/src/lib/ui-flags.ts. It shows again, read from the existing gates: the task header priority control (ui/src/pages/IssueDetail.tsx, header seed and editable control), the Properties row (ui/src/components/issue-properties/IssueProperties.tsx, editable through PriorityIcon), the Kanban card icon (KanbanBoard.tsx), the suggested-task priority in thread cards (IssueThreadInteractionCard.tsx), the Priority option of Sort and Group in the task lists (IssuesList.tsx, LegacyIssuesList.tsx), the Priority filter section (IssueFiltersPopover.tsx), the search filter bar and sheet (search/SearchFilterBar.tsx, search/SearchFilterSheet.tsx), the 'Tasks by Priority' charts (Dashboard.tsx, AgentDetail.production.tsx), and the design guide page. Added by the studio, absent upstream: a Priority group in the filter panel of the Tasks page (ui/src/components/IssueFilterPanel.tsx, the 'refreshed' presentation built by upstream after PAP-411 without any priority element), behind the same flag, reusing the existing filter state and applyIssueFilters (priorities). Not shown again: on the Tasks page, a priority icon on the row and a priority column to sort by (the refreshed task table never had them; they touch its shared column grid); a priority control in the new-task dialog (removed upstream by #15091; new tasks keep the medium default, changeable afterwards in the Properties row or the header). Nothing changes on the server or for the roles: no server or package file reads the flag; API responses, chat publications and the run queue order are unchanged by the flag itself. Once the owner changes a priority in the interface, that value orders the agent's queued runs as it already did when set through the API. Delivery: server/ui-dist only (UI_DELTA_SHA in livrer.py), with the next server version.",
+      "rollback": "Set SHOW_TASK_PRIORITY_UI back to false (or switch cli/current back to the previous install folder). Stored priorities stay as they are.",
+      "retireWhen": "Upstream turns the priority UI back on or makes the flag configurable (#11547).",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: SHOW_TASK_PRIORITY_UI = true. Why: the owner wants to see and change task priority himself (V364, V365). Origin: studio fork only, reverting upstream #11024's default; to re-apply after an upstream update, set the flag to true in ui/src/lib/ui-flags.ts, put back by hand the Priority FilterGroup of ui/src/components/IssueFilterPanel.tsx (studio only, not an upstream gate), check that every reader still gates on it (git grep SHOW_TASK_PRIORITY_UI under ui/src), adapt the upstream tests that assert the hidden priority, and run the whole UI suite with TZ=UTC."
+    },
+    {
+      "id": "STUDIO-0054",
+      "title": "Question cards render their text as Markdown and keep their context once answered",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production, 15 Nov 2026 (TR-723, 'PR #191 — décision après la reprise ciblée'): the owner could hardly read the questions addressed to him. A question's prompt and help text were plain text in a block: the role's line breaks collapsed, its bullet points ran into the sentence and Markdown links stayed raw ([Rapport complet](/TR/issues/TR-723#…)). Bench, lot 20: the question set's description (already Markdown on the pending form) was no longer shown anywhere once the card was answered.",
+      "reason": "Requested by the owner (15 Nov 2026): 'mettre un peu de mise en forme dans toutes les questions qui me sont adressées'.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "UI: issue thread interaction card, question form, compact interaction card",
+      "paths": [
+        "ui/src/components/IssueThreadInteractionCard.tsx",
+        "ui/src/components/task-chat/QuestionForm.tsx",
+        "ui/src/components/task-chat/TaskChatCompactInteractionCard.tsx",
+        "ui/src/components/IssueThreadInteractionCard.test.tsx",
+        "ui/src/components/coordinator/CoordinatorTaskCommitment.test.tsx",
+        "ui/src/components/task-chat/QuestionResponseSummary.test.tsx",
+        "ui/src/index.css"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: upstream renders question prompts and help text as plain text.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, jsdom (UI dependencies from an earlier UI build tree of the bench machine). IssueThreadInteractionCard.test.tsx, three new cases with the real MarkdownBody: a prompt with bold, a list and a link, and a help text with emphasis, render <strong>, <li>, <a href> and <em> on a pending card without a question set, on a pending card rendered by the question form (its description too), and on an answered card; the raw Markdown no longer shows. CoordinatorTaskCommitment.test.tsx, two new cases: an answered question in the coordinator timeline keeps its description under the receipt as a 'Question context' disclosure rendered as Markdown; without a description, the bare receipt as before. With QuestionForm.test.tsx and CoordinatorChatUpdates.test.tsx: 116 passed. Negative control: the three formatting cases fail on the previous components. Typecheck: no error in the changed files. Review fixes (15 Nov): question text inherits the size, line height and colour of its container (class paperclip-markdown-inherit; the help text stays small and muted, the decision prompt keeps its large size); relative ticket links stay in-app links in the question form (linkIssueReferences no longer turned off, the description included). New cases: file names with underscores and inline code stay literal; a javascript: link gives no link and raw HTML (b, img, script) is not rendered; a one-line prompt is a single paragraph; a relative ticket link in the form is a link; the resolved receipt renders the help text as Markdown; QuestionResponseSummary renders the prompt as Markdown. 122 passed.",
+      "migration": "None on the server and no change to what roles send. The prompt and help text of each question go through MarkdownBody (the same safe renderer as comments and as the question set's description; soft breaks on, media as references) on the pending card, the question form, the answered card and the resolved receipt; the question set's description of the resolved receipt too. In the coordinator timeline, an answered question with a description shows a 'Question context' disclosure under its receipt. A one-line prompt looks as before (its block keeps the prompt id used by aria-labelledby; the question form's focus target moves from a <p> to a <div>). Ships as UI assets (server/ui-dist), so with the next server install. Left as plain text on purpose: the card title and summary (one-line labels), the older protocol card (TaskChatProtocolCard), and the server-side notifications (Discord, chat), which have their own formatting. An HTML comment in the text is hidden, as in comments today (same renderer).",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Upstream renders question text as Markdown and keeps the answered context.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: question prompt and help text rendered by MarkdownBody; answered question keeps its question set description. Why: owner's request after TR-723 (15 Nov 2026) and bench lot 20. Origin: studio fork only; to re-apply, wrap question.prompt and question.helpText in MarkdownBody in IssueThreadInteractionCard.tsx (pending and answered), QuestionForm.tsx (form and answered summary) and TaskChatCompactInteractionCard.tsx (ReceiptDisclosure, and the coordinator timeline receipt branch with its 'Question context' disclosure); run the STUDIO-0054 cases of IssueThreadInteractionCard.test.tsx and CoordinatorTaskCommitment.test.tsx."
+    },
+    {
+      "id": "STUDIO-0058",
+      "title": "A secret resolution refused by the rate limit carries a stable code for the plugin",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "A plugin whose secrets.resolve call is refused by the host's rate limit (30 per minute per company and plugin) only gets the sentence 'Rate limit exceeded for secret resolution' with the generic JSON-RPC internal error code; the Worker Router recognises it by comparing that sentence (router review, lot 21).",
+      "reason": "Requested by the router's review through the studio setup session (single window of 15 Nov 2026).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "plugin host: secret resolution and worker host-call errors",
+      "paths": [
+        "server/src/services/plugin-secrets-handler.ts",
+        "server/src/services/plugin-worker-manager.ts",
+        "server/src/__tests__/plugin-secrets-handler.test.ts",
+        "server/src/__tests__/plugin-worker-manager.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: upstream sends host handler errors to the worker with a code and a message only.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. plugin-secrets-handler.test.ts: after 30 refused lookups, the 31st call is refused by the rate limit with the same name and sentence and rpcErrorData { code: 'secret_resolution_rate_limited' }. plugin-worker-manager.test.ts: a host handler error carrying rpcErrorData reaches the worker as JSON-RPC error data unchanged (through a real worker process). With studio-plugin-own-db-channel and tool-gateway: 229 passed. Typecheck of the whole server project in the test tree: 310 errors, the same as the base, none in a changed file.",
+      "migration": "None. The refusal keeps its name and sentence (a router matching the sentence keeps working) and now carries error data { code: 'secret_resolution_rate_limited' }, read on the plugin side as JsonRpcCallError.data.code. The worker manager passes error data only when a host handler attached rpcErrorData (an object); every other host error is sent as before (code and message, no data).",
+      "rollback": "Switch cli/current back to the previous install folder; the router falls back to the sentence.",
+      "retireWhen": "Upstream gives host-call refusals stable codes.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: rpcErrorData { code: 'secret_resolution_rate_limited' } on the rate-limit refusal, passed to the worker as JSON-RPC error data. Why: the router recognised the refusal by its sentence. Origin: studio fork only; to re-apply, keep SECRET_RESOLUTION_RATE_LIMITED and the Object.assign in plugin-secrets-handler.ts and errorDataForWorkerHostError in plugin-worker-manager.ts; run the two STUDIO-0058 cases."
+    },
+    {
       "id": "STUDIO-0053",
       "title": "A stopped legacy run that launched no process proves its own stop",
       "status": "implemented-locally-validated-not-deployed",
