@@ -305,6 +305,24 @@ describe("Coordinator tasks using the proposed table", () => {
     expect(mocks.list).toHaveBeenCalledWith("company", expect.objectContaining({ q: query }), expect.anything());
     expect(host.querySelector('[data-task-id="server-match"]')).not.toBeNull();
   });
+  // STUDIO-0057: the studio adds a Priority group to this filter panel (absent upstream), behind SHOW_TASK_PRIORITY_UI.
+  it("filters the task list by priority from the filter panel", async () => {
+    mocks.realFilters = true;
+    mocks.list.mockResolvedValue([
+      createIssue({ id: "urgent", companyId: "company", parentId: null, priority: "critical" }),
+      createIssue({ id: "later", companyId: "company", parentId: null, priority: "low" }),
+    ]);
+    await mount("/issues?view=all");
+    const taskIds = () => [...host.querySelectorAll("[data-task-id]")].map(node => node.getAttribute("data-task-id"));
+    expect(host.querySelector('[data-filter-options="priorities"]')).not.toBeNull();
+    const critical = () => host.querySelector<HTMLButtonElement>('[role="checkbox"][aria-label="Critical"]')!;
+    await vi.waitFor(() => expect(taskIds()).toEqual(["urgent", "later"]));
+    flushSync(() => critical().click());
+    await vi.waitFor(() => expect(taskIds()).toEqual(["urgent"]));
+    expect(critical().getAttribute("aria-checked")).toBe("true");
+    flushSync(() => critical().click());
+    await vi.waitFor(() => expect(taskIds()).toEqual(["urgent", "later"]));
+  });
   it("keeps a selected label and other URL filters after sorting and reloading", async () => {
     mocks.realFilters = true;
     mocks.labels = [{ id: "qa", name: "qa-task", color: "var(--accent)" }];
