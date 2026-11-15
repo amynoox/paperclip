@@ -920,14 +920,15 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:31:00.000Z"))).toMatchObject({ exhausted: 1 });
       expect(await monitorStatus(issueId)).toMatchObject({ status: "cleared", clearReason: "max_attempts_exhausted" });
       const comments = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
-        .filter(row => row.body.includes("its owner could not be woken"));
+        .filter(row => row.body.includes("Paperclip ended the external-service monitor"));
       expect(comments).toHaveLength(1);
-      expect(comments[0]!.body).toContain(kind === "task busy" ? "the task stayed busy" : "its wake could not be admitted");
+      expect(comments[0]!.body).toContain(kind === "task busy"
+        ? "this monitor ended before Paperclip could settle it; nobody was woken." : "its wake could not be admitted");
       const exhausted = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))
         .then(rows => rows.filter(row => row.action === "issue.monitor_exhausted"));
       expect(exhausted).toHaveLength(1);
       expect(exhausted[0]!.details).toMatchObject({ wake: "not_admitted",
-        reason: kind === "task busy" ? "task_busy" : "monitor_recovery_failed" });
+        reason: kind === "task busy" ? "not_attempted" : "monitor_recovery_failed" });
       expect((await recoveryWakes(agentId)).filter(row => row.runId)).toHaveLength(0);
       // Once: the next tick leaves it alone.
       expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T13:31:00.000Z"))).toMatchObject({ exhausted: 0 });

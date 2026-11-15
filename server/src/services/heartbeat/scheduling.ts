@@ -1378,10 +1378,12 @@ export function createHeartbeatScheduling(
       eq(activityLog.companyId, row.companyId), eq(activityLog.entityId, row.id), eq(activityLog.action, "issue.monitor_deferred"),
       sql`${activityLog.details} ->> 'lastTriggeredAt' = ${triggeredAtIso}`)).orderBy(desc(activityLog.createdAt)).limit(1);
     const reason = typeof (deferred?.details as { reason?: unknown } | undefined)?.reason === "string"
-      ? (deferred!.details as { reason: string }).reason : "task_busy";
-    const why = reason === "task_busy"
-      ? "the task stayed busy (a run, a run lock, a held wake, a recovery action, a question, an approval or a review)"
-      : "its wake could not be admitted (for example a paused agent or a blocked budget)";
+      ? (deferred!.details as { reason: string }).reason : "not_attempted";
+    // Without a held-wake record no wake was ever tried (the task stayed busy,
+    // or the monitor ended before this catch-up existed): say only that.
+    const ended = reason === "not_attempted"
+      ? "this monitor ended before Paperclip could settle it; nobody was woken."
+      : "its bounds were used up and, for 24 hours, its owner could not be woken because its wake could not be admitted (for example a paused agent or a blocked budget).";
     const publications: ActivityPublication[] = [];
     const settled = await db.transaction(async tx => {
       await notifyStatusCardIssueChange(tx, row.companyId);
@@ -1406,7 +1408,7 @@ export function createHeartbeatScheduling(
         companyId: row.companyId,
         issueId: row.id,
         body: [
-          `Paperclip ended the external-service monitor for ${label}: its bounds were used up and, for 24 hours, its owner could not be woken because ${why}.`,
+          `Paperclip ended the external-service monitor for ${label}: ${ended}`,
           "",
           `- Recovery policy: ${recoveryPolicy}`,
           "",
@@ -1428,9 +1430,14 @@ export function createHeartbeatScheduling(
   }
 
   async function tickExhaustedIssueMonitors(now: Date, canContinue: () => boolean) {
+    // Tasks tried in the last 15 minutes are left out in SQL, so more than 50
+    // held wakes cannot starve the newer ones.
+    const recentlyTried = [...exhaustedMonitorAttemptAt]
+      .filter(([, at]) => now.getTime() - at < EXHAUSTED_MONITOR_RETRY_MS).map(([id]) => id);
     const rows = await db.select(issueMonitorDispatchColumns).from(issues)
       .innerJoin(companies, eq(companies.id, issues.companyId))
-      .where(and(eq(companies.status, "active"), exhaustedIssueMonitorCondition(now), exhaustedIssueMonitorIdleCondition()))
+      .where(and(eq(companies.status, "active"), exhaustedIssueMonitorCondition(now), exhaustedIssueMonitorIdleCondition(),
+        ...(recentlyTried.length ? [notInArray(issues.id, recentlyTried)] : [])))
       .orderBy(asc(issues.monitorLastTriggeredAt)).limit(50);
     let settled = 0;
     for (const row of rows as IssueMonitorDispatchRow[]) {
