@@ -1124,9 +1124,16 @@ export function createHeartbeatScheduling(
   // that cannot be admitted now (paused agent, blocked budget, execution hold)
   // is tried again on a later tick instead of being lost.
   const EXHAUSTED_MONITOR_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+  // Past 24 h without an admitted wake, the monitor is ended once with a note
+  // that its owner could not be woken; older states (reopened tasks) are left.
+  const EXPIRED_MONITOR_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+  const EXHAUSTED_MONITOR_RETRY_MS = 15 * 60 * 1000;
+  const exhaustedMonitorAttemptAt = new Map<string, number>();
 
-  function exhaustedIssueMonitorCondition(now: Date) {
-    const oldest = new Date(now.getTime() - EXHAUSTED_MONITOR_MAX_AGE_MS).toISOString();
+  function exhaustedIssueMonitorCondition(now: Date, window: "fresh" | "expired" = "fresh") {
+    const freshFrom = new Date(now.getTime() - EXHAUSTED_MONITOR_MAX_AGE_MS).toISOString();
+    const oldest = window === "fresh" ? freshFrom : new Date(now.getTime() - EXPIRED_MONITOR_MAX_AGE_MS).toISOString();
+    const newest = window === "fresh" ? now.toISOString() : freshFrom;
     const timeoutAt = sql`(${issues.executionState} -> 'monitor' ->> 'timeoutAt')::timestamptz`;
     return and(
       sql`${issues.monitorNextCheckAt} is null`,
@@ -1138,17 +1145,19 @@ export function createHeartbeatScheduling(
       sql`(
         (jsonb_typeof(${issues.executionState} -> 'monitor' -> 'maxAttempts') = 'number'
           and ${issues.monitorAttemptCount} >= (${issues.executionState} -> 'monitor' ->> 'maxAttempts')::int
-          and ${issues.monitorLastTriggeredAt} > ${oldest}::timestamptz)
+          and ${issues.monitorLastTriggeredAt} > ${oldest}::timestamptz
+          and ${issues.monitorLastTriggeredAt} <= ${newest}::timestamptz)
         or (jsonb_typeof(${issues.executionState} -> 'monitor' -> 'timeoutAt') = 'string'
-          and ${timeoutAt} <= ${now.toISOString()}::timestamptz and ${timeoutAt} > ${oldest}::timestamptz))`,
-      // The current assignee received the last check of this monitor.
-      sql`exists (select 1 from ${agentWakeupRequests} last_check
+          and ${timeoutAt} <= ${newest}::timestamptz and ${timeoutAt} > ${oldest}::timestamptz))`,
+      // The current assignee received the last check of this monitor: the
+      // latest check wake of the task (inserted during the tick that set
+      // lastTriggeredAt, possibly late in a slow tick) went to that agent.
+      sql`(select last_check.agent_id from ${agentWakeupRequests} last_check
         where last_check.company_id = ${issues.companyId}
-          and last_check.agent_id = ${issues.assigneeAgentId}
           and last_check.payload ->> 'issueId' = ${issues.id}::text
           and last_check.idempotency_key like 'issue-monitor:' || ${issues.id}::text || ':%'
-          and last_check.requested_at between ${issues.monitorLastTriggeredAt} - interval '10 minutes'
-            and ${issues.monitorLastTriggeredAt} + interval '1 minute')`,
+          and last_check.requested_at <= ${issues.monitorLastTriggeredAt} + interval '15 minutes'
+        order by last_check.requested_at desc limit 1) = ${issues.assigneeAgentId}`,
       isNull(issues.assigneeUserId),
       sql`${issues.assigneeAgentId} is not null`,
       inArray(issues.status, ["in_progress", "in_review"]),
@@ -1230,6 +1239,9 @@ export function createHeartbeatScheduling(
       issueId: row.id, monitorAttemptCount: input.attemptCount, monitorNotes: row.monitorNotes ?? null,
       clearReason: input.clearReason, serviceName: input.serviceName, timeoutAt: input.timeoutAt,
       maxAttempts: input.maxAttempts, monitorExhaustedWithoutNextCheck: true,
+      // The run may start before the comment is written: the same instruction travels with the wake.
+      monitorRecoveryInstruction: exhaustedMonitorComment({ issue: row, clearReason: input.clearReason,
+        recoveryPolicy: "wake_owner", attemptCount: input.attemptCount, maxAttempts: input.maxAttempts }),
     };
     const run = await enqueueWakeup(row.assigneeAgentId!, {
       issueStateGuard: { statuses: [row.status], assigneeAgentId: row.assigneeAgentId! },
@@ -1272,16 +1284,24 @@ export function createHeartbeatScheduling(
     const triggeredAtIso = row.monitorLastTriggeredAt.toISOString();
     const key = `issue-monitor-recovery:${row.id}:${clearReason}:${triggeredAtIso}`;
 
+    // A held wake is tried again at most every 15 minutes per task.
+    const lastAttempt = exhaustedMonitorAttemptAt.get(row.id);
+    if (lastAttempt !== undefined && now.getTime() - lastAttempt < EXHAUSTED_MONITOR_RETRY_MS) return false;
+    exhaustedMonitorAttemptAt.set(row.id, now.getTime());
+
     // 1. The follow-up first. Nothing is cleared unless it is admitted.
     let recoveryIssueIdentifier: string | null = null;
     try {
       if (recoveryPolicy === "create_recovery_issue") {
-        await performIssueMonitorRecovery({
-          claimed: row, scheduledAtIso: triggeredAtIso, nextAttemptCount: attemptCount, clearReason, recoveryPolicy,
-          monitor: null, actorType: "system", actorId: "heartbeat_scheduler", agentId: null, runId: null,
-          activitySource: "scheduled",
-        });
-        const recoveryIssue = await findOpenIssueMonitorRecoveryIssue(row);
+        let recoveryIssue = await findOpenIssueMonitorRecoveryIssue(row);
+        if (!recoveryIssue) {
+          await performIssueMonitorRecovery({
+            claimed: row, scheduledAtIso: triggeredAtIso, nextAttemptCount: attemptCount, clearReason, recoveryPolicy,
+            monitor: null, actorType: "system", actorId: "heartbeat_scheduler", agentId: null, runId: null,
+            activitySource: "scheduled",
+          });
+          recoveryIssue = await findOpenIssueMonitorRecoveryIssue(row);
+        }
         if (!recoveryIssue) {
           await deferExhaustedIssueMonitor(row, triggeredAtIso, "monitor_recovery_issue_missing");
           return false;
@@ -1340,6 +1360,70 @@ export function createHeartbeatScheduling(
       return true;
     });
     for (const publication of publications) publishActivity(publication);
+    if (settled) exhaustedMonitorAttemptAt.delete(row.id);
+    return settled;
+  }
+
+  /** Past 24 h without an admitted wake: end the monitor once, saying the owner could not be woken. */
+  async function expireExhaustedIssueMonitor(row: IssueMonitorDispatchRow, now: Date) {
+    const state = parseIssueExecutionState(row.executionState)?.monitor ?? null;
+    if (!state || !row.monitorLastTriggeredAt) return false;
+    const maxAttempts = typeof state.maxAttempts === "number" ? state.maxAttempts : null;
+    const attemptCount = row.monitorAttemptCount ?? state.attemptCount ?? 0;
+    const clearReason: IssueExecutionMonitorClearReason =
+      maxAttempts !== null && attemptCount >= maxAttempts ? "max_attempts_exhausted" : "timeout_exceeded";
+    const recoveryPolicy = state.recoveryPolicy ?? "wake_owner";
+    const triggeredAtIso = row.monitorLastTriggeredAt.toISOString();
+    const [deferred] = await db.select({ details: activityLog.details }).from(activityLog).where(and(
+      eq(activityLog.companyId, row.companyId), eq(activityLog.entityId, row.id), eq(activityLog.action, "issue.monitor_deferred"),
+      sql`${activityLog.details} ->> 'lastTriggeredAt' = ${triggeredAtIso}`)).orderBy(desc(activityLog.createdAt)).limit(1);
+    const reason = typeof (deferred?.details as { reason?: unknown } | undefined)?.reason === "string"
+      ? (deferred!.details as { reason: string }).reason : "task_busy";
+    const why = reason === "task_busy"
+      ? "the task stayed busy (a run, a run lock, a held wake, a recovery action, a question, an approval or a review)"
+      : "its wake could not be admitted (for example a paused agent or a blocked budget)";
+    const publications: ActivityPublication[] = [];
+    const settled = await db.transaction(async tx => {
+      await notifyStatusCardIssueChange(tx, row.companyId);
+      await notifyDeliveryWork(tx, DELIVERY_QUEUES.issueMonitors);
+      await notifyIssueReviewState(tx, { companyId: row.companyId, issueId: row.id });
+      const cleared = buildIssueMonitorClearedPatch({ issue: row, policy: normalizeIssueExecutionPolicy(row.executionPolicy ?? null),
+        clearReason, clearedAt: now });
+      const [updated] = await tx.update(issues).set({
+        executionState: sql`jsonb_set(coalesce(${issues.executionState}, '{}'::jsonb), '{monitor}',
+          ${JSON.stringify(cleared.executionState?.monitor ?? null)}::jsonb)`,
+        updatedAt: now,
+      }).where(and(
+        eq(issues.id, row.id), eq(issues.companyId, row.companyId),
+        eq(issues.monitorLastTriggeredAt, row.monitorLastTriggeredAt!),
+        sql`${issues.monitorNextCheckAt} is null`,
+        sql`(${issues.executionPolicy} -> 'monitor') is null`,
+        sql`${issues.executionState} -> 'monitor' ->> 'status' = 'triggered'`,
+      )).returning({ id: issues.id });
+      if (!updated) return false;
+      const label = formatIssueIdentifierLink(row.identifier, row.id);
+      await insertIssueComment(tx, {
+        companyId: row.companyId,
+        issueId: row.id,
+        body: [
+          `Paperclip ended the external-service monitor for ${label}: its bounds were used up and, for 24 hours, its owner could not be woken because ${why}.`,
+          "",
+          `- Recovery policy: ${recoveryPolicy}`,
+          "",
+          "Next action for the assignee or the Board: read the external service directly, record the result on this task, then continue the work or ask the Board with a question on this task.",
+          "There is no Paperclip support to contact.",
+        ].join("\n"),
+      });
+      await logActivity(tx as unknown as Db, {
+        companyId: row.companyId, actorType: "system", actorId: "heartbeat_scheduler", agentId: null, runId: null,
+        action: "issue.monitor_exhausted", entityType: "issue", entityId: row.id,
+        details: { identifier: row.identifier, lastTriggeredAt: triggeredAtIso, attemptedAttemptCount: attemptCount,
+          maxAttempts, clearReason, recoveryPolicy, wake: "not_admitted", reason, source: "exhausted_without_next_check" },
+      }, publications);
+      return true;
+    });
+    for (const publication of publications) publishActivity(publication);
+    if (settled) exhaustedMonitorAttemptAt.delete(row.id);
     return settled;
   }
 
@@ -1355,6 +1439,19 @@ export function createHeartbeatScheduling(
         if (await settleExhaustedIssueMonitor(row, now)) settled += 1;
       } catch (err) {
         logger.error({ err, issueId: row.id }, "exhausted issue monitor settlement failed");
+      }
+    }
+    // Past 24 h: whatever kept it busy, end it once and say so (no wake).
+    const expired = canContinue() ? await db.select(issueMonitorDispatchColumns).from(issues)
+      .innerJoin(companies, eq(companies.id, issues.companyId))
+      .where(and(eq(companies.status, "active"), exhaustedIssueMonitorCondition(now, "expired")))
+      .orderBy(asc(issues.monitorLastTriggeredAt)).limit(50) : [];
+    for (const row of expired as IssueMonitorDispatchRow[]) {
+      if (!canContinue()) break;
+      try {
+        if (await expireExhaustedIssueMonitor(row, now)) settled += 1;
+      } catch (err) {
+        logger.error({ err, issueId: row.id }, "expired issue monitor settlement failed");
       }
     }
     return settled;
@@ -1386,7 +1483,7 @@ export function createHeartbeatScheduling(
     const now = new Date();
     const [exhausted] = await db.select({ at: sql<string | null>`min(greatest(${issues.monitorLastTriggeredAt}, now())
       + interval '1 minute')` }).from(issues).innerJoin(companies, eq(companies.id, issues.companyId))
-      .where(and(eq(companies.status, "active"), exhaustedIssueMonitorCondition(now)));
+      .where(and(eq(companies.status, "active"), or(exhaustedIssueMonitorCondition(now), exhaustedIssueMonitorCondition(now, "expired"))));
     const [timeout] = await db.select({ at: sql<string | null>`min((${issues.executionState} -> 'monitor' ->> 'timeoutAt')::timestamptz)` })
       .from(issues).innerJoin(companies, eq(companies.id, issues.companyId))
       .where(and(eq(companies.status, "active"), sql`${issues.monitorNextCheckAt} is null`,

@@ -759,7 +759,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
   // STUDIO-0049, production 14 Nov 2026 (TR-915): the last allowed check was
   // triggered, no further check could be scheduled, and the monitor ended
   // without any comment, activity or wake, whatever its recovery policy.
-  async function seedExhaustedWithoutNextCheck(input: { recoveryPolicy: string; timeoutOnly?: boolean; triggeredAt?: Date }) {
+  async function seedExhaustedWithoutNextCheck(input: { recoveryPolicy: string; timeoutOnly?: boolean; triggeredAt?: Date; checkWakeAt?: Date }) {
     const fixture = await seedFixture({
       monitorAttemptCount: 3,
       monitor: { maxAttempts: 3, recoveryPolicy: input.recoveryPolicy, serviceName: "TeamCity Debug",
@@ -780,7 +780,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     // The wake of the last check, as the scheduler records it.
     await db.insert(agentWakeupRequests).values({ companyId: fixture.companyId, agentId: fixture.agentId, source: "automation",
       triggerDetail: "system", reason: "issue_monitor_due", status: "completed", payload: { issueId: fixture.issueId },
-      idempotencyKey: `issue-monitor:${fixture.issueId}:${triggeredAt.toISOString()}`, requestedAt: triggeredAt } as never);
+      idempotencyKey: `issue-monitor:${fixture.issueId}:${triggeredAt.toISOString()}`, requestedAt: input.checkWakeAt ?? triggeredAt } as never);
     return { ...fixture, triggeredAt };
   }
 
@@ -814,6 +814,8 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       expect(wakes[0]!.runId).not.toBeNull();
       expect(wakes[0]!.payload).toMatchObject({ issueId, clearReason: "max_attempts_exhausted", maxAttempts: 3,
         monitorExhaustedWithoutNextCheck: true });
+      expect(String((wakes[0]!.payload as { monitorRecoveryInstruction?: string }).monitorRecoveryInstruction))
+        .toContain("There is no Paperclip support to contact");
       const activity = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId)).then(rows => rows.map(row => row.action));
       expect(activity).toContain("issue.monitor_exhausted");
       expect(activity).toContain("issue.monitor_recovery_wake_queued");
@@ -838,7 +840,9 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
       .then(rows => rows.filter(row => row.action === "issue.monitor_deferred"));
     expect(deferred).toHaveLength(1);
     await db.update(agents).set({ status: "active" }).where(eq(agents.id, agentId));
-    expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:33:00.000Z"))).toMatchObject({ exhausted: 1 });
+    // Retries are spaced 15 minutes apart per task.
+    expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:40:00.000Z"))).toMatchObject({ exhausted: 0 });
+    expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:47:00.000Z"))).toMatchObject({ exhausted: 1 });
     expect((await recoveryWakes(agentId)).filter(row => row.runId)).toHaveLength(1);
     expect(await monitorComments(issueId)).toHaveLength(1);
   });
@@ -884,7 +888,7 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
 
   it.each(["reassigned", "old"] as const)("does not wake anyone for a %s exhausted monitor", async (kind) => {
     const { issueId, agentId, companyId } = await seedExhaustedWithoutNextCheck({ recoveryPolicy: "escalate_to_board",
-      ...(kind === "old" ? { triggeredAt: new Date("2026-04-10T06:00:00.000Z") } : {}) });
+      ...(kind === "old" ? { triggeredAt: new Date("2026-04-01T06:00:00.000Z") } : {}) });
     if (kind === "reassigned") {
       const otherAgentId = randomUUID();
       await db.insert(agents).values({ id: otherAgentId, companyId, name: "Other", role: "engineer", status: "active",
@@ -899,6 +903,42 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     }
     expect(await recoveryWakes(agentId)).toHaveLength(0);
     expect(await monitorStatus(issueId)).toMatchObject({ status: "triggered" });
+  });
+
+  it.each(["task busy", "wake not admitted"] as const)(
+    "ends a monitor still unsettled after 24 h once, saying its owner could not be woken (%s)", async (kind) => {
+      const triggeredAt = new Date("2026-04-10T11:00:00.000Z");
+      const { issueId, agentId, companyId } = await seedExhaustedWithoutNextCheck({ recoveryPolicy: "escalate_to_board", triggeredAt });
+      const heartbeat = heartbeatService(db);
+      if (kind === "task busy") {
+        await db.insert(heartbeatRuns).values({ companyId, agentId, invocationSource: "automation", status: "scheduled_retry",
+          scheduledRetryAt: new Date(Date.now() + 3_600_000), issueId } as never);
+      } else {
+        await db.update(agents).set({ status: "paused" }).where(eq(agents.id, agentId));
+        expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T10:00:00.000Z"))).toMatchObject({ exhausted: 0 });
+      }
+      expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T12:31:00.000Z"))).toMatchObject({ exhausted: 1 });
+      expect(await monitorStatus(issueId)).toMatchObject({ status: "cleared", clearReason: "max_attempts_exhausted" });
+      const comments = (await db.select().from(issueComments).where(eq(issueComments.issueId, issueId)))
+        .filter(row => row.body.includes("its owner could not be woken"));
+      expect(comments).toHaveLength(1);
+      expect(comments[0]!.body).toContain(kind === "task busy" ? "the task stayed busy" : "its wake could not be admitted");
+      const exhausted = await db.select().from(activityLog).where(eq(activityLog.entityId, issueId))
+        .then(rows => rows.filter(row => row.action === "issue.monitor_exhausted"));
+      expect(exhausted).toHaveLength(1);
+      expect(exhausted[0]!.details).toMatchObject({ wake: "not_admitted",
+        reason: kind === "task busy" ? "task_busy" : "monitor_recovery_failed" });
+      expect((await recoveryWakes(agentId)).filter(row => row.runId)).toHaveLength(0);
+      // Once: the next tick leaves it alone.
+      expect(await heartbeat.tickIssueMonitors(new Date("2026-04-11T13:31:00.000Z"))).toMatchObject({ exhausted: 0 });
+    });
+
+  it("keeps the assignee link when the last check wake was written late in a slow tick", async () => {
+    const triggeredAt = new Date("2026-04-11T12:10:00.000Z");
+    const { agentId } = await seedExhaustedWithoutNextCheck({ recoveryPolicy: "wake_owner", triggeredAt,
+      checkWakeAt: new Date(triggeredAt.getTime() + 5 * 60_000) });
+    expect(await heartbeatService(db).tickIssueMonitors(new Date("2026-04-11T12:31:00.000Z"))).toMatchObject({ exhausted: 1 });
+    expect(await recoveryWakes(agentId)).toHaveLength(1);
   });
 
   it("plans a deadline at the timeout of a triggered monitor with no next check", async () => {
@@ -927,15 +967,10 @@ describeEmbeddedPostgres("issue monitor scheduler", () => {
     // The same missing disposition also opens a recovery action and may leave a
     // held wake or a run lock; each correctly keeps the catch-up away, so the
     // fixture removes them to reach the state TR-915 was in.
-    const blockedByFixture = {
-      recoveryActions: (await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId)))
-        .filter(row => ["active", "escalated"].includes(row.status)).length,
-    };
     await db.update(issueRecoveryActions).set({ status: "cancelled", resolvedAt: new Date() }).where(eq(issueRecoveryActions.sourceIssueId, issueId));
     await db.execute(sql`update agent_wakeup_requests set status = 'cancelled' where payload ->> 'issueId' = ${issueId} and status = 'deferred_issue_execution'`);
     await db.update(issues).set({ status: "in_progress", executionRunId: null, checkoutRunId: null }).where(eq(issues.id, issueId));
     expect(await heartbeat.tickIssueMonitors(new Date())).toMatchObject({ exhausted: 1 });
-    void blockedByFixture;
     expect(await recoveryWakes(agentId)).toHaveLength(1);
   });
 
