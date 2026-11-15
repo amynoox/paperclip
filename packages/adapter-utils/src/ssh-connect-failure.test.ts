@@ -26,6 +26,12 @@ describe("sshConnectFailureCode", () => {
     expect(sshConnectFailureCode(failure(stderr))).toBeNull();
   });
 
+  it("never maps a failure after the remote command printed something", () => {
+    const ran = Object.assign(failure("ssh: connect to host h port 22: Connection timed out"), { stdout: "/Users/codex/paperclip-workspace\n" });
+    expect(sshConnectFailureCode(ran)).toBeNull();
+    expect(sshConnectFailureCode(Object.assign(failure("ssh: connect to host h port 22: Connection timed out"), { stdout: "" }))).toBe("ETIMEDOUT");
+  });
+
   it("needs ssh's own exit code 255", () => {
     expect(sshConnectFailureCode(failure("ssh: connect to host h port 22: Connection timed out", 1))).toBeNull();
     expect(sshConnectFailureCode(failure("ssh: connect to host h port 22: Connection timed out", "ETIMEDOUT"))).toBeNull();

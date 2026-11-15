@@ -1168,8 +1168,10 @@ const SSH_CONNECT_FAILURES: Array<[RegExp, "ETIMEDOUT" | "ECONNREFUSED" | "ENETU
 
 /** The network code an `ssh` exit 255 stands for, when its stderr says the connection never happened. */
 export function sshConnectFailureCode(error: unknown): "ETIMEDOUT" | "ECONNREFUSED" | "ENETUNREACH" | null {
-  const failure = error as { code?: unknown; stderr?: unknown } | null;
+  const failure = error as { code?: unknown; stdout?: unknown; stderr?: unknown } | null;
   if (!failure || failure.code !== 255 || typeof failure.stderr !== "string") return null;
+  // Nothing may have run remotely: a remote command that printed anything is never retried.
+  if (typeof failure.stdout === "string" && failure.stdout !== "") return null;
   for (const [pattern, code] of SSH_CONNECT_FAILURES) if (pattern.test(failure.stderr)) return code;
   return null;
 }
@@ -1234,16 +1236,20 @@ export async function runSshCommand(
       `sh -c ${shellQuote(remoteScript)}`,
     );
 
+    // STUDIO-0052: ssh's own diagnostics in English, so the connection patterns hold whatever the server locale.
+    const env = { ...process.env, LC_ALL: "C" };
     try {
       return options.stdin != null
         ? await spawnText("ssh", sshArgs, {
             stdin: options.stdin,
             timeout: options.timeoutMs ?? 15_000,
             maxBuffer: options.maxBuffer ?? 1024 * 128,
+            env,
           })
         : await execFileText("ssh", sshArgs, {
             timeout: options.timeoutMs ?? 15_000,
             maxBuffer: options.maxBuffer ?? 1024 * 128,
+            env,
           });
     } catch (error) {
       throw withSshConnectFailureCause(error);
