@@ -18,6 +18,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import {
   createPluginSecretsHandler,
   extractSecretRefBindingsFromConfig,
+  SECRET_RESOLUTION_RATE_LIMITED,
 } from "../services/plugin-secrets-handler.js";
 import { secretService } from "../services/secrets.js";
 
@@ -70,6 +71,20 @@ describe("createPluginSecretsHandler fail-closed guards", () => {
       handler.resolve({ companyId: randomUUID(), secretRef: randomUUID() }),
     ).rejects.toThrow(/use \{ type: "secret_ref"/i);
     expect(db.select).not.toHaveBeenCalled();
+  });
+
+  // STUDIO-0058: the refusal keeps its sentence and carries a stable code for the plugin.
+  it("marks a resolution refused by the rate limit with a stable code", async () => {
+    const db = { select: vi.fn(() => { throw new Error("binding lookup"); }) };
+    const handler = createPluginSecretsHandler({ db: db as never, pluginId });
+    const companyId = randomUUID();
+    const call = () => handler.resolve({ companyId, secretRef: { type: "secret_ref", secretId: randomUUID() } });
+    for (let attempt = 0; attempt < 30; attempt++) await expect(call()).rejects.toThrow("binding lookup");
+    await expect(call()).rejects.toMatchObject({
+      name: "RateLimitExceededError",
+      message: "Rate limit exceeded for secret resolution",
+      rpcErrorData: { code: SECRET_RESOLUTION_RATE_LIMITED },
+    });
   });
 });
 

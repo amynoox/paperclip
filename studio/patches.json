@@ -1440,6 +1440,34 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: question prompt and help text rendered by MarkdownBody; answered question keeps its question set description. Why: owner's request after TR-723 (15 Nov 2026) and bench lot 20. Origin: studio fork only; to re-apply, wrap question.prompt and question.helpText in MarkdownBody in IssueThreadInteractionCard.tsx (pending and answered), QuestionForm.tsx (form and answered summary) and TaskChatCompactInteractionCard.tsx (ReceiptDisclosure, and the coordinator timeline receipt branch with its 'Question context' disclosure); run the STUDIO-0054 cases of IssueThreadInteractionCard.test.tsx and CoordinatorTaskCommitment.test.tsx."
+    },
+    {
+      "id": "STUDIO-0058",
+      "title": "A secret resolution refused by the rate limit carries a stable code for the plugin",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "A plugin whose secrets.resolve call is refused by the host's rate limit (30 per minute per company and plugin) only gets the sentence 'Rate limit exceeded for secret resolution' with the generic JSON-RPC internal error code; the Worker Router recognises it by comparing that sentence (router review, lot 21).",
+      "reason": "Requested by the router's review through the studio setup session (single window of 15 Nov 2026).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "plugin host: secret resolution and worker host-call errors",
+      "paths": [
+        "server/src/services/plugin-secrets-handler.ts",
+        "server/src/services/plugin-worker-manager.ts",
+        "server/src/__tests__/plugin-secrets-handler.test.ts",
+        "server/src/__tests__/plugin-worker-manager.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-15",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: upstream sends host handler errors to the worker with a code and a message only.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. plugin-secrets-handler.test.ts: after 30 refused lookups, the 31st call is refused by the rate limit with the same name and sentence and rpcErrorData { code: 'secret_resolution_rate_limited' }. plugin-worker-manager.test.ts: a host handler error carrying rpcErrorData reaches the worker as JSON-RPC error data unchanged (through a real worker process). With studio-plugin-own-db-channel and tool-gateway: 229 passed. Typecheck of the whole server project in the test tree: 310 errors, the same as the base, none in a changed file.",
+      "migration": "None. The refusal keeps its name and sentence (a router matching the sentence keeps working) and now carries error data { code: 'secret_resolution_rate_limited' }, read on the plugin side as JsonRpcCallError.data.code. The worker manager passes error data only when a host handler attached rpcErrorData (an object); every other host error is sent as before (code and message, no data).",
+      "rollback": "Switch cli/current back to the previous install folder; the router falls back to the sentence.",
+      "retireWhen": "Upstream gives host-call refusals stable codes.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: rpcErrorData { code: 'secret_resolution_rate_limited' } on the rate-limit refusal, passed to the worker as JSON-RPC error data. Why: the router recognised the refusal by its sentence. Origin: studio fork only; to re-apply, keep SECRET_RESOLUTION_RATE_LIMITED and the Object.assign in plugin-secrets-handler.ts and errorDataForWorkerHostError in plugin-worker-manager.ts; run the two STUDIO-0058 cases."
     }
   ]
 }
