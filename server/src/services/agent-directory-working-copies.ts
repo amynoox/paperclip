@@ -287,7 +287,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       throw error;
     } finally { await projection?.cleanupWorkspaceSnapshot?.(); }
   }
-  async function retrieve(row: Copy, target?: AdapterExecutionTarget | null) {
+  async function retrieve(row: Copy, target?: AdapterExecutionTarget | null, beforeInspect?: () => Promise<void>) {
     if (row.location !== "local") {
       let runtime = transports.get(key(row));
       if (!runtime) {
@@ -297,8 +297,13 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       }
       await runtime.restoreWorkspace();
     }
+    await beforeInspect?.();
     return inspectAgentDirectory(row.localRoot);
   }
+  /** STUDIO-0055: put the published entry back in the run's own copy before it is scanned (see the file store). */
+  const setOwnEntryAside = (row: Copy) =>
+    store.setOwnEntryAside({ companyId: row.companyId, agentId: row.agentId, dir: row.localRoot, baseline: baseline(row) }, actor(row));
+  const discardMark = (error: unknown) => Boolean(error && typeof error === "object" && (error as { entryEditDiscarded?: unknown }).entryEditDiscarded === true);
   async function hasChanges(row: Copy, target?: AdapterExecutionTarget | null) {
     try {
       if (row.receipt?.retainedByRunId || row.receipt?.retirementRequired || typeof row.receipt?.materializationIdentity !== "string") return true;
@@ -411,27 +416,36 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
         nextAttemptAt: stopped ? new Date(Date.now() + 30_000) : null });
     }
     let failure: unknown;
+    // STUDIO-0055: kept across attempts, so a retry after the entry was put back still records it.
+    let discarded = false;
     for (let attempt = 0; attempt < 3; attempt++) {
       let captured: Awaited<ReturnType<typeof captureAgentFileCheckpoint>> | undefined;
       try {
+        // A local warm copy is the live directory: put the published entry back before the capture, so the
+        // saved baseline matches the canonical files and the warm copy stays reusable.
+        if (row.location === "local" && await setOwnEntryAside(row)) discarded = true;
         const previous = row.receipt?.checkpointManifest as AgentFileManifest | undefined ?? checkpointBaseline(baseline(row));
         captured = await captureAgentFileCheckpoint({ runId: row.runId, localRoot: row.localRoot, executionRoot: row.executionRoot, previous, target });
         const snapshot = checkpointSnapshot(captured.manifest);
         const nextHash = directorySnapshotSha256(snapshot);
         const changed = nextHash !== row.baseHash;
-        const { storageWarning } = changed
+        const { storageWarning, entryEditDiscarded: discardedNow } = changed
           ? await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: path.join(captured.directory, "files"), baseline: baseline(row), checkpoint: captured.manifest }, actor(row))
           : await store.locked(row.companyId, row.agentId, actor(row), true, async () => ({
             storageWarning: typeof row.receipt?.storageWarning === "string" ? row.receipt.storageWarning : null,
+            entryEditDiscarded: false,
           }));
         row = await patch(row, { state: stopped ? (changed ? "saved" : "unchanged") : "warm_saved", baseHash: nextHash,
           candidateHash: nextHash, errorCode: null, errorMessage: null, attempts: 0, nextAttemptAt: null,
           ...(stopped ? { processStoppedAt: new Date() } : {}),
           receipt: { ...row.receipt, baseline: serializeDirectorySnapshot(snapshot), checkpointManifest: captured.manifest,
-            checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning } });
+            checkpointState: changed ? "saved" : "unchanged", checkpointStats: captured.stats, storageWarning,
+            // STUDIO-0055: the run's edit of its own entry file was set aside; the rest was saved.
+            ...(discarded || discardedNow ? { entryEditDiscarded: true } : {}) } });
         return row;
       } catch (error) {
         failure = error;
+        if (discardMark(error)) discarded = true;
         logger.warn({ err: error, runId: row.runId, attempt: attempt + 1, stopped }, "Agent file checkpoint failed");
         if (error instanceof HttpError && error.status < 500) break;
       }
@@ -440,6 +454,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       }
     }
     const rejection = failure instanceof HttpError && failure.status === 403 ? failure.message : null;
+    if (discarded) row = await patch(row, { receipt: { ...row.receipt, entryEditDiscarded: true } });
     if (!stopped) return patch(row, { errorCode: "AGENT_FILES_CHECKPOINT_UNSTABLE",
       errorMessage: rejection ? `Agent-file save rejected: ${rejection} Changes were not saved.` : "Incremental checkpoint could not be validated; collecting after provider stop.", nextAttemptAt: null });
     const storageLimit = failure instanceof AgentFileLimitError || String(failure).includes("LIMIT_EXCEEDED");
@@ -468,26 +483,33 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
     // The stopped working copy is the only temporary tree. Retry transient I/O
     // at this boundary, then clean it up; there are no preserved run snapshots.
     let inspected: Awaited<ReturnType<typeof retrieve>> | undefined;
+    // STUDIO-0055: kept across attempts (the entry is put back once, before the scan).
+    let discarded = false;
     for (;;) {
       row = await patch(row, { attempts: row.attempts + 1 });
       try {
-        inspected ??= await retrieve(row, target);
+        inspected ??= await retrieve(row, target, async () => { if (await setOwnEntryAside(row)) discarded = true; });
         const { snapshot } = inspected;
         const candidateHash = directorySnapshotSha256(snapshot);
         let storageWarning = inspected.storageWarning;
+        let entryEditDiscarded = false;
         if (candidateHash === row.baseHash) {
           row = await patch(row, { state: "unchanged", errorCode: null, errorMessage: null, nextAttemptAt: null });
         } else {
-          ({ storageWarning } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
+          ({ storageWarning, entryEditDiscarded } = await store.apply({ companyId: row.companyId, agentId: row.agentId, sourceDir: row.localRoot, baseline: baseline(row) }, actor(row)));
+          if (entryEditDiscarded) discarded = true;
           row = await patch(row, { state: "saved", candidateHash, errorCode: null, errorMessage: null, nextAttemptAt: null });
         }
-        row = await patch(row, { receipt: { ...row.receipt, storageWarning } });
+        // STUDIO-0055: the run's edit of its own entry file was set aside; the rest was saved.
+        row = await patch(row, { receipt: { ...row.receipt, storageWarning, ...(discarded ? { entryEditDiscarded: true } : {}) } });
         break;
       } catch (error) {
+        if (discardMark(error)) discarded = true;
         const retryable = !(error instanceof HttpError) || error.status >= 500;
         if (retryable && row.attempts < 3) continue;
         row = await patch(row, { state: "unavailable", nextAttemptAt: null,
-          receipt: { ...row.receipt, storageWarning: error instanceof AgentFileLimitError ? agentStorageWarning(error.message) : row.receipt?.storageWarning ?? null },
+          receipt: { ...row.receipt, storageWarning: error instanceof AgentFileLimitError ? agentStorageWarning(error.message) : row.receipt?.storageWarning ?? null,
+            ...(discarded ? { entryEditDiscarded: true } : {}) },
           errorCode: error instanceof AgentFileLimitError ? "AGENT_FILES_LIMIT_EXCEEDED" : "AGENT_FILES_SAVE_FAILED",
           errorMessage: error instanceof HttpError && (error.status === 403 || error.status === 422)
             ? `${error.message}. This run's agent-folder changes were not saved; the temporary copy is discarded.`
@@ -555,6 +577,7 @@ export function agentDirectoryWorkingCopyService(db: Db, get: (companyId: string
       await patch(row, { receipt: { schema: AGENT_FILES_CONTRACT, state: row.state, appliedCandidateHash: row.candidateHash, storageWarning: row.receipt?.storageWarning ?? null, cleanupPending,
         materializationRunId: row.receipt?.materializationRunId ?? row.runId,
         ...(row.receipt?.directoryRunId ? { directoryRunId: row.receipt.directoryRunId } : {}),
+        ...(row.receipt?.entryEditDiscarded ? { entryEditDiscarded: true } : {}),
         ...(cleanupPending ? { cleanup: row.receipt?.cleanup, ...(destroyedOnly ? { cleanupDestroyedOnly: true } : {}) } : {}) },
         nextAttemptAt: cleanupPending ? new Date(Date.now() + 30_000) : null });
     }

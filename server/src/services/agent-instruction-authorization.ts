@@ -159,6 +159,17 @@ export async function authorizeInstructionRead(
   return bound;
 }
 
+/**
+ * STUDIO-0055: an agent never rewrites its own entry file (AGENTS.md): the Board publishes it. The rest of the
+ * agent's folder (notes, evidence, memory files) stays the agent's own. Peers and the Board are not concerned here.
+ */
+export function assertNotOwnEntryEdit(bound: AuthorizationActor, targetAgentId: string) {
+  if (bound.type === "agent" && bound.agentId === targetAgentId) {
+    throw forbidden("An agent cannot rewrite its own entry instructions (AGENTS.md); the Board publishes them. Write notes and evidence in other files of the agent folder.",
+      { code: "AGENT_ENTRY_SELF_EDIT_REFUSED" });
+  }
+}
+
 /** Current target edit access + agent containment + protected-change consent, shared by all writers. */
 export async function authorizeInstructionCommit(
   db: Connection,

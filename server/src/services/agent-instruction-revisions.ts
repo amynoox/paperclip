@@ -37,6 +37,7 @@ import {
   materializeInstructionBytes,
 } from "./agent-instruction-files.js";
 import {
+  assertNotOwnEntryEdit,
   authorizeInstructionCommit,
   authorizeInstructionRead,
 } from "./agent-instruction-authorization.js";
@@ -237,6 +238,7 @@ export function agentInstructionRevisionService(db: Db) {
       const bound = actor.type === "plugin"
         ? await authorizePluginReset(tx, actor, input, state.agent)
         : await authorizeInstructionCommit(tx, actor, state.agent);
+      if (bound.type !== "plugin") assertNotOwnEntryEdit(bound, state.agent.id);
       if (bound.type === "plugin") {
         if (input.entryFile !== bound.declaredEntryFile) throw forbidden("Plugin reset must restore its declared entry file");
         if (configuredEntryFile !== state.entryFile) throw conflict("Configured instruction entry changed; read the current entry and retry", { code: "INSTRUCTION_ENTRY_CHANGED", entryFile: state.entryFile });

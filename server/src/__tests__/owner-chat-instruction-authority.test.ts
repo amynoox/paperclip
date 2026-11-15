@@ -88,15 +88,17 @@ describe("owner-chat instruction authority", () => {
     expect(await fs.readFile(path.join(f.root, "AGENTS.md"), "utf8")).toBe(initial);
   };
 
-  it("persists the requested self-edit without relaxing the agent's trust or configuration permissions", async () => {
+  // STUDIO-0055 (deliberate change from upstream): even when the owner asks in the chat, the agent never rewrites
+  // its own AGENTS.md; the Board publishes it. The owner-chat authority still governs the agent's other files.
+  it("refuses the requested self-edit of AGENTS.md without relaxing the agent's trust or configuration permissions", async () => {
     const f = await seed();
     const service = agentInstructionRevisionService(db);
     const target = { companyId: f.companyId, agentId: f.agentId };
     const before = (await service.readCurrent(target, f.actor))!;
-    const saved = await service.commit({ ...target, entryFile: "AGENTS.md", baseRevisionId: before.revision.id,
-      content: "# Ralph\nFollow the owner's project conventions.\n", source: "api" }, f.actor);
-    expect(saved.changed).toBe(true);
-    expect(await fs.readFile(path.join(f.root, "AGENTS.md"), "utf8")).toBe(saved.content);
+    await expect(service.commit({ ...target, entryFile: "AGENTS.md", baseRevisionId: before.revision.id,
+      content: "# Ralph\nFollow the owner's project conventions.\n", source: "api" }, f.actor))
+      .rejects.toMatchObject({ status: 403, details: { code: "AGENT_ENTRY_SELF_EDIT_REFUSED" } });
+    expect(await fs.readFile(path.join(f.root, "AGENTS.md"), "utf8")).toBe(initial);
     const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
     expect(agent.permissions).toEqual(f.permissions);
     const actor = await resolveInstructionActor(db, f.actor);
@@ -106,38 +108,44 @@ describe("owner-chat instruction authority", () => {
     }
   });
 
-  it.each(["running", "succeeded", "failed", "timed_out"])("collects authorized private edits from a %s owner-chat run", async (status) => {
+  it.each(["running", "succeeded", "failed", "timed_out"])("keeps a legacy copy edit of AGENTS.md as a refused candidate from a %s owner-chat run", async (status) => {
     const f = await seed();
     const copies = agentInstructionWorkingCopyService(db);
     const copy = (await copies.prepare({ companyId: f.companyId, agentId: f.agentId, runId: f.run.id, cwd: home, legacy: true }))!;
     await fs.writeFile(path.join(copy.localRoot, copy.entryFile), "The owner's requested edit");
     await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, f.run.id));
-    expect((await copies.collectStopped({ companyId: f.companyId, runId: f.run.id }))?.state).toBe("saved");
-    expect(await fs.readFile(path.join(f.root, "AGENTS.md"), "utf8")).toBe("The owner's requested edit");
+    expect(await copies.collectStopped({ companyId: f.companyId, runId: f.run.id })).toMatchObject({
+      state: "conflict", errorCode: "AGENT_ENTRY_SELF_EDIT_REFUSED", candidateBase64: expect.any(String) });
+    expect(await fs.readFile(path.join(f.root, "AGENTS.md"), "utf8")).toBe(initial);
   });
 
-  it.each([false, true])("saves the current agent directory in owner chat (warm: %s)", async (warm) => {
+  it.each([false, true])("saves the agent directory in owner chat and sets its AGENTS.md edit aside (warm: %s)", async (warm) => {
     const f = await seed();
     const copies = agentInstructionWorkingCopyService(db);
     const copy = (await copies.prepare({ companyId: f.companyId, agentId: f.agentId, runId: f.run.id, cwd: home, warm }))!;
     await fs.writeFile(path.join(copy.localRoot, copy.entryFile), "Requested through owner chat");
-    expect((await copies.collectStopped({ companyId: f.companyId, runId: f.run.id }))?.state).toBe("saved");
-    expect(await fs.readFile(path.join(f.root, "AGENTS.md"), "utf8")).toBe("Requested through owner chat");
+    await fs.writeFile(path.join(copy.localRoot, "conventions.md"), "Project conventions noted in owner chat");
+    expect(await copies.collectStopped({ companyId: f.companyId, runId: f.run.id })).toMatchObject({
+      state: "saved", receipt: { entryEditDiscarded: true } });
+    expect(await fs.readFile(path.join(f.root, "conventions.md"), "utf8")).toBe("Project conventions noted in owner chat");
+    expect(await fs.readFile(path.join(f.root, "AGENTS.md"), "utf8")).toBe(initial);
   });
 
   it.each([false, true])("surfaces the actual rejection when directory collection loses chat authority (warm: %s)", async (warm) => {
     const f = await seed();
     const copies = agentInstructionWorkingCopyService(db);
     const copy = (await copies.prepare({ companyId: f.companyId, agentId: f.agentId, runId: f.run.id, cwd: home, warm }))!;
-    await fs.writeFile(path.join(copy.localRoot, copy.entryFile), "Must not be saved");
+    // STUDIO-0055: the AGENTS.md edit is set aside before the save, so the rejection is shown on another file.
+    await fs.writeFile(path.join(copy.localRoot, "notes.md"), "Must not be saved");
     await db.update(agentWakeupRequests).set({ requestedByActorType: "agent", requestedByActorId: f.agentId }).where(eq(agentWakeupRequests.id, f.wake.id));
     if (warm) {
       expect((await copies.checkpointWarm({ companyId: f.companyId, runId: f.run.id }))?.errorMessage)
-        .toContain("Self-edits require a direct message");
+        .toContain("requires a direct message in the authorized user's chat");
     }
     expect(await copies.collectStopped({ companyId: f.companyId, runId: f.run.id })).toMatchObject({
-      state: "unavailable", errorMessage: expect.stringContaining("Self-edits require a direct message"),
+      state: "unavailable", errorMessage: expect.stringContaining("requires a direct message in the authorized user's chat"),
     });
+    await expect(fs.stat(path.join(f.root, "notes.md"))).rejects.toMatchObject({ code: "ENOENT" });
     expect(await fs.readFile(path.join(f.root, "AGENTS.md"), "utf8")).toBe(initial);
   });
 

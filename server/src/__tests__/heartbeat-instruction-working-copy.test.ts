@@ -34,7 +34,7 @@ if (!support.supported) console.warn(`Skipping heartbeat instruction copies test
 
 describePostgres("heartbeat instruction working-copy lifecycle", () => {
   const adapterType = "instruction_working_copy_test";
-  const entryFile = "policy/INSTRUCTIONS.txt";
+  const entryFile = "policy/INSTRUCTIONS.txt", noteFile = "notes.md";
   const initial = "\uFEFF# Original\r\n☃\n", edited = "\uFEFF# Saved\r\nKeep across runs. ☃\n";
   const previousHome = process.env.PAPERCLIP_HOME;
   let home: string;
@@ -55,7 +55,11 @@ describePostgres("heartbeat instruction working-copy lifecycle", () => {
       execute: async input => {
         const instructionPath = typeof input.config.instructionsFilePath === "string" ? input.config.instructionsFilePath : null;
         captured.set(input.runId, { instructionPath, before: instructionPath ? await fs.readFile(instructionPath, "utf8") : null, context: structuredClone(input.context) });
-        if (instructionPath) await fs.writeFile(instructionPath, edited);
+        if (instructionPath) {
+          // STUDIO-0055: the run edits its own entry (set aside) and writes a note in its folder (saved).
+          await fs.writeFile(instructionPath, edited);
+          await fs.writeFile(path.join(instructionPath.slice(0, -entryFile.length), noteFile), edited);
+        }
         await db.update(issues).set({ status: "in_review" }).where(eq(issues.id, String(input.context.issueId)));
         await input.onProviderStopped?.();
         if (failures.has(input.agent.id)) throw new Error("Invalid fixture adapter configuration");
@@ -115,11 +119,13 @@ describePostgres("heartbeat instruction working-copy lifecycle", () => {
     expect(first.input.context.paperclipTaskMarkdown).toContain("Your persistent agent directory is");
     expect(first.finished.resultJson?.instructionSave).toMatchObject({ state: "saved", contract: "agent_files", entryFile });
     expect(first.events.some(event => event.eventType === "instruction_save" && event.payload?.state === "saved")).toBe(true);
-    expect(await fs.readFile(path.join(f.root, entryFile), "utf8")).toBe(edited);
+    // STUDIO-0055 (deliberate change from upstream): the note is saved; the run's edit of its own entry is set aside.
+    expect(await fs.readFile(path.join(f.root, noteFile), "utf8")).toBe(edited);
+    expect(await fs.readFile(path.join(f.root, entryFile), "utf8")).toBe(initial);
     await expect(fs.stat(first.input.instructionPath!)).rejects.toMatchObject({ code: "ENOENT" });
     const second = await execute(f);
     expect(second.finished.status, second.finished.error ?? undefined).toBe("succeeded");
-    expect(second.input.before).toBe(edited);
+    expect(second.input.before).toBe(initial);
     expect(second.finished.resultJson?.instructionSave).toMatchObject({ state: "unchanged" });
   });
 
@@ -141,7 +147,8 @@ describePostgres("heartbeat instruction working-copy lifecycle", () => {
     const { finished, events } = await execute(f);
     expect(finished.status, finished.error ?? undefined).toBe("succeeded");
     expect(finished.resultJson?.instructionSave).toMatchObject({ state: "saved" });
-    expect(await fs.readFile(path.join(f.root, entryFile), "utf8")).toBe(edited);
+    expect(await fs.readFile(path.join(f.root, noteFile), "utf8")).toBe(edited);
+    expect(await fs.readFile(path.join(f.root, entryFile), "utf8")).toBe(initial);
     expect(cleanup.attempts.get(finished.id)).toBe(1);
     expect(events.filter(event => event.eventType === "instruction_cleanup")).toEqual([expect.objectContaining({ level: "warn", payload: { state: "deferred" } })]);
   });
@@ -153,7 +160,8 @@ describePostgres("heartbeat instruction working-copy lifecycle", () => {
     expect(finished.status).toBe("failed");
     expect(finished.error).toContain("Invalid fixture adapter configuration");
     expect(events.some(event => event.eventType === "instruction_save" && event.payload?.state === "saved")).toBe(true);
-    expect(await fs.readFile(path.join(f.root, entryFile), "utf8")).toBe(edited);
+    expect(await fs.readFile(path.join(f.root, noteFile), "utf8")).toBe(edited);
+    expect(await fs.readFile(path.join(f.root, entryFile), "utf8")).toBe(initial);
     await expect(fs.stat(input.instructionPath!)).rejects.toMatchObject({ code: "ENOENT" });
   });
 });

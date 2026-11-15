@@ -2,8 +2,9 @@ import { sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 
 /**
- * A direct owner-chat turn may edit its own instructions, subject to the normal
- * instruction permissions. Inherited responsible-user identity is not consent.
+ * A direct owner-chat turn may write its own agent-folder files, subject to the normal
+ * instruction permissions; never its own entry file (STUDIO-0055: the Board publishes it).
+ * Inherited responsible-user identity is not consent.
  * Keep this authority out of trust policies and task inheritance entirely.
  */
 export async function hasOwnerChatInstructionAuthority(

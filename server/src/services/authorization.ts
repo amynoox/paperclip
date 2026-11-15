@@ -1337,7 +1337,7 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
         return null;
       }
       return lowTrustDeny(
-        "This low-trust run cannot change persistent agent instructions, including AGENTS.md. Self-edits require a direct message in the authorized user's chat with this agent. Outside-triggered work and subtasks do not inherit that authority; ask the authorized user to request the edit in their chat or apply it directly.",
+        "This low-trust run cannot change persistent agent files. Writing the files of your own agent folder requires a direct message in the authorized user's chat with this agent; your AGENTS.md is published by the Board and never changed by you. Outside-triggered work and subtasks do not inherit that authority; ask the authorized user to request the change in their chat or apply it directly.",
       );
     }
 
