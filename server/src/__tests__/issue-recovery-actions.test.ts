@@ -2397,6 +2397,41 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       expect(recorded!.evidence).toHaveProperty("awaitingResponseWithdrawnAt");
     });
 
+  it("delivers one continuation when an answer came but no run followed it within fifteen minutes (lost wake)", async () => {
+    const { companyId, coderId, sourceIssueId, action, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
+    await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    // Reconciled thirty minutes ago; answered twenty minutes ago; its wake was lost (no row, no run).
+    await db.execute(sql`update issue_recovery_actions set evidence = jsonb_set(evidence, '{executionReconciliation,recordedAt}',
+      to_jsonb((now() - interval '30 minutes')::text)) where id = ${action.id}`);
+    const answeredAt = new Date(Date.now() - 20 * 60_000);
+    await db.update(issueThreadInteractions).set({ status: "answered", resolvedByUserId: responsibleUserId, resolvedAt: answeredAt, updatedAt: answeredAt } as never)
+      .where(eq(issueThreadInteractions.id, interactionId!));
+    expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(1);
+    expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
+    const heartbeat = heartbeatService(db, { runtimeEnv: {} });
+    await deliverReconciledExecutions(db, heartbeat.wakeup);
+    await deliverReconciledExecutions(db, heartbeat.wakeup);
+    expect((await coderWakes(companyId, coderId)).filter(row => row.idempotencyKey === `execution-reconciliation:${action.id}`)).toHaveLength(1);
+  });
+
+  it("keeps an answer held behind the reconciled hold while a blocker added afterwards is open", async () => {
+    const { companyId, coderId, sourceIssueId, prefix, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
+    const app = createApp({ type: "board", source: "local_implicit", userId: responsibleUserId });
+    await request(app).post(`/api/issues/${sourceIssueId}/interactions/${interactionId}/accept`).send({}).expect(200);
+    const held = (await coderWakes(companyId, coderId)).filter(row => row.status === "deferred_issue_execution");
+    expect(held).toHaveLength(1);
+    await request(app).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+    const blockerId = randomUUID();
+    await db.insert(issues).values({ id: blockerId, companyId, title: "Blocker added later", status: "in_progress", priority: "medium",
+      assigneeAgentId: coderId, issueNumber: 9, identifier: `${prefix}-9` });
+    await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: sourceIssueId, type: "blocks" });
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() })
+      .where(and(eq(heartbeatRuns.agentId, coderId), eq(heartbeatRuns.status, "running")));
+    await heartbeatService(db, { runtimeEnv: {} }).resumeQueuedRuns();
+    const [still] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, held[0]!.id));
+    expect(still!.status).toBe("deferred_issue_execution");
+  });
+
   it("does not release a message held behind a dependency-blocked reconciliation while the blocker is open", async () => {
     const { companyId, coderId, sourceIssueId, action, body, wakeBlockersResolved } = await seedDependencyBlockedLegacyHold("in_progress");
     void wakeBlockersResolved;

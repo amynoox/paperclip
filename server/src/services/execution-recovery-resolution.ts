@@ -374,15 +374,19 @@ export async function markExecutionReconciliation(
 
 // STUDIO-0051: a hold reconciled without a continuation because the task
 // waited on a person (a question or an approval). The continuation it spared
-// is due, once, only on a proof that the wait was withdrawn after the
-// reconciliation (the person's question cancelled, expired or replaced by a
-// newer card, or the approval rejected, cancelled or sent back for revision,
-// none of which wakes the assignee) and no answer since: no answered, accepted
-// or rejected question, no question closed by the person's comment, no
-// approval approved (its decision wakes the requester), and no comment by a person. A
-// pending or held wake of the assignee on the task, or any run of the assignee
-// on it since the reconciliation, also rules it out: an answer whose wake has
-// not created a run yet never gets a second run beside it.
+// is due, once, when nothing will start the assignee any more:
+// - a proof that the wait was withdrawn after the reconciliation (the person's
+//   question cancelled, expired or replaced by a newer card, or the approval
+//   rejected, cancelled or sent back for revision, none of which wakes the
+//   assignee) and no answer since; or
+// - an answer since the reconciliation (an answered, accepted or rejected
+//   question, a question closed by the person's comment, an approval approved,
+//   or a comment by a person) whose wake was lost: the last answer is fifteen
+//   minutes old and no run followed it.
+// Never while a question or an approval is still pending, while a wake of the
+// assignee on the task is queued, claimed or held, or once the assignee ran on
+// the task since the reconciliation: an answer whose wake has not created a run
+// yet never gets a second run beside it.
 const RECONCILED_AT = sql`(${issueRecoveryActions.evidence}->'executionReconciliation'->>'recordedAt')::timestamptz`;
 
 function awaitingReconciliationOpen() {
@@ -398,7 +402,22 @@ function laterAssigneeRun() {
     where later_run.company_id = run_task.company_id and later_run.agent_id = run_task.assignee_agent_id
       and later_run.context_snapshot->>'issueId' = run_task.id::text
       and later_run.created_at >= ${RECONCILED_AT}
+      and later_run.id::text <> coalesce(${issueRecoveryActions.evidence}->'executionReconciliation'->>'runId', '')
     order by later_run.created_at asc limit 1`;
+}
+
+function personAnswersSince(task: string) {
+  return sql.raw(`select coalesce(answer.resolved_at, answer.updated_at) as answered_at from issue_thread_interactions answer
+      where answer.company_id = ${task}.company_id and answer.issue_id = ${task}.id and answer.addressee_user_id is not null
+        and (answer.status in ('answered', 'accepted', 'rejected')
+          or answer.status = 'expired' and answer.result->>'outcome' = 'superseded_by_comment')
+    union all select decided.updated_at from issue_approvals decided_link join approvals decided
+        on decided.id = decided_link.approval_id and decided.company_id = decided_link.company_id
+      where decided_link.company_id = ${task}.company_id and decided_link.issue_id = ${task}.id
+        and decided.requested_by_agent_id = ${task}.assignee_agent_id and decided.status = 'approved'
+    union all select person_comment.created_at from issue_comments person_comment
+      where person_comment.company_id = ${task}.company_id and person_comment.issue_id = ${task}.id
+        and person_comment.author_user_id is not null`);
 }
 
 function withdrawnAwaitingReconciliation() {
@@ -408,38 +427,35 @@ function withdrawnAwaitingReconciliation() {
       where waiting_task.id = ${issueRecoveryActions.sourceIssueId} and waiting_task.company_id = ${issueRecoveryActions.companyId}
         and waiting_task.status not in ('done', 'cancelled')
         and waiting_task.assignee_agent_id = ${issueRecoveryActions.returnOwnerAgentId}
-        and (exists (select 1 from issue_thread_interactions withdrawn_question
-            where withdrawn_question.company_id = waiting_task.company_id and withdrawn_question.issue_id = waiting_task.id
-              and withdrawn_question.addressee_user_id is not null
-              and withdrawn_question.status in ('cancelled', 'expired')
-              and coalesce(withdrawn_question.result->>'outcome', '') <> 'superseded_by_comment'
-              and coalesce(withdrawn_question.resolved_at, withdrawn_question.updated_at) > ${RECONCILED_AT})
-          or exists (select 1 from issue_approvals linked join approvals withdrawn_approval
-              on withdrawn_approval.id = linked.approval_id and withdrawn_approval.company_id = linked.company_id
-            where linked.company_id = waiting_task.company_id and linked.issue_id = waiting_task.id
-              and withdrawn_approval.requested_by_agent_id = waiting_task.assignee_agent_id
-              and withdrawn_approval.status in ('rejected', 'cancelled', 'revision_requested')
-              and withdrawn_approval.updated_at > ${RECONCILED_AT}))
         and not exists (select 1 from issue_thread_interactions awaited_question
           where awaited_question.company_id = waiting_task.company_id and awaited_question.issue_id = waiting_task.id
             and awaited_question.addressee_user_id is not null
-            and (awaited_question.status = 'pending' and awaited_question.continuation_policy = 'wake_assignee'
-              or (awaited_question.status in ('answered', 'accepted', 'rejected')
-                or awaited_question.status = 'expired' and awaited_question.result->>'outcome' = 'superseded_by_comment')
-                and coalesce(awaited_question.resolved_at, awaited_question.updated_at) > ${RECONCILED_AT}))
+            and awaited_question.status = 'pending' and awaited_question.continuation_policy = 'wake_assignee')
         and not exists (select 1 from issue_approvals linked join approvals awaited_approval
             on awaited_approval.id = linked.approval_id and awaited_approval.company_id = linked.company_id
           where linked.company_id = waiting_task.company_id and linked.issue_id = waiting_task.id
             and awaited_approval.requested_by_agent_id = waiting_task.assignee_agent_id
-            and (awaited_approval.status = 'pending'
-              or awaited_approval.status = 'approved' and awaited_approval.updated_at > ${RECONCILED_AT}))
-        and not exists (select 1 from issue_comments person_comment
-          where person_comment.company_id = waiting_task.company_id and person_comment.issue_id = waiting_task.id
-            and person_comment.author_user_id is not null and person_comment.created_at > ${RECONCILED_AT})
+            and awaited_approval.status = 'pending')
         and not exists (select 1 from agent_wakeup_requests coming_wake
           where coming_wake.company_id = waiting_task.company_id and coming_wake.agent_id = waiting_task.assignee_agent_id
             and coming_wake.status in ('queued', 'claimed', 'deferred_issue_execution')
-            and coming_wake.payload->>'issueId' = waiting_task.id::text))`;
+            and coming_wake.payload->>'issueId' = waiting_task.id::text)
+        and ((not exists (select 1 from (${personAnswersSince("waiting_task")}) answered where answered.answered_at > ${RECONCILED_AT})
+            and (exists (select 1 from issue_thread_interactions withdrawn_question
+                where withdrawn_question.company_id = waiting_task.company_id and withdrawn_question.issue_id = waiting_task.id
+                  and withdrawn_question.addressee_user_id is not null
+                  and withdrawn_question.status in ('cancelled', 'expired')
+                  and coalesce(withdrawn_question.result->>'outcome', '') <> 'superseded_by_comment'
+                  and coalesce(withdrawn_question.resolved_at, withdrawn_question.updated_at) > ${RECONCILED_AT})
+              or exists (select 1 from issue_approvals linked join approvals withdrawn_approval
+                  on withdrawn_approval.id = linked.approval_id and withdrawn_approval.company_id = linked.company_id
+                where linked.company_id = waiting_task.company_id and linked.issue_id = waiting_task.id
+                  and withdrawn_approval.requested_by_agent_id = waiting_task.assignee_agent_id
+                  and withdrawn_approval.status in ('rejected', 'cancelled', 'revision_requested')
+                  and withdrawn_approval.updated_at > ${RECONCILED_AT})))
+          or (exists (select 1 from (${personAnswersSince("waiting_task")}) answered where answered.answered_at > ${RECONCILED_AT})
+            and not exists (select 1 from (${personAnswersSince("waiting_task")}) answered
+              where answered.answered_at > now() - interval '15 minutes'))))`;
 }
 
 /**

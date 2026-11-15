@@ -2314,6 +2314,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       ownershipVisited.add(issueKey);
       try {
         if (await getExecutionBlocker(db, wake.companyId, heldIssueId)) continue;
+        // STUDIO-0051: behind a reconciled hold, a blocker added after the
+        // reconciliation would make admission consume the wake; keep it held
+        // until the task's dependencies are ready.
+        if (readNonEmptyString(parseObject(wake.payload?.executionWait).recoveryActionId)) {
+          const readiness = (await issuesSvc.listDependencyReadiness(wake.companyId, [heldIssueId])).get(heldIssueId);
+          if (readiness && !readiness.isDependencyReady) continue;
+        }
         const context = parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]);
         const { executionWait: _wait, [DEFERRED_WAKE_CONTEXT_KEY]: _context, ...payload } = parseObject(wake.payload);
         // Retire the held row first: `skipped` is outside every partial unique
