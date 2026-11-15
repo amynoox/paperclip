@@ -373,41 +373,87 @@ export async function markExecutionReconciliation(
 }
 
 // STUDIO-0051: a hold reconciled without a continuation because the task
-// waited on a person (a question, an approval, or an answer set aside) whose
-// wait is gone without any run of the assignee on the task since then (the
-// question was cancelled, withdrawn, expired or replaced by an agent-addressed
-// card): the continuation the reconciliation spared is now due, once.
-function withdrawnAwaitingReconciliation() {
+// waited on a person (a question or an approval). The continuation it spared
+// is due, once, only on a proof that the wait was withdrawn after the
+// reconciliation (the person's question cancelled, expired or replaced by a
+// newer card, or the approval rejected, cancelled or sent back for revision,
+// none of which wakes the assignee) and no answer since: no answered, accepted
+// or rejected question, no question closed by the person's comment, no
+// approval approved (its decision wakes the requester), and no comment by a person. A
+// pending or held wake of the assignee on the task, or any run of the assignee
+// on it since the reconciliation, also rules it out: an answer whose wake has
+// not created a run yet never gets a second run beside it.
+const RECONCILED_AT = sql`(${issueRecoveryActions.evidence}->'executionReconciliation'->>'recordedAt')::timestamptz`;
+
+function awaitingReconciliationOpen() {
   return sql`${issueRecoveryActions.status} = 'resolved'
     and ${issueRecoveryActions.evidence}->>'awaitingResponseReconciliation' = 'true'
     and ${issueRecoveryActions.evidence}->>'continuationDelivery' = 'not_requested'
-    and ${issueRecoveryActions.resolvedAt} > now() - interval '7 days'
+    and ${issueRecoveryActions.resolvedAt} > now() - interval '7 days'`;
+}
+
+function laterAssigneeRun() {
+  return sql`select later_run.id from heartbeat_runs later_run
+    join issues run_task on run_task.id = ${issueRecoveryActions.sourceIssueId} and run_task.company_id = ${issueRecoveryActions.companyId}
+    where later_run.company_id = run_task.company_id and later_run.agent_id = run_task.assignee_agent_id
+      and later_run.context_snapshot->>'issueId' = run_task.id::text
+      and later_run.created_at >= ${RECONCILED_AT}
+    order by later_run.created_at asc limit 1`;
+}
+
+function withdrawnAwaitingReconciliation() {
+  return sql`${awaitingReconciliationOpen()}
+    and not exists (${laterAssigneeRun()})
     and exists (select 1 from issues waiting_task
       where waiting_task.id = ${issueRecoveryActions.sourceIssueId} and waiting_task.company_id = ${issueRecoveryActions.companyId}
         and waiting_task.status not in ('done', 'cancelled')
         and waiting_task.assignee_agent_id = ${issueRecoveryActions.returnOwnerAgentId}
+        and (exists (select 1 from issue_thread_interactions withdrawn_question
+            where withdrawn_question.company_id = waiting_task.company_id and withdrawn_question.issue_id = waiting_task.id
+              and withdrawn_question.addressee_user_id is not null
+              and withdrawn_question.status in ('cancelled', 'expired')
+              and coalesce(withdrawn_question.result->>'outcome', '') <> 'superseded_by_comment'
+              and coalesce(withdrawn_question.resolved_at, withdrawn_question.updated_at) > ${RECONCILED_AT})
+          or exists (select 1 from issue_approvals linked join approvals withdrawn_approval
+              on withdrawn_approval.id = linked.approval_id and withdrawn_approval.company_id = linked.company_id
+            where linked.company_id = waiting_task.company_id and linked.issue_id = waiting_task.id
+              and withdrawn_approval.requested_by_agent_id = waiting_task.assignee_agent_id
+              and withdrawn_approval.status in ('rejected', 'cancelled', 'revision_requested')
+              and withdrawn_approval.updated_at > ${RECONCILED_AT}))
         and not exists (select 1 from issue_thread_interactions awaited_question
           where awaited_question.company_id = waiting_task.company_id and awaited_question.issue_id = waiting_task.id
-            and awaited_question.status = 'pending' and awaited_question.addressee_user_id is not null
-            and awaited_question.continuation_policy = 'wake_assignee')
+            and awaited_question.addressee_user_id is not null
+            and (awaited_question.status = 'pending' and awaited_question.continuation_policy = 'wake_assignee'
+              or (awaited_question.status in ('answered', 'accepted', 'rejected')
+                or awaited_question.status = 'expired' and awaited_question.result->>'outcome' = 'superseded_by_comment')
+                and coalesce(awaited_question.resolved_at, awaited_question.updated_at) > ${RECONCILED_AT}))
         and not exists (select 1 from issue_approvals linked join approvals awaited_approval
             on awaited_approval.id = linked.approval_id and awaited_approval.company_id = linked.company_id
           where linked.company_id = waiting_task.company_id and linked.issue_id = waiting_task.id
-            and awaited_approval.status = 'pending'
-            and awaited_approval.requested_by_agent_id = waiting_task.assignee_agent_id)
-        and not exists (select 1 from agent_wakeup_requests held_answer
-          where held_answer.company_id = waiting_task.company_id and held_answer.status = 'deferred_issue_execution'
-            and held_answer.payload->>'issueId' = waiting_task.id::text
-            and held_answer.payload->'executionWait'->>'recoveryActionId' = ${issueRecoveryActions.id}::text)
-        and not exists (select 1 from heartbeat_runs later_run
-          where later_run.company_id = waiting_task.company_id and later_run.agent_id = waiting_task.assignee_agent_id
-            and later_run.context_snapshot->>'issueId' = waiting_task.id::text
-            and later_run.created_at >= (${issueRecoveryActions.evidence}->'executionReconciliation'->>'recordedAt')::timestamptz))`;
+            and awaited_approval.requested_by_agent_id = waiting_task.assignee_agent_id
+            and (awaited_approval.status = 'pending'
+              or awaited_approval.status = 'approved' and awaited_approval.updated_at > ${RECONCILED_AT}))
+        and not exists (select 1 from issue_comments person_comment
+          where person_comment.company_id = waiting_task.company_id and person_comment.issue_id = waiting_task.id
+            and person_comment.author_user_id is not null and person_comment.created_at > ${RECONCILED_AT})
+        and not exists (select 1 from agent_wakeup_requests coming_wake
+          where coming_wake.company_id = waiting_task.company_id and coming_wake.agent_id = waiting_task.assignee_agent_id
+            and coming_wake.status in ('queued', 'claimed', 'deferred_issue_execution')
+            and coming_wake.payload->>'issueId' = waiting_task.id::text))`;
 }
 
-/** Hands a withdrawn wait to the ordinary continuation delivery (pending, once). */
+/**
+ * Hands a withdrawn wait to the ordinary continuation delivery (pending, once),
+ * and closes the wait as satisfied once a run of the assignee on the task took
+ * place after the reconciliation (no more checks, no continuation promised).
+ */
 export async function resumeWithdrawnAwaitingReconciliations(db: Db) {
   return db.transaction(async tx => {
+    await tx.update(issueRecoveryActions).set({
+      evidence: sql`${issueRecoveryActions.evidence} || jsonb_build_object('continuationDelivery', 'satisfied',
+        'awaitingResponseSatisfiedByRunId', (${laterAssigneeRun()}), 'awaitingResponseSatisfiedAt', to_jsonb(now()))`,
+      updatedAt: new Date(),
+    }).where(sql`${awaitingReconciliationOpen()} and exists (${laterAssigneeRun()})`);
     const rows = await tx.update(issueRecoveryActions).set({
       evidence: sql`${issueRecoveryActions.evidence} || jsonb_build_object('continuationDelivery', 'pending',
         'awaitingResponseWithdrawnAt', to_jsonb(now()))`,
@@ -420,10 +466,7 @@ export async function resumeWithdrawnAwaitingReconciliations(db: Db) {
 
 /** Still waiting on a person behind a reconciled hold: look again in five minutes. */
 export async function nextAwaitingReconciliationCheckAt(db: Db) {
-  const [row] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(sql`${issueRecoveryActions.status} = 'resolved'
-    and ${issueRecoveryActions.evidence}->>'awaitingResponseReconciliation' = 'true'
-    and ${issueRecoveryActions.evidence}->>'continuationDelivery' = 'not_requested'
-    and ${issueRecoveryActions.resolvedAt} > now() - interval '7 days'`).limit(1);
+  const [row] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(awaitingReconciliationOpen()).limit(1);
   return row ? Date.now() + 5 * 60_000 : null;
 }
 

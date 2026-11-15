@@ -373,6 +373,14 @@ export function projectExecution(
       projection.nextAction = "The previous execution is reconciled. The task starts again when the pending question or approval is answered; if that wait is withdrawn, one continuation is delivered instead.";
       return set("completed", "Reconciled");
     }
+    if (recoveryAction.evidence.awaitingResponseReconciliation === true
+      && recoveryAction.evidence.continuationDelivery === "satisfied") {
+      // STUDIO-0051: the assignee ran on the task after the reconciliation (the answer's wake).
+      projection.successorRunId = text(recoveryAction.evidence.awaitingResponseSatisfiedByRunId);
+      projection.cause = null;
+      projection.nextAction = null;
+      return set("completed", "Continued in another run");
+    }
     if (recoveryAction.evidence.dependencyBlockedReconciliation === true
       && recoveryAction.evidence.continuationDelivery === "not_requested") {
       // STUDIO-0048: reconciled while blocked; the dependency wake restarts it.

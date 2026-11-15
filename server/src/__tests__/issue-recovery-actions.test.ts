@@ -2346,16 +2346,42 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     const [answerRun] = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, coderId),
       sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${sourceIssueId}`, sql`${heartbeatRuns.id} <> ${cutRunId}`));
     expect(answerRun!.contextSnapshot).toMatchObject({ interactionId });
-    // Answered: the withdrawn-wait hand-off never fires.
+    // Answered: the withdrawn-wait hand-off never fires, and the wait is closed
+    // as satisfied by the answer's run (no more checks, no continuation promised).
     expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
+    const [satisfied] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+    expect(satisfied!.evidence).toMatchObject({ continuationDelivery: "satisfied", awaitingResponseSatisfiedByRunId: answerRun!.id });
+    expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
+    expect((await coderWakes(companyId, coderId)).filter(row => row.idempotencyKey === `execution-reconciliation:${action.id}`)).toHaveLength(0);
   });
+
+  it.each(["answered, its wake still queued", "answered, no wake recorded yet", "closed by the person's comment"] as const)(
+    "never delivers a continuation when the awaited question was %s", async (kind) => {
+      const { companyId, coderId, sourceIssueId, action, body, interactionId, responsibleUserId } = await seedAwaitingResponseHold("person question");
+      await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
+      await db.update(issueThreadInteractions).set((kind === "closed by the person's comment"
+        ? { status: "expired", result: { version: 1, outcome: "superseded_by_comment" } }
+        : { status: "answered", resolvedByUserId: responsibleUserId }) as never)
+        .where(eq(issueThreadInteractions.id, interactionId!));
+      await db.update(issueThreadInteractions).set({ resolvedAt: new Date(), updatedAt: new Date() } as never)
+        .where(eq(issueThreadInteractions.id, interactionId!));
+      if (kind === "answered, its wake still queued") await db.insert(agentWakeupRequests).values({ companyId, agentId: coderId,
+        source: "automation", triggerDetail: "system", reason: "issue_interaction_answered", status: "queued",
+        payload: { issueId: sourceIssueId, interactionId } } as never);
+      expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
+      const [recorded] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, action.id));
+      expect(recorded!.evidence).toMatchObject({ continuationDelivery: "not_requested", awaitingResponseReconciliation: true });
+      await deliverReconciledExecutions(db, heartbeatService(db, { runtimeEnv: {} }).wakeup);
+      expect((await coderWakes(companyId, coderId)).filter(row => row.idempotencyKey === `execution-reconciliation:${action.id}`)).toHaveLength(0);
+    });
 
   it.each(["cancelled", "replaced by an agent card"] as const)(
     "delivers the spared continuation once when the awaited question is %s after the reconciliation", async (kind) => {
       const { companyId, coderId, managerId, sourceIssueId, action, body, interactionId } = await seedAwaitingResponseHold("person question");
       await request(createApp()).post(`/api/issues/${sourceIssueId}/recovery-actions/resolve`).send(body).expect(200);
       expect(await resumeWithdrawnAwaitingReconciliations(db)).toBe(0);
-      await db.update(issueThreadInteractions).set({ status: "cancelled" } as never).where(eq(issueThreadInteractions.id, interactionId!));
+      await db.update(issueThreadInteractions).set({ status: "cancelled", resolvedAt: new Date(), updatedAt: new Date() } as never)
+        .where(eq(issueThreadInteractions.id, interactionId!));
       if (kind === "replaced by an agent card") await db.insert(issueThreadInteractions).values({ companyId, issueId: sourceIssueId,
         kind: "request_confirmation", status: "pending", continuationPolicy: "none", addresseeAgentId: managerId,
         createdByAgentId: coderId, payload: { version: 1, prompt: "Executor interrupted." } } as never);

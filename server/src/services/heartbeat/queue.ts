@@ -2290,7 +2290,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               and reconciled_hold.id::text = ${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId'
               and reconciled_hold.status = 'resolved'
               and reconciled_hold.evidence ? 'executionReconciliation'
-              and reconciled_hold.evidence->>'continuationDelivery' = 'not_requested'
+              and reconciled_hold.evidence->>'continuationDelivery' in ('not_requested', 'satisfied')
               and reconciled_hold.evidence->>'awaitingResponseReconciliation' = 'true'))`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'stale-addressee-requeue:%'`,
