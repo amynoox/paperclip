@@ -12,6 +12,7 @@ import {
 import { parseRunnerGoalCommand, TaskChatComposer } from "./TaskChatComposer";
 import { ComposerAddMenu } from "./ComposerAddMenu";
 import { QuestionForm } from "./QuestionForm";
+import { ThemeProvider } from "../../context/ThemeContext";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { Agent, HeartbeatRun, IssueWorkMode } from "@paperclipai/shared";
 import { agentsApi } from "@/api/agents";
@@ -214,7 +215,8 @@ afterEach(() => {
 });
 
 function render(ui: ReactElement) {
-  flushSync(() => root!.render(ui));
+  // QuestionForm renders MarkdownBody (STUDIO-0054), which needs the theme provider the app always mounts.
+  flushSync(() => root!.render(<ThemeProvider>{ui}</ThemeProvider>));
 }
 
 async function flushAsync() {
