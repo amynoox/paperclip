@@ -1567,6 +1567,31 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: an agent never rewrites its own AGENTS.md (refused or set aside), and writes the rest of its own managed folder without agents:* rights. Why: rights hardening of the studio roles (V329, 15 Nov 2026). Origin: studio fork only; to re-apply, keep assertNotOwnEntryEdit in agent-instruction-authorization.ts and its calls in agent-instruction-revisions.ts (commit) and agent-file-store.ts (write, setOwnEntryAside, and the entry set-aside in apply with entryEditDiscarded), the setOwnEntryAside calls and the receipt field in agent-directory-working-copies.ts, the texts in agent-conversations.ts, authorization.ts, owner-chat-instruction-authority.ts and agent-instruction-working-copies.ts, and the ownManagedFile / ownManagedDelete exemptions in routes/agents.ts; run agent-instruction-own-entry.test.ts, agent-directory-working-copies.test.ts, owner-chat-instruction-authority.test.ts, heartbeat-instruction-working-copy.test.ts and agent-instruction-working-copies.test.ts (refusal lifted there by vi.mock)."
+    },
+    {
+      "id": "STUDIO-0059",
+      "title": "A run the worker router refused before any reservation is neither retried nor blocked as a lost execution path",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production 15-16 Nov 2026: the worker router refuses some runs before any reservation (no machine contacted, no engine launched) because the ticket cannot run now: router_group_participant_ended, _closed, _mismatch, _reserved (router 0.30.14) and router_ticket_blocked. The server retried each refused run, then stranded-work recovery requeued and blocked the ticket for the Board (TR-1261: three refused runs then blocked; TR-1318: nine router_group_participant_ended in bursts of three).",
+      "reason": "Requested by the studio setup session for the 16 Nov update (V412), from the worker router chat's contract drafts/routeur-deux-moteurs/refus-sans-relance-pour-serveur.md.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "recovery: adapter-declared waits (STUDIO-0042, STUDIO-0046)",
+      "paths": [
+        "server/src/services/recovery/adapter-declared-wait.ts",
+        "server/src/__tests__/recovery-adapter-declared-wait.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-16",
+        "repository": "paperclipai/paperclip",
+        "details": "No counterpart: the codes are named by the studio's worker router plugin; upstream has no adapter-declared wait list (STUDIO-0042).",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. Real path: for each of the five codes a run woken by the Board really ends refused (declared with a transient error family, the worst case): no transient retry; two stranded-work sweeps neither requeue nor block, no recovery action, no comment; past the 12 h bound normal recovery blocks as for any wait. On fb1ad740 the same case fails (a transient retry is scheduled). recovery-adapter-declared-wait 28 passed; with recovery-classifiers, issue-recovery-actions and the wake-queue module: 13 files, 490 passed. tsc: no error in a changed file.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder; the refused runs are then retried and recovered as before.",
+      "retireWhen": "The worker router stops returning these codes, or upstream offers a declared refusal contract for adapters.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }

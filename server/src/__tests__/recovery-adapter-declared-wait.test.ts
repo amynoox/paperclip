@@ -27,6 +27,7 @@ import {
   ADAPTER_DECLARED_WAIT_ERROR_CODES,
   ADAPTER_DECLARED_WAIT_MAX_MS,
   ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES,
+  ROUTER_REFUSAL_HOLD_ERROR_CODES,
   adapterDeclaredWaitMaxMs,
 } from "../services/recovery/adapter-declared-wait.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
@@ -50,6 +51,8 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   const dispatched = new Set<string>();
   // Per-issue adapter outcome; default finishes the task.
   const modes = new Map<string, "wait" | "wait-transient" | "other-transient" | "stop-transient" | "unsettled-transient" | "stop-plain">();
+  // STUDIO-0059: per-issue router refusal code (worst case: declared with a transient error family).
+  const refusals = new Map<string, string>();
   const oldHome = process.env.PAPERCLIP_HOME;
   let home: string;
   const WAIT = "router_waiting_for_resources";
@@ -67,6 +70,10 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       type: adapterType, supportsLocalAgentJwt: false,
       execute: async input => {
         dispatched.add(input.runId);
+        const refusal = refusals.get(String(input.context.issueId));
+        if (refusal) {
+          return { exitCode: 1, signal: null, timedOut: false, errorCode: refusal, errorMessage: "Refused by the worker router", errorFamily: "transient_upstream" as const };
+        }
         const mode = modes.get(String(input.context.issueId));
         if (mode) {
           return {
@@ -134,15 +141,20 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   const commentsOf = (issueId: string) => db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
   const actionsOf = (issueId: string) => db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
 
-  it("declares only the router's three codes: 12 h for a machine wait, 1 h for an unproven stop", () => {
-    expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT, STOP, UNSETTLED]);
+  it("declares the router's three wait codes and its five refusals: 12 h for a machine wait or a refusal, 1 h for an unproven stop", () => {
+    expect(ROUTER_REFUSAL_HOLD_ERROR_CODES).toEqual([
+      "router_group_participant_ended", "router_group_participant_closed", "router_group_participant_mismatch",
+      "router_group_participant_reserved", "router_ticket_blocked",
+    ]);
+    expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT, STOP, UNSETTLED, ...ROUTER_REFUSAL_HOLD_ERROR_CODES]);
+    for (const code of ROUTER_REFUSAL_HOLD_ERROR_CODES) expect(adapterDeclaredWaitMaxMs(code)).toBe(12 * 60 * 60_000);
     expect(ADAPTER_DECLARED_WAIT_MAX_MS).toBe(12 * 60 * 60_000);
     expect(ADAPTER_DECLARED_STOP_WAIT_MAX_MS).toBe(60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(WAIT)).toBe(12 * 60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(STOP)).toBe(60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(UNSETTLED)).toBe(60 * 60_000);
     // The cut run keeps its transient retry (the retried run waits for the link itself).
-    expect(ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES).toEqual([WAIT, UNSETTLED]);
+    expect(ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES).toEqual([WAIT, UNSETTLED, ...ROUTER_REFUSAL_HOLD_ERROR_CODES]);
   });
 
   // Production, 14 Nov 2026: the responsible coordinates on its executor's
@@ -360,6 +372,40 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     expect((await runsOf(other)).filter(run => run.retryOfRunId === otherRun.id)).toEqual([
       expect.objectContaining({ status: "scheduled_retry", scheduledRetryReason: "transient_failure" }),
     ]);
+  }, 180_000);
+
+  // STUDIO-0059: production 15-16 Nov 2026, TR-1261 and TR-1318. A run the router refuses before any reservation
+  // was retried (30 s, 60 s), then recovery requeued and blocked the ticket for the Board. Each refusal now ends one
+  // run: no transient retry, and two stranded-work sweeps neither requeue nor block it.
+  it("neither retries, requeues nor blocks a run the router refused before any reservation", async () => {
+    const fixtures: Array<{ code: string; f: Awaited<ReturnType<typeof seed>>; runId: string }> = [];
+    for (const code of ["router_group_participant_ended", "router_group_participant_closed", "router_group_participant_mismatch",
+      "router_group_participant_reserved", "router_ticket_blocked"]) {
+      const f = await seed("todo", []);
+      refusals.set(f.issueId, code);
+      fixtures.push({ code, f, runId: (await boardWake(f)).id });
+    }
+    await heartbeat.drainActiveRunExecutions();
+    for (const { code, f, runId } of fixtures) {
+      await expect.poll(async () => (await runsOf(f)).find(run => run.id === runId)?.status, { timeout: 30_000 }).toBe("failed");
+      expect((await runsOf(f)).find(run => run.id === runId)).toMatchObject({ errorCode: code });
+      expect((await runsOf(f)).filter(run => run.retryOfRunId === runId)).toHaveLength(0);
+    }
+    for (let sweep = 0; sweep < 2; sweep += 1) {
+      for (const { f } of fixtures) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    }
+    await heartbeat.drainActiveRunExecutions();
+    for (const { f, runId } of fixtures) {
+      expect((await runsOf(f)).map(run => run.id)).toEqual([runId]);
+      expect((await issueOf(f.issueId)).status).not.toBe("blocked");
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect(await commentsOf(f.issueId)).toHaveLength(0);
+    }
+    // Past the bound, normal recovery applies as for any wait.
+    const bound = ADAPTER_DECLARED_WAIT_MAX_MS / 60_000;
+    const old = await seed("todo", [{ minutesAgo: bound + 12, errorCode: "router_group_participant_reserved" }, { minutesAgo: 10, errorCode: "router_group_participant_reserved", retry: true }]);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: old.companyId });
+    expect((await issueOf(old.issueId)).status).toBe("blocked");
   }, 180_000);
 
   it("does not re-block an issue the Board returned to todo whose new run ends waiting (production race)", async () => {

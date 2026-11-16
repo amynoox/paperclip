@@ -17,10 +17,40 @@
 // - router_previous_dispatch_unsettled: the same state seen by the next run
 //   (it waited up to 10 min for the proof); same settlement and wake by the
 //   router's periodic pass.
+// STUDIO-0059: refusals the worker router returns BEFORE any reservation (no
+// machine contacted, no engine launched, no dispatch created), for a ticket
+// that cannot run now; asking again cannot succeed (router contract,
+// drafts/routeur-deux-moteurs/refus-sans-relance-pour-serveur.md). They are
+// held like a wait: no transient retry, and within the bound stranded-work
+// recovery neither requeues nor blocks the issue as a lost execution path.
+// Production 15-16 Nov 2026: TR-1261 (three runs refused, then blocked),
+// TR-1318 (nine `router_group_participant_ended` in bursts of three).
+// - router_group_participant_ended: this participant has finished its part;
+//   another participant still holds its reservation.
+// - router_group_participant_closed: another listed participant is done or
+//   cancelled; only a change to the tickets lets it pass.
+// - router_group_participant_mismatch: another participant is not a child of
+//   the same coordinating ticket, or names another group; passes after the
+//   list in the description is corrected.
+// - router_group_participant_reserved (router 0.30.14): a listed participant
+//   already has its own reservation; passes only with another participant.
+// - router_ticket_blocked: the ticket is blocked; its dependency wake starts
+//   it again once unblocked.
+// The router does not wake the assignee when these could pass: past the bound,
+// normal recovery shows a ticket that has really been left too long.
+export const ROUTER_REFUSAL_HOLD_ERROR_CODES: readonly string[] = Object.freeze([
+  "router_group_participant_ended",
+  "router_group_participant_closed",
+  "router_group_participant_mismatch",
+  "router_group_participant_reserved",
+  "router_ticket_blocked",
+]);
+
 export const ADAPTER_DECLARED_WAIT_ERROR_CODES: readonly string[] = Object.freeze([
   "router_waiting_for_resources",
   "router_provider_stop_unverified",
   "router_previous_dispatch_unsettled",
+  ...ROUTER_REFUSAL_HOLD_ERROR_CODES,
 ]);
 
 // Bound on such a wait, counted from the END of the oldest run of the latest
@@ -62,6 +92,7 @@ export function isAdapterDeclaredWaitErrorCode(code: string | null | undefined):
 export const ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES: readonly string[] = Object.freeze([
   "router_waiting_for_resources",
   "router_previous_dispatch_unsettled",
+  ...ROUTER_REFUSAL_HOLD_ERROR_CODES,
 ]);
 
 // STUDIO-0046: an unproven stop after a cut link is retried by the server on
