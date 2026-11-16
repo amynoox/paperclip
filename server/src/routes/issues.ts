@@ -1,5 +1,5 @@
 import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
-import { readUndeliveredHeldCommentIds } from "../services/heartbeat/held-dependency-comments.js";
+import { handBackDependentsLeftWithCancelledBlockers } from "../services/heartbeat/held-dependency-comments.js";
 import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteractionDelivery } from "../services/agent-interaction-delivery.js";
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
@@ -17047,6 +17047,32 @@ export function issueRoutes(
               mutation: "blocker_done",
             });
           }
+          // STUDIO-0063: a dependent whose remaining unresolved blockers are all cancelled gets no blockers-resolved
+          // wake (cancelled blockers stay unresolved): hand the dependency back to its assignee as for a cancelled
+          // blocker (STUDIO-0029). The admitted run carries the agents' comments held meanwhile.
+          try {
+            for (const handoff of await handBackDependentsLeftWithCancelledBlockers(db, { companyId: issue.companyId,
+              doneBlocker: { id: issue.id, identifier: issue.identifier ?? null, completedAt: issue.completedAt ?? null } })) {
+              addWakeup(handoff.assigneeAgentId, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "issue_commented",
+                payload: { issueId: handoff.dependentId, commentId: handoff.commentId, mutation: "comment",
+                  cancelledBlockerIssueId: handoff.cancelledBlockerIssueId },
+                idempotencyKey: `issue_dependency_cancelled_left:${handoff.commentId}`,
+                requestedByActorType: "system",
+                requestedByActorId: "cancelled_blocker_handoff",
+                contextSnapshot: {
+                  issueId: handoff.dependentId, taskId: handoff.dependentId,
+                  commentId: handoff.commentId, wakeCommentId: handoff.commentId,
+                  source: "issue.cancelled_dependency_handoff", wakeReason: "issue_commented",
+                  cancelledBlockerIssueId: handoff.cancelledBlockerIssueId,
+                },
+              });
+            }
+          } catch (err) {
+            logger.warn({ err, issueId: issue.id }, "failed to hand dependents left with cancelled blockers back");
+          }
         }
 
         // STUDIO-0029, adapted from paperclipai/paperclip#19843: a cancelled
@@ -17153,35 +17179,36 @@ export function issueRoutes(
           }
         }
 
-        // STUDIO-0063: removing the last blockers fires no issue_blockers_resolved wake, so agents' comments held
-        // while the issue waited on them are handed over now (the admitted run carries heldDependencyCommentIds).
+        // STUDIO-0063: an edit of the blocker set that makes the issue ready (a blocker removed, all or part of the
+        // list) fires no issue_blockers_resolved wake unless the restored-blocked path above sent one: wake the
+        // assignee now. Its admitted run carries the agents' comments held meanwhile, and the held assignment
+        // itself. The key carries the edit's time, so each such edit wakes once.
         if (
           Array.isArray(req.body.blockedByIssueIds) &&
+          existingRelations?.blockedBy?.some((blocker) => blocker.status !== "done") &&
           issue.assigneeAgentId &&
-          !["done", "cancelled"].includes(issue.status) &&
+          !["done", "cancelled", "backlog"].includes(issue.status) &&
           typeof dependencyReadinessSvc.getDependencyReadiness === "function"
         ) {
           const readiness = await dependencyReadinessSvc.getDependencyReadiness(issue.id);
-          if (readiness.isDependencyReady && readiness.blockerIssueIds.length === 0) {
-            const heldIds = await readUndeliveredHeldCommentIds(db, { companyId: issue.companyId, issueId: issue.id });
-            if (heldIds.length > 0) {
-              addWakeup(issue.assigneeAgentId, {
-                source: "automation",
-                triggerDetail: "system",
-                reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-                payload: { issueId: issue.id, blockerIssueIds: [], mutation: "blockers_removed" },
-                idempotencyKey: `issue_blockers_removed:${issue.id}:${heldIds[heldIds.length - 1]}`,
-                requestedByActorType: actor.actorType,
-                requestedByActorId: actor.actorId,
-                contextSnapshot: {
-                  issueId: issue.id,
-                  taskId: issue.id,
-                  wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
-                  source: "issue.blockers_removed",
-                  blockerIssueIds: [],
-                },
-              });
-            }
+          const restoredWakeSent = restoredBlockedReadyDependency && readiness.blockerIssueIds.length > 0;
+          if (readiness.isDependencyReady && !restoredWakeSent) {
+            addWakeup(issue.assigneeAgentId, {
+              source: "automation",
+              triggerDetail: "system",
+              reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+              payload: { issueId: issue.id, blockerIssueIds: readiness.blockerIssueIds, mutation: "blockers_edited" },
+              idempotencyKey: `issue_blockers_ready:${issue.id}:${new Date(issue.updatedAt).toISOString()}`,
+              requestedByActorType: actor.actorType,
+              requestedByActorId: actor.actorId,
+              contextSnapshot: {
+                issueId: issue.id,
+                taskId: issue.id,
+                wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+                source: "issue.blockers_edited",
+                blockerIssueIds: readiness.blockerIssueIds,
+              },
+            });
           }
         }
 
@@ -17361,11 +17388,41 @@ export function issueRoutes(
     if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     const attachments = await svc.listAttachments(id);
+    // STUDIO-0063: deleting an unresolved blocker can make its dependents ready without any other wake.
+    const dependentsBefore = existing.status !== "done"
+      ? (await svc.getRelationSummaries(id)).blocks
+      : [];
 
     const issue = await svc.remove(id, req.actor.type === "agent" ? req.actor.agentId : null);
     if (!issue) {
       res.status(404).json({ error: "Issue not found" });
       return;
+    }
+
+    // STUDIO-0063: a dependent made ready by this delete wakes its assignee, whose admitted run carries the agents'
+    // comments held meanwhile and the held assignment.
+    const readinessProvider = svc as { getDependencyReadiness?: typeof svc.getDependencyReadiness };
+    for (const dependent of dependentsBefore) {
+      if (!dependent.assigneeAgentId || ["done", "cancelled", "backlog"].includes(dependent.status)) continue;
+      if (typeof readinessProvider.getDependencyReadiness !== "function") break;
+      try {
+        const readiness = await readinessProvider.getDependencyReadiness(dependent.id);
+        if (!readiness.isDependencyReady) continue;
+        await heartbeat.wakeup(dependent.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+          payload: { issueId: dependent.id, blockerIssueIds: readiness.blockerIssueIds, mutation: "blocker_deleted",
+            deletedBlockerIssueId: id },
+          idempotencyKey: `issue_blockers_ready:${dependent.id}:deleted:${id}`,
+          requestedByActorType: req.actor.type === "agent" ? "agent" : "user",
+          requestedByActorId: req.actor.type === "agent" ? req.actor.agentId ?? null : req.actor.userId ?? null,
+          contextSnapshot: { issueId: dependent.id, taskId: dependent.id, wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+            source: "issue.blocker_deleted", blockerIssueIds: readiness.blockerIssueIds },
+        });
+      } catch (err) {
+        logger.warn({ err, issueId: dependent.id, deletedBlockerIssueId: id }, "failed to wake a dependent made ready by a delete");
+      }
     }
 
     for (const attachment of attachments) {
@@ -20842,6 +20899,32 @@ export function issueRoutes(
               blockerIssueIds: dependent.blockerIssueIds,
               blockedTransitionAt: dependent.blockedTransitionAt,
             });
+          }
+          // STUDIO-0063: a dependent whose remaining unresolved blockers are all cancelled gets no blockers-resolved
+          // wake (cancelled blockers stay unresolved): hand the dependency back to its assignee as for a cancelled
+          // blocker (STUDIO-0029). The admitted run carries the agents' comments held meanwhile.
+          try {
+            for (const handoff of await handBackDependentsLeftWithCancelledBlockers(db, { companyId: currentIssue.companyId,
+              doneBlocker: { id: currentIssue.id, identifier: currentIssue.identifier ?? null, completedAt: currentIssue.completedAt ?? null } })) {
+              addWakeup(handoff.assigneeAgentId, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: "issue_commented",
+                payload: { issueId: handoff.dependentId, commentId: handoff.commentId, mutation: "comment",
+                  cancelledBlockerIssueId: handoff.cancelledBlockerIssueId },
+                idempotencyKey: `issue_dependency_cancelled_left:${handoff.commentId}`,
+                requestedByActorType: "system",
+                requestedByActorId: "cancelled_blocker_handoff",
+                contextSnapshot: {
+                  issueId: handoff.dependentId, taskId: handoff.dependentId,
+                  commentId: handoff.commentId, wakeCommentId: handoff.commentId,
+                  source: "issue.cancelled_dependency_handoff", wakeReason: "issue_commented",
+                  cancelledBlockerIssueId: handoff.cancelledBlockerIssueId,
+                },
+              });
+            }
+          } catch (err) {
+            logger.warn({ err, issueId: currentIssue.id }, "failed to hand dependents left with cancelled blockers back");
           }
         }
 

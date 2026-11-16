@@ -4,14 +4,14 @@
  * Production 15 Nov 2026, TR-1258: the CTO set a blocker and commented on the Dev's task in one call; the
  * assignment wake was held, the comment wake started the Dev's run. The rule now, through the real routes:
  * - an agent's comment waits with the issue, at admission and at the claim gate (a comment queued while the
- *   assignee was busy, before the blocker was added);
- * - a person's comment and a verified blocker stall keep their way in; another role reaches the blocked assignee
- *   with a card on its own task addressed to the assignee (an existing path, proven here);
- * - the held comments are handed to the assignee with the wake that follows the blockers' resolution.
- * Third version (second independent review): a comment held at the CLAIM gate is handed over too, merged comments
- * included; so are held comments when the blockers are removed or cancelled, or the issue reassigned; a person's
- * bounded run does not consume them; a mentioned non-assignee passes as before; all held comments are named.
+ *   assignee was busy, before the blocker was added); only the assignee is held, a person's comment, a card, a
+ *   verified stall and an issue whose unresolved blockers are all cancelled keep their way in;
+ * - nothing is recorded: the thread is the record. The assignee's admitted run that can act (issue ready, every
+ *   unresolved blocker cancelled, or a stall/cancel handoff) carries every agent comment written after the start of
+ *   its latest QUALIFIED run (admitted ready, engine process started, succeeded), the latest twenty named;
+ * - a removed, deleted or cancelled-left blocker set wakes the assignee when the issue becomes ready.
  */
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
@@ -37,14 +37,16 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 
 const support = await getEmbeddedPostgresTestSupport();
 const ADAPTER = "codex_local";
+type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
 
 (support.supported ? describe : describe.skip)("agent comments on a dependency-blocked issue (STUDIO-0063)", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
   let heartbeat: ReturnType<typeof heartbeatService>;
   const dispatched: string[] = [];
-  // Per-issue outcome of the NEXT run: a worker router refusal before any engine started.
-  const refuseNext = new Map<string, string>();
+  // Per-issue outcome of the NEXT run. By default the engine process starts (onSpawn, as claude_local and codex_local
+  // report it) and the run succeeds.
+  const nextOutcome = new Map<string, Outcome>();
   // Per-issue gate: the run waits until released (an assignee busy on its dependency run).
   const holdOpen = new Map<string, Promise<void>>();
 
@@ -59,13 +61,21 @@ const ADAPTER = "codex_local";
       execute: async (input) => {
         dispatched.push(input.runId);
         const issueId = String((input.context as any)?.issueId ?? "");
-        const refusal = refuseNext.get(issueId);
-        if (refusal) {
-          refuseNext.delete(issueId);
-          return { exitCode: 1, signal: null, timedOut: false, errorCode: refusal, errorMessage: "Refused by the worker router" };
+        const outcome = nextOutcome.get(issueId) ?? "spawn-success";
+        nextOutcome.delete(issueId);
+        // The worker router refuses before any reservation: no process is started.
+        if (outcome.startsWith("refuse:")) {
+          return { exitCode: 1, signal: null, timedOut: false, errorCode: outcome.slice("refuse:".length), errorMessage: "Refused by the worker router" };
+        }
+        // The engine process starts: a real, already ended process (its stop is provable), as the adapters report it.
+        if (outcome !== "no-spawn") {
+          const engine = spawnSync(process.execPath, ["-e", ""]);
+          await input.onSpawn?.({ pid: engine.pid!, processGroupId: null, startedAt: new Date().toISOString() });
         }
         const gate = holdOpen.get(issueId);
         if (gate) await gate;
+        // A cut SSH link after the process started: ssh exits 255.
+        if (outcome === "spawn-255") return { exitCode: 255, signal: null, timedOut: false, errorMessage: "ssh: connection closed" };
         return { exitCode: 0, signal: null, timedOut: false, resultJson: {} };
       },
       testEnvironment: async () => ({ adapterType: ADAPTER, status: "pass", checks: [], testedAt: new Date().toISOString() }),
@@ -80,7 +90,7 @@ const ADAPTER = "codex_local";
 
   async function seed(options: { blocked?: boolean; devMaxConcurrent?: number } = {}) {
     const companyId = randomUUID(), devId = randomUUID(), ctoId = randomUUID(), qaId = randomUUID(), dev2Id = randomUUID();
-    const taskId = randomUUID(), blockerId = randomUUID(), ctoTaskId = randomUUID(), ctoRunId = randomUUID();
+    const taskId = randomUUID(), blockerId = randomUUID(), blocker2Id = randomUUID(), ctoTaskId = randomUUID(), ctoRunId = randomUUID();
     const prefix = `B${companyId.replaceAll("-", "").slice(0, 5).toUpperCase()}`;
     await db.insert(companies).values({ id: companyId, name: "Blocked comment", issuePrefix: prefix,
       requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "board-user" });
@@ -99,6 +109,7 @@ const ADAPTER = "codex_local";
       { id: blockerId, companyId, title: "Blocker", status: "todo", issueNumber: 1, identifier: `${prefix}-1`, responsibleUserId: "board-user" },
       { id: taskId, companyId, title: "Dev task", status: "todo", assigneeAgentId: devId, issueNumber: 2, identifier: `${prefix}-2`, responsibleUserId: "board-user" },
       { id: ctoTaskId, companyId, title: "CTO task", status: "in_progress", assigneeAgentId: ctoId, issueNumber: 3, identifier: `${prefix}-3`, responsibleUserId: "board-user" },
+      { id: blocker2Id, companyId, title: "Blocker 2", status: "todo", issueNumber: 4, identifier: `${prefix}-4`, responsibleUserId: "board-user" },
     ]);
     // The CTO writes from its own live run on its own task.
     await db.insert(heartbeatRuns).values({ id: ctoRunId, companyId, agentId: ctoId, invocationSource: "assignment",
@@ -106,8 +117,9 @@ const ADAPTER = "codex_local";
     if (options.blocked !== false) {
       await request(app(companyId)).patch(`/api/issues/${taskId}`).send({ blockedByIssueIds: [blockerId] }).expect(200);
     }
-    return { companyId, devId, ctoId, qaId, dev2Id, taskId, blockerId, ctoRunId };
+    return { companyId, devId, ctoId, qaId, dev2Id, taskId, blockerId, blocker2Id, ctoTaskId, ctoRunId };
   }
+  type Fixture = Awaited<ReturnType<typeof seed>>;
 
   function app(companyId: string, agentActor?: { agentId: string; runId: string }) {
     const testApp = express();
@@ -123,98 +135,92 @@ const ADAPTER = "codex_local";
     return testApp;
   }
 
-  const devRuns = (f: { devId: string; taskId: string }) => db.select().from(heartbeatRuns)
-    .where(and(eq(heartbeatRuns.agentId, f.devId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.taskId}`));
-  const heldFor = (f: { devId: string }, commentId: string) => db.select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
-    .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.devId), sql`${agentWakeupRequests.payload}->>'commentId' = ${commentId}`));
   const agentRuns = (agentId: string, taskId: string) => db.select().from(heartbeatRuns)
     .where(and(eq(heartbeatRuns.agentId, agentId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${taskId}`));
-  const cto = (f: { companyId: string; ctoId: string; ctoRunId: string }) => app(f.companyId, { agentId: f.ctoId, runId: f.ctoRunId });
-  const ctoComment = async (f: { companyId: string; ctoId: string; ctoRunId: string; taskId: string }, body: string) => {
-    await request(cto(f)).post(`/api/issues/${f.taskId}/comments`).send({ body }).expect(201);
+  const devRuns = (f: { devId: string; taskId: string }) => agentRuns(f.devId, f.taskId);
+  const runById = async (id: string) => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)))[0];
+  const commentIdOf = async (taskId: string, body: string) =>
+    (await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, taskId), eq(issueComments.body, body))))[0]!.id;
+  // The admission's own skip of a comment wake (the gate's behaviour on fb1ad740 too; nothing reads it back).
+  const admissionHeld = (f: { devId: string }, commentId: string) => db.select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+    .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.devId), sql`${agentWakeupRequests.payload}->>'commentId' = ${commentId}`));
+  const cto = (f: Fixture, runId = f.ctoRunId) => app(f.companyId, { agentId: f.ctoId, runId });
+  const ctoComment = async (f: Fixture, body: string, runId = f.ctoRunId) => {
+    await request(cto(f, runId)).post(`/api/issues/${f.taskId}/comments`).send({ body }).expect(201);
     return commentIdOf(f.taskId, body);
   };
-  // Held comments only (a recovery wake held by the same gate carries no comment).
-  const heldRequests = (f: { companyId: string; taskId: string }) => db.select().from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.reason, "issue_dependencies_blocked"),
-    eq(agentWakeupRequests.status, "skipped"), eq(agentWakeupRequests.requestedByActorType, "agent"),
-    sql`${agentWakeupRequests.payload}->>'issueId' = ${f.taskId}`,
-    sql`(${agentWakeupRequests.payload} ? 'commentId' or ${agentWakeupRequests.payload} ? 'commentIds')`));
-  // The run that carries held comments, once started; its packet shows them.
-  const carrierOf = async (agentId: string, taskId: string, predicate: (context: any) => boolean = () => true, skipRunId?: string) => {
+  // No Dev run queued or running (the route sends its wakes after answering).
+  const devAtRest = async (f: Fixture) => {
+    await heartbeat.drainActiveRunExecutions();
+    await expect.poll(async () => (await devRuns(f)).filter(run => ["queued", "running"].includes(run.status)).length,
+      { timeout: 20_000 }).toBe(0);
+  };
+  // An agent comment written while the Dev's task is blocked and the Dev is at rest: held at admission, no Dev run.
+  const heldComment = async (f: Fixture, body: string) => {
+    await devAtRest(f);
+    const id = await ctoComment(f, body);
+    await expect.poll(() => admissionHeld(f, id), { timeout: 20_000 }).toEqual([{ status: "skipped", reason: "issue_dependencies_blocked" }]);
+    return id;
+  };
+  // The first run of the agent on the task (after skipRunIds) whose context matches; waited until it ends.
+  const runWhere = async (agentId: string, taskId: string, predicate: (run: typeof heartbeatRuns.$inferSelect) => boolean, skipRunIds: string[] = []) => {
     let found: typeof heartbeatRuns.$inferSelect | undefined;
     await expect.poll(async () => {
-      found = (await agentRuns(agentId, taskId)).find(run => run.id !== skipRunId
-        && Array.isArray((run.contextSnapshot as any)?.heldDependencyCommentIds)
-        && predicate(run.contextSnapshot));
+      found = (await agentRuns(agentId, taskId)).find(run => !skipRunIds.includes(run.id) && predicate(run));
       return Boolean(found);
     }, { timeout: 20_000 }).toBe(true);
     await heartbeat.drainActiveRunExecutions();
-    return found!;
+    return (await runById(found!.id))!;
   };
+  const handedOver = (run: typeof heartbeatRuns.$inferSelect) => ((run.contextSnapshot as any)?.heldDependencyCommentIds ?? []) as string[];
+  const carrying = (commentId: string) => (run: typeof heartbeatRuns.$inferSelect) => handedOver(run).includes(commentId);
   const packetOf = (f: { companyId: string }, agentId: string, run: typeof heartbeatRuns.$inferSelect) =>
     buildPaperclipWakePayload({ db, companyId: f.companyId, agentId, runId: run.id,
       contextSnapshot: run.contextSnapshot as Record<string, unknown> });
-  const finishBlocker = (f: { companyId: string; blockerId: string }) =>
-    request(app(f.companyId)).patch(`/api/issues/${f.blockerId}`).send({ status: "done" }).expect(200);
-  const commentIdOf = async (taskId: string, body: string) =>
-    (await db.select({ id: issueComments.id }).from(issueComments).where(and(eq(issueComments.issueId, taskId), eq(issueComments.body, body))))[0]!.id;
+  const setStatus = (f: { companyId: string }, issueId: string, status: string) =>
+    request(app(f.companyId)).patch(`/api/issues/${issueId}`).send({ status }).expect(200);
 
   it("holds the CTO's comment written with the blocker in one call (TR-1258), then hands it over when the blocker is done", async () => {
     const f = await seed({ blocked: false });
     const body = "Mission attributed; admission held until the group is ready.";
-    await request(app(f.companyId, { agentId: f.ctoId, runId: f.ctoRunId })).patch(`/api/issues/${f.taskId}`)
-      .send({ blockedByIssueIds: [f.blockerId], comment: body }).expect(200);
+    await request(cto(f)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId], comment: body }).expect(200);
     await heartbeat.drainActiveRunExecutions();
     const commentId = await commentIdOf(f.taskId, body);
-    // The route sends its wakes after answering: wait for the request it records.
-    await expect.poll(() => heldFor(f, commentId), { timeout: 20_000 }).toEqual([{ status: "skipped", reason: "issue_dependencies_blocked" }]);
+    await expect.poll(() => admissionHeld(f, commentId), { timeout: 20_000 }).toEqual([{ status: "skipped", reason: "issue_dependencies_blocked" }]);
     expect(await devRuns(f)).toEqual([]);
-
-    // The blocker is done: the Dev's dependency wake carries the held comment, and its wake packet shows it.
-    await request(app(f.companyId)).patch(`/api/issues/${f.blockerId}`).send({ status: "done" }).expect(200);
-    const resolvedRun = async () => (await devRuns(f)).find((run) => (run.contextSnapshot as any)?.wakeReason === "issue_blockers_resolved");
-    await expect.poll(resolvedRun, { timeout: 20_000 }).toBeDefined();
-    await heartbeat.drainActiveRunExecutions();
-    const resolved = await resolvedRun();
-    expect((resolved!.contextSnapshot as any).heldDependencyCommentIds).toEqual([commentId]);
-    const packet = await buildPaperclipWakePayload({ db, companyId: f.companyId, agentId: f.devId, runId: resolved!.id,
-      contextSnapshot: resolved!.contextSnapshot as Record<string, unknown> });
-    expect(JSON.stringify(packet)).toContain(body);
+    await setStatus(f, f.blockerId, "done");
+    const resolved = await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.wakeReason === "issue_blockers_resolved");
+    expect(handedOver(resolved)).toEqual([commentId]);
+    expect(JSON.stringify(await packetOf(f, f.devId, resolved))).toContain(body);
   }, 120_000);
 
-  it("holds at the claim gate the CTO comments queued while the Dev was busy, merged ones included, and hands them over", async () => {
+  it("holds at the claim gate the CTO comments merged in one queued run, records nothing, and hands both over", async () => {
     const f = await seed({ blocked: false, devMaxConcurrent: 1 });
-    // The Dev is busy on another task: the comment's run waits in the queue.
     const busyRunId = randomUUID();
     await db.insert(heartbeatRuns).values({ id: busyRunId, companyId: f.companyId, agentId: f.devId, invocationSource: "assignment",
       status: "running", startedAt: new Date(), contextSnapshot: { issueId: randomUUID() } });
     await db.update(agents).set({ status: "running" }).where(eq(agents.id, f.devId));
     const first = await ctoComment(f, "Please look at the build log.");
     await expect.poll(async () => (await devRuns(f))[0]?.status, { timeout: 20_000 }).toBe("queued");
-    // A second comment merges into the same queued run.
     const second = await ctoComment(f, "And the test report.");
     await expect.poll(async () => JSON.stringify((await devRuns(f))[0]?.contextSnapshot ?? {}), { timeout: 20_000 }).toContain(second);
-    expect(await devRuns(f)).toHaveLength(1);
     const [queued] = await devRuns(f);
-    // The blocker comes after; then the busy run ends and the queue is resumed.
+    const requestsBefore = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.devId));
     await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId] }).expect(200);
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busyRunId));
     await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.devId));
     await heartbeat.resumeQueuedRuns();
     await heartbeat.drainActiveRunExecutions();
-    const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
-    expect(after).toMatchObject({ status: "cancelled", errorCode: "issue_dependencies_blocked" });
+    expect(await runById(queued!.id)).toMatchObject({ status: "cancelled", errorCode: "issue_dependencies_blocked" });
     expect(dispatched).not.toContain(queued!.id);
-    // The claim recorded both comments as held, like an admission hold.
-    const held = await heldRequests(f);
-    expect(held.flatMap(row => [(row.payload as any).commentId, ...((row.payload as any).commentIds ?? [])])).toEqual(
-      expect.arrayContaining([first, second]));
-    // The blocker is done: the dependency wake hands both over, in full in its packet.
-    await finishBlocker(f);
-    const carrier = await carrierOf(f.devId, f.taskId, context => context.wakeReason === "issue_blockers_resolved");
-    expect((carrier.contextSnapshot as any).heldDependencyCommentIds).toEqual([first, second]);
-    const packet = JSON.stringify(await packetOf(f, f.devId, carrier));
+    // Nothing is recorded for the comments (a cut here could lose nothing): no request names them.
+    const requestsAfter = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.devId));
+    expect(requestsAfter.filter(row => JSON.stringify(row.payload ?? {}).includes("commentIds"))).toEqual([]);
+    expect(requestsAfter.length).toBe(requestsBefore.length);
+    await setStatus(f, f.blockerId, "done");
+    const resolved = await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.wakeReason === "issue_blockers_resolved");
+    expect(handedOver(resolved)).toEqual([first, second]);
+    const packet = JSON.stringify(await packetOf(f, f.devId, resolved));
     expect(packet).toContain("Please look at the build log.");
     expect(packet).toContain("And the test report.");
   }, 120_000);
@@ -236,181 +242,218 @@ const ADAPTER = "codex_local";
     await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.devId));
     await heartbeat.resumeQueuedRuns();
     await heartbeat.drainActiveRunExecutions();
-    const [after] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, queued!.id));
-    expect(after!.status).not.toBe("cancelled");
+    expect((await runById(queued!.id))!.status).not.toBe("cancelled");
     expect(dispatched).toContain(queued!.id);
   }, 120_000);
 
-  it("hands held comments over when the blockers are removed instead of done", async () => {
+  // Second review, point 1: a run of ANOTHER role that carried the comment must not count as handed over to the Dev.
+  it("hands the comment to the Dev at the lift even after a non-assignee's run carried it", async () => {
     const f = await seed();
-    const held = await ctoComment(f, "Removed-blocker note.");
-    await expect.poll(async () => (await heldRequests(f)).length, { timeout: 20_000 }).toBe(1);
-    expect(await devRuns(f)).toEqual([]);
-    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [] }).expect(200);
-    const carrier = await carrierOf(f.devId, f.taskId);
-    expect((carrier.contextSnapshot as any).heldDependencyCommentIds).toEqual([held]);
-    expect(JSON.stringify(await packetOf(f, f.devId, carrier))).toContain("Removed-blocker note.");
-  }, 120_000);
-
-  it("hands held comments over with the cancelled blocker's handoff, and no longer holds while every blocker is cancelled", async () => {
-    const f = await seed();
-    const held = await ctoComment(f, "Before the cancel.");
-    await expect.poll(async () => (await heldRequests(f)).length, { timeout: 20_000 }).toBe(1);
-    await request(app(f.companyId)).patch(`/api/issues/${f.blockerId}`).send({ status: "cancelled" }).expect(200);
-    const carrier = await carrierOf(f.devId, f.taskId);
-    expect((carrier.contextSnapshot as any).cancelledBlockerIssueId).toBe(f.blockerId);
-    expect((carrier.contextSnapshot as any).heldDependencyCommentIds).toEqual([held]);
-    // Nothing would lift a cancelled blocker: an agent's comment now reaches the assignee as a bounded run.
-    const after = await ctoComment(f, "After the cancel.");
-    await expect.poll(async () => (await devRuns(f)).some(run => JSON.stringify(run.contextSnapshot).includes(after)), { timeout: 20_000 }).toBe(true);
-    await heartbeat.drainActiveRunExecutions();
-    const heldNow = await heldRequests(f);
-    expect(heldNow.length, JSON.stringify({ held: heldNow.map(r => r.payload),
-      runs: (await devRuns(f)).map(r => ({ s: r.status, e: r.errorCode, c: r.contextSnapshot })) })).toBe(1);
-  }, 120_000);
-
-  it("hands held comments over to the new assignee after a reassignment", async () => {
-    const f = await seed();
-    const held = await ctoComment(f, "For whoever owns this task.");
-    await expect.poll(async () => (await heldRequests(f)).length, { timeout: 20_000 }).toBe(1);
-    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ assigneeAgentId: f.dev2Id }).expect(200);
-    await heartbeat.drainActiveRunExecutions();
-    await finishBlocker(f);
-    const carrier = await carrierOf(f.dev2Id, f.taskId);
-    expect((carrier.contextSnapshot as any).heldDependencyCommentIds).toEqual([held]);
-  }, 120_000);
-
-  it("does not let a person's bounded run consume the agents' held comments (lastRun)", async () => {
-    const f = await seed();
-    const held = await ctoComment(f, "Held before the person.");
-    await expect.poll(async () => (await heldRequests(f)).length, { timeout: 20_000 }).toBe(1);
-    await request(app(f.companyId)).post(`/api/issues/${f.taskId}/comments`).send({ body: "Person meanwhile." }).expect(201);
-    await expect.poll(async () => (await devRuns(f)).length, { timeout: 20_000 }).toBe(1);
-    await heartbeat.drainActiveRunExecutions();
-    const [personRun] = await devRuns(f);
-    expect((personRun!.contextSnapshot as any).heldDependencyCommentIds).toBeUndefined();
-    await finishBlocker(f);
-    const carrier = await carrierOf(f.devId, f.taskId, context => context.wakeReason === "issue_blockers_resolved");
-    expect((carrier.contextSnapshot as any).heldDependencyCommentIds).toEqual([held]);
-    // Handed over once: a later run of the issue carries nothing more.
-    const laterId = await ctoComment(f, "A later note.");
-    await expect.poll(async () => (await devRuns(f)).some(run => JSON.stringify(run.contextSnapshot).includes(laterId)), { timeout: 20_000 }).toBe(true);
-    await heartbeat.drainActiveRunExecutions();
-    const others = (await devRuns(f)).filter(run => run.id !== personRun!.id && run.id !== carrier.id);
-    expect(others.length).toBeGreaterThan(0);
-    for (const run of others) expect((run.contextSnapshot as any).heldDependencyCommentIds).toBeUndefined();
-  }, 120_000);
-
-  it("still wakes, as before, a role that is not the blocked issue's assignee for an agent's comment", async () => {
-    const f = await seed();
-    // In this fork a mention never wakes (queue.ts: "Mentions only annotate comments"), before and after this change.
-    // A non-assignee reached by an agent's comment wake on the Dev's blocked task (a review participant, for example)
-    // passes the dependency gate as before; only the assignee is held.
     const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.taskId, authorType: "agent",
-      authorAgentId: f.ctoId, body: `[@QA](agent://${f.qaId}) can you check the fixture?` }).returning();
+      authorAgentId: f.ctoId, body: "QA, can you check the fixture? Dev, this changes your task." }).returning();
     const commentWake = (agentId: string) => heartbeat.wakeup(agentId, {
       source: "automation", triggerDetail: "system", reason: "issue_commented",
       payload: { issueId: f.taskId, commentId: comment!.id }, requestedByActorType: "agent", requestedByActorId: f.ctoId,
       contextSnapshot: { issueId: f.taskId, taskId: f.taskId, wakeReason: "issue_commented", commentId: comment!.id,
         wakeCommentId: comment!.id, source: "issue.comment" },
     });
+    // A non-assignee passes as before (only the assignee is held); a mention never wakes in this fork.
     const qaRun = await commentWake(f.qaId);
-    expect(qaRun, JSON.stringify(await db.select({ s: agentWakeupRequests.status, r: agentWakeupRequests.reason,
-      e: agentWakeupRequests.error }).from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.qaId)))).not.toBeNull();
+    expect(qaRun).not.toBeNull();
     expect(qaRun!.contextSnapshot).toMatchObject({ dependencyBlockedInteraction: true });
-    // The same wake for the blocked assignee is held.
+    await heartbeat.drainActiveRunExecutions();
+    expect((await runById(qaRun!.id))!.status).toBe("succeeded");
+    // The same wake for the blocked assignee is held (at admission, or at the claim gate behind QA's run).
     expect(await commentWake(f.devId)).toBeNull();
     await heartbeat.drainActiveRunExecutions();
-    // The assignee's wake (deferred behind QA's run on the issue) is held at the claim gate: never dispatched.
     for (const run of (await devRuns(f)).filter(row => JSON.stringify(row.contextSnapshot).includes(comment!.id))) {
       expect(run).toMatchObject({ status: "cancelled", errorCode: "issue_dependencies_blocked" });
-      expect(dispatched).not.toContain(run.id);
     }
+    await setStatus(f, f.blockerId, "done");
+    const resolved = await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.wakeReason === "issue_blockers_resolved");
+    expect(handedOver(resolved)).toEqual([comment!.id]);
   }, 120_000);
 
-  // Pilot's correction: a run that carried the held comments but never reached the engine (refused by the worker
-  // router before any reservation) did not show them; the next run carries them again.
-  it("hands held comments over again when the carrying run was refused by the worker router", async () => {
-    const f = await seed();
-    const held = await ctoComment(f, "Seen only by a run that reaches the engine.");
-    await expect.poll(async () => (await heldRequests(f)).length, { timeout: 20_000 }).toBe(1);
-    refuseNext.set(f.taskId, "router_group_participant_reserved");
-    await finishBlocker(f);
-    const refused = await carrierOf(f.devId, f.taskId);
-    await expect.poll(async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, refused.id)))[0]?.errorCode,
-      { timeout: 20_000 }).toBe("router_group_participant_reserved");
-    // The refused run carried it but did not show it: it is still to hand over.
-    const { readUndeliveredHeldCommentIds } = await import("../services/heartbeat/held-dependency-comments.js");
-    expect(await readUndeliveredHeldCommentIds(db, { companyId: f.companyId, issueId: f.taskId })).toEqual([held]);
-    // A person returns the issue to work: the next run carries the comment again (on this branch alone, the refused
-    // run's retry; with STUDIO-0059 the person's return wakes the assignee).
-    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ status: "todo" }).expect(200);
-    await heartbeat.resumeQueuedRuns();
-    const again = await carrierOf(f.devId, f.taskId, () => true, refused.id);
-    expect((again.contextSnapshot as any).heldDependencyCommentIds).toEqual([held]);
-  }, 120_000);
-
-  // The safety net for an issue made ready without a route: the stranded-dependency backstop
-  // (reconcileResolvedDependencyWakeBackstop, recovery/service.ts) wakes a `blocked` issue whose blockers are all done.
-  it("hands held comments over through the dependency backstop when the blocker became done without a route", async () => {
+  // Second review, point 2: one blocker cancelled, the other then done. Cancelled blockers stay unresolved, so no
+  // blockers-resolved wake comes; the dependency is handed back to the Dev, whose run carries the held comment.
+  it("hands the dependency back, with the held comment, when the remaining blockers are all cancelled", async () => {
     const f = await seed({ blocked: false });
-    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId], status: "blocked" }).expect(200);
-    const held = await ctoComment(f, "Backstop note.");
-    await expect.poll(async () => (await heldRequests(f)).length, { timeout: 20_000 }).toBe(1);
-    // Done without the route: no issue_blockers_resolved wake is sent.
-    await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, f.blockerId));
-    await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId, issueId: f.taskId });
-    const carrier = await carrierOf(f.devId, f.taskId);
-    expect((carrier.contextSnapshot as any).wakeReason).toBe("issue_blockers_resolved");
-    expect((carrier.contextSnapshot as any).heldDependencyCommentIds).toEqual([held]);
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId, f.blocker2Id] }).expect(200);
+    await setStatus(f, f.blocker2Id, "cancelled");
+    await heartbeat.drainActiveRunExecutions();
+    // Written while one blocker is still open (it may merge into the Dev's bounded handoff run, which does not settle it).
+    await devAtRest(f);
+    const held = await ctoComment(f, "Written while one blocker is still open.");
+    await devAtRest(f);
+    const before = (await devRuns(f)).map(run => run.id);
+    await setStatus(f, f.blockerId, "done");
+    const handBack = await runWhere(f.devId, f.taskId, carrying(held), before);
+    expect((handBack.contextSnapshot as any).cancelledBlockerIssueId).toBe(f.blocker2Id);
+    const notes = await db.select({ body: issueComments.body }).from(issueComments)
+      .where(and(eq(issueComments.issueId, f.taskId), eq(issueComments.authorType, "system")));
+    expect(notes.some(row => row.body.includes("every blocker this task still waits on is cancelled"))).toBe(true);
   }, 120_000);
 
-  // Reverse order: an agent's comment while the assignee's dependency run is already running is neither held nor lost.
-  it("neither holds nor loses an agent's comment written while the assignee's dependency run is running", async () => {
+  // Second review, point 3: a partial removal leaving only done blockers makes the issue ready; so does deleting the
+  // blocker. Both statuses that hold work (`todo` and `blocked`).
+  for (const status of ["todo", "blocked"] as const) {
+    it(`wakes the assignee with the held comment when a partial removal makes a ${status} issue ready`, async () => {
+      const f = await seed({ blocked: false });
+      await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`)
+        .send({ blockedByIssueIds: [f.blockerId, f.blocker2Id], ...(status === "blocked" ? { status: "blocked" } : {}) }).expect(200);
+      await setStatus(f, f.blockerId, "done");
+      await heartbeat.drainActiveRunExecutions();
+      const held = await heldComment(f, `Held on a ${status} issue.`);
+      const before = (await devRuns(f)).map(run => run.id);
+      // The open blocker is removed; the done one stays: the issue is ready, the list is not empty.
+      await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId] }).expect(200);
+      const run = await runWhere(f.devId, f.taskId, carrying(held), before);
+      expect((run.contextSnapshot as any).wakeReason).toBe("issue_blockers_resolved");
+    }, 120_000);
+  }
+
+  it("wakes the assignee with the held comment when its blocker issue is deleted", async () => {
+    const f = await seed();
+    const held = await heldComment(f, "Held until the blocker goes away.");
+    await request(app(f.companyId)).delete(`/api/issues/${f.blockerId}`).expect(200);
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect((run.contextSnapshot as any).source).toBe("issue.blocker_deleted");
+  }, 120_000);
+
+  // Second review, point 9: the wake key carries the edit's time, so two removals give two wakes.
+  it("wakes once for each removal that makes the issue ready", async () => {
+    const f = await seed();
+    const firstHeld = await heldComment(f, "Before the first removal.");
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [] }).expect(200);
+    const first = await runWhere(f.devId, f.taskId, carrying(firstHeld));
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blocker2Id] }).expect(200);
+    await devAtRest(f);
+    const secondHeld = await ctoComment(f, "Before the second removal.");
+    await devAtRest(f);
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [] }).expect(200);
+    const second = await runWhere(f.devId, f.taskId, carrying(secondHeld), [first.id]);
+    expect([first, second].map(run => (run.contextSnapshot as any).source)).toEqual(["issue.blockers_edited", "issue.blockers_edited"]);
+    // The first run succeeded with its engine started: the first comment is not handed over again.
+    expect(handedOver(second)).toEqual([secondHeld]);
+  }, 120_000);
+
+  // Proof of delivery (pilot's choice B): a run counts only if its engine process started AND it succeeded.
+  it("hands the comment over again after a run without a started engine, a run cut after its start, or a router refusal", async () => {
+    for (const outcome of ["no-spawn", "spawn-255", "refuse:router_group_participant_reserved"] as const) {
+      const f = await seed();
+      const held = await heldComment(f, `Held, then a ${outcome} run.`);
+      nextOutcome.set(f.taskId, outcome);
+      await setStatus(f, f.blockerId, "done");
+      const carrier = await runWhere(f.devId, f.taskId, carrying(held));
+      expect(carrier.status).toBe(outcome === "no-spawn" ? "succeeded" : "failed");
+      if (outcome === "no-spawn") expect(carrier.processStartedAt).toBeNull();
+      if (outcome === "spawn-255") expect(carrier.processStartedAt).not.toBeNull();
+      // The Dev's next started run on the task (a recovery run, or the run of another agent comment) carries it again.
+      await devAtRest(f);
+      await ctoComment(f, `A note after the ${outcome} run.`);
+      // A cut run is retried later (transient retry): let it fall due now.
+      let again: typeof heartbeatRuns.$inferSelect | undefined;
+      for (let attempt = 0; attempt < 80 && !again; attempt += 1) {
+        await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1000) })
+          .where(and(eq(heartbeatRuns.agentId, f.devId), eq(heartbeatRuns.status, "scheduled_retry")));
+        await heartbeat.promoteDueScheduledRetries(new Date());
+        await heartbeat.resumeQueuedRuns();
+        again = (await devRuns(f)).filter(run => run.id !== carrier.id && run.startedAt && run.createdAt >= carrier.createdAt)
+          .sort((x, y) => x.createdAt.getTime() - y.createdAt.getTime())[0];
+        if (!again) await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      expect(again, JSON.stringify({ runs: (await devRuns(f)).map(run => ({ s: run.status, e: run.errorCode,
+        st: Boolean(run.startedAt), r: (run.contextSnapshot as any)?.wakeReason })),
+        wakes: await db.select({ s: agentWakeupRequests.status, r: agentWakeupRequests.reason, e: agentWakeupRequests.error })
+          .from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.devId)) })).toBeDefined();
+      expect(handedOver(again!)).toEqual([held]);
+      await devAtRest(f);
+      expect((await runById(again!.id))!.status).toBe("succeeded");
+      // That run qualified: no later run carries it any more.
+      await ctoComment(f, `A later note after the ${outcome} run.`);
+      let later: typeof heartbeatRuns.$inferSelect[] = [];
+      for (let attempt = 0; attempt < 80 && later.length === 0; attempt += 1) {
+        await heartbeat.resumeQueuedRuns();
+        await heartbeat.drainActiveRunExecutions();
+        later = (await devRuns(f)).filter(run => run.startedAt && run.createdAt > again!.createdAt);
+        if (later.length === 0) await new Promise(resolve => setTimeout(resolve, 250));
+      }
+      expect(later.length).toBeGreaterThan(0);
+      for (const run of later) expect(handedOver(run)).not.toContain(held);
+    }
+  }, 240_000);
+
+  it("hands the whole agent thread to the new assignee after a reassignment during the wait", async () => {
+    const f = await seed();
+    const held = await heldComment(f, "For whoever owns this task.");
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ assigneeAgentId: f.dev2Id }).expect(200);
+    await heartbeat.drainActiveRunExecutions();
+    await setStatus(f, f.blockerId, "done");
+    const run = await runWhere(f.dev2Id, f.taskId, carrying(held));
+    expect(handedOver(run)).toEqual([held]);
+  }, 120_000);
+
+  it("does not let a person's bounded run settle the agents' held comments", async () => {
+    const f = await seed();
+    const held = await heldComment(f, "Held before the person.");
+    await request(app(f.companyId)).post(`/api/issues/${f.taskId}/comments`).send({ body: "Person meanwhile." }).expect(201);
+    const personRun = await runWhere(f.devId, f.taskId, () => true);
+    expect(personRun.contextSnapshot).toMatchObject({ dependencyBlockedInteraction: true });
+    expect(handedOver(personRun)).toEqual([]);
+    expect(personRun.status).toBe("succeeded");
+    await setStatus(f, f.blockerId, "done");
+    const resolved = await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.wakeReason === "issue_blockers_resolved");
+    expect(handedOver(resolved)).toEqual([held]);
+  }, 120_000);
+
+  it("hands over at the next run a comment written while the assignee's dependency run is running", async () => {
     const f = await seed();
     let release!: () => void;
     holdOpen.set(f.taskId, new Promise<void>(resolve => { release = resolve; }));
-    await finishBlocker(f);
+    await setStatus(f, f.blockerId, "done");
     await expect.poll(async () => (await devRuns(f)).find(run => run.status === "running")?.id, { timeout: 20_000 }).toBeDefined();
+    const [running] = (await devRuns(f)).filter(run => run.status === "running");
     const during = await ctoComment(f, "Written while the dependency run runs.");
     holdOpen.delete(f.taskId);
     release();
     await heartbeat.drainActiveRunExecutions();
     await heartbeat.resumeQueuedRuns();
-    await expect.poll(async () => (await devRuns(f)).some(run => run.status === "succeeded"
-      && JSON.stringify(run.contextSnapshot).includes(during)), { timeout: 20_000 }).toBe(true);
-    await heartbeat.drainActiveRunExecutions();
-    expect(await heldRequests(f)).toEqual([]);
+    const next = await runWhere(f.devId, f.taskId, run => JSON.stringify(run.contextSnapshot).includes(during), [running!.id]);
+    expect(next.status).toBe("succeeded");
   }, 120_000);
 
-  it("names every held comment and shows the latest twenty in full", async () => {
+  it("names the latest twenty comments written through the route and counts the older ones", async () => {
     const f = await seed();
-    // The route limits an agent's comment rate: two come through the route, the twenty others are written as the
-    // admission writes them (an agent comment and its skipped issue_dependencies_blocked request).
     const ids: string[] = [];
+    // Each comment from a separate CTO run (the route limits how much one run writes on another task).
     for (let i = 1; i <= 22; i += 1) {
-      const body = `Held note ${String(i).padStart(2, "0")}.`;
-      if (i <= 2) { ids.push(await ctoComment(f, body)); continue; }
-      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.taskId, authorType: "agent",
-        authorAgentId: f.ctoId, body, createdAt: new Date(Date.now() + i) }).returning();
-      await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.devId, source: "automation",
-        triggerDetail: "system", reason: "issue_dependencies_blocked", status: "skipped", requestedByActorType: "agent",
-        requestedByActorId: f.ctoId, requestedAt: new Date(Date.now() + 1000 + i), finishedAt: new Date(),
-        payload: { issueId: f.taskId, commentId: comment!.id } });
-      ids.push(comment!.id);
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.ctoId, invocationSource: "assignment",
+        status: "running", startedAt: new Date(), contextSnapshot: { issueId: f.ctoTaskId } });
+      ids.push(await ctoComment(f, `Held note ${String(i).padStart(2, "0")}.`, runId));
     }
-    await expect.poll(async () => (await heldRequests(f)).length, { timeout: 30_000 }).toBe(22);
-    await finishBlocker(f);
-    const carrier = await carrierOf(f.devId, f.taskId);
-    expect((carrier.contextSnapshot as any).heldDependencyCommentIds).toEqual(ids);
-    const packet = await packetOf(f, f.devId, carrier) as any;
+    await setStatus(f, f.blockerId, "done");
+    const resolved = await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.wakeReason === "issue_blockers_resolved");
+    expect(handedOver(resolved)).toEqual(ids.slice(2));
+    expect((resolved.contextSnapshot as any).heldDependencyOlderCount).toBe(2);
+    const packet = await packetOf(f, f.devId, resolved) as any;
     expect(packet.heldDependencyComments).toMatchObject({ heldCount: 22, shownCount: 20, olderInThreadCount: 2 });
-    // The packet lists the latest twenty (its usual inline body limit applies) and asks the agent to read the thread.
     expect(packet.commentIds).toEqual(ids.slice(2));
     expect(packet.truncated).toBe(true);
     expect(packet.fallbackFetchNeeded).toBe(true);
-    expect(JSON.stringify(packet)).not.toContain("Held note 02.");
-  }, 180_000);
+  }, 240_000);
+
+  // The safety net for a `blocked` issue made ready without a route: the stranded-dependency backstop
+  // (reconcileResolvedDependencyWakeBackstop, recovery/service.ts) wakes it; that run carries the held comment.
+  it("hands the held comment over through the dependency backstop when the blocker became done without a route", async () => {
+    const f = await seed({ blocked: false });
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId], status: "blocked" }).expect(200);
+    const held = await heldComment(f, "Backstop note.");
+    await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, f.blockerId));
+    await heartbeat.reconcileResolvedDependencyWakes({ companyId: f.companyId, issueId: f.taskId });
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect((run.contextSnapshot as any).wakeReason).toBe("issue_blockers_resolved");
+  }, 120_000);
 
   it("keeps a person's comment as a bounded interaction run on the blocked issue", async () => {
     const f = await seed();
@@ -424,23 +467,18 @@ const ADAPTER = "codex_local";
 
   it("reaches the blocked assignee through a card on the asker's own task, addressed to the assignee", async () => {
     const f = await seed();
-    const ctoTaskId = (await db.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId, f.companyId), eq(issues.title, "CTO task"))))[0]!.id;
-    // The CTO asks from its own task (a card is created by a run of the same issue), addressed to the Dev.
-    const created = await request(app(f.companyId, { agentId: f.ctoId, runId: f.ctoRunId })).post(`/api/issues/${ctoTaskId}/interactions`).send({
+    const created = await request(cto(f)).post(`/api/issues/${f.ctoTaskId}/interactions`).send({
       kind: "ask_user_questions", addresseeAgentId: f.devId, resolverPolicy: "anyone",
       payload: { version: 1, questions: [{ id: "q", prompt: "Is WIN-01 free?", selectionMode: "single",
         options: [{ id: "y", label: "Yes" }, { id: "n", label: "No" }] }] },
     });
     expect(created.status, JSON.stringify(created.body)).toBeLessThan(300);
-    // The Dev's wake on the CTO's task is admitted (not held by the Dev's own blockers). As in production (TR-1258,
-    // 15 Nov: card at 21:08:11, addressee run at 21:09:01 when the asker's run ended), it waits for the asker's run.
     const cardWakes = () => db.select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason }).from(agentWakeupRequests)
-      .where(and(eq(agentWakeupRequests.agentId, f.devId), sql`${agentWakeupRequests.payload}->>'issueId' = ${ctoTaskId}`));
+      .where(and(eq(agentWakeupRequests.agentId, f.devId), sql`${agentWakeupRequests.payload}->>'issueId' = ${f.ctoTaskId}`));
     await expect.poll(async () => (await cardWakes()).length, { timeout: 20_000 }).toBeGreaterThan(0);
     expect((await cardWakes()).every((wake) => wake.status !== "skipped" && wake.reason !== "issue_dependencies_blocked")).toBe(true);
     expect(await devRuns(f)).toEqual([]);
-    // A card put by the CTO on the Dev's own blocked task is refused by the route (not from a run of that task).
-    const refused = await request(app(f.companyId, { agentId: f.ctoId, runId: f.ctoRunId })).post(`/api/issues/${f.taskId}/interactions`).send({
+    const refused = await request(cto(f)).post(`/api/issues/${f.taskId}/interactions`).send({
       kind: "ask_user_questions", addresseeAgentId: f.devId, resolverPolicy: "anyone",
       payload: { version: 1, questions: [{ id: "q", prompt: "?", selectionMode: "single", options: [{ id: "y", label: "Yes" }] }] },
     });
@@ -449,8 +487,7 @@ const ADAPTER = "codex_local";
 
   it("still wakes the assignee for an agent's comment when the issue is not blocked", async () => {
     const f = await seed({ blocked: false });
-    await request(app(f.companyId, { agentId: f.ctoId, runId: f.ctoRunId })).post(`/api/issues/${f.taskId}/comments`)
-      .send({ body: "A note on an open task." }).expect(201);
+    await ctoComment(f, "A note on an open task.");
     await expect.poll(async () => (await devRuns(f)).length, { timeout: 20_000 }).toBe(1);
     await heartbeat.drainActiveRunExecutions();
   }, 120_000);

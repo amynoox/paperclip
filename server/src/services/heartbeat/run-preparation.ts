@@ -2323,14 +2323,17 @@ export async function buildPaperclipWakePayload(input: {
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
   const wakeCommentIds = extractWakeCommentIds(input.contextSnapshot);
-  // STUDIO-0063: agent comments held while the issue waited on its blockers, handed to the assignee by the run that
-  // can act on them. Shown like the wake's own comments, after them: the latest 20 in full; the count of older ones
-  // is written in the payload (heldDependencyComments) and marks it truncated, so the agent reads the thread.
+  // STUDIO-0063: agent comments the assignee may not have seen (held while the issue waited on its blockers), handed
+  // over by the run that can act on them. Shown like the wake's own comments, after them: the latest 20; the count of
+  // older ones (heldDependencyOlderCount) is written in the payload and marks it truncated, so the agent reads the
+  // thread.
   const allHeldDependencyCommentIds = (Array.isArray(input.contextSnapshot.heldDependencyCommentIds)
     ? input.contextSnapshot.heldDependencyCommentIds : [])
     .map((id) => readNonEmptyString(id)).filter((id): id is string => Boolean(id) && !wakeCommentIds.includes(id!));
   const heldDependencyCommentIds = allHeldDependencyCommentIds.slice(-20);
-  const heldDependencyOlderCount = allHeldDependencyCommentIds.length - heldDependencyCommentIds.length;
+  const heldDependencyOlderCount = allHeldDependencyCommentIds.length - heldDependencyCommentIds.length
+    + (typeof input.contextSnapshot.heldDependencyOlderCount === "number" && input.contextSnapshot.heldDependencyOlderCount > 0
+      ? Math.floor(input.contextSnapshot.heldDependencyOlderCount) : 0);
   const commentIds = [...wakeCommentIds, ...heldDependencyCommentIds];
   const annotationCommentId = readNonEmptyString(
     input.contextSnapshot.annotationCommentId,
@@ -2884,10 +2887,10 @@ export async function buildPaperclipWakePayload(input: {
     },
     ...(allHeldDependencyCommentIds.length > 0 ? {
       heldDependencyComments: {
-        heldCount: allHeldDependencyCommentIds.length,
+        heldCount: heldDependencyCommentIds.length + heldDependencyOlderCount,
         shownCount: heldDependencyCommentIds.length,
         olderInThreadCount: heldDependencyOlderCount,
-        note: "Comments from other agents written while this issue waited on its blockers; they were held until now.",
+        note: "Comments from other agents you may not have seen (written while this issue waited on its blockers, or during your last run).",
       },
     } : {}),
     truncated: payloadTruncated,

@@ -1,43 +1,20 @@
 // STUDIO-0063: an agent's comment on an issue that waits on unresolved blockers does not start the assignee's run
-// (production 15 Nov 2026, TR-1258); it waits with the issue and is handed to the assignee later. One decision for
-// both gates (admission and claim), and one durable trace of what was held:
-// - held: a wake request `skipped` with reason `issue_dependencies_blocked`, requested by an `agent`, whose payload
-//   names the issue and the held comments (`commentId` and/or `commentIds`);
-// - handed over: a run of the issue that REACHED THE ENGINE carries the comment, in `heldDependencyCommentIds` or
-//   among its own wake comments. A run refused or held by the worker router before any reservation, or cancelled by
-//   a gate before dispatch, did not show it to the agent: the next run carries it again. A held comment that no such
-//   run carried is still to hand over, whatever ran in between.
-import { and, asc, eq, gte, inArray, isNotNull, sql } from "drizzle-orm";
-import { agentWakeupRequests, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
+// (production 15 Nov 2026, TR-1258); it waits with the issue and is handed to the assignee later.
+// - One decision for both gates (admission and claim): agentCommentHeldByDependencies. Nothing is recorded.
+// - The issue thread is the record. What the current assignee may not have seen is every agent comment (not its own)
+//   written after the START of its latest QUALIFIED run on the issue: admitted with the issue ready (not under a
+//   person's, card's or stall's bounded exception), with its engine process started (processStartedAt) and
+//   succeeded. Without such a run, the whole thread. An error can only repeat a comment, never lose one: a comment
+//   written during a run, or merged into it, comes after its start and is handed over again by the next run.
+import { and, desc, eq, gt, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
+import { heartbeatRuns, issueComments, issueRelations, issues, type Db } from "@paperclipai/db";
 import { ISSUE_BLOCKER_STALLED_WAKE_REASON } from "@paperclipai/shared";
 import { extractWakeCommentIds } from "../../modules/run-dispatch/index.js";
+import { insertIssueComment } from "../issue-comment-writes.js";
 
 export const HELD_DEPENDENCY_COMMENT_IDS_KEY = "heldDependencyCommentIds";
+export const HELD_DEPENDENCY_OLDER_COUNT_KEY = "heldDependencyOlderCount";
 export const HELD_DEPENDENCY_COMMENTS_SHOWN_MAX = 20;
-const HELD_DEPENDENCY_REASON = "issue_dependencies_blocked";
-
-// Run error codes by which the worker router ended a run before any engine started (its refusals and declared waits,
-// STUDIO-0042/0046/0059), and the gates that cancel a queued run before dispatch. Kept here as one list so the
-// handover does not depend on the order in which the router patches land.
-const NO_ENGINE_RUN_ERROR_CODES: ReadonlySet<string> = new Set([
-  "router_waiting_for_resources",
-  "router_provider_stop_unverified",
-  "router_previous_dispatch_unsettled",
-  "router_readmission_not_drained",
-  "router_ticket_blocked",
-  "router_group_participant_ended",
-  "router_group_participant_closed",
-  "router_group_participant_mismatch",
-  "router_group_participant_reserved",
-  "issue_dependencies_blocked",
-  "queued_comment_discarded",
-]);
-
-/** Whether a run of the issue showed its comments to the agent (it started, and reached the engine). */
-export function runReachedEngine(run: { startedAt: Date | null; status: string; errorCode: string | null }): boolean {
-  if (!run.startedAt) return false;
-  return !(run.errorCode && NO_ENGINE_RUN_ERROR_CODES.has(run.errorCode) && run.status !== "succeeded");
-}
 
 type Reader = Pick<Db, "select">;
 
@@ -55,11 +32,24 @@ export function wakeContextCommentIds(context: Record<string, unknown> | null | 
   return ids;
 }
 
+/** Whether every unresolved blocker is cancelled (nothing would ever lift them; STUDIO-0029 hands them back). */
+export async function allUnresolvedBlockersCancelled(db: Reader, input: {
+  companyId: string;
+  unresolvedBlockerIssueIds: readonly string[];
+}): Promise<boolean> {
+  if (input.unresolvedBlockerIssueIds.length === 0) return false;
+  const blockers = await db.select({ status: issues.status }).from(issues).where(and(
+    eq(issues.companyId, input.companyId),
+    inArray(issues.id, [...input.unresolvedBlockerIssueIds]),
+  ));
+  return blockers.length > 0 && blockers.every(row => row.status === "cancelled");
+}
+
 /**
  * Whether the comment exception of the dependency gate is withheld for this wake, because only agents wrote what it
  * carries. Read from the comments themselves, so a run that merged a person's comment with an agent's keeps the
- * person's exception. Only the issue's assignee is held (a mentioned agent passes as before), and never while every
- * unresolved blocker is cancelled (nothing would ever lift it).
+ * person's exception. Only the issue's assignee is held (another role passes as before), and never while every
+ * unresolved blocker is cancelled.
  */
 export async function agentCommentHeldByDependencies(db: Reader, input: {
   companyId: string;
@@ -83,125 +73,127 @@ export async function agentCommentHeldByDependencies(db: Reader, input: {
   } else if (input.requestedByActorType !== "agent") {
     return false;
   }
-  if (input.unresolvedBlockerIssueIds.length > 0) {
-    const blockers = await db.select({ status: issues.status }).from(issues).where(and(
-      eq(issues.companyId, input.companyId),
-      inArray(issues.id, [...input.unresolvedBlockerIssueIds]),
-    ));
-    if (blockers.length > 0 && blockers.every(row => row.status === "cancelled")) return false;
-  }
-  return true;
+  return !(await allUnresolvedBlockersCancelled(db, input));
 }
 
-/** A wake that asks the blocked assignee to act on its dependencies, so it carries the held comments. */
+/** A wake that asks the blocked assignee to act on its dependencies, so it carries the comments to hand over. */
 export function isDependencyHandoffWake(context: Record<string, unknown>): boolean {
   return readString(context.wakeReason) === ISSUE_BLOCKER_STALLED_WAKE_REASON
     || readString(context.cancelledBlockerIssueId) !== null;
 }
 
-/** Held agent comments on the issue that no started run of the issue carried yet, oldest first. */
-export async function readUndeliveredHeldCommentIds(db: Reader, input: {
+/** Start of the assignee's latest qualified run on the issue (see the header); null without one. */
+export async function readLatestQualifiedRunStart(db: Reader, input: {
   companyId: string;
   issueId: string;
-}): Promise<string[]> {
-  const held = await db.select({
-    commentId: sql<string | null>`${agentWakeupRequests.payload}->>'commentId'`,
-    commentIds: sql<unknown>`${agentWakeupRequests.payload}->'commentIds'`,
-    requestedAt: agentWakeupRequests.requestedAt,
-  }).from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, input.companyId),
-    eq(agentWakeupRequests.status, "skipped"),
-    eq(agentWakeupRequests.reason, HELD_DEPENDENCY_REASON),
-    eq(agentWakeupRequests.requestedByActorType, "agent"),
-    sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
-    sql`(nullif(${agentWakeupRequests.payload}->>'commentId', '') is not null
-      or jsonb_typeof(${agentWakeupRequests.payload}->'commentIds') = 'array')`,
-  )).orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id));
-  const heldIds: string[] = [];
-  for (const row of held) {
-    const ids = [row.commentId, ...(Array.isArray(row.commentIds) ? row.commentIds : [])];
-    for (const value of ids) {
-      const id = readString(value);
-      if (id && !heldIds.includes(id)) heldIds.push(id);
-    }
-  }
-  if (heldIds.length === 0) return [];
-  const oldest = held[0]!.requestedAt;
-  const carried = await db.select({
-    context: heartbeatRuns.contextSnapshot,
-    startedAt: heartbeatRuns.startedAt,
-    status: heartbeatRuns.status,
-    errorCode: heartbeatRuns.errorCode,
-  }).from(heartbeatRuns).where(and(
+  agentId: string;
+}): Promise<Date | null> {
+  const [run] = await db.select({ startedAt: heartbeatRuns.startedAt }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, input.agentId),
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
+    eq(heartbeatRuns.status, "succeeded"),
+    isNotNull(heartbeatRuns.processStartedAt),
     isNotNull(heartbeatRuns.startedAt),
-    oldest ? gte(heartbeatRuns.createdAt, oldest) : undefined,
-  ));
-  const delivered = new Set<string>();
-  for (const run of carried) {
-    if (!runReachedEngine(run)) continue;
-    const snapshot = (run.context ?? {}) as Record<string, unknown>;
-    for (const id of wakeContextCommentIds(snapshot)) delivered.add(id);
-    const heldCarried = snapshot[HELD_DEPENDENCY_COMMENT_IDS_KEY];
-    if (Array.isArray(heldCarried)) for (const value of heldCarried) {
-      const id = readString(value);
-      if (id) delivered.add(id);
-    }
-  }
-  // A comment deleted since is not handed over.
-  const live = await db.select({ id: issueComments.id }).from(issueComments).where(and(
-    eq(issueComments.companyId, input.companyId),
-    eq(issueComments.issueId, input.issueId),
-    inArray(issueComments.id, heldIds),
-    sql`${issueComments.deletedAt} is null`,
-  ));
-  const liveIds = new Set(live.map(row => row.id));
-  return heldIds.filter(id => liveIds.has(id) && !delivered.has(id));
+    sql`coalesce(${heartbeatRuns.contextSnapshot}->>'dependencyBlockedInteraction', 'false') <> 'true'`,
+  )).orderBy(desc(heartbeatRuns.startedAt), desc(heartbeatRuns.id)).limit(1);
+  return run?.startedAt ?? null;
 }
 
 /**
- * The claim gate held a queued run: its wake request becomes the same trace as an admission hold, naming every
- * comment the run carried (merged ones included). Without a request, a skipped one is written.
+ * The agent comments the assignee may not have seen: after the start of its latest qualified run (or the whole
+ * thread). The latest twenty, oldest first, and how many older ones the thread holds.
  */
-export async function recordClaimHeldComments(db: Db, input: {
-  run: typeof heartbeatRuns.$inferSelect;
+export async function readCommentsToHandOver(db: Reader, input: {
+  companyId: string;
   issueId: string;
-  commentIds: string[];
-  unresolvedBlockerIssueIds: string[];
-  error: string;
-}): Promise<void> {
-  if (input.commentIds.length === 0) return;
-  const now = new Date();
-  const heldPayload = {
-    issueId: input.issueId,
-    commentIds: input.commentIds,
-    unresolvedBlockerIssueIds: input.unresolvedBlockerIssueIds,
-    heldAt: "claim",
-  };
-  if (input.run.wakeupRequestId) {
-    const updated = await db.update(agentWakeupRequests).set({
-      status: "skipped",
-      reason: HELD_DEPENDENCY_REASON,
-      requestedByActorType: "agent",
-      payload: sql`coalesce(${agentWakeupRequests.payload}, '{}'::jsonb) || ${JSON.stringify(heldPayload)}::jsonb`,
-      finishedAt: now,
-      error: input.error,
-      updatedAt: now,
-    }).where(eq(agentWakeupRequests.id, input.run.wakeupRequestId)).returning({ id: agentWakeupRequests.id });
-    if (updated.length > 0) return;
-  }
-  await db.insert(agentWakeupRequests).values({
-    companyId: input.run.companyId,
-    agentId: input.run.agentId,
-    source: "automation",
-    triggerDetail: "system",
-    reason: HELD_DEPENDENCY_REASON,
-    payload: heldPayload,
-    status: "skipped",
-    requestedByActorType: "agent",
-    requestedByActorId: null,
-    finishedAt: now,
-    error: input.error,
+  assigneeAgentId: string;
+  excludeCommentIds?: readonly string[];
+}): Promise<{ ids: string[]; olderCount: number }> {
+  const since = await readLatestQualifiedRunStart(db, {
+    companyId: input.companyId, issueId: input.issueId, agentId: input.assigneeAgentId,
   });
+  const exclude = [...new Set(input.excludeCommentIds ?? [])];
+  const where = and(
+    eq(issueComments.companyId, input.companyId),
+    eq(issueComments.issueId, input.issueId),
+    eq(issueComments.authorType, "agent"),
+    or(isNull(issueComments.authorAgentId), ne(issueComments.authorAgentId, input.assigneeAgentId)),
+    isNull(issueComments.deletedAt),
+    since ? gt(issueComments.createdAt, since) : undefined,
+    exclude.length ? sql`${issueComments.id} not in (${sql.join(exclude.map(id => sql`${id}::uuid`), sql`, `)})` : undefined,
+  );
+  const latest = await db.select({ id: issueComments.id }).from(issueComments).where(where)
+    .orderBy(desc(issueComments.createdAt), desc(issueComments.id)).limit(HELD_DEPENDENCY_COMMENTS_SHOWN_MAX);
+  if (latest.length === 0) return { ids: [], olderCount: 0 };
+  const [{ total }] = await db.select({ total: sql<number>`count(*)::int` }).from(issueComments).where(where);
+  return { ids: latest.map(row => row.id).reverse(), olderCount: Math.max(0, total - latest.length) };
+}
+
+/**
+ * Dependents of a blocker that just became done whose remaining unresolved blockers are all cancelled: nothing
+ * else will wake their assignee (cancelled blockers stay unresolved), so the route hands the dependency back.
+ */
+export async function listDependentsLeftWithCancelledBlockers(db: Reader, input: {
+  companyId: string;
+  blockerIssueId: string;
+}): Promise<Array<{ id: string; assigneeAgentId: string; cancelledBlockerIssueIds: string[] }>> {
+  const dependents = await db.select({ id: issues.id, assigneeAgentId: issues.assigneeAgentId })
+    .from(issueRelations).innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id)).where(and(
+      eq(issueRelations.companyId, input.companyId),
+      eq(issueRelations.type, "blocks"),
+      eq(issueRelations.issueId, input.blockerIssueId),
+      isNotNull(issues.assigneeAgentId),
+      isNull(issues.hiddenAt),
+      sql`${issues.status} not in ('done', 'cancelled', 'backlog')`,
+    ));
+  const out: Array<{ id: string; assigneeAgentId: string; cancelledBlockerIssueIds: string[] }> = [];
+  for (const dependent of dependents) {
+    const blockers = await db.select({ id: issues.id, status: issues.status })
+      .from(issueRelations).innerJoin(issues, eq(issueRelations.issueId, issues.id)).where(and(
+        eq(issueRelations.companyId, input.companyId),
+        eq(issueRelations.type, "blocks"),
+        eq(issueRelations.relatedIssueId, dependent.id),
+      ));
+    const unresolved = blockers.filter(row => row.status !== "done");
+    if (unresolved.length > 0 && unresolved.every(row => row.status === "cancelled")) {
+      out.push({ id: dependent.id, assigneeAgentId: dependent.assigneeAgentId!, cancelledBlockerIssueIds: unresolved.map(row => row.id) });
+    }
+  }
+  return out;
+}
+
+/**
+ * A blocker became done and its dependent's remaining unresolved blockers are all cancelled: hand the dependency back
+ * to the dependent's assignee like a cancelled blocker (STUDIO-0029), with one system comment per such event. The
+ * caller wakes the assignee on that comment (`cancelledBlockerIssueId` in the wake context).
+ */
+export async function handBackDependentsLeftWithCancelledBlockers(db: Db, input: {
+  companyId: string;
+  doneBlocker: { id: string; identifier: string | null; completedAt?: Date | string | null };
+}): Promise<Array<{ dependentId: string; assigneeAgentId: string; commentId: string; cancelledBlockerIssueId: string }>> {
+  const dependents = await listDependentsLeftWithCancelledBlockers(db, { companyId: input.companyId, blockerIssueId: input.doneBlocker.id });
+  const out: Array<{ dependentId: string; assigneeAgentId: string; commentId: string; cancelledBlockerIssueId: string }> = [];
+  const doneAt = input.doneBlocker.completedAt ? new Date(input.doneBlocker.completedAt).toISOString() : new Date().toISOString();
+  for (const dependent of dependents) {
+    const label = input.doneBlocker.identifier ?? input.doneBlocker.id;
+    const body =
+      `System dependency handoff: ${label} is done, and every blocker this task still waits on is cancelled. ` +
+      "A cancelled blocker never resolves, so this task stays blocked until its blocker set changes.\n\n" +
+      "As the assignee, reassess these dependencies: replace them with the tasks that now carry the work, or remove " +
+      "them if nothing is left to wait for (set_dependencies, or `blockedByIssueIds` with the blockers to keep).\n\n" +
+      `<!-- cancelled-blockers-left:${input.doneBlocker.id}:${doneAt} -->`;
+    const comment = await db.transaction(async (tx) => {
+      const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
+        eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, dependent.id),
+        eq(issueComments.authorType, "system"), eq(issueComments.body, body),
+      )).limit(1);
+      if (existing) return null;
+      const [inserted] = await insertIssueComment(tx, { companyId: input.companyId, issueId: dependent.id, authorType: "system", body });
+      return inserted ?? null;
+    });
+    if (comment) out.push({ dependentId: dependent.id, assigneeAgentId: dependent.assigneeAgentId,
+      commentId: comment.id, cancelledBlockerIssueId: dependent.cancelledBlockerIssueIds[0]! });
+  }
+  return out;
 }

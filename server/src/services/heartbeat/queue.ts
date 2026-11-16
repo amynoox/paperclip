@@ -1,7 +1,8 @@
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
-import { agentCommentHeldByDependencies, HELD_DEPENDENCY_COMMENT_IDS_KEY, isDependencyHandoffWake,
-  readUndeliveredHeldCommentIds, recordClaimHeldComments, wakeContextCommentIds } from "./held-dependency-comments.js";
+import { agentCommentHeldByDependencies, allUnresolvedBlockersCancelled, HELD_DEPENDENCY_COMMENT_IDS_KEY,
+  HELD_DEPENDENCY_OLDER_COUNT_KEY, isDependencyHandoffWake, readCommentsToHandOver,
+  wakeContextCommentIds } from "./held-dependency-comments.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed } from "./run-admission.js";
 import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
@@ -1159,19 +1160,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         !(await verifyNonAssigneeAddresseeInteractionWake(db, { companyId: run.companyId,
           issueId, agentId: run.agentId, contextSnapshot: context }))
       ) {
-        const cancelled = await cancelQueuedRunForBlockedDependencies(
+        await cancelQueuedRunForBlockedDependencies(
           run,
           issueId,
           readiness?.unresolvedBlockerIssueIds ?? [],
         );
-        // STUDIO-0063: the held comments are recorded like an admission hold, so the same handover finds them.
-        if (cancelled && agentCommentHeld) {
-          await recordClaimHeldComments(db, {
-            run, issueId, commentIds: wakeContextCommentIds(context),
-            unresolvedBlockerIssueIds: readiness?.unresolvedBlockerIssueIds ?? [],
-            error: "Held because issue dependencies are still blocked; handed to the assignee when they resolve",
-          });
-        }
         logger.info(
           { runId: run.id, issueId, unresolvedBlockerCount },
           "claimQueuedRun: cancelled blocked queued run",
@@ -4719,21 +4712,27 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
 
-          // STUDIO-0063: agents' comments held by the dependency gate (at admission or at claim) are handed to the
-          // issue's CURRENT assignee by its next admitted run that can act on them: once the issue waits on no blocker
-          // (whatever the wake reason: blockers done or removed, reassignment, reopening), or when it is asked to act
-          // on a stalled or cancelled blocker. heldDependencyCommentIds names every held comment no started run of the
-          // issue carried yet, oldest first; buildPaperclipWakePayload shows the latest ones in full.
+          // STUDIO-0063: agents' comments held by the dependency gate are handed to the issue's CURRENT assignee by
+          // its next admitted run that can act on them: when the issue waits on no blocker (whatever the wake reason:
+          // blockers done or removed, reassignment, reopening), when every unresolved blocker is cancelled, or when it
+          // is asked to act on a stalled or cancelled blocker. The thread is the record (held-dependency-comments.ts):
+          // every agent comment after the start of the assignee's latest qualified run; the latest twenty named, the
+          // older ones counted. Nothing is lost if a run fails: the next one carries them again.
           if (
-            agentId === issue.assigneeAgentId &&
-            (dependencyReadiness?.isDependencyReady !== false || isDependencyHandoffWake(enrichedContextSnapshot))
+            issue.assigneeAgentId && agentId === issue.assigneeAgentId &&
+            (dependencyReadiness?.isDependencyReady !== false ||
+              isDependencyHandoffWake(enrichedContextSnapshot) ||
+              await allUnresolvedBlockersCancelled(tx as unknown as Db, { companyId: issue.companyId,
+                unresolvedBlockerIssueIds: dependencyReadiness?.unresolvedBlockerIssueIds ?? [] }))
           ) {
-            const heldIds = await readUndeliveredHeldCommentIds(tx as unknown as Db, {
-              companyId: issue.companyId, issueId: issue.id,
+            const handOver = await readCommentsToHandOver(tx as unknown as Db, {
+              companyId: issue.companyId, issueId: issue.id, assigneeAgentId: agentId,
+              excludeCommentIds: wakeContextCommentIds(enrichedContextSnapshot),
             });
-            const ownIds = wakeContextCommentIds(enrichedContextSnapshot);
-            const toHand = heldIds.filter(id => !ownIds.includes(id));
-            if (toHand.length) enrichedContextSnapshot[HELD_DEPENDENCY_COMMENT_IDS_KEY] = toHand;
+            if (handOver.ids.length) {
+              enrichedContextSnapshot[HELD_DEPENDENCY_COMMENT_IDS_KEY] = handOver.ids;
+              if (handOver.olderCount > 0) enrichedContextSnapshot[HELD_DEPENDENCY_OLDER_COUNT_KEY] = handOver.olderCount;
+            }
           }
 
           if (
