@@ -824,6 +824,32 @@ describeEmbeddedPostgres("heartbeat dependency-aware queued run selection", () =
       unresolvedBlockerIssueIds: [blockerId],
     });
 
+    // STUDIO-0063: production 15 Nov 2026, TR-1258. A comment written by another agent on the blocked issue waits
+    // with the issue, as its assignment did: no run, a skipped issue_dependencies_blocked request.
+    const agentCommentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: agentCommentId, companyId, issueId: blockedIssueId,
+      authorType: "agent", authorAgentId: agentId,
+      body: "Mission attributed; admission held until the group is ready.",
+    });
+    const agentCommentWake = await heartbeat.wakeup(agentId, {
+      source: "automation",
+      triggerDetail: "system",
+      reason: "issue_commented",
+      payload: { issueId: blockedIssueId, commentId: agentCommentId, mutation: "comment" },
+      contextSnapshot: { issueId: blockedIssueId, wakeReason: "issue_commented", source: "issue.comment" },
+      requestedByActorType: "agent",
+      requestedByActorId: randomUUID(),
+    });
+    expect(agentCommentWake).toBeNull();
+    const agentCommentRequests = await db.select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, agentId), sql`${agentWakeupRequests.payload} ->> 'commentId' = ${agentCommentId}`));
+    expect(agentCommentRequests).toEqual([{ status: "skipped", reason: "issue_dependencies_blocked" }]);
+    const blockedRunsAfterAgentComment = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+      .where(sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${blockedIssueId}`);
+    expect(blockedRunsAfterAgentComment.map((run) => run.id)).toEqual([interactionWake!.id]);
+
     let finishReadyRun!: () => void;
     const readyRunCanFinish = new Promise<void>((resolve) => {
       finishReadyRun = resolve;

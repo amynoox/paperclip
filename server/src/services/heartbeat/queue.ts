@@ -4619,11 +4619,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // A stalled child or blocker (issue_blocker_stalled, once per stall)
           // is the other exception: the assignee must be able to re-delegate,
           // escalate or block with a reason while that dependency is stuck.
+          // STUDIO-0063: the comment/mention exception is for a person's comment. A comment written by an agent on a
+          // dependency-blocked issue waits with the issue, as its assignment does (production 15 Nov 2026, TR-1258:
+          // the CTO set a blocker and commented in one call at 21:03:58; the assignment wake was held as
+          // issue_dependencies_blocked but the comment wake started the Dev's run at 21:04:02). An agent that needs
+          // the blocked assignee asks through an interaction card, whose response keeps its own exception below.
+          const personCommentWake = opts.requestedByActorType !== "agent";
           const blockedInteractionWake =
             dependencyReadiness &&
             !dependencyReadiness.isDependencyReady &&
             allowsDependencyBlockedWake(
-              enrichedContextSnapshot,
+              personCommentWake ? enrichedContextSnapshot : null,
               ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
               await verifyBlockerStallWake(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
                 contextSnapshot: enrichedContextSnapshot, requestedByActorType: opts.requestedByActorType }),

@@ -1567,6 +1567,31 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: an agent never rewrites its own AGENTS.md (refused or set aside), and writes the rest of its own managed folder without agents:* rights. Why: rights hardening of the studio roles (V329, 15 Nov 2026). Origin: studio fork only; to re-apply, keep assertNotOwnEntryEdit in agent-instruction-authorization.ts and its calls in agent-instruction-revisions.ts (commit) and agent-file-store.ts (write, setOwnEntryAside, and the entry set-aside in apply with entryEditDiscarded), the setOwnEntryAside calls and the receipt field in agent-directory-working-copies.ts, the texts in agent-conversations.ts, authorization.ts, owner-chat-instruction-authority.ts and agent-instruction-working-copies.ts, and the ownManagedFile / ownManagedDelete exemptions in routes/agents.ts; run agent-instruction-own-entry.test.ts, agent-directory-working-copies.test.ts, owner-chat-instruction-authority.test.ts, heartbeat-instruction-working-copy.test.ts and agent-instruction-working-copies.test.ts (refusal lifted there by vi.mock)."
+    },
+    {
+      "id": "STUDIO-0063",
+      "title": "A comment written by an agent on a dependency-blocked issue waits with the issue instead of waking its assignee",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production 15 Nov 2026, TR-1258 (B17): at 21:03:58 the CTO set a blocker and posted a comment on the Dev's ticket in one call. The assignment wake was held (issue_dependencies_blocked) but the comment wake started the Dev's run at 21:04:02; the next run was cancelled by the dependency gate at 21:10:44. The dependency gate exempts every comment or mention wake (bounded interaction mode, documented as the exception for human comments) whoever wrote it.",
+      "reason": "Requested by the studio setup session for the 16 Nov update (V412, point 2).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "wake admission dependency gate (heartbeat/queue.ts)",
+      "paths": [
+        "server/src/services/heartbeat/queue.ts",
+        "server/src/__tests__/heartbeat-dependency-scheduling.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-16",
+        "repository": "paperclipai/paperclip",
+        "details": "Searched pull requests for comment wake, dependency blocked and blocker interaction: no counterpart restricting the exception to people.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. Real wake path: on a blocked issue a person's comment still starts a bounded interaction run; an agent-requested comment wake returns no run and records a skipped issue_dependencies_blocked request; on fb1ad740 it starts a run. heartbeat-dependency-scheduling, legacy-continuation-authority, heartbeat-issue-liveness-escalation and the run-dispatch module: 7 files, 297 passed. tsc: no error in a changed file.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Upstream restricts the dependency-blocked comment exception to people.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
