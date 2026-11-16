@@ -33,7 +33,6 @@ import { issueRoutes } from "../routes/issues.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat/run-preparation.js";
-import { readUndeliveredHeldCommentIds } from "../services/heartbeat/held-dependency-comments.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -341,6 +340,7 @@ const ADAPTER = "codex_local";
     await expect.poll(async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, refused.id)))[0]?.errorCode,
       { timeout: 20_000 }).toBe("router_group_participant_reserved");
     // The refused run carried it but did not show it: it is still to hand over.
+    const { readUndeliveredHeldCommentIds } = await import("../services/heartbeat/held-dependency-comments.js");
     expect(await readUndeliveredHeldCommentIds(db, { companyId: f.companyId, issueId: f.taskId })).toEqual([held]);
     // A person returns the issue to work: the next run carries the comment again (on this branch alone, the refused
     // run's retry; with STUDIO-0059 the person's return wakes the assignee).
