@@ -506,6 +506,7 @@ import {
   buildConfigurationIncompleteRecoveryNoticeSeed,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
   buildImmediateExecutionPathRecoveryNoticeSeed,
+  buildRouterRefusalRecoveryNoticeSeed,
   buildWorkspaceValidationRecoveryNoticeSeed,
   type StrandedRecoveryNoticeSeed,
 } from "./recovery/stranded-notice.js";
@@ -1206,6 +1207,10 @@ export function heartbeatService(
         ),
         recoveryCause: CONFIGURATION_INCOMPLETE_RECOVERY_CAUSE,
       };
+    }
+    if (noticeKind === "router_refusal" && input.runRow.errorCode) {
+      // STUDIO-0059: name the router's code, its meaning and the gesture.
+      return { notice: buildRouterRefusalRecoveryNoticeSeed(input.runRow.errorCode), recoveryCause: undefined };
     }
     if (noticeKind === "execution_review_participant") {
       return {
