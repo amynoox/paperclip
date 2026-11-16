@@ -1867,6 +1867,19 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // STUDIO-0063: a dependency-resolved wake admitted with the issue ready, merged into a bounded run still waiting
+  // (a person's comment run queued while the issue was blocked), makes it a run of the ready issue: the bounded mode
+  // and its blocker snapshot go, so the run works the issue and can settle the held comments it carries.
+  if (
+    existing.dependencyBlockedInteraction === true &&
+    incoming.dependencyBlockedInteraction !== true &&
+    readNonEmptyString(incoming.wakeReason) === "issue_blockers_resolved"
+  ) {
+    delete merged.dependencyBlockedInteraction;
+    delete merged.unresolvedBlockerIssueIds;
+    delete merged.unresolvedBlockerCount;
+    delete merged.unresolvedBlockerSummaries;
+  }
   // Only executeRun can mint this proof. Coalescence may retain an unchanged
   // admitted proof, but must never accept a new marker from an incoming wake.
   delete merged[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];

@@ -374,8 +374,8 @@ export async function executeIssuePostCommitActions(
             : { id: action.issueId, identifier: action.identifier, completedAt: action.completedAt },
           actor: action.actor,
           at: new Date(action.at),
-          wake: (agentId, request) => {
-            void heartbeat.wakeup(agentId, request as never).catch((err: unknown) =>
+          wake: async (agentId, request) => {
+            await heartbeat.wakeup(agentId, request as never).catch((err: unknown) =>
               logger.warn({ err, issueId: action.issueId, agentId }, "dependency change wake failed"));
           },
         });

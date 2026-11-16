@@ -59,7 +59,7 @@ export async function wakeDependentsAfterDependencyChange(db: Db, input: {
         blockedTransitionAt: dependent.blockedTransitionAt,
       }).catch(() => null);
       if (existing) continue;
-      input.wake(dependent.assigneeAgentId, {
+      await input.wake(dependent.assigneeAgentId, {
         ...readyWake(dependent.id, dependent.blockerIssueIds, input),
         idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
           dependentIssueId: dependent.id, blockerIssueIds: dependent.blockerIssueIds,
@@ -80,8 +80,36 @@ export async function wakeDependentsAfterDependencyChange(db: Db, input: {
     }
     return out;
   }
-  const ids = [...new Set(input.dependentIssueIds)];
+  let ids = [...new Set(input.dependentIssueIds)];
   if (ids.length === 0) return out;
+  // A blocker cancelled outside the issue route (a native status decision, a decision card): the STUDIO-0029
+  // hand-back the route does, one system comment per dependent and its wake. Its comment is deduplicated, so a
+  // dependent the route already handed back is left to the checks below.
+  if (input.kind === "blocker_cancelled" && input.changedBlocker) {
+    const [blocker] = await db.select().from(issues)
+      .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.changedBlocker.id)));
+    if (blocker) {
+      for (const { comment, dependent } of await issueService(db).addCancelledBlockerHandoffComments(blocker)) {
+        await input.wake(dependent.assigneeAgentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: "issue_commented",
+          payload: { issueId: dependent.id, commentId: comment.id, mutation: "comment", cancelledBlockerIssueId: blocker.id },
+          idempotencyKey: `issue_dependency_cancelled:${comment.id}`,
+          requestedByActorType: "system",
+          requestedByActorId: "cancelled_blocker_handoff",
+          contextSnapshot: {
+            issueId: dependent.id, taskId: dependent.id, commentId: comment.id, wakeCommentId: comment.id,
+            source: "issue.cancelled_dependency_handoff", wakeReason: "issue_commented",
+            cancelledBlockerIssueId: blocker.id,
+          },
+        });
+        out.push({ dependentIssueId: dependent.id, outcome: "handed_back" });
+        ids = ids.filter(id => id !== dependent.id);
+      }
+      if (ids.length === 0) return out;
+    }
+  }
   const svc = issueService(db);
   const readiness = await svc.listDependencyReadiness(input.companyId, ids);
   const rows = await db.select({
@@ -98,7 +126,7 @@ export async function wakeDependentsAfterDependencyChange(db: Db, input: {
     if (!ready) {
       // No relation left at all (the last blocker removed or deleted): ready.
       if (input.kind === "blockers_edited" || input.kind === "blocker_deleted") {
-        input.wake(dependent.assigneeAgentId, readyWake(id, [], input));
+        await input.wake(dependent.assigneeAgentId, readyWake(id, [], input));
         out.push({ dependentIssueId: id, outcome: "ready" });
       }
       continue;
@@ -110,14 +138,14 @@ export async function wakeDependentsAfterDependencyChange(db: Db, input: {
           blockedTransitionAt: dependent.blockedTransitionAt,
         }).catch(() => null);
         if (existing) continue;
-        input.wake(dependent.assigneeAgentId, {
+        await input.wake(dependent.assigneeAgentId, {
           ...readyWake(id, ready.blockerIssueIds, input),
           idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
             dependentIssueId: id, blockerIssueIds: ready.blockerIssueIds, blockedTransitionAt: dependent.blockedTransitionAt,
           }),
         });
       } else {
-        input.wake(dependent.assigneeAgentId, readyWake(id, [], input));
+        await input.wake(dependent.assigneeAgentId, readyWake(id, [], input));
       }
       out.push({ dependentIssueId: id, outcome: "ready" });
       continue;
@@ -134,7 +162,7 @@ async function handBack(db: Db, input: { companyId: string; wake: DependencyChan
     for (const handoff of await handBackDependentsLeftWithCancelledBlockers(db, {
       companyId: input.companyId, dependentIds,
     })) {
-      input.wake(handoff.assigneeAgentId, {
+      await input.wake(handoff.assigneeAgentId, {
         source: "automation",
         triggerDetail: "system",
         reason: "issue_commented",

@@ -23,16 +23,24 @@ import {
   authUsers,
   companies,
   companyMemberships,
+  completionContracts,
   createDb,
   heartbeatRuns,
   issueComments,
   issues,
+  nativeRunFinalizations,
+  nativeRunResults,
+  workAssessments,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { buildPaperclipWakePayload } from "../services/heartbeat/run-preparation.js";
+import { issueService } from "../services/issues.js";
+import { decisionService } from "../services/decisions.js";
+import { commitNativeStatusDecision } from "../services/native-runtime/status-decision-committer.js";
+import { NATIVE_STATUS_ARBITER_POLICY_VERSION, type NativeStatusDecision } from "../services/native-runtime/status-arbiter.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
 const support = await getEmbeddedPostgresTestSupport();
@@ -47,6 +55,8 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
   // Per-issue outcome of the NEXT run. By default the engine process starts (onSpawn, as claude_local and codex_local
   // report it) and the run succeeds.
   const nextOutcome = new Map<string, Outcome>();
+  // Per-issue outcome of EVERY run until cleared (automatic recovery runs included).
+  const stickyOutcome = new Map<string, Outcome>();
   // Per-issue gate: the run waits until released (an assignee busy on its dependency run).
   const holdOpen = new Map<string, Promise<void>>();
 
@@ -61,7 +71,7 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
       execute: async (input) => {
         dispatched.push(input.runId);
         const issueId = String((input.context as any)?.issueId ?? "");
-        const outcome = nextOutcome.get(issueId) ?? "spawn-success";
+        const outcome = stickyOutcome.get(issueId) ?? nextOutcome.get(issueId) ?? "spawn-success";
         nextOutcome.delete(issueId);
         // The worker router refuses before any reservation: no process is started.
         if (outcome.startsWith("refuse:")) {
@@ -607,6 +617,219 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
     const { readLatestQualifiedRunStart } = await import("../services/heartbeat/held-dependency-comments.js");
     expect(await readLatestQualifiedRunStart(db, { companyId: f.companyId, issueId: f.taskId, agentId: f.devId })).toBeNull();
   }, 120_000);
+
+  // v6, A: the periodic hand-over backstop. A writer that bypasses the routes (here the exact service write a plugin's
+  // setBlockedBy makes: issueService.update outside any transaction) wakes nobody; one backstop pass hands it over.
+  it("hands the held comment over through one backstop pass after a direct service write (the plugin's setBlockedBy)", async () => {
+    const f = await seed();
+    const held = await heldComment(f, "Held, then the blocker removed by a plugin.");
+    await taskQuiet(f);
+    await issueService(db).update(f.taskId, { blockedByIssueIds: [], actorAgentId: null, actorUserId: null } as never);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    await heartbeat.drainActiveRunExecutions();
+    expect((await devRuns(f)).filter(carrying(held))).toEqual([]);
+    expect(await heartbeat.reconcileHeldCommentHandover({ companyId: f.companyId, issueId: f.taskId })).toBe("woken");
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect((run.contextSnapshot as any).source).toBe("issue.held_comment_handover_backstop");
+    // Settled by that qualified run: the next pass finds nothing to do.
+    await taskQuiet(f);
+    expect(await heartbeat.reconcileHeldCommentHandover({ companyId: f.companyId, issueId: f.taskId })).toBe("no_trace");
+  }, 120_000);
+
+  // v6, B8: the runner's set_dependencies makes the same service write inside its own transaction.
+  it("hands the held comment over through the backstop after the runner's set_dependencies write", async () => {
+    const f = await seed();
+    const held = await heldComment(f, "Held, then the blocker removed by the runner tool.");
+    await taskQuiet(f);
+    await db.transaction(async tx => {
+      await issueService(tx as never).update(f.taskId, { blockedByIssueIds: [], actorAgentId: f.ctoId, actorRunId: f.ctoRunId } as never, tx);
+    });
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    expect((await devRuns(f)).filter(carrying(held))).toEqual([]);
+    expect(await heartbeat.reconcileHeldCommentHandover({ companyId: f.companyId, issueId: f.taskId })).toBe("woken");
+    await runWhere(f.devId, f.taskId, carrying(held));
+  }, 120_000);
+
+  // v6, A: a hand-over run that fails before the engine leaves the issue eligible; the next pass wakes it again.
+  it("wakes again on the next backstop pass when the hand-over run fails before the engine", async () => {
+    const f = await seed();
+    const held = await heldComment(f, "Held, handed over by a refused run first.");
+    await taskQuiet(f);
+    await issueService(db).update(f.taskId, { blockedByIssueIds: [] } as never);
+    // Every run of the task is refused for now (the server's own recovery runs too).
+    stickyOutcome.set(f.taskId, "refuse:router_group_participant_reserved");
+    expect(await heartbeat.reconcileHeldCommentHandover({ companyId: f.companyId, issueId: f.taskId })).toBe("woken");
+    const refused = await runWhere(f.devId, f.taskId, carrying(held));
+    expect(refused.status).toBe("failed");
+    await taskQuiet(f);
+    expect((await devRuns(f)).filter(run => run.status === "succeeded")).toEqual([]);
+    // Still eligible: no qualified run after the hold. The next pass wakes again (no key prevents it).
+    stickyOutcome.delete(f.taskId);
+    const before = (await devRuns(f)).map(run => run.id);
+    expect(await heartbeat.reconcileHeldCommentHandover({ companyId: f.companyId, issueId: f.taskId })).toBe("woken");
+    const again = await runWhere(f.devId, f.taskId, carrying(held), before);
+    expect(again.status).toBe("succeeded");
+    expect((again.contextSnapshot as any).source).toBe("issue.held_comment_handover_backstop");
+  }, 180_000);
+
+  // v6, B1: every blocker edit goes through the function, on a `blocked` issue too.
+  it("wakes a blocked issue whose blocker list is emptied, with the held comment", async () => {
+    const f = await seed({ blocked: false });
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId], status: "blocked" }).expect(200);
+    const held = await heldComment(f, "Held on a blocked issue, list emptied.");
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [] }).expect(200);
+    await runWhere(f.devId, f.taskId, carrying(held));
+  }, 120_000);
+
+  it("hands a blocked issue back when its blockers are replaced by cancelled ones only", async () => {
+    const f = await seed({ blocked: false });
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId], status: "blocked" }).expect(200);
+    const held = await heldComment(f, "Held, then only a cancelled blocker left.");
+    await db.update(issues).set({ status: "cancelled", cancelledAt: new Date() }).where(eq(issues.id, f.blocker2Id));
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blocker2Id] }).expect(200);
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect((run.contextSnapshot as any).cancelledBlockerIssueId).toBe(f.blocker2Id);
+  }, 120_000);
+
+  // v6, B2 (regression of v5): a person's comment in the same PATCH as a blocker removal is not dropped.
+  it("keeps a person's comment written in the same PATCH as the blocker removal", async () => {
+    const f = await seed();
+    const held = await heldComment(f, "Held before the person's PATCH.");
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`)
+      .send({ blockedByIssueIds: [], comment: "Person: unblocked, go ahead." }).expect(200);
+    const personComment = await commentIdOf(f.taskId, "Person: unblocked, go ahead.");
+    const run = await runWhere(f.devId, f.taskId, row => JSON.stringify(row.contextSnapshot).includes(personComment));
+    expect(handedOver(run)).toContain(held);
+  }, 120_000);
+
+  // v6, B6: a "ready" wake merged into a bounded run still queued turns it into a run of the ready issue.
+  it("drops the bounded mode when a ready wake merges into a queued bounded run", async () => {
+    const f = await seed({ devMaxConcurrent: 1 });
+    const busyRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: busyRunId, companyId: f.companyId, agentId: f.devId, invocationSource: "assignment",
+      status: "running", startedAt: new Date(), contextSnapshot: { issueId: randomUUID() } });
+    await db.update(agents).set({ status: "running" }).where(eq(agents.id, f.devId));
+    await request(app(f.companyId)).post(`/api/issues/${f.taskId}/comments`).send({ body: "Person, while blocked." }).expect(201);
+    await expect.poll(async () => (await devRuns(f))[0]?.status, { timeout: 20_000 }).toBe("queued");
+    const [bounded] = await devRuns(f);
+    expect(bounded!.contextSnapshot).toMatchObject({ dependencyBlockedInteraction: true });
+    await setStatus(f, f.blockerId, "done");
+    await expect.poll(async () => JSON.stringify((await runById(bounded!.id))?.contextSnapshot ?? {}), { timeout: 20_000 })
+      .toContain("issue_blockers_resolved");
+    expect(((await runById(bounded!.id))!.contextSnapshot as any).dependencyBlockedInteraction).toBeUndefined();
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busyRunId));
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.devId));
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+  }, 120_000);
+
+  // v6, B3: the decision cards' effects go through the one function after commit.
+  const decide = async (f: Fixture, effect: Record<string, unknown>) => {
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.ctoId, status: "running",
+      responsibleUserId: "board-user", contextSnapshot: { issueId: f.ctoTaskId } });
+    const service = decisionService(db, { wakeOriginAgent: async () => {} });
+    const created = await service.create({
+      companyId: f.companyId,
+      actor: { type: "agent" as const, companyId: f.companyId, agentId: f.ctoId, runId, source: "agent_jwt" as const,
+        onBehalfOfUserId: "board-user", onBehalfOfMemberships: [{ companyId: f.companyId, membershipRole: "operator", status: "active" }] },
+      agentId: f.ctoId, runId, title: "Decide?", body: "Body",
+      options: [{ id: "yes", label: "Yes", effects: [effect] }],
+    } as never);
+    const result = await service.decide({ id: created.id, optionId: "yes", decidedByUserId: "board-user",
+      userActor: { type: "board" as const, userId: "board-user", companyIds: [f.companyId], source: "session" as const,
+        memberships: [{ companyId: f.companyId, membershipRole: "operator", status: "active" }] } } as never);
+    expect((result as any).executions[0], JSON.stringify((result as any).executions[0])).toMatchObject({ status: "executed" });
+  };
+
+  it("hands the held comment over when a resolve_blocker decision makes the issue ready", async () => {
+    const f = await seed();
+    const held = await heldComment(f, "Held until a decision removes the blocker.");
+    await taskQuiet(f);
+    await decide(f, { type: "resolve_blocker", targetIssueId: f.taskId, staleness: "lenient", removeBlockedByIssueIds: [f.blockerId] });
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect((run.contextSnapshot as any).source).toBe("issue.blockers_edited");
+  }, 120_000);
+
+  it("hands the held comment over when an update_issue_status decision finishes the blocker", async () => {
+    const f = await seed();
+    const held = await heldComment(f, "Held until a decision finishes the blocker.");
+    await taskQuiet(f);
+    await decide(f, { type: "update_issue_status", targetIssueId: f.blockerId, staleness: "lenient", status: "done" });
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect((run.contextSnapshot as any).wakeReason).toBe("issue_blockers_resolved");
+  }, 120_000);
+
+  it("hands the dependency back when a cancel_issue_tree decision cancels the blocker", async () => {
+    const f = await seed();
+    const held = await heldComment(f, "Held until a decision cancels the blocker.");
+    await taskQuiet(f);
+    await decide(f, { type: "cancel_issue_tree", targetIssueId: f.blockerId, staleness: "lenient", reasonComment: "cleanup" });
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect((run.contextSnapshot as any).cancelledBlockerIssueId).toBe(f.blockerId);
+  }, 120_000);
+
+  // v6, B3: a native status decision that makes a blocker done or cancelled goes through the function after commit.
+  const nativeDecision = async (f: Fixture, status: "done" | "cancelled") => {
+    const runId = randomUUID(), contractId = randomUUID(), resultId = randomUUID(), assessmentId = randomUUID();
+    await db.update(issues).set({ status: "in_progress", assigneeAgentId: f.qaId, workMode: "standard" }).where(eq(issues.id, f.blockerId));
+    const [prior] = await db.select().from(issues).where(eq(issues.id, f.blockerId));
+    await db.insert(completionContracts).values({ id: contractId, companyId: f.companyId, issueId: f.blockerId, revision: 1,
+      schemaVersion: "paperclip.completion-contract.v1", policyVersion: "dependency-wake-test", risk: "standard",
+      completionAuthority: "server_arbiter", incompleteCriteriaPolicy: "preserve_non_terminal",
+      contractJson: { revision: "1", objective: "Finish", criteria: [] }, canonicalSha256: `contract-${contractId}`,
+      createdByActorType: "system", createdByActorId: "test" });
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.qaId, status: "running", runtimeMode: "native",
+      nativeIssueId: f.blockerId, completionContractId: contractId, completionContractSha256: `contract-${contractId}`,
+      contextSnapshot: { issueId: f.blockerId } });
+    await db.insert(nativeRunResults).values({ id: resultId, companyId: f.companyId, issueId: f.blockerId, runId,
+      completionContractId: contractId, serverFingerprint: `fp-${resultId}`, schemaStatus: "accepted", resultJson: {},
+      canonicalSha256: `sha-${resultId}` });
+    await db.insert(workAssessments).values({ id: assessmentId, companyId: f.companyId, issueId: f.blockerId, runId, contractId, resultId,
+      triggerKind: "native_result", triggerActorCompanyId: f.companyId, priorIssueStatus: "in_progress",
+      priorStatusVersion: prior!.statusVersion, policyVersion: "dependency-wake-test", assessmentJson: {},
+      inputDigest: `assessment-${assessmentId}` });
+    await db.insert(nativeRunFinalizations).values({ runId, companyId: f.companyId, issueId: f.blockerId, phase: "arbitrating", resultId });
+    const decision: NativeStatusDecision = { policyVersion: NATIVE_STATUS_ARBITER_POLICY_VERSION, statusAction: status,
+      toStatus: status, reasonCode: "dependency_wake_test", unblockDescriptor: null, effects: [] };
+    const committed = await commitNativeStatusDecision({ db, companyId: f.companyId, issueId: f.blockerId, runId, assessmentId,
+      priorStatus: "in_progress", priorStatusVersion: prior!.statusVersion, priorDecisionId: prior!.lastStatusDecisionId, decision });
+    expect((await db.select().from(issues).where(eq(issues.id, f.blockerId)))[0]?.status).toBe(status);
+    return { runId, decisionId: committed.decision.id };
+  };
+
+  it("adds no second wake when a native decision finishes the blocker: its own dependency wake stays the only one", async () => {
+    const f = await seed();
+    await heldComment(f, "Held until the blocker's native run is done.");
+    await taskQuiet(f);
+    await nativeDecision(f, "done");
+    // The decision's own transaction queued the dependent's wake (delivered by the native effects dispatcher, as
+    // before); the function, called after commit, finds it and adds none.
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    const wakes = await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.devId),
+      eq(agentWakeupRequests.reason, "issue_blockers_resolved")));
+    expect(wakes).toHaveLength(1);
+    expect(wakes[0]!.requestedByActorId).toBe("native-status-committer");
+    // That wake is live: the backstop leaves the issue alone.
+    expect(await heartbeat.reconcileHeldCommentHandover({ companyId: f.companyId, issueId: f.taskId })).toBe("live_path");
+  }, 120_000);
+
+  // The pilot's silence: D waits on A and B, a comment is held, A is cancelled by a native decision, then B is done.
+  it("hands the dependency back when a native decision cancels a blocker, then again when only cancelled ones are left", async () => {
+    const f = await seed({ blocked: false });
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId, f.blocker2Id] }).expect(200);
+    const held = await heldComment(f, "Held while both blockers are open (native).");
+    await taskQuiet(f);
+    await nativeDecision(f, "cancelled");
+    // STUDIO-0029's hand-back for the cancelled blocker, as the route does it.
+    const first = await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.cancelledBlockerIssueId === f.blockerId);
+    expect(handedOver(first)).toContain(held);
+    await taskQuiet(f);
+    const before = (await devRuns(f)).map(run => run.id);
+    await setStatus(f, f.blocker2Id, "done");
+    const second = await runWhere(f.devId, f.taskId, carrying(held), before);
+    expect((second.contextSnapshot as any).cancelledBlockerIssueId).toBe(f.blockerId);
+  }, 180_000);
 
   it("notes once per series that an agent's comment waits, and the note wakes nobody", async () => {
     const f = await seed();
