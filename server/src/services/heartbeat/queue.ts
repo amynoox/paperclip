@@ -1,7 +1,7 @@
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { agentCommentHeldByDependencies, allUnresolvedBlockersCancelled, HELD_DEPENDENCY_COMMENT_IDS_KEY,
-  HELD_DEPENDENCY_OLDER_COUNT_KEY, isDependencyHandoffWake, readCommentsToHandOver,
+  HELD_DEPENDENCY_OLDER_COUNT_KEY, HELD_DEPENDENCY_REASON_KEY, isDependencyHandoffWake, readCommentsToHandOver,
   wakeContextCommentIds } from "./held-dependency-comments.js";
 import { noteHeldAgentComment } from "./held-dependency-notice.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
@@ -1177,6 +1177,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           "claimQueuedRun: cancelled blocked queued run",
         );
         return null;
+      }
+      // STUDIO-0063: a run that passes the claim gate under a dependency exception (a person's comment, a card or
+      // its non-assignee responder, a verified stall) runs in the bounded mode, as at admission. Marking it keeps it
+      // from settling the held comments (it is never a qualified run).
+      if (unresolvedBlockerCount > 0 && context.dependencyBlockedInteraction !== true) {
+        const marked = await db.update(heartbeatRuns).set({
+          contextSnapshot: sql`coalesce(${heartbeatRuns.contextSnapshot}, '{}'::jsonb) || '{"dependencyBlockedInteraction": true}'::jsonb`,
+          updatedAt: new Date(),
+        }).where(and(eq(heartbeatRuns.id, run.id), eq(heartbeatRuns.status, "queued")))
+          .returning({ contextSnapshot: heartbeatRuns.contextSnapshot });
+        if (marked[0]) {
+          context.dependencyBlockedInteraction = true;
+          run = { ...run, contextSnapshot: marked[0].contextSnapshot };
+        }
       }
 
       const staleness = await runDispatch.cancelStaleQueuedRun({
@@ -4748,6 +4762,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             });
             if (handOver.ids.length) {
               enrichedContextSnapshot[HELD_DEPENDENCY_COMMENT_IDS_KEY] = handOver.ids;
+              enrichedContextSnapshot[HELD_DEPENDENCY_REASON_KEY] = handOver.reason;
               if (handOver.olderCount > 0) enrichedContextSnapshot[HELD_DEPENDENCY_OLDER_COUNT_KEY] = handOver.olderCount;
             }
           }

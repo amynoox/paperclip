@@ -2890,7 +2890,9 @@ export async function buildPaperclipWakePayload(input: {
         heldCount: heldDependencyCommentIds.length + heldDependencyOlderCount,
         shownCount: heldDependencyCommentIds.length,
         olderInThreadCount: heldDependencyOlderCount,
-        note: "Comments from other agents you may not have seen (written while this issue waited on its blockers, or during your last run).",
+        note: input.contextSnapshot.heldDependencyReason === "reassignment"
+          ? "Comments from other agents written on this issue before you took it over, since your last completed run on it."
+          : "Comments from other agents written while this issue waited on its blockers, since your last completed run on it.",
       },
     } : {}),
     truncated: payloadTruncated,

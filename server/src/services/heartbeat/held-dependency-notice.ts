@@ -1,14 +1,17 @@
-// STUDIO-0063, point 6 of the third review (kept apart so it can be removed on its own): when the dependency gate
-// holds an agent's comment for the assignee, one system note tells the thread (people, the watch, the commenter)
-// that it waits, and how to get an answer before. One note per series: none of this kind since the start of the
-// assignee's latest qualified run (the same base as the handover). It wakes nobody (a system comment written by the
-// service, outside the comment route). If a cut prevents it, the next hold writes it.
+// STUDIO-0063 (accepted by the owner): when the dependency gate holds an agent's comment for the assignee, one system
+// note tells the thread (people, the watch, the commenter) that it waits, and how to get an answer before. It is a
+// signal only; the handover never depends on it. One note per assignee and per series: none for this assignee since
+// the start of its latest qualified run (the handover's base), under a lock on the issue row so two holds cannot both
+// write it. It wakes nobody (a system comment written by the service, outside the comment route). If a cut prevents
+// it, the next hold writes it.
+// Not handled here (moved to the next batch): the note's other review points and the dotEvents noise.
 import { and, eq, gt, inArray, like } from "drizzle-orm";
 import { agents, issueComments, issues, type Db } from "@paperclipai/db";
 import { insertIssueComment } from "../issue-comment-writes.js";
 import { readLatestQualifiedRunStart, wakeContextCommentIds } from "./held-dependency-comments.js";
 
 export const HELD_DEPENDENCY_NOTICE_MARKER = "<!-- held-dependency-comment-notice -->";
+const noticeAssigneeMarker = (assigneeAgentId: string) => `<!-- held-dependency-comment-notice-for:${assigneeAgentId} -->`;
 
 export async function noteHeldAgentComment(db: Db, input: {
   companyId: string;
@@ -17,6 +20,15 @@ export async function noteHeldAgentComment(db: Db, input: {
   context: Record<string, unknown>;
   unresolvedBlockerIssueIds: readonly string[];
 }): Promise<boolean> {
+  return db.transaction(async (tx) => {
+    const lockDb = tx as unknown as Db;
+    await lockDb.select({ id: issues.id }).from(issues)
+      .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("update");
+    return writeNoticeOnce(lockDb, input);
+  });
+}
+
+async function writeNoticeOnce(db: Db, input: Parameters<typeof noteHeldAgentComment>[1]): Promise<boolean> {
   const since = await readLatestQualifiedRunStart(db, {
     companyId: input.companyId, issueId: input.issueId, agentId: input.assigneeAgentId,
   });
@@ -24,7 +36,7 @@ export async function noteHeldAgentComment(db: Db, input: {
     eq(issueComments.companyId, input.companyId),
     eq(issueComments.issueId, input.issueId),
     eq(issueComments.authorType, "system"),
-    like(issueComments.body, `%${HELD_DEPENDENCY_NOTICE_MARKER}%`),
+    like(issueComments.body, `%${noticeAssigneeMarker(input.assigneeAgentId)}%`),
     since ? gt(issueComments.createdAt, since) : undefined,
   )).limit(1);
   if (existing) return false;
@@ -48,7 +60,8 @@ export async function noteHeldAgentComment(db: Db, input: {
   const body =
     `A comment from ${commenter?.name ?? "another agent"} waits for ${blockerList} to resolve before it reaches ` +
     `${assignee?.name ?? "the assignee"}. For an answer before, put a question card addressed to ` +
-    `${assignee?.name ?? "the assignee"} on your own task.\n\n${HELD_DEPENDENCY_NOTICE_MARKER}`;
+    `${assignee?.name ?? "the assignee"} on your own task.\n\n${HELD_DEPENDENCY_NOTICE_MARKER}\n` +
+    noticeAssigneeMarker(input.assigneeAgentId);
   await insertIssueComment(db, { companyId: input.companyId, issueId: input.issueId, authorType: "system", body });
   return true;
 }
