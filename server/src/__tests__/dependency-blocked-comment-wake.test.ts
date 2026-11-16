@@ -155,9 +155,26 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
     await expect.poll(async () => (await devRuns(f)).filter(run => ["queued", "running"].includes(run.status)).length,
       { timeout: 20_000 }).toBe(0);
   };
-  // An agent comment written while the Dev's task is blocked and the Dev is at rest: held at admission, no Dev run.
+  // The Dev's work on the task is over: no queued, running or scheduled run, no pending wake, the task's execution
+  // lock released (a comment merged into a live or pending run reaches that run and is not held).
+  const taskQuiet = async (f: Fixture) => {
+    const pending = async () => (await devRuns(f)).filter(run => ["queued", "running", "scheduled_retry"].includes(run.status)).length
+      + (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.devId),
+        sql`${agentWakeupRequests.status} in ('queued', 'deferred_issue_execution')`))).length
+      + ((await db.select({ lock: issues.executionRunId }).from(issues).where(eq(issues.id, f.taskId)))[0]?.lock ? 1 : 0);
+    for (let attempt = 0; attempt < 120 && (await pending()) > 0; attempt += 1) {
+      await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1000) })
+        .where(and(eq(heartbeatRuns.agentId, f.devId), eq(heartbeatRuns.status, "scheduled_retry")));
+      await heartbeat.promoteDueScheduledRetries(new Date());
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    expect(await pending()).toBe(0);
+  };
+  // An agent comment written while the Dev's task is blocked and quiet: held at admission, no Dev run.
   const heldComment = async (f: Fixture, body: string) => {
-    await devAtRest(f);
+    await taskQuiet(f);
     const id = await ctoComment(f, body);
     await expect.poll(() => admissionHeld(f, id), { timeout: 20_000 }).toEqual([{ status: "skipped", reason: "issue_dependencies_blocked" }]);
     return id;
@@ -279,19 +296,73 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
   it("hands the dependency back, with the held comment, when the remaining blockers are all cancelled", async () => {
     const f = await seed({ blocked: false });
     await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId, f.blocker2Id] }).expect(200);
+    // Held while both blockers are open.
+    const held = await heldComment(f, "Written while both blockers are open.");
     await setStatus(f, f.blocker2Id, "cancelled");
-    await heartbeat.drainActiveRunExecutions();
-    // Written while one blocker is still open (it may merge into the Dev's bounded handoff run, which does not settle it).
-    await devAtRest(f);
-    const held = await ctoComment(f, "Written while one blocker is still open.");
-    await devAtRest(f);
+    await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.cancelledBlockerIssueId === f.blocker2Id);
+    await taskQuiet(f);
     const before = (await devRuns(f)).map(run => run.id);
+    // The open one is done: only a cancelled blocker is left, so the dependency is handed back, with the comment.
     await setStatus(f, f.blockerId, "done");
     const handBack = await runWhere(f.devId, f.taskId, carrying(held), before);
     expect((handBack.contextSnapshot as any).cancelledBlockerIssueId).toBe(f.blocker2Id);
     const notes = await db.select({ body: issueComments.body }).from(issueComments)
       .where(and(eq(issueComments.issueId, f.taskId), eq(issueComments.authorType, "system")));
     expect(notes.some(row => row.body.includes("every blocker this task still waits on is cancelled"))).toBe(true);
+  }, 120_000);
+
+  // v5, point 3: nothing is held as soon as ONE unresolved blocker is cancelled (studio.21 there, a bounded run).
+  it("holds nothing once one unresolved blocker is cancelled: the comment runs bounded, as in studio.21", async () => {
+    const f = await seed({ blocked: false });
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId, f.blocker2Id] }).expect(200);
+    await setStatus(f, f.blocker2Id, "cancelled");
+    await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.cancelledBlockerIssueId === f.blocker2Id);
+    await taskQuiet(f);
+    const comment = await ctoComment(f, "One blocker cancelled, one open.");
+    const run = await runWhere(f.devId, f.taskId, row => JSON.stringify(row.contextSnapshot).includes(comment));
+    expect(run.contextSnapshot).toMatchObject({ dependencyBlockedInteraction: true });
+    expect((await admissionHeld(f, comment)).filter(row => row.status === "skipped")).toEqual([]);
+  }, 120_000);
+
+  // v5, point 5: the hand-back comment is written, its wake fails (a cut between the two); the next dependency change
+  // finds the comment without its wake and wakes it.
+  it("wakes again a hand-back comment left without its wake", async () => {
+    const f = await seed({ blocked: false });
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId, f.blocker2Id] }).expect(200);
+    await setStatus(f, f.blocker2Id, "cancelled");
+    await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.cancelledBlockerIssueId === f.blocker2Id);
+    await taskQuiet(f);
+    await db.execute(sql.raw(`
+      create or replace function studio_test_fail_handback_wake() returns trigger language plpgsql as $$
+      begin
+        if new.payload->>'issueId' = '${f.taskId}' and new.payload ? 'cancelledBlockerIssueId' and new.reason = 'issue_commented'
+          and coalesce(new.payload->>'mutation', '') = 'comment' and new.requested_by_actor_id = 'cancelled_blocker_handoff'
+          and new.payload->>'commentId' in (select id::text from issue_comments where body like '%cancelled-blockers-left:%') then
+          raise exception 'injected: hand-back wake lost';
+        end if;
+        return new;
+      end $$;
+      drop trigger if exists studio_test_fail_handback_wake on agent_wakeup_requests;
+      create trigger studio_test_fail_handback_wake before insert on agent_wakeup_requests
+        for each row execute function studio_test_fail_handback_wake();`));
+    const handBackComments = () => db.select({ id: issueComments.id }).from(issueComments)
+      .where(and(eq(issueComments.issueId, f.taskId), sql`${issueComments.body} like '%cancelled-blockers-left:%'`));
+    try {
+      await setStatus(f, f.blockerId, "done");
+      await expect.poll(async () => (await handBackComments()).length, { timeout: 20_000 }).toBe(1);
+      await heartbeat.drainActiveRunExecutions();
+      await new Promise(resolve => setTimeout(resolve, 500));
+      const [lost] = await handBackComments();
+      expect((await devRuns(f)).filter(run => JSON.stringify(run.contextSnapshot).includes(lost!.id))).toEqual([]);
+    } finally {
+      await db.execute(sql.raw(`drop trigger if exists studio_test_fail_handback_wake on agent_wakeup_requests;`));
+    }
+    // The next change of the task's dependencies (here, its blocker set written again) wakes the comment.
+    const [comment] = await handBackComments();
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId, f.blocker2Id] }).expect(200);
+    const woken = await runWhere(f.devId, f.taskId, run => JSON.stringify(run.contextSnapshot).includes(comment!.id));
+    expect((woken.contextSnapshot as any).cancelledBlockerIssueId).toBe(f.blocker2Id);
+    expect(await handBackComments()).toHaveLength(1);
   }, 120_000);
 
   // Second review, point 3: a partial removal leaving only done blockers makes the issue ready; so does deleting the
@@ -327,9 +398,7 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
     await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [] }).expect(200);
     const first = await runWhere(f.devId, f.taskId, carrying(firstHeld));
     await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blocker2Id] }).expect(200);
-    await devAtRest(f);
-    const secondHeld = await ctoComment(f, "Before the second removal.");
-    await devAtRest(f);
+    const secondHeld = await heldComment(f, "Before the second removal.");
     await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [] }).expect(200);
     const second = await runWhere(f.devId, f.taskId, carrying(secondHeld), [first.id]);
     expect([first, second].map(run => (run.contextSnapshot as any).source)).toEqual(["issue.blockers_edited", "issue.blockers_edited"]);
@@ -457,6 +526,88 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
 
   // Third review, point 6 (kept by the owner): one system note per series says that an agent's comment waits, and how
   // to get an answer before. It wakes nobody.
+  // v5, point 1: no atomic trace of a hold, no handover (and no cost): an issue never blocked is unchanged.
+  it("adds nothing to the runs of an issue that was never blocked, even after a failed run", async () => {
+    const f = await seed({ blocked: false });
+    await ctoComment(f, "First note on an open task.");
+    await taskQuiet(f);
+    nextOutcome.set(f.taskId, "spawn-255");
+    await ctoComment(f, "Second note; this run is cut.");
+    await taskQuiet(f);
+    await ctoComment(f, "Third note.");
+    await taskQuiet(f);
+    const runs = await devRuns(f);
+    expect(runs.length).toBeGreaterThanOrEqual(3);
+    expect(runs.some(run => run.status === "failed")).toBe(true);
+    for (const run of runs) expect((run.contextSnapshot as any)?.heldDependencyCommentIds).toBeUndefined();
+  }, 120_000);
+
+  // v5, point 1: a trace older than the base (a hold from before the change was installed) is ignored.
+  it("ignores a hold trace older than the assignee's latest qualified run", async () => {
+    const f = await seed({ blocked: false });
+    await ctoComment(f, "Settled by the next run.");
+    const settled = await runWhere(f.devId, f.taskId, () => true);
+    expect(settled.status).toBe("succeeded");
+    await taskQuiet(f);
+    // An agent comment after that run: it would be handed over if the old trace counted.
+    await ctoComment(f, "After the settled run.");
+    await taskQuiet(f);
+    // A skipped issue_dependencies_blocked request written before that run started.
+    await db.insert(agentWakeupRequests).values({ companyId: f.companyId, agentId: f.devId, source: "automation",
+      triggerDetail: "system", reason: "issue_dependencies_blocked", status: "skipped", requestedByActorType: "agent",
+      requestedByActorId: f.ctoId, requestedAt: new Date(settled.startedAt!.getTime() - 60_000), finishedAt: new Date(),
+      payload: { issueId: f.taskId } });
+    // A Board wake of the Dev on the ready task goes through the real admission, which decides the handover.
+    const run = await heartbeat.wakeup(f.devId, {
+      source: "on_demand", triggerDetail: "manual", reason: "issue_status_changed",
+      payload: { issueId: f.taskId }, contextSnapshot: { issueId: f.taskId, taskId: f.taskId },
+    });
+    expect(run).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    expect((run!.contextSnapshot as any)?.heldDependencyCommentIds).toBeUndefined();
+  }, 120_000);
+
+  // v5, point 1: the first run after a reassignment gets the agent comments written before, with its own text.
+  it("hands the agent thread to a new assignee with the reassignment text", async () => {
+    const f = await seed({ blocked: false });
+    const before = await ctoComment(f, "Written to the first owner.");
+    await taskQuiet(f);
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ assigneeAgentId: f.dev2Id }).expect(200);
+    const run = await runWhere(f.dev2Id, f.taskId, row => handedOver(row).length > 0);
+    expect(handedOver(run)).toContain(before);
+    expect((run.contextSnapshot as any).heldDependencyReason).toBe("reassignment");
+    const packet = await packetOf(f, f.dev2Id, run) as any;
+    expect(packet.heldDependencyComments.note).toContain("before you took it over");
+  }, 120_000);
+
+  // v5, point 4: a run that passes the claim gate under a person's exception is bounded, so it does not settle the
+  // comment held before it.
+  it("marks a run passing the claim gate under an exception as bounded, so it never settles held comments", async () => {
+    const f = await seed({ blocked: false, devMaxConcurrent: 1 });
+    const busyRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: busyRunId, companyId: f.companyId, agentId: f.devId, invocationSource: "assignment",
+      status: "running", startedAt: new Date(), contextSnapshot: { issueId: randomUUID() } });
+    await db.update(agents).set({ status: "running" }).where(eq(agents.id, f.devId));
+    // A person's comment admitted while the task is ready: queued behind the busy run, then the blocker comes.
+    await request(app(f.companyId)).post(`/api/issues/${f.taskId}/comments`).send({ body: "Person, before the blocker." }).expect(201);
+    await expect.poll(async () => (await devRuns(f))[0]?.status, { timeout: 20_000 }).toBe("queued");
+    const [personRun] = await devRuns(f);
+    expect((personRun!.contextSnapshot as any).dependencyBlockedInteraction).toBeUndefined();
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId] }).expect(200);
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, busyRunId));
+    await db.update(agents).set({ status: "idle" }).where(eq(agents.id, f.devId));
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    // It passed the claim gate under the person's exception, succeeded with its engine started, and is marked bounded.
+    const passed = (await runById(personRun!.id))!;
+    expect(passed.status).toBe("succeeded");
+    expect(passed.processStartedAt).not.toBeNull();
+    expect(passed.contextSnapshot).toMatchObject({ dependencyBlockedInteraction: true });
+    // So it is not a qualified run: the base did not move.
+    const { readLatestQualifiedRunStart } = await import("../services/heartbeat/held-dependency-comments.js");
+    expect(await readLatestQualifiedRunStart(db, { companyId: f.companyId, issueId: f.taskId, agentId: f.devId })).toBeNull();
+  }, 120_000);
+
   it("notes once per series that an agent's comment waits, and the note wakes nobody", async () => {
     const f = await seed();
     await devAtRest(f);
@@ -483,22 +634,13 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
     await setStatus(f, f.blockerId, "done");
     await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.wakeReason === "issue_blockers_resolved");
     await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blocker2Id] }).expect(200);
-    await devAtRest(f);
-    // Let the Dev's follow-up runs (the fake adapter leaves no disposition, so repairs follow) all end first.
-    const pending = async () => (await devRuns(f)).filter(run => ["queued", "running", "scheduled_retry"].includes(run.status)).length
-      + (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.devId),
-        sql`${agentWakeupRequests.status} in ('queued', 'deferred_issue_execution')`))).length;
-    for (let attempt = 0; attempt < 120 && (await pending()) > 0; attempt += 1) {
-      await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1000) })
-        .where(and(eq(heartbeatRuns.agentId, f.devId), eq(heartbeatRuns.status, "scheduled_retry")));
-      await heartbeat.promoteDueScheduledRetries(new Date());
-      await heartbeat.resumeQueuedRuns();
-      await heartbeat.drainActiveRunExecutions();
-      await new Promise(resolve => setTimeout(resolve, 250));
-    }
-    expect(await pending()).toBe(0);
-    await heldComment(f, "Held in the next series.");
+    const third = await heldComment(f, "Held in the next series.");
     expect(await notes()).toHaveLength(2);
+    // The second lift hands over the second series only (the first was settled by the qualified run).
+    const lifts = (await devRuns(f)).map(run => run.id);
+    await setStatus(f, f.blocker2Id, "done");
+    const secondLift = await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.wakeReason === "issue_blockers_resolved", lifts);
+    expect(handedOver(secondLift)).toEqual([third]);
   }, 180_000);
 
   it("keeps a person's comment as a bounded interaction run on the blocked issue", async () => {

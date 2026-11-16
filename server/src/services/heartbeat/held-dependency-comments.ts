@@ -191,79 +191,56 @@ export async function readCommentsToHandOver(db: Reader, input: {
 }
 
 /**
- * Dependents of a blocker that just became done whose remaining unresolved blockers are all cancelled: nothing
- * else will wake their assignee (cancelled blockers stay unresolved), so the route hands the dependency back.
- */
-export async function listDependentsLeftWithCancelledBlockers(db: Reader, input: {
-  companyId: string;
-  blockerIssueId: string;
-}): Promise<Array<{ id: string; assigneeAgentId: string; cancelledBlockerIssueIds: string[] }>> {
-  const dependents = await db.select({ id: issues.id, assigneeAgentId: issues.assigneeAgentId })
-    .from(issueRelations).innerJoin(issues, eq(issueRelations.relatedIssueId, issues.id)).where(and(
-      eq(issueRelations.companyId, input.companyId),
-      eq(issueRelations.type, "blocks"),
-      eq(issueRelations.issueId, input.blockerIssueId),
-      isNotNull(issues.assigneeAgentId),
-      isNull(issues.hiddenAt),
-      sql`${issues.status} not in ('done', 'cancelled', 'backlog')`,
-    ));
-  const out: Array<{ id: string; assigneeAgentId: string; cancelledBlockerIssueIds: string[] }> = [];
-  for (const dependent of dependents) {
-    const blockers = await db.select({ id: issues.id, status: issues.status })
-      .from(issueRelations).innerJoin(issues, eq(issueRelations.issueId, issues.id)).where(and(
-        eq(issueRelations.companyId, input.companyId),
-        eq(issueRelations.type, "blocks"),
-        eq(issueRelations.relatedIssueId, dependent.id),
-      ));
-    const unresolved = blockers.filter(row => row.status !== "done");
-    if (unresolved.length > 0 && unresolved.every(row => row.status === "cancelled")) {
-      out.push({ id: dependent.id, assigneeAgentId: dependent.assigneeAgentId!, cancelledBlockerIssueIds: unresolved.map(row => row.id) });
-    }
-  }
-  return out;
-}
-
-/**
- * A blocker became done and its dependent's remaining unresolved blockers are all cancelled: hand the dependency back
- * to the dependent's assignee like a cancelled blocker (STUDIO-0029), with one system comment per such event. The
- * caller wakes the assignee on that comment (`cancelledBlockerIssueId` in the wake context).
+ * Dependents (among `dependentIds`) whose unresolved blockers are all cancelled: nothing else will wake their
+ * assignee (cancelled blockers stay unresolved), so the dependency is handed back as for a cancelled blocker
+ * (STUDIO-0029): one system comment per dependent and per set of cancelled blockers, and the caller wakes the
+ * assignee on it (`cancelledBlockerIssueId` in the wake context). The comment and its wake cannot share one
+ * transaction (the wake is admitted by the heartbeat service): the deduplication skips only when the wake exists too,
+ * so a comment left without its wake (a cut between the two) is woken again by the next dependency change.
  */
 export async function handBackDependentsLeftWithCancelledBlockers(db: Db, input: {
   companyId: string;
-  doneBlocker: { id: string; identifier: string | null; completedAt?: Date | string | null };
+  dependentIds: readonly string[];
 }): Promise<Array<{ dependentId: string; assigneeAgentId: string; commentId: string; cancelledBlockerIssueId: string }>> {
-  const dependents = await listDependentsLeftWithCancelledBlockers(db, { companyId: input.companyId, blockerIssueId: input.doneBlocker.id });
   const out: Array<{ dependentId: string; assigneeAgentId: string; commentId: string; cancelledBlockerIssueId: string }> = [];
-  const doneAt = input.doneBlocker.completedAt ? new Date(input.doneBlocker.completedAt).toISOString() : new Date().toISOString();
-  for (const dependent of dependents) {
-    const label = input.doneBlocker.identifier ?? input.doneBlocker.id;
+  for (const dependentId of [...new Set(input.dependentIds)]) {
+    const [dependent] = await db.select({ id: issues.id, assigneeAgentId: issues.assigneeAgentId, status: issues.status })
+      .from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, dependentId), isNull(issues.hiddenAt)));
+    if (!dependent?.assigneeAgentId || ["done", "cancelled", "backlog"].includes(dependent.status)) continue;
+    const blockers = await db.select({ id: issues.id, identifier: issues.identifier, status: issues.status })
+      .from(issueRelations).innerJoin(issues, eq(issueRelations.issueId, issues.id)).where(and(
+        eq(issueRelations.companyId, input.companyId),
+        eq(issueRelations.type, "blocks"),
+        eq(issueRelations.relatedIssueId, dependentId),
+      ));
+    const unresolved = blockers.filter(row => row.status !== "done");
+    if (unresolved.length === 0 || !unresolved.every(row => row.status === "cancelled")) continue;
+    const cancelledIds = unresolved.map(row => row.id).sort();
+    const labels = unresolved.map(row => row.identifier ?? row.id).sort().join(", ");
     const body =
-      `System dependency handoff: ${label} is done, and every blocker this task still waits on is cancelled. ` +
+      `System dependency handoff: every blocker this task still waits on is cancelled (${labels}). ` +
       "A cancelled blocker never resolves, so this task stays blocked until its blocker set changes.\n\n" +
       "As the assignee, reassess these dependencies: replace them with the tasks that now carry the work, or remove " +
       "them if nothing is left to wait for (set_dependencies, or `blockedByIssueIds` with the blockers to keep).\n\n" +
-      `<!-- cancelled-blockers-left:${input.doneBlocker.id}:${doneAt} -->`;
+      `<!-- cancelled-blockers-left:${dependentId}:${cancelledIds.join(",")} -->`;
+    const assigneeAgentId = dependent.assigneeAgentId;
     const comment = await db.transaction(async (tx) => {
       const [existing] = await tx.select({ id: issueComments.id }).from(issueComments).where(and(
-        eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, dependent.id),
+        eq(issueComments.companyId, input.companyId), eq(issueComments.issueId, dependentId),
         eq(issueComments.authorType, "system"), eq(issueComments.body, body),
       )).limit(1);
-      // The comment and its wake cannot share one transaction (the wake is admitted by the heartbeat service). The
-      // deduplication only skips when the wake exists too: a comment left without its wake (a cut between the two)
-      // is woken again by the next call.
       if (existing) {
         const [woken] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
           eq(agentWakeupRequests.companyId, input.companyId),
-          eq(agentWakeupRequests.agentId, dependent.assigneeAgentId),
+          eq(agentWakeupRequests.agentId, assigneeAgentId),
           sql`${agentWakeupRequests.payload}->>'commentId' = ${existing.id}`,
         )).limit(1);
         return woken ? null : existing;
       }
-      const [inserted] = await insertIssueComment(tx, { companyId: input.companyId, issueId: dependent.id, authorType: "system", body });
+      const [inserted] = await insertIssueComment(tx, { companyId: input.companyId, issueId: dependentId, authorType: "system", body });
       return inserted ?? null;
     });
-    if (comment) out.push({ dependentId: dependent.id, assigneeAgentId: dependent.assigneeAgentId,
-      commentId: comment.id, cancelledBlockerIssueId: dependent.cancelledBlockerIssueIds[0]! });
+    if (comment) out.push({ dependentId, assigneeAgentId, commentId: comment.id, cancelledBlockerIssueId: cancelledIds[0]! });
   }
   return out;
 }
