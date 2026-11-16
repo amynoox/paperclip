@@ -15,6 +15,7 @@ import {
   findExistingIssueBlockersResolvedWakeForReadyState,
 } from "./issue-dependency-wakeups.js";
 import { handBackDependentsLeftWithCancelledBlockers } from "./heartbeat/held-dependency-comments.js";
+import { logger } from "../middleware/logger.js";
 
 export type DependencyChangeWakeRequest = {
   source: "automation";
@@ -29,7 +30,7 @@ export type DependencyChangeWakeRequest = {
 
 export type DependencyChangeWakeSender = (agentId: string, request: DependencyChangeWakeRequest) => unknown;
 
-export type DependencyChangeKind = "blocker_done" | "blockers_edited" | "blocker_deleted";
+export type DependencyChangeKind = "blocker_done" | "blocker_cancelled" | "blockers_edited" | "blocker_deleted";
 
 export async function wakeDependentsAfterDependencyChange(db: Db, input: {
   companyId: string;
@@ -72,8 +73,9 @@ export async function wakeDependentsAfterDependencyChange(db: Db, input: {
     if (others.length > 0) {
       try {
         out.push(...await handBack(db, input, others));
-      } catch {
-        // The hand-back never prevents the ready dependents' wakes; the next dependency change retries it.
+      } catch (err) {
+        // The hand-back never prevents the ready dependents' wakes; the hand-over backstop retries it.
+        logger.warn({ err, companyId: input.companyId, dependentIssueIds: others }, "dependency hand-back failed");
       }
     }
     return out;

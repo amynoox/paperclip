@@ -16822,6 +16822,28 @@ export function issueRoutes(
           if (wakeIssueId === issue.id && issue.externalConversationState && issue.identifier) {
             wakeup.contextSnapshot = { ...wakeup.contextSnapshot, taskKey: issue.identifier };
           }
+          // STUDIO-0063: a later wake for the same agent and issue (a dependency wake after a person's comment, in
+          // one PATCH) merges the earlier wake's comments instead of dropping them.
+          const earlier = wakeups.get(`${agentId}:${wakeIssueId}`)?.wakeup;
+          if (earlier && earlier !== wakeup) {
+            const earlierContext = (earlier.contextSnapshot ?? {}) as Record<string, unknown>;
+            const earlierPayload = (earlier.payload ?? {}) as Record<string, unknown>;
+            const nextContext = { ...((wakeup.contextSnapshot ?? {}) as Record<string, unknown>) };
+            const nextPayload = { ...((wakeup.payload ?? {}) as Record<string, unknown>) };
+            const ids = [earlierContext.wakeCommentIds, nextContext.wakeCommentIds]
+              .flatMap((value) => (Array.isArray(value) ? value : []))
+              .concat([earlierContext.wakeCommentId, earlierContext.commentId, nextContext.wakeCommentId, nextContext.commentId])
+              .filter((value): value is string => typeof value === "string" && value.length > 0);
+            const commentIds = [...new Set(ids)];
+            if (commentIds.length > 0) {
+              const latest = (nextContext.wakeCommentId ?? nextContext.commentId ?? earlierContext.wakeCommentId
+                ?? earlierContext.commentId) as string | undefined;
+              nextContext.wakeCommentIds = commentIds;
+              if (latest) { nextContext.wakeCommentId = latest; nextContext.commentId = latest; nextPayload.commentId = latest; }
+              if (!nextPayload.commentId && earlierPayload.commentId) nextPayload.commentId = earlierPayload.commentId;
+              wakeup = { ...wakeup, contextSnapshot: nextContext, payload: nextPayload } as WakeupRequest;
+            }
+          }
           wakeups.set(`${agentId}:${wakeIssueId}`, { agentId, wakeup });
         };
         const addDependencyResolvedWakeup = async (input: {
@@ -17158,14 +17180,10 @@ export function issueRoutes(
           }
         }
 
-        // STUDIO-0063: an edit of the blocker set that removes an unresolved blocker can make the issue ready (or
-        // leave only cancelled ones). Unless the restored-blocked path above already woke it, the same function
-        // decides; the key carries the edit's time, so each such edit wakes once.
-        if (
-          Array.isArray(req.body.blockedByIssueIds) &&
-          existingRelations?.blockedBy?.some((blocker) => blocker.status !== "done") &&
-          !restoredBlockedReadyDependency
-        ) {
+        // STUDIO-0063: every edit of the blocker set goes through the same function (ready, or only cancelled
+        // blockers left). If the restored-blocked path above already woke the assignee, the two wakes merge in
+        // addWakeup (same agent, same issue); the key carries the edit's time, so each such edit wakes once.
+        if (Array.isArray(req.body.blockedByIssueIds)) {
           try {
             await wakeDependentsAfterDependencyChange(db, {
               companyId: issue.companyId,

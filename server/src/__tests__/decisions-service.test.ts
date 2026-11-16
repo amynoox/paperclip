@@ -6,6 +6,7 @@ import { eq, inArray, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   authUsers,
   companies,
@@ -387,6 +388,51 @@ describePg("decisionService", () => {
     const cancelResult = await service().decide({ id: cancelDecision.id, optionId: "yes", decidedByUserId, userActor: boardActor() });
     expect(cancelResult.executions[0]).toMatchObject({ status: "skipped", error: "target_changed" });
     expect((await db.select().from(issues).where(eq(issues.id, childId)))[0]?.status).toBe("todo");
+  });
+
+  // STUDIO-0063: a decision card's effects go through the one "dependencies changed" function after commit.
+  it("wakes the assignee when a resolve_blocker decision makes its issue ready (STUDIO-0063)", async () => {
+    const blockerId = randomUUID();
+    await db.insert(issues).values({ id: blockerId, companyId, title: "Open blocker", status: "todo", priority: "medium", responsibleUserId: decidedByUserId });
+    await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: targetIssueId, type: "blocks" });
+    await db.update(issues).set({ assigneeAgentId: agentId }).where(eq(issues.id, targetIssueId));
+    const created = await service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Resolve blocker?", body: "Body",
+      options: [{ id: "yes", label: "Yes", effects: [{ type: "resolve_blocker", targetIssueId, staleness: "lenient",
+        removeBlockedByIssueIds: [blockerId] }] }],
+    });
+    await service().decide({ id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor() });
+    await vi.waitFor(async () => {
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakes.some(wake => wake.reason === "issue_blockers_resolved"
+        && (wake.payload as Record<string, unknown> | null)?.issueId === targetIssueId)).toBe(true);
+    }, { timeout: 20_000 });
+  });
+
+  it("hands a dependent back when a cancellation decision leaves it waiting only on cancelled blockers (STUDIO-0063)", async () => {
+    const cancelledBlockerId = randomUUID();
+    const dependentId = randomUUID();
+    await db.insert(issues).values([
+      { id: cancelledBlockerId, companyId, title: "Already cancelled", status: "cancelled", priority: "medium", responsibleUserId: decidedByUserId },
+      { id: dependentId, companyId, title: "Dependent", status: "todo", priority: "medium", assigneeAgentId: agentId, responsibleUserId: decidedByUserId },
+    ]);
+    await db.insert(issueRelations).values([
+      { companyId, issueId: targetIssueId, relatedIssueId: dependentId, type: "blocks" },
+      { companyId, issueId: cancelledBlockerId, relatedIssueId: dependentId, type: "blocks" },
+    ]);
+    const created = await service().create({
+      companyId, actor: agentActor(), agentId, runId, title: "Cancel?", body: "Body",
+      options: [{ id: "yes", label: "Yes", effects: [{ type: "cancel_issue_tree", targetIssueId, staleness: "lenient", reasonComment: "cleanup" }] }],
+    });
+    await service().decide({ id: created.id, optionId: "yes", decidedByUserId, userActor: boardActor() });
+    expect((await db.select().from(issues).where(eq(issues.id, targetIssueId)))[0]?.status).toBe("cancelled");
+    await vi.waitFor(async () => {
+      const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, agentId));
+      expect(wakes.some(wake => (wake.payload as Record<string, unknown> | null)?.issueId === dependentId
+        && typeof (wake.payload as Record<string, unknown> | null)?.cancelledBlockerIssueId === "string")).toBe(true);
+    }, { timeout: 20_000 });
+    const notes = await db.select().from(issueComments).where(eq(issueComments.issueId, dependentId));
+    expect(notes.some(note => note.body.includes("every blocker this task still waits on is cancelled"))).toBe(true);
   });
 
   it("never expands a lenient cancellation beyond the signed descendant scope", async () => {

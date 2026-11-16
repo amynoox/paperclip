@@ -1,7 +1,7 @@
 // STUDIO-0063: an agent's comment on an issue that waits on unresolved blockers does not start the assignee's run
 // (production 15 Nov 2026, TR-1258); it waits with the issue and is handed to the assignee later.
 // - One decision for both gates (admission and claim): agentCommentHeldByDependencies. Nothing is recorded.
-// - Handover, only after an atomic trace of a hold (or a reassignment) since the BASE: the start of the current
+// - Handover, only after an atomic trace of a hold of the current assignee (or a reassignment to it) since the BASE: the start of the current
 //   assignee's latest QUALIFIED run on the issue (admitted with the issue ready, not under a person's, card's or
 //   stall's bounded exception; processStartedAt set; succeeded), or the whole thread without one. The traces are the
 //   admission's skipped `issue_dependencies_blocked` request (written in the hold's own transaction), the claim
@@ -135,6 +135,7 @@ export async function readHandOverReason(db: Reader, input: {
 }): Promise<HandOverReason | null> {
   const [skipped] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, input.companyId),
+    eq(agentWakeupRequests.agentId, input.assigneeAgentId),
     eq(agentWakeupRequests.status, "skipped"),
     eq(agentWakeupRequests.reason, "issue_dependencies_blocked"),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
@@ -143,6 +144,7 @@ export async function readHandOverReason(db: Reader, input: {
   if (skipped) return "dependency_hold";
   const [cancelledAtClaim] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId),
+    eq(heartbeatRuns.agentId, input.assigneeAgentId),
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
     eq(heartbeatRuns.status, "cancelled"),
     eq(heartbeatRuns.errorCode, "issue_dependencies_blocked"),
@@ -153,9 +155,19 @@ export async function readHandOverReason(db: Reader, input: {
     eq(activityLog.companyId, input.companyId),
     eq(activityLog.entityType, "issue"),
     eq(activityLog.entityId, input.issueId),
-    eq(activityLog.action, "issue.updated"),
-    sql`${activityLog.details}->'changes'->'assigneeAgentId'->>'to' = ${input.assigneeAgentId}`,
-    sql`${activityLog.details}->'changes'->'assigneeAgentId'->>'from' is distinct from ${input.assigneeAgentId}`,
+    or(
+      and(
+        eq(activityLog.action, "issue.updated"),
+        sql`${activityLog.details}->'changes'->'assigneeAgentId'->>'to' = ${input.assigneeAgentId}`,
+        sql`${activityLog.details}->'changes'->'assigneeAgentId'->>'from' is distinct from ${input.assigneeAgentId}`,
+      ),
+      // A case handoff moves the issue with its own activity.
+      and(
+        eq(activityLog.action, "issue.reassigned"),
+        sql`${activityLog.details}->>'assigneeAgentId' = ${input.assigneeAgentId}`,
+        sql`${activityLog.details}->>'previousAssigneeAgentId' is distinct from ${input.assigneeAgentId}`,
+      ),
+    ),
     input.since ? gt(activityLog.createdAt, input.since) : undefined,
   )).limit(1);
   return reassigned ? "reassignment" : null;
@@ -170,7 +182,8 @@ export async function readCommentsToHandOver(db: Reader, input: {
   const since = await readLatestQualifiedRunStart(db, {
     companyId: input.companyId, issueId: input.issueId, agentId: input.assigneeAgentId,
   });
-  // Nothing without a trace: an issue that was never held (nor reassigned) is unchanged, at no cost.
+  // Nothing without a trace: an issue that was never held (nor reassigned) gets no handover. The trace reads above
+  // run on every admitted wake of the assignee (a few indexed reads); the comment read only after a trace.
   const reason = await readHandOverReason(db, { ...input, since });
   if (!reason) return { ids: [], olderCount: 0, reason: null };
   const exclude = [...new Set(input.excludeCommentIds ?? [])];
@@ -234,6 +247,7 @@ export async function handBackDependentsLeftWithCancelledBlockers(db: Db, input:
           eq(agentWakeupRequests.companyId, input.companyId),
           eq(agentWakeupRequests.agentId, assigneeAgentId),
           sql`${agentWakeupRequests.payload}->>'commentId' = ${existing.id}`,
+          sql`${agentWakeupRequests.status} not in ('skipped', 'failed', 'cancelled')`,
         )).limit(1);
         return woken ? null : existing;
       }

@@ -325,6 +325,25 @@ export type IssuePostCommitAction = {
   runId: string;
   issueId: string;
   issueStatus: string;
+} | IssueDependenciesChangedAction;
+
+/**
+ * STUDIO-0063: a committed change that can make dependents ready, or leave them waiting only on cancelled blockers.
+ * Queued explicitly by the callers that commit such a change outside the issue routes (the native status decision,
+ * the decision cards) and executed after commit by wakeDependentsAfterDependencyChange (dependency-change-wakes.ts),
+ * the one function that decides those wakes. issueService.update does not queue it (moved to the next batch); the
+ * periodic hand-over backstop covers the other writers.
+ */
+export type IssueDependenciesChangedAction = {
+  type: "dependencies_changed";
+  companyId: string;
+  kind: "blocker_done" | "blocker_cancelled" | "blockers_edited";
+  /** The issue whose status changed (a blocker), or whose blocker set was edited (a dependent). */
+  issueId: string;
+  identifier: string | null;
+  completedAt: Date | string | null;
+  at: Date | string;
+  actor: { type: "user" | "agent" | "system"; id: string | null };
 };
 
 /** Execute side effects that must never run before the issue transaction commits. */
@@ -337,6 +356,34 @@ export async function executeIssuePostCommitActions(
   const heartbeat = heartbeatService(db);
   const cancelledRunIds = new Set<string>();
   for (const action of actions) {
+    if (action.type === "dependencies_changed") {
+      try {
+        const { wakeDependentsAfterDependencyChange } = await import("./dependency-change-wakes.js");
+        const dependentIssueIds = action.kind === "blockers_edited"
+          ? [action.issueId]
+          : await db.select({ id: issueRelations.relatedIssueId }).from(issueRelations).where(and(
+            eq(issueRelations.companyId, action.companyId),
+            eq(issueRelations.type, "blocks"),
+            eq(issueRelations.issueId, action.issueId),
+          )).then(rows => rows.map(row => row.id));
+        await wakeDependentsAfterDependencyChange(db, {
+          companyId: action.companyId,
+          dependentIssueIds,
+          kind: action.kind,
+          changedBlocker: action.kind === "blockers_edited" ? null
+            : { id: action.issueId, identifier: action.identifier, completedAt: action.completedAt },
+          actor: action.actor,
+          at: new Date(action.at),
+          wake: (agentId, request) => {
+            void heartbeat.wakeup(agentId, request as never).catch((err: unknown) =>
+              logger.warn({ err, issueId: action.issueId, agentId }, "dependency change wake failed"));
+          },
+        });
+      } catch (err) {
+        logger.warn({ err, issueId: action.issueId, kind: action.kind }, "dependency change wakes deferred to the backstop");
+      }
+      continue;
+    }
     if (cancelledRunIds.has(action.runId)) continue;
     cancelledRunIds.add(action.runId);
     try {
