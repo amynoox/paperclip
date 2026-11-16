@@ -3,8 +3,10 @@
 // both gates (admission and claim), and one durable trace of what was held:
 // - held: a wake request `skipped` with reason `issue_dependencies_blocked`, requested by an `agent`, whose payload
 //   names the issue and the held comments (`commentId` and/or `commentIds`);
-// - handed over: a STARTED run of the issue carries the comment, in `heldDependencyCommentIds` or among its own wake
-//   comments. A held comment that no started run carried is still to hand over, whatever ran in between.
+// - handed over: a run of the issue that REACHED THE ENGINE carries the comment, in `heldDependencyCommentIds` or
+//   among its own wake comments. A run refused or held by the worker router before any reservation, or cancelled by
+//   a gate before dispatch, did not show it to the agent: the next run carries it again. A held comment that no such
+//   run carried is still to hand over, whatever ran in between.
 import { and, asc, eq, gte, inArray, isNotNull, sql } from "drizzle-orm";
 import { agentWakeupRequests, heartbeatRuns, issueComments, issues, type Db } from "@paperclipai/db";
 import { ISSUE_BLOCKER_STALLED_WAKE_REASON } from "@paperclipai/shared";
@@ -13,6 +15,29 @@ import { extractWakeCommentIds } from "../../modules/run-dispatch/index.js";
 export const HELD_DEPENDENCY_COMMENT_IDS_KEY = "heldDependencyCommentIds";
 export const HELD_DEPENDENCY_COMMENTS_SHOWN_MAX = 20;
 const HELD_DEPENDENCY_REASON = "issue_dependencies_blocked";
+
+// Run error codes by which the worker router ended a run before any engine started (its refusals and declared waits,
+// STUDIO-0042/0046/0059), and the gates that cancel a queued run before dispatch. Kept here as one list so the
+// handover does not depend on the order in which the router patches land.
+const NO_ENGINE_RUN_ERROR_CODES: ReadonlySet<string> = new Set([
+  "router_waiting_for_resources",
+  "router_provider_stop_unverified",
+  "router_previous_dispatch_unsettled",
+  "router_readmission_not_drained",
+  "router_ticket_blocked",
+  "router_group_participant_ended",
+  "router_group_participant_closed",
+  "router_group_participant_mismatch",
+  "router_group_participant_reserved",
+  "issue_dependencies_blocked",
+  "queued_comment_discarded",
+]);
+
+/** Whether a run of the issue showed its comments to the agent (it started, and reached the engine). */
+export function runReachedEngine(run: { startedAt: Date | null; status: string; errorCode: string | null }): boolean {
+  if (!run.startedAt) return false;
+  return !(run.errorCode && NO_ENGINE_RUN_ERROR_CODES.has(run.errorCode) && run.status !== "succeeded");
+}
 
 type Reader = Pick<Db, "select">;
 
@@ -102,15 +127,21 @@ export async function readUndeliveredHeldCommentIds(db: Reader, input: {
   }
   if (heldIds.length === 0) return [];
   const oldest = held[0]!.requestedAt;
-  const carried = await db.select({ context: heartbeatRuns.contextSnapshot }).from(heartbeatRuns).where(and(
+  const carried = await db.select({
+    context: heartbeatRuns.contextSnapshot,
+    startedAt: heartbeatRuns.startedAt,
+    status: heartbeatRuns.status,
+    errorCode: heartbeatRuns.errorCode,
+  }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId),
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
     isNotNull(heartbeatRuns.startedAt),
     oldest ? gte(heartbeatRuns.createdAt, oldest) : undefined,
   ));
   const delivered = new Set<string>();
-  for (const { context } of carried) {
-    const snapshot = (context ?? {}) as Record<string, unknown>;
+  for (const run of carried) {
+    if (!runReachedEngine(run)) continue;
+    const snapshot = (run.context ?? {}) as Record<string, unknown>;
     for (const id of wakeContextCommentIds(snapshot)) delivered.add(id);
     const heldCarried = snapshot[HELD_DEPENDENCY_COMMENT_IDS_KEY];
     if (Array.isArray(heldCarried)) for (const value of heldCarried) {
