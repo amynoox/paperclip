@@ -72,6 +72,31 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+// STUDIO-0059: the cumulative totals the resumed Claude session had reported when its
+// previous run ended (execute.ts writes them; parse.ts subtracts them). Without them in
+// the stored session params every resumed run reports the whole session's cost.
+// Kept only when they belong to this session id and have the shape parse.ts writes.
+function readSessionTotals(value: unknown, sessionId: string): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const totals = value as Record<string, unknown>;
+  if (readNonEmptyString(totals.sessionId) !== sessionId) return null;
+  const finite = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v >= 0;
+  if (totals.totalCostUsd !== null && totals.totalCostUsd !== undefined && !finite(totals.totalCostUsd)) return null;
+  const usage = totals.modelUsage;
+  if (typeof usage !== "object" || usage === null || Array.isArray(usage)) return null;
+  const modelUsage: Record<string, Record<string, number>> = {};
+  for (const [model, raw] of Object.entries(usage as Record<string, unknown>)) {
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+    const counters: Record<string, number> = {};
+    for (const [field, count] of Object.entries(raw as Record<string, unknown>)) {
+      if (!finite(count)) return null;
+      counters[field] = count as number;
+    }
+    modelUsage[model] = counters;
+  }
+  return { sessionId, modelUsage, totalCostUsd: finite(totals.totalCostUsd) ? totals.totalCostUsd : null };
+}
+
 export const sessionCodec: AdapterSessionCodec = {
   deserialize(raw: unknown) {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
@@ -89,6 +114,7 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(record.workspaceId) ?? readNonEmptyString(record.workspace_id);
     const repoUrl = readNonEmptyString(record.repoUrl) ?? readNonEmptyString(record.repo_url);
     const repoRef = readNonEmptyString(record.repoRef) ?? readNonEmptyString(record.repo_ref);
+    const claudeSessionTotals = readSessionTotals(record.claudeSessionTotals, sessionId);
     return {
       sessionId,
       ...(cwd ? { cwd } : {}),
@@ -97,6 +123,7 @@ export const sessionCodec: AdapterSessionCodec = {
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
+      ...(claudeSessionTotals ? { claudeSessionTotals } : {}),
     };
   },
   serialize(params: Record<string, unknown> | null) {
@@ -114,6 +141,7 @@ export const sessionCodec: AdapterSessionCodec = {
     const workspaceId = readNonEmptyString(params.workspaceId) ?? readNonEmptyString(params.workspace_id);
     const repoUrl = readNonEmptyString(params.repoUrl) ?? readNonEmptyString(params.repo_url);
     const repoRef = readNonEmptyString(params.repoRef) ?? readNonEmptyString(params.repo_ref);
+    const claudeSessionTotals = readSessionTotals(params.claudeSessionTotals, sessionId);
     return {
       sessionId,
       ...(cwd ? { cwd } : {}),
@@ -122,6 +150,7 @@ export const sessionCodec: AdapterSessionCodec = {
       ...(workspaceId ? { workspaceId } : {}),
       ...(repoUrl ? { repoUrl } : {}),
       ...(repoRef ? { repoRef } : {}),
+      ...(claudeSessionTotals ? { claudeSessionTotals } : {}),
     };
   },
   getDisplayId(params: Record<string, unknown> | null) {

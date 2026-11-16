@@ -23,6 +23,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", async () => {
 });
 
 import { execute, usageAccounting } from "./execute.js";
+import { sessionCodec } from "./index.js";
 
 // A resumed Claude session reports a cumulative result ledger; each run must
 // report its own share and persist the ledger for the next resumed run.
@@ -103,6 +104,35 @@ describe("claude_local per-invocation accounting (STUDIO-0013)", () => {
     expect(receipt?.complete).toBe(true);
     expect(receipt?.costUsd).toBeCloseTo(0.0098);
     expect(second.sessionParams?.claudeSessionTotals).toMatchObject({ sessionId: SESSION, totalCostUsd: 0.0942 });
+  });
+
+  // Production path: the server stores a run's sessionParams through the adapter's session codec
+  // (run-state.ts resolveNextSessionState: codec.serialize, then codec.deserialize on the next run).
+  // Production, 16 Nov 2026: the codec dropped the ledger, so every resumed run reported the whole
+  // session's cost (session 4b16c1cb: 3.48, 42.29, 47.27, 53.43, 59.07 USD).
+  it("keeps the ledger through the session codec, so the next resumed run reports its own share", async () => {
+    launch(0.0844, 20, 5);
+    const first = await execute(buildContext(null) as never);
+    const stored = sessionCodec.serialize(first.sessionParams ?? null);
+    expect(stored?.claudeSessionTotals).toMatchObject({ sessionId: SESSION, totalCostUsd: 0.0844 });
+    const restored = sessionCodec.deserialize(JSON.parse(JSON.stringify(stored)));
+
+    launch(0.0942, 30, 8);
+    const second = await execute(buildContext(restored) as never);
+    expect(claudeArgs()).toEqual(expect.arrayContaining(["--resume", SESSION]));
+    expect(second.costUsd).toBeCloseTo(0.0098);
+    expect(second.usage).toMatchObject({ inputTokens: 10, outputTokens: 3 });
+  });
+
+  it("drops a stored ledger that names another session or has a broken shape", () => {
+    const other = { sessionId: "99999999-2222-4333-8444-555555555555", modelUsage: {}, totalCostUsd: 1 };
+    expect(sessionCodec.deserialize({ sessionId: SESSION, claudeSessionTotals: other })).toEqual({ sessionId: SESSION });
+    expect(sessionCodec.serialize({ sessionId: SESSION, claudeSessionTotals: { sessionId: SESSION, modelUsage: { m: { inputTokens: -1 } }, totalCostUsd: 1 } }))
+      .toEqual({ sessionId: SESSION });
+    expect(sessionCodec.serialize({ sessionId: SESSION, claudeSessionTotals: { sessionId: SESSION, modelUsage: "x", totalCostUsd: 1 } }))
+      .toEqual({ sessionId: SESSION });
+    expect(sessionCodec.deserialize({ sessionId: SESSION, claudeSessionTotals: { sessionId: SESSION, modelUsage: { m: { costUSD: 0.5 } }, totalCostUsd: null } }))
+      .toEqual({ sessionId: SESSION, claudeSessionTotals: { sessionId: SESSION, modelUsage: { m: { costUSD: 0.5 } }, totalCostUsd: null } });
   });
 
   it("does not subtract a ledger persisted for another session", async () => {
