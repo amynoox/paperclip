@@ -1,4 +1,5 @@
 import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
+import { readUndeliveredHeldCommentIds } from "../services/heartbeat/held-dependency-comments.js";
 import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteractionDelivery } from "../services/agent-interaction-delivery.js";
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
@@ -17149,6 +17150,38 @@ export function issueRoutes(
               source: "issue.blockers_restored",
               mutation: "blocked_dependency_restored",
             });
+          }
+        }
+
+        // STUDIO-0063: removing the last blockers fires no issue_blockers_resolved wake, so agents' comments held
+        // while the issue waited on them are handed over now (the admitted run carries heldDependencyCommentIds).
+        if (
+          Array.isArray(req.body.blockedByIssueIds) &&
+          issue.assigneeAgentId &&
+          !["done", "cancelled"].includes(issue.status) &&
+          typeof dependencyReadinessSvc.getDependencyReadiness === "function"
+        ) {
+          const readiness = await dependencyReadinessSvc.getDependencyReadiness(issue.id);
+          if (readiness.isDependencyReady && readiness.blockerIssueIds.length === 0) {
+            const heldIds = await readUndeliveredHeldCommentIds(db, { companyId: issue.companyId, issueId: issue.id });
+            if (heldIds.length > 0) {
+              addWakeup(issue.assigneeAgentId, {
+                source: "automation",
+                triggerDetail: "system",
+                reason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+                payload: { issueId: issue.id, blockerIssueIds: [], mutation: "blockers_removed" },
+                idempotencyKey: `issue_blockers_removed:${issue.id}:${heldIds[heldIds.length - 1]}`,
+                requestedByActorType: actor.actorType,
+                requestedByActorId: actor.actorId,
+                contextSnapshot: {
+                  issueId: issue.id,
+                  taskId: issue.id,
+                  wakeReason: ISSUE_BLOCKERS_RESOLVED_WAKE_REASON,
+                  source: "issue.blockers_removed",
+                  blockerIssueIds: [],
+                },
+              });
+            }
           }
         }
 

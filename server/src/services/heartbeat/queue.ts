@@ -1,5 +1,7 @@
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
+import { agentCommentHeldByDependencies, HELD_DEPENDENCY_COMMENT_IDS_KEY, isDependencyHandoffWake,
+  readUndeliveredHeldCommentIds, recordClaimHeldComments, wakeContextCommentIds } from "./held-dependency-comments.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed } from "./run-admission.js";
 import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
@@ -1133,12 +1135,20 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const blockerStallVerified = unresolvedBlockerCount > 0 && await verifyBlockerStallWake(db, {
         companyId: run.companyId, issueId, contextSnapshot: context, requestedByActorType,
       });
+      // STUDIO-0063: the same rule as admission. A comment queued before its issue became blocked (the assignee was
+      // busy) is held here when only agents wrote what the run carries (merged comments included).
+      const agentCommentHeld = unresolvedBlockerCount > 0 && await agentCommentHeldByDependencies(db, {
+        companyId: run.companyId, issueId, agentId: run.agentId,
+        assigneeAgentId: await db.select({ assigneeAgentId: issues.assigneeAgentId }).from(issues)
+          .where(and(eq(issues.id, issueId), eq(issues.companyId, run.companyId)))
+          .then(rows => rows[0]?.assigneeAgentId ?? null),
+        context, requestedByActorType,
+        unresolvedBlockerIssueIds: readiness?.unresolvedBlockerIssueIds ?? [],
+      });
       if (
         unresolvedBlockerCount > 0 &&
-        // STUDIO-0063: the same rule as admission. A comment queued before its issue became blocked (the assignee was
-        // busy) is held here when an agent wrote it.
         !allowsDependencyBlockedWake(
-          requestedByActorType !== "agent" ? context : null,
+          agentCommentHeld ? null : context,
           ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
           blockerStallVerified,
           await isVerifiedDependencyInteractionResponse(db, { companyId: run.companyId,
@@ -1149,11 +1159,19 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         !(await verifyNonAssigneeAddresseeInteractionWake(db, { companyId: run.companyId,
           issueId, agentId: run.agentId, contextSnapshot: context }))
       ) {
-        await cancelQueuedRunForBlockedDependencies(
+        const cancelled = await cancelQueuedRunForBlockedDependencies(
           run,
           issueId,
           readiness?.unresolvedBlockerIssueIds ?? [],
         );
+        // STUDIO-0063: the held comments are recorded like an admission hold, so the same handover finds them.
+        if (cancelled && agentCommentHeld) {
+          await recordClaimHeldComments(db, {
+            run, issueId, commentIds: wakeContextCommentIds(context),
+            unresolvedBlockerIssueIds: readiness?.unresolvedBlockerIssueIds ?? [],
+            error: "Held because issue dependencies are still blocked; handed to the assignee when they resolve",
+          });
+        }
         logger.info(
           { runId: run.id, issueId, unresolvedBlockerCount },
           "claimQueuedRun: cancelled blocked queued run",
@@ -4628,12 +4646,19 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // issue_dependencies_blocked but the comment wake started the Dev's run at 21:04:02). An agent that needs
           // the blocked assignee puts a card on its OWN issue addressed to that assignee: the assignee answers it there
           // as a named responder (verifyNonAssigneeAddresseeInteractionWake), whatever its own issue waits on.
-          const personCommentWake = opts.requestedByActorType !== "agent";
+          // Only the assignee is held, and a run carrying a person's comment keeps the exception
+          // (agentCommentHeldByDependencies, shared with the claim gate).
+          const agentCommentHeld = Boolean(dependencyReadiness && !dependencyReadiness.isDependencyReady) &&
+            await agentCommentHeldByDependencies(tx as unknown as Db, {
+              companyId: issue.companyId, issueId: issue.id, agentId, assigneeAgentId: issue.assigneeAgentId ?? null,
+              context: enrichedContextSnapshot, requestedByActorType: opts.requestedByActorType,
+              unresolvedBlockerIssueIds: dependencyReadiness?.unresolvedBlockerIssueIds ?? [],
+            });
           const blockedInteractionWake =
             dependencyReadiness &&
             !dependencyReadiness.isDependencyReady &&
             allowsDependencyBlockedWake(
-              personCommentWake ? enrichedContextSnapshot : null,
+              agentCommentHeld ? null : enrichedContextSnapshot,
               ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
               await verifyBlockerStallWake(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
                 contextSnapshot: enrichedContextSnapshot, requestedByActorType: opts.requestedByActorType }),
@@ -4694,26 +4719,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return { kind: "skipped" as const };
           }
 
-          // STUDIO-0063: an agent's comment held by the dependency gate is handed to the assignee with the wake that
-          // follows the blockers' resolution (heldDependencyCommentIds, shown in full by buildPaperclipWakePayload):
-          // the held comments since the assignee's last run on this issue, at most 20, oldest first.
-          if (dependencyReadiness?.isDependencyReady &&
-            readNonEmptyString(enrichedContextSnapshot.wakeReason) === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) {
-            const [lastRun] = await tx.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns).where(and(
-              eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId),
-              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`, isNotNull(heartbeatRuns.startedAt),
-            )).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
-            const held = await tx.select({ commentId: sql<string>`${agentWakeupRequests.payload}->>'commentId'` })
-              .from(agentWakeupRequests).where(and(
-                eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
-                eq(agentWakeupRequests.status, "skipped"), eq(agentWakeupRequests.reason, "issue_dependencies_blocked"),
-                eq(agentWakeupRequests.requestedByActorType, "agent"),
-                sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
-                sql`nullif(${agentWakeupRequests.payload}->>'commentId', '') is not null`,
-                lastRun ? gt(agentWakeupRequests.requestedAt, lastRun.createdAt) : undefined,
-              )).orderBy(asc(agentWakeupRequests.requestedAt)).limit(20);
-            const heldIds = [...new Set(held.map((row) => row.commentId))];
-            if (heldIds.length) enrichedContextSnapshot.heldDependencyCommentIds = heldIds;
+          // STUDIO-0063: agents' comments held by the dependency gate (at admission or at claim) are handed to the
+          // issue's CURRENT assignee by its next admitted run that can act on them: once the issue waits on no blocker
+          // (whatever the wake reason: blockers done or removed, reassignment, reopening), or when it is asked to act
+          // on a stalled or cancelled blocker. heldDependencyCommentIds names every held comment no started run of the
+          // issue carried yet, oldest first; buildPaperclipWakePayload shows the latest ones in full.
+          if (
+            agentId === issue.assigneeAgentId &&
+            (dependencyReadiness?.isDependencyReady !== false || isDependencyHandoffWake(enrichedContextSnapshot))
+          ) {
+            const heldIds = await readUndeliveredHeldCommentIds(tx as unknown as Db, {
+              companyId: issue.companyId, issueId: issue.id,
+            });
+            const ownIds = wakeContextCommentIds(enrichedContextSnapshot);
+            const toHand = heldIds.filter(id => !ownIds.includes(id));
+            if (toHand.length) enrichedContextSnapshot[HELD_DEPENDENCY_COMMENT_IDS_KEY] = toHand;
           }
 
           if (
