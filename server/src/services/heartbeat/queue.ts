@@ -94,6 +94,7 @@ import {
   gt,
   gte,
   inArray,
+  isNotNull,
   isNull,
   like,
   lte,
@@ -1125,17 +1126,19 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       const readiness = dependencyReadiness.get(issueId);
       const unresolvedBlockerCount = readiness?.unresolvedBlockerCount ?? 0;
       // The run's wake request records who asked for it.
+      const requestedByActorType = unresolvedBlockerCount > 0 && run.wakeupRequestId
+        ? (await db.select({ actor: agentWakeupRequests.requestedByActorType }).from(agentWakeupRequests)
+          .where(eq(agentWakeupRequests.id, run.wakeupRequestId)).then(rows => rows[0]?.actor ?? null))
+        : null;
       const blockerStallVerified = unresolvedBlockerCount > 0 && await verifyBlockerStallWake(db, {
-        companyId: run.companyId, issueId, contextSnapshot: context,
-        requestedByActorType: run.wakeupRequestId
-          ? (await db.select({ actor: agentWakeupRequests.requestedByActorType }).from(agentWakeupRequests)
-            .where(eq(agentWakeupRequests.id, run.wakeupRequestId)).then(rows => rows[0]?.actor ?? null))
-          : null,
+        companyId: run.companyId, issueId, contextSnapshot: context, requestedByActorType,
       });
       if (
         unresolvedBlockerCount > 0 &&
+        // STUDIO-0063: the same rule as admission. A comment queued before its issue became blocked (the assignee was
+        // busy) is held here when an agent wrote it.
         !allowsDependencyBlockedWake(
-          context,
+          requestedByActorType !== "agent" ? context : null,
           ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
           blockerStallVerified,
           await isVerifiedDependencyInteractionResponse(db, { companyId: run.companyId,
@@ -4623,7 +4626,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // dependency-blocked issue waits with the issue, as its assignment does (production 15 Nov 2026, TR-1258:
           // the CTO set a blocker and commented in one call at 21:03:58; the assignment wake was held as
           // issue_dependencies_blocked but the comment wake started the Dev's run at 21:04:02). An agent that needs
-          // the blocked assignee asks through an interaction card, whose response keeps its own exception below.
+          // the blocked assignee puts a card on its OWN issue addressed to that assignee: the assignee answers it there
+          // as a named responder (verifyNonAssigneeAddresseeInteractionWake), whatever its own issue waits on.
           const personCommentWake = opts.requestedByActorType !== "agent";
           const blockedInteractionWake =
             dependencyReadiness &&
@@ -4688,6 +4692,28 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               },
             });
             return { kind: "skipped" as const };
+          }
+
+          // STUDIO-0063: an agent's comment held by the dependency gate is handed to the assignee with the wake that
+          // follows the blockers' resolution (heldDependencyCommentIds, shown in full by buildPaperclipWakePayload):
+          // the held comments since the assignee's last run on this issue, at most 20, oldest first.
+          if (dependencyReadiness?.isDependencyReady &&
+            readNonEmptyString(enrichedContextSnapshot.wakeReason) === ISSUE_BLOCKERS_RESOLVED_WAKE_REASON) {
+            const [lastRun] = await tx.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.agentId, agentId),
+              sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`, isNotNull(heartbeatRuns.startedAt),
+            )).orderBy(desc(heartbeatRuns.createdAt)).limit(1);
+            const held = await tx.select({ commentId: sql<string>`${agentWakeupRequests.payload}->>'commentId'` })
+              .from(agentWakeupRequests).where(and(
+                eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.status, "skipped"), eq(agentWakeupRequests.reason, "issue_dependencies_blocked"),
+                eq(agentWakeupRequests.requestedByActorType, "agent"),
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+                sql`nullif(${agentWakeupRequests.payload}->>'commentId', '') is not null`,
+                lastRun ? gt(agentWakeupRequests.requestedAt, lastRun.createdAt) : undefined,
+              )).orderBy(asc(agentWakeupRequests.requestedAt)).limit(20);
+            const heldIds = [...new Set(held.map((row) => row.commentId))];
+            if (heldIds.length) enrichedContextSnapshot.heldDependencyCommentIds = heldIds;
           }
 
           if (

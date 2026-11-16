@@ -2322,7 +2322,14 @@ export async function buildPaperclipWakePayload(input: {
   simplifiedEnglishInteractions?: boolean;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
-  const commentIds = extractWakeCommentIds(input.contextSnapshot);
+  const wakeCommentIds = extractWakeCommentIds(input.contextSnapshot);
+  // STUDIO-0063: agent comments held while the issue waited on its blockers, handed to the assignee with the wake
+  // that follows the blockers' resolution. Shown like the wake's own comments, after them.
+  const heldDependencyCommentIds = (Array.isArray(input.contextSnapshot.heldDependencyCommentIds)
+    ? input.contextSnapshot.heldDependencyCommentIds : [])
+    .map((id) => readNonEmptyString(id)).filter((id): id is string => Boolean(id) && !wakeCommentIds.includes(id!))
+    .slice(0, 20);
+  const commentIds = [...wakeCommentIds, ...heldDependencyCommentIds];
   const annotationCommentId = readNonEmptyString(
     input.contextSnapshot.annotationCommentId,
   );
@@ -2361,9 +2368,14 @@ export async function buildPaperclipWakePayload(input: {
   )
     return null;
 
-  const commentRows = input.wakeCommentRows
-    ? input.wakeCommentRows.filter(row => row.companyId === input.companyId && (!issueId || row.issueId === issueId) && commentIds.includes(row.id))
-    : await readHeartbeatWakeComments(input.db, input.companyId, issueId, commentIds);
+  const commentRows = [
+    ...(input.wakeCommentRows
+      ? input.wakeCommentRows.filter(row => row.companyId === input.companyId && (!issueId || row.issueId === issueId) && wakeCommentIds.includes(row.id))
+      : await readHeartbeatWakeComments(input.db, input.companyId, issueId, wakeCommentIds)),
+    ...(heldDependencyCommentIds.length
+      ? await readHeartbeatWakeComments(input.db, input.companyId, issueId, heldDependencyCommentIds)
+      : []),
+  ];
 
   const commentsById = new Map(
     commentRows.map((comment) => [comment.id, comment]),

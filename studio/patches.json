@@ -1570,7 +1570,7 @@
     },
     {
       "id": "STUDIO-0063",
-      "title": "A comment written by an agent on a dependency-blocked issue waits with the issue instead of waking its assignee",
+      "title": "An agent's comment on a dependency-blocked issue waits with the issue at both gates, and is handed to the assignee when the blockers resolve",
       "status": "implemented-locally-validated-not-deployed",
       "problem": "Production 15 Nov 2026, TR-1258 (B17): at 21:03:58 the CTO set a blocker and posted a comment on the Dev's ticket in one call. The assignment wake was held (issue_dependencies_blocked) but the comment wake started the Dev's run at 21:04:02; the next run was cancelled by the dependency gate at 21:10:44. The dependency gate exempts every comment or mention wake (bounded interaction mode, documented as the exception for human comments) whoever wrote it.",
       "reason": "Requested by the studio setup session for the 16 Nov update (V412, point 2).",
@@ -1578,6 +1578,8 @@
       "owner": "wake admission dependency gate (heartbeat/queue.ts)",
       "paths": [
         "server/src/services/heartbeat/queue.ts",
+        "server/src/services/heartbeat/run-preparation.ts",
+        "server/src/__tests__/dependency-blocked-comment-wake.test.ts",
         "server/src/__tests__/heartbeat-dependency-scheduling.test.ts"
       ],
       "upstreamSearch": {
@@ -1586,7 +1588,7 @@
         "details": "Searched pull requests for comment wake, dependency blocked and blocker interaction: no counterpart restricting the exception to people.",
         "selected": null
       },
-      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. Real wake path: on a blocked issue a person's comment still starts a bounded interaction run; an agent-requested comment wake returns no run and records a skipped issue_dependencies_blocked request; on fb1ad740 it starts a run. heartbeat-dependency-scheduling, legacy-continuation-authority, heartbeat-issue-liveness-escalation and the run-dispatch module: 7 files, 297 passed. tsc: no error in a changed file.",
+      "validation": "Second version after the independent review of e380a451 (claim gate not updated, no way to reach a blocked assignee, held wake lost, tests off the real path). Linux, Node 24.22.2, embedded PostgreSQL, real issue routes and heartbeat. The admission and the claim gate (claimQueuedRun) apply one rule: the comment/mention exception only for a wake not requested by an agent. The held agent comments since the assignee's last run on the issue are put in heldDependencyCommentIds on the issue_blockers_resolved wake, and buildPaperclipWakePayload shows them in full. Real-path cases (dependency-blocked-comment-wake): TR-1258 (PATCH with blocker and comment by the CTO's run) holds the comment, then the blocker's done PATCH gives the Dev a blockers-resolved run carrying it and its wake packet shows it; a comment queued while the Dev was busy, then a blocker added, is cancelled at the claim gate; a person's comment keeps its bounded interaction run; another role reaches the blocked assignee with a card on its own task addressed to the assignee (existing named-responder path; the route refuses a card on the other role's task); an agent comment on an unblocked issue wakes as before. On fb1ad740 the TR-1258 and claim-gate cases fail. With heartbeat-dependency-scheduling (blocker stall and interaction response exceptions), legacy-continuation-authority, heartbeat-issue-liveness-escalation, the run-dispatch module, heartbeat-comment-wake-batching and heartbeat-context-content-trust: 9 files, 329 passed; agent-conversations 59 passed. tsc: no error in a changed file. Not detected: two tickets waiting on each other; a blocker that never resolves is reported by the blocker stall wake (issue_blocker_stalled).",
       "migration": "None.",
       "rollback": "Switch cli/current back to the previous install folder.",
       "retireWhen": "Upstream restricts the dependency-blocked comment exception to people.",
