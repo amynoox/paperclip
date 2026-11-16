@@ -484,6 +484,34 @@ describe("agent cross-tenant route authorization", () => {
     }));
   });
 
+  // STUDIO-0061: production 15 Nov 2026, two roles stayed `pausing` after a resume answered 200.
+  it("says the resume is deferred while the pause is still stopping the agent's runs", async () => {
+    const pausingAgent = { ...baseAgent, status: "paused", pauseReason: null, pausedAt: new Date(), lifecycleState: "pausing", lifecycleHolds: [] };
+    mockAgentService.getById.mockResolvedValue(pausingAgent);
+    const app = await createApp({ type: "board", userId: "board-user", companyIds: [companyId], source: "local_implicit", isInstanceAdmin: true });
+
+    mockAgentService.resume.mockResolvedValue(pausingAgent);
+    const res = await requestApp(app, (baseUrl) => request(baseUrl).post(`/api/agents/${agentId}/resume`).send({}));
+    expect(res.status).toBe(202);
+    expect(res.body.resumeDeferred).toEqual({ reason: "pause_in_progress", remainingHolds: [],
+      message: "The pause is still stopping this agent's runs: the agent resumes by itself when the pause completes." });
+    expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      action: "agent.resumed", entityId: agentId, details: { deferredUntilPauseCompletes: true, remainingHolds: [] },
+    }));
+
+    mockAgentService.resume.mockResolvedValue({ ...pausingAgent, lifecycleHolds: ["budget"] });
+    const held = await requestApp(app, (baseUrl) => request(baseUrl).post(`/api/agents/${agentId}/resume`).send({}));
+    expect(held.status).toBe(202);
+    expect(held.body.resumeDeferred).toMatchObject({ remainingHolds: ["budget"],
+      message: "The pause is still stopping this agent's runs, and holds remain: the agent stays paused after the pause completes." });
+
+    // An agent that resumed at once answers as before.
+    mockAgentService.resume.mockResolvedValue({ ...pausingAgent, status: "idle", lifecycleState: "resuming" });
+    const resumed = await requestApp(app, (baseUrl) => request(baseUrl).post(`/api/agents/${agentId}/resume`).send({}));
+    expect(resumed.status).toBe(200);
+    expect(resumed.body.resumeDeferred).toBeUndefined();
+  });
+
   it("allows a same-company agent with a direct agents:configure grant to resume", async () => {
     mockAccessService.decide.mockResolvedValue({
       allowed: true,
