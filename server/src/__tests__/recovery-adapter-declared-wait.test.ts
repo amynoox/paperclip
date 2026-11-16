@@ -108,13 +108,15 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
 
   type PriorRun = { minutesAgo: number; errorCode: string | null; status?: string; retry?: boolean; durationMinutes?: number };
 
-  async function seed(status: "todo" | "in_progress" | "in_review" | "backlog" | "blocked", prior: PriorRun[], opts?: { review?: boolean }) {
-    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+  async function seed(status: "todo" | "in_progress" | "in_review" | "backlog" | "blocked", prior: PriorRun[],
+    opts?: { review?: boolean; reviewer?: boolean }) {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), reviewerId = randomUUID();
     const userId = `wait-user-${companyId}`;
     await db.insert(authUsers).values({ id: userId, name: "Board user", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companies).values({ id: companyId, name: "Adapter wait fixture", issuePrefix: `W${companyId.slice(0, 6)}` });
     await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Executor", adapterType, status: "idle", adapterConfig: {} });
+    if (opts?.reviewer) await db.insert(agents).values({ id: reviewerId, companyId, name: "Reviewer", adapterType, status: "idle", adapterConfig: {} });
     const runIds: string[] = [];
     for (const run of prior) {
       const createdAt = new Date(Date.now() - run.minutesAgo * 60_000);
@@ -139,16 +141,16 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       checkoutRunId: status === "in_progress" ? runIds[runIds.length - 1] ?? null : null,
       startedAt: status === "in_progress" ? new Date() : null,
       // STUDIO-0059: an execution-review stage whose current participant is the assignee (TR-1318).
-      ...(opts?.review ? {
+      ...(opts?.review || opts?.reviewer ? {
         executionState: {
           status: "pending", currentStageId: randomUUID(), currentStageIndex: 0, currentStageType: "review",
-          currentParticipant: { type: "agent", agentId, userId: null },
+          currentParticipant: { type: "agent", agentId: opts?.reviewer ? reviewerId : agentId, userId: null },
           returnAssignee: { type: "agent", agentId, userId: null },
           reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
         },
       } : {}),
     });
-    return { companyId, agentId, issueId, runIds };
+    return { companyId, agentId, issueId, runIds, reviewerId };
   }
 
   const issueOf = async (issueId: string) => (await db.select().from(issues).where(eq(issues.id, issueId)))[0];
@@ -432,6 +434,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     const fixtures: Array<{ code: string; gesture: string; f: Awaited<ReturnType<typeof seed>>; runId: string }> = [];
     for (const [code, status, gesture] of [
       [RESERVED, "todo", "Replace the already-reserved participant"],
+      // The gesture puts the issue back where the assignee is queued again (`todo`; `in_progress` wakes nobody).
       [MISMATCH, "todo", "Correct the `worker-router` block"],
       [CLOSED, "in_progress", "Remove the finished or cancelled participant"],
       [CLOSED, "todo", "Remove the finished or cancelled participant"],
@@ -453,6 +456,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       const [notice] = await routerNotices(f.issueId);
       expect(notice?.body).toContain(`\`${code}\``);
       expect(JSON.stringify(notice?.metadata)).toContain(gesture);
+      if (code !== ENDED) expect(JSON.stringify(notice?.metadata)).toContain("then move this issue back to `todo`.");
       expect(await actionsOf(f.issueId)).toEqual([expect.objectContaining({ kind: "stranded_assigned_issue", status: "active" })]);
     }
     // Further sweeps add nothing.
@@ -533,6 +537,32 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       expect((await routerNotices(f.issueId))[0]?.body).toContain(code);
       expect(await actionsOf(f.issueId)).toHaveLength(1);
     }
+  }, 180_000);
+
+  it("reads the review participant's own run when the reviewer is another agent than the assignee", async () => {
+    // The refusal and the wait are on the REVIEWER's run (the gate serves the pending participant).
+    const blocked = await seed("in_review", [], { reviewer: true });
+    const refused = { ...blocked, agentId: blocked.reviewerId };
+    refusals.set(blocked.issueId, RESERVED);
+    const refusedRun = await commentWake(refused);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: blocked.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await issueOf(blocked.issueId)).status).toBe("blocked");
+    expect((await routerNotices(blocked.issueId))[0]?.body).toContain(RESERVED);
+    expect((await runsOf(refused)).map(run => run.id)).toEqual([refusedRun.id]);
+    expect(await runsOf(blocked)).toEqual([]);
+
+    const held = await seed("in_review", [], { reviewer: true });
+    const waiting = { ...held, agentId: held.reviewerId };
+    refusals.set(held.issueId, TICKET_BLOCKED);
+    const waitRun = await commentWake(waiting);
+    for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: held.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await issueOf(held.issueId)).status).toBe("in_review");
+    expect((await runsOf(waiting)).map(run => run.id)).toEqual([waitRun.id]);
+    expect(await runsOf(held)).toEqual([]);
+    expect(await actionsOf(held.issueId)).toHaveLength(0);
+    expect((await waitNotes(held.issueId)).map(row => row.body.includes(TICKET_BLOCKED))).toEqual([true]);
   }, 180_000);
 
   it("leaves a refusal on a backlog or blocked issue alone (a status that calls for no run, or is already visible)", async () => {

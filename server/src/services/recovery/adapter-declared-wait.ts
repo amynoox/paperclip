@@ -77,17 +77,17 @@ const ROUTER_REFUSAL_TEXTS: Readonly<Record<string, RouterRefusalText>> = Object
   router_group_participant_reserved: {
     title: "Worker router: a participant is already reserved",
     meaning: "another participant listed in this ticket's group already holds its own machine reservation, so the group cannot be reserved",
-    gesture: "Replace the already-reserved participant in the `worker-router` block of the description (or wait for its reservation to end), then return this issue to work.",
+    gesture: "Replace the already-reserved participant in the `worker-router` block of the description (or wait for its reservation to end), then move this issue back to `todo`.",
   },
   router_group_participant_mismatch: {
     title: "Worker router: the group list is wrong",
     meaning: "another participant listed in this ticket's group is not a child of the same coordinating ticket, or names another group",
-    gesture: "Correct the `worker-router` block of the description so every participant is a child of the same coordinating ticket and names this group, then return this issue to work.",
+    gesture: "Correct the `worker-router` block of the description so every participant is a child of the same coordinating ticket and names this group, then move this issue back to `todo`.",
   },
   router_group_participant_closed: {
     title: "Worker router: a participant is closed",
     meaning: "another participant listed in this ticket's group is done or cancelled",
-    gesture: "Remove the finished or cancelled participant from the `worker-router` block of the description (or reopen it), then return this issue to work.",
+    gesture: "Remove the finished or cancelled participant from the `worker-router` block of the description (or reopen it), then move this issue back to `todo`.",
   },
   router_group_participant_ended: {
     title: "Worker router: this participant's part is finished",
