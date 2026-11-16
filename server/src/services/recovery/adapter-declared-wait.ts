@@ -18,39 +18,112 @@
 //   (it waited up to 10 min for the proof); same settlement and wake by the
 //   router's periodic pass.
 // STUDIO-0059: refusals the worker router returns BEFORE any reservation (no
-// machine contacted, no engine launched, no dispatch created), for a ticket
-// that cannot run now; asking again cannot succeed (router contract,
-// drafts/routeur-deux-moteurs/refus-sans-relance-pour-serveur.md). They are
-// held like a wait: no transient retry, and within the bound stranded-work
-// recovery neither requeues nor blocks the issue as a lost execution path.
-// Production 15-16 Nov 2026: TR-1261 (three runs refused, then blocked),
-// TR-1318 (nine `router_group_participant_ended` in bursts of three).
-// - router_group_participant_ended: this participant has finished its part;
-//   another participant still holds its reservation.
-// - router_group_participant_closed: another listed participant is done or
-//   cancelled; only a change to the tickets lets it pass.
-// - router_group_participant_mismatch: another participant is not a child of
-//   the same coordinating ticket, or names another group; passes after the
-//   list in the description is corrected.
+// machine contacted, no engine launched, no dispatch created). Asking again
+// cannot succeed (router contract,
+// drafts/routeur-deux-moteurs/refus-sans-relance-pour-serveur.md), so none of
+// them is retried. Production 15-16 Nov 2026: TR-1261 (three refused runs,
+// then blocked), TR-1318 (`in_review`, refused `_ended` then `_closed`, then
+// blocked by recovery). What follows a refusal depends on the code:
 // - router_group_participant_reserved (router 0.30.14): a listed participant
-//   already has its own reservation; passes only with another participant.
+//   already holds its own reservation; only replacing it lets the group pass.
+// - router_group_participant_mismatch: another participant is not a child of
+//   the same coordinating ticket, or names another group; only correcting the
+//   `worker-router` block of the description lets it pass.
+//   Both need a person's gesture: the issue is blocked AT ONCE, with a notice
+//   naming the code, its meaning and the gesture, and a Board recovery action.
+// - router_group_participant_closed: another listed participant is done or
+//   cancelled. Blocked the same way while this issue still has work to do
+//   (`todo`, `in_progress`); otherwise a note only, as `_ended` below.
+// - router_group_participant_ended: this participant's part is finished.
+//   Blocked the same way while this issue still has work to do (nothing
+//   changes without a retry, so waiting would only delay the same block).
+//   Once in review or done, neither retried nor blocked: the status stays and
+//   one note per series says so (TR-1318). A new comment still wakes it, and
+//   the router refuses again at no cost.
 // - router_ticket_blocked: the ticket is blocked; its dependency wake starts
-//   it again once unblocked.
-// The router does not wake the assignee when these could pass: past the bound,
-// normal recovery shows a ticket that has really been left too long.
-export const ROUTER_REFUSAL_HOLD_ERROR_CODES: readonly string[] = Object.freeze([
+//   it again once unblocked. It stays a bounded wait (list below).
+export const ROUTER_REFUSAL_ERROR_CODES: readonly string[] = Object.freeze([
   "router_group_participant_ended",
   "router_group_participant_closed",
   "router_group_participant_mismatch",
   "router_group_participant_reserved",
-  "router_ticket_blocked",
 ]);
+
+export type RouterRefusalOutcome = "block" | "note";
+
+const ROUTER_REFUSAL_WORK_STATUSES: readonly string[] = Object.freeze(["todo", "in_progress"]);
+
+// What a refused run leads to, by its error code and the issue's status; null
+// for any other code (that run keeps today's path).
+export function routerRefusalOutcome(
+  code: string | null | undefined,
+  issueStatus: string | null | undefined,
+): RouterRefusalOutcome | null {
+  switch (code) {
+    case "router_group_participant_reserved":
+    case "router_group_participant_mismatch":
+      return "block";
+    case "router_group_participant_closed":
+    case "router_group_participant_ended":
+      return issueStatus && ROUTER_REFUSAL_WORK_STATUSES.includes(issueStatus) ? "block" : "note";
+    default:
+      return null;
+  }
+}
+
+export type RouterRefusalText = { title: string; meaning: string; gesture: string | null };
+
+const ROUTER_REFUSAL_TEXTS: Readonly<Record<string, RouterRefusalText>> = Object.freeze({
+  router_group_participant_reserved: {
+    title: "Worker router: a participant is already reserved",
+    meaning: "another participant listed in this ticket's group already holds its own machine reservation, so the group cannot be reserved",
+    gesture: "Replace the already-reserved participant in the `worker-router` block of the description (or wait for its reservation to end), then return this issue to work.",
+  },
+  router_group_participant_mismatch: {
+    title: "Worker router: the group list is wrong",
+    meaning: "another participant listed in this ticket's group is not a child of the same coordinating ticket, or names another group",
+    gesture: "Correct the `worker-router` block of the description so every participant is a child of the same coordinating ticket and names this group, then return this issue to work.",
+  },
+  router_group_participant_closed: {
+    title: "Worker router: a participant is closed",
+    meaning: "another participant listed in this ticket's group is done or cancelled",
+    gesture: "Remove the finished or cancelled participant from the `worker-router` block of the description (or reopen it), then return this issue to work.",
+  },
+  router_group_participant_ended: {
+    title: "Worker router: this participant's part is finished",
+    meaning: "this participant has finished its part of the group",
+    gesture: "If this participant's part is finished, move the issue to review or done; otherwise reassign it, or correct the participant in the `worker-router` block of the description.",
+  },
+});
+
+export function routerRefusalText(code: string): RouterRefusalText {
+  return ROUTER_REFUSAL_TEXTS[code] ?? { title: "Worker router refusal", meaning: "the worker router refused the run", gesture: null };
+}
+
+// Body of the blocking notice (`block`). The run was refused before any
+// reservation, so no work was lost and nothing was retried.
+export function routerRefusalBlockBody(code: string): string {
+  const text = routerRefusalText(code);
+  return (
+    `The worker router refused this run before reserving any machine (\`${code}\`): ${text.meaning}. ` +
+    "Asking again cannot pass, so nothing was retried. Moving the issue to `blocked` until the group is corrected."
+  );
+}
+
+// Body of the note (`note`), posted once per series of refusals under the code.
+export function routerRefusalNoteBody(code: string): string {
+  const text = routerRefusalText(code);
+  return (
+    `The worker router refused this run before reserving any machine (\`${code}\`): ${text.meaning}. ` +
+    "Nothing is retried and the issue status is unchanged."
+  );
+}
 
 export const ADAPTER_DECLARED_WAIT_ERROR_CODES: readonly string[] = Object.freeze([
   "router_waiting_for_resources",
   "router_provider_stop_unverified",
   "router_previous_dispatch_unsettled",
-  ...ROUTER_REFUSAL_HOLD_ERROR_CODES,
+  "router_ticket_blocked",
 ]);
 
 // Bound on such a wait, counted from the END of the oldest run of the latest
@@ -79,6 +152,23 @@ const ADAPTER_DECLARED_WAIT_MAX_MS_BY_CODE: Readonly<Record<string, number>> = O
   router_previous_dispatch_unsettled: ADAPTER_DECLARED_STOP_WAIT_MAX_MS,
 });
 
+// STUDIO-0059: each kind of wait counts its own series. A run under another
+// kind breaks the series, so a machine wait followed by a stop wait (or by a
+// dependency wait) no longer takes the latest code's bound counted from the
+// first machine wait. The unproven stop and its unsettled dispatch are one
+// stop (the second is the next run's view of the first).
+const ADAPTER_DECLARED_WAIT_SERIES_BY_CODE: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  router_waiting_for_resources: Object.freeze(["router_waiting_for_resources"]),
+  router_provider_stop_unverified: Object.freeze(["router_provider_stop_unverified", "router_previous_dispatch_unsettled"]),
+  router_previous_dispatch_unsettled: Object.freeze(["router_provider_stop_unverified", "router_previous_dispatch_unsettled"]),
+  router_ticket_blocked: Object.freeze(["router_ticket_blocked"]),
+});
+
+// Codes counted in the same series as the given wait code.
+export function adapterDeclaredWaitSeriesCodes(code: string | null | undefined): readonly string[] {
+  return (code && ADAPTER_DECLARED_WAIT_SERIES_BY_CODE[code]) || (code ? [code] : []);
+}
+
 export function isAdapterDeclaredWaitErrorCode(code: string | null | undefined): boolean {
   return Boolean(code && ADAPTER_DECLARED_WAIT_ERROR_CODES.includes(code));
 }
@@ -92,7 +182,8 @@ export function isAdapterDeclaredWaitErrorCode(code: string | null | undefined):
 export const ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES: readonly string[] = Object.freeze([
   "router_waiting_for_resources",
   "router_previous_dispatch_unsettled",
-  ...ROUTER_REFUSAL_HOLD_ERROR_CODES,
+  "router_ticket_blocked",
+  ...ROUTER_REFUSAL_ERROR_CODES,
 ]);
 
 // STUDIO-0046: an unproven stop after a cut link is retried by the server on

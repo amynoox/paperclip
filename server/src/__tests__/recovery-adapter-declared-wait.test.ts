@@ -27,8 +27,9 @@ import {
   ADAPTER_DECLARED_WAIT_ERROR_CODES,
   ADAPTER_DECLARED_WAIT_MAX_MS,
   ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES,
-  ROUTER_REFUSAL_HOLD_ERROR_CODES,
+  ROUTER_REFUSAL_ERROR_CODES,
   adapterDeclaredWaitMaxMs,
+  routerRefusalOutcome,
 } from "../services/recovery/adapter-declared-wait.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 
@@ -56,6 +57,11 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   const oldHome = process.env.PAPERCLIP_HOME;
   let home: string;
   const WAIT = "router_waiting_for_resources";
+  const ENDED = "router_group_participant_ended";
+  const CLOSED = "router_group_participant_closed";
+  const MISMATCH = "router_group_participant_mismatch";
+  const RESERVED = "router_group_participant_reserved";
+  const TICKET_BLOCKED = "router_ticket_blocked";
   // A cut link to the worker machine (router 0.30.10): the cut run, then the next run.
   const STOP = "router_provider_stop_unverified";
   const UNSETTLED = "router_previous_dispatch_unsettled";
@@ -101,7 +107,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
 
   type PriorRun = { minutesAgo: number; errorCode: string | null; status?: string; retry?: boolean; durationMinutes?: number };
 
-  async function seed(status: "todo" | "in_progress", prior: PriorRun[]) {
+  async function seed(status: "todo" | "in_progress" | "in_review", prior: PriorRun[], opts?: { review?: boolean }) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     const userId = `wait-user-${companyId}`;
     await db.insert(authUsers).values({ id: userId, name: "Board user", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
@@ -131,6 +137,15 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       id: issueId, companyId, title: "Routed task", status, assigneeAgentId: agentId, responsibleUserId: userId, issueNumber: 1,
       checkoutRunId: status === "in_progress" ? runIds[runIds.length - 1] ?? null : null,
       startedAt: status === "in_progress" ? new Date() : null,
+      // STUDIO-0059: an execution-review stage whose current participant is the assignee (TR-1318).
+      ...(opts?.review ? {
+        executionState: {
+          status: "pending", currentStageId: randomUUID(), currentStageIndex: 0, currentStageType: "review",
+          currentParticipant: { type: "agent", agentId, userId: null },
+          returnAssignee: { type: "agent", agentId, userId: null },
+          reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        },
+      } : {}),
     });
     return { companyId, agentId, issueId, runIds };
   }
@@ -141,20 +156,27 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   const commentsOf = (issueId: string) => db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
   const actionsOf = (issueId: string) => db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
 
-  it("declares the router's three wait codes and its five refusals: 12 h for a machine wait or a refusal, 1 h for an unproven stop", () => {
-    expect(ROUTER_REFUSAL_HOLD_ERROR_CODES).toEqual([
-      "router_group_participant_ended", "router_group_participant_closed", "router_group_participant_mismatch",
-      "router_group_participant_reserved", "router_ticket_blocked",
-    ]);
-    expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT, STOP, UNSETTLED, ...ROUTER_REFUSAL_HOLD_ERROR_CODES]);
-    for (const code of ROUTER_REFUSAL_HOLD_ERROR_CODES) expect(adapterDeclaredWaitMaxMs(code)).toBe(12 * 60 * 60_000);
+  it("declares the router's waits (machine, stop, blocked ticket) and its four group refusals, none retried", () => {
+    expect(ROUTER_REFUSAL_ERROR_CODES).toEqual([ENDED, CLOSED, MISMATCH, RESERVED]);
+    // Only the dependency wait joins the bounded waits; the group refusals are never a wait.
+    expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT, STOP, UNSETTLED, TICKET_BLOCKED]);
+    expect(adapterDeclaredWaitMaxMs(TICKET_BLOCKED)).toBe(12 * 60 * 60_000);
+    expect(routerRefusalOutcome(RESERVED, "in_review")).toBe("block");
+    expect(routerRefusalOutcome(MISMATCH, "todo")).toBe("block");
+    expect(routerRefusalOutcome(CLOSED, "in_progress")).toBe("block");
+    expect(routerRefusalOutcome(CLOSED, "in_review")).toBe("note");
+    expect(routerRefusalOutcome(ENDED, "todo")).toBe("block");
+    expect(routerRefusalOutcome(ENDED, "in_progress")).toBe("block");
+    expect(routerRefusalOutcome(ENDED, "in_review")).toBe("note");
+    expect(routerRefusalOutcome(TICKET_BLOCKED, "todo")).toBeNull();
+    expect(routerRefusalOutcome("process_lost", "todo")).toBeNull();
     expect(ADAPTER_DECLARED_WAIT_MAX_MS).toBe(12 * 60 * 60_000);
     expect(ADAPTER_DECLARED_STOP_WAIT_MAX_MS).toBe(60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(WAIT)).toBe(12 * 60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(STOP)).toBe(60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(UNSETTLED)).toBe(60 * 60_000);
     // The cut run keeps its transient retry (the retried run waits for the link itself).
-    expect(ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES).toEqual([WAIT, UNSETTLED, ...ROUTER_REFUSAL_HOLD_ERROR_CODES]);
+    expect(ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES).toEqual([WAIT, UNSETTLED, TICKET_BLOCKED, ...ROUTER_REFUSAL_ERROR_CODES]);
   });
 
   // Production, 14 Nov 2026: the responsible coordinates on its executor's
@@ -374,38 +396,153 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     ]);
   }, 180_000);
 
-  // STUDIO-0059: production 15-16 Nov 2026, TR-1261 and TR-1318. A run the router refuses before any reservation
-  // was retried (30 s, 60 s), then recovery requeued and blocked the ticket for the Board. Each refusal now ends one
-  // run: no transient retry, and two stranded-work sweeps neither requeue nor block it.
-  it("neither retries, requeues nor blocks a run the router refused before any reservation", async () => {
-    const fixtures: Array<{ code: string; f: Awaited<ReturnType<typeof seed>>; runId: string }> = [];
-    for (const code of ["router_group_participant_ended", "router_group_participant_closed", "router_group_participant_mismatch",
-      "router_group_participant_reserved", "router_ticket_blocked"]) {
-      const f = await seed("todo", []);
+  // STUDIO-0059: production 15-16 Nov 2026. TR-1261: three runs refused (`router_control_failed`, today
+  // `router_group_participant_reserved`), retried, then blocked by recovery. TR-1318: `in_review`, woken by comments,
+  // refused `_ended` twice, `_closed` after a retry, then blocked by recovery at 02:26:35. A refusal before any
+  // reservation is never retried. A code only a gesture lifts blocks AT ONCE, naming the code and the gesture; a
+  // finished participant's refusal leaves the issue as it is, with one note per series.
+  const routerNotices = async (issueId: string) => (await commentsOf(issueId)).filter(row => row.body.includes("The worker router refused this run"));
+
+  it("blocks at once, with the code and the gesture, a run the router refused for a code only a gesture lifts", async () => {
+    const fixtures: Array<{ code: string; gesture: string; f: Awaited<ReturnType<typeof seed>>; runId: string }> = [];
+    for (const [code, status, gesture] of [
+      [RESERVED, "todo", "Replace the already-reserved participant"],
+      [MISMATCH, "todo", "Correct the `worker-router` block"],
+      [CLOSED, "in_progress", "Remove the finished or cancelled participant"],
+      // Nothing changes without a retry: a finished participant whose issue still has work to do is blocked now too.
+      [ENDED, "todo", "move the issue to review or done"],
+      [ENDED, "in_progress", "move the issue to review or done"],
+    ] as const) {
+      const f = await seed(status, []);
       refusals.set(f.issueId, code);
-      fixtures.push({ code, f, runId: (await boardWake(f)).id });
+      fixtures.push({ code, gesture, f, runId: (await boardWake(f)).id });
     }
     await heartbeat.drainActiveRunExecutions();
-    for (const { code, f, runId } of fixtures) {
+    for (const { code, gesture, f, runId } of fixtures) {
       await expect.poll(async () => (await runsOf(f)).find(run => run.id === runId)?.status, { timeout: 30_000 }).toBe("failed");
       expect((await runsOf(f)).find(run => run.id === runId)).toMatchObject({ errorCode: code });
-      expect((await runsOf(f)).filter(run => run.retryOfRunId === runId)).toHaveLength(0);
+      // Released by the run's own end: no retry, no recovery run, blocked now (no sweep yet).
+      expect((await runsOf(f)).map(run => run.id)).toEqual([runId]);
+      await expect.poll(async () => (await issueOf(f.issueId)).status, { timeout: 30_000 }).toBe("blocked");
+      const [notice] = await routerNotices(f.issueId);
+      expect(notice?.body).toContain(`\`${code}\``);
+      expect(JSON.stringify(notice?.metadata)).toContain(gesture);
+      expect(await actionsOf(f.issueId)).toEqual([expect.objectContaining({ kind: "stranded_assigned_issue", status: "active" })]);
     }
+    // Further sweeps add nothing.
     for (let sweep = 0; sweep < 2; sweep += 1) {
       for (const { f } of fixtures) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
     }
     await heartbeat.drainActiveRunExecutions();
     for (const { f, runId } of fixtures) {
       expect((await runsOf(f)).map(run => run.id)).toEqual([runId]);
-      expect((await issueOf(f.issueId)).status).not.toBe("blocked");
-      expect(await actionsOf(f.issueId)).toHaveLength(0);
-      expect(await commentsOf(f.issueId)).toHaveLength(0);
+      expect(await routerNotices(f.issueId)).toHaveLength(1);
+      expect(await actionsOf(f.issueId)).toHaveLength(1);
     }
-    // Past the bound, normal recovery applies as for any wait.
+  }, 180_000);
+
+  it("the stranded-work sweep blocks with the same notice a refused run whose release did not", async () => {
+    const reserved = await seed("todo", [{ minutesAgo: 5, errorCode: RESERVED }]);
+    const closed = await seed("in_progress", [{ minutesAgo: 5, errorCode: CLOSED }]);
+    const ended = await seed("todo", [{ minutesAgo: 5, errorCode: ENDED }]);
+    const codeOf = new Map([[reserved, RESERVED], [closed, CLOSED], [ended, ENDED]]);
+    // Even a refusal minutes old: no bound, no requeue.
+    for (const f of [reserved, closed, ended]) {
+      const result = await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      expect(result.dispatchRequeued + result.continuationRequeued).toBe(0);
+      expect((await issueOf(f.issueId)).status).toBe("blocked");
+      expect((await routerNotices(f.issueId))[0]?.body).toContain(codeOf.get(f)!);
+      expect(await actionsOf(f.issueId)).toHaveLength(1);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+    }
+    await heartbeat.drainActiveRunExecutions();
+  }, 180_000);
+
+  // TR-1318 replayed: an `in_review` issue whose review participant is its assignee, woken by a comment.
+  it("keeps an in-review issue in review when the router refuses its participant as ended, then closed (TR-1318)", async () => {
+    for (const review of [true, false]) {
+      const f = await seed("in_review", [], { review });
+      refusals.set(f.issueId, ENDED);
+      const commented = async () => {
+        const [comment] = await db.insert(issueComments).values({
+          companyId: f.companyId, issueId: f.issueId, authorType: "user", authorUserId: `wait-user-${f.companyId}`,
+          body: "Can you confirm the result?",
+        }).returning();
+        const run = await heartbeat.wakeup(f.agentId, {
+          source: "automation", triggerDetail: "system", reason: "issue_commented",
+          payload: { issueId: f.issueId, commentId: comment!.id },
+          contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented", commentId: comment!.id, wakeCommentId: comment!.id },
+        });
+        expect(run).not.toBeNull();
+        await heartbeat.drainActiveRunExecutions();
+        await expect.poll(async () => {
+          const row = (await runsOf(f)).find(r => r.id === run!.id);
+          return `${row?.status}:${row?.errorCode}:${row?.error}`;
+        }, { timeout: 30_000 }).toMatch(/^failed:/);
+        return run!;
+      };
+      const ended = await commented();
+      for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      expect((await issueOf(f.issueId)).status).toBe("in_review");
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect((await runsOf(f)).map(run => run.id)).toEqual([ended.id]);
+      const [note] = await routerNotices(f.issueId);
+      expect(note).toMatchObject({ authorType: "system" });
+      expect(note!.body).toContain(ENDED);
+      // Refused again in the same series (production: twice): still one note, nothing requeued.
+      const endedAgain = await commented();
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      expect((await routerNotices(f.issueId)).map(row => row.body.includes(ENDED))).toEqual([true]);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([ended.id, endedAgain.id].sort());
+
+      refusals.set(f.issueId, CLOSED);
+      const closed = await commented();
+      for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      expect((await issueOf(f.issueId)).status).toBe("in_review");
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([ended.id, endedAgain.id, closed.id].sort());
+      const notes = await routerNotices(f.issueId);
+      expect(notes).toHaveLength(2);
+      expect(notes.some(row => row.body.includes(CLOSED))).toBe(true);
+    }
+  }, 240_000);
+
+  it("counts each kind of wait in its own series: a wait after another kind gets its own bound", async () => {
     const bound = ADAPTER_DECLARED_WAIT_MAX_MS / 60_000;
-    const old = await seed("todo", [{ minutesAgo: bound + 12, errorCode: "router_group_participant_reserved" }, { minutesAgo: 10, errorCode: "router_group_participant_reserved", retry: true }]);
+    // A machine wait older than 12 h, then an unproven stop 5 min ago: the 1 h stop bound counts from the stop.
+    const stop = await seed("todo", [{ minutesAgo: bound + 30, errorCode: WAIT }, { minutesAgo: 5, durationMinutes: 1, errorCode: STOP, retry: true }]);
+    // A machine wait older than 12 h, then a blocked ticket 5 min ago: the dependency wait counts from itself.
+    const ticket = await seed("todo", [{ minutesAgo: bound + 30, errorCode: WAIT }, { minutesAgo: 5, durationMinutes: 1, errorCode: TICKET_BLOCKED, retry: true }]);
+    for (const f of [stop, ticket]) {
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      expect((await issueOf(f.issueId)).status).toBe("todo");
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+    }
+    // The blocked ticket's own series past its bound: normal recovery, as for any wait.
+    const old = await seed("todo", [{ minutesAgo: bound + 12, errorCode: TICKET_BLOCKED }, { minutesAgo: 10, errorCode: TICKET_BLOCKED, retry: true }]);
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: old.companyId });
     expect((await issueOf(old.issueId)).status).toBe("blocked");
+    await heartbeat.drainActiveRunExecutions();
+  }, 180_000);
+
+  it("schedules no transient retry for a blocked-ticket refusal and keeps it held within its bound", async () => {
+    const f = await seed("todo", []);
+    refusals.set(f.issueId, TICKET_BLOCKED);
+    const run = await boardWake(f);
+    await heartbeat.drainActiveRunExecutions();
+    await expect.poll(async () => (await runsOf(f)).find(row => row.id === run.id)?.status, { timeout: 30_000 }).toBe("failed");
+    const leftStatus = (await issueOf(f.issueId)).status;
+    expect(leftStatus).not.toBe("blocked");
+    for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await runsOf(f)).map(row => row.id)).toEqual([run.id]);
+    expect((await issueOf(f.issueId)).status).toBe(leftStatus);
+    expect(await actionsOf(f.issueId)).toHaveLength(0);
+    expect(await commentsOf(f.issueId)).toHaveLength(0);
   }, 180_000);
 
   it("does not re-block an issue the Board returned to todo whose new run ends waiting (production race)", async () => {

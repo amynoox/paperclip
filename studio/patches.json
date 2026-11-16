@@ -1570,15 +1570,21 @@
     },
     {
       "id": "STUDIO-0059",
-      "title": "A run the worker router refused before any reservation is neither retried nor blocked as a lost execution path",
+      "title": "The worker router's refusals before reservation are never retried: a refusal on an issue that still has work to do blocks at once with its gesture; in review, a finished participant's refusal leaves the issue as it is with one note",
       "status": "implemented-locally-validated-not-deployed",
-      "problem": "Production 15-16 Nov 2026: the worker router refuses some runs before any reservation (no machine contacted, no engine launched) because the ticket cannot run now: router_group_participant_ended, _closed, _mismatch, _reserved (router 0.30.14) and router_ticket_blocked. The server retried each refused run, then stranded-work recovery requeued and blocked the ticket for the Board (TR-1261: three refused runs then blocked; TR-1318: nine router_group_participant_ended in bursts of three).",
-      "reason": "Requested by the studio setup session for the 16 Nov update (V412), from the worker router chat's contract drafts/routeur-deux-moteurs/refus-sans-relance-pour-serveur.md.",
+      "problem": "Production 15-16 Nov 2026: the worker router refuses some runs before any reservation (no machine contacted, no engine launched): router_group_participant_ended, _closed, _mismatch, _reserved (router 0.30.14) and router_ticket_blocked. The server retried each refused run, then recovery requeued and blocked the ticket (TR-1261: three refused runs then blocked; TR-1318: in_review, refused _ended twice, _closed after a retry, then blocked at 02:26:35). A first fix held them all as a 12 h wait; the independent review showed it replaced the noise by a silence (a ticket whose group list is wrong stayed silent up to 12 h) and that the wait series mixed codes.",
+      "reason": "Requested by the studio setup session for the 16 Nov update (V412); the owner asked for the review's fixes before any update (V415). Router contract: drafts/routeur-deux-moteurs/refus-sans-relance-pour-serveur.md.",
       "observedOnUpstream": "2026.1110.0",
-      "owner": "recovery: adapter-declared waits (STUDIO-0042, STUDIO-0046)",
+      "owner": "recovery: adapter-declared waits (STUDIO-0042, STUDIO-0046) and release recovery",
       "paths": [
         "server/src/services/recovery/adapter-declared-wait.ts",
-        "server/src/__tests__/recovery-adapter-declared-wait.test.ts"
+        "server/src/services/recovery/service.ts",
+        "server/src/services/recovery/stranded-notice.ts",
+        "server/src/services/heartbeat.ts",
+        "server/src/modules/wake-queue/domain/policy.ts",
+        "server/src/modules/wake-queue/application/use-cases.ts",
+        "server/src/__tests__/recovery-adapter-declared-wait.test.ts",
+        "server/src/modules/wake-queue/domain/policy.test.ts"
       ],
       "upstreamSearch": {
         "date": "2026-11-16",
@@ -1586,12 +1592,13 @@
         "details": "No counterpart: the codes are named by the studio's worker router plugin; upstream has no adapter-declared wait list (STUDIO-0042).",
         "selected": null
       },
-      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. Real path: for each of the five codes a run woken by the Board really ends refused (declared with a transient error family, the worst case): no transient retry; two stranded-work sweeps neither requeue nor block, no recovery action, no comment; past the 12 h bound normal recovery blocks as for any wait. On fb1ad740 the same case fails (a transient retry is scheduled). recovery-adapter-declared-wait 28 passed; with recovery-classifiers, issue-recovery-actions and the wake-queue module: 13 files, 490 passed. tsc: no error in a changed file.",
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. Real path (recovery-adapter-declared-wait, 33 passed): for _reserved, _mismatch, _closed (in_progress) and _ended (todo, in_progress) a Board wake really ends refused: no retry, blocked at the run's release with the code and the gesture, one recovery action, nothing more after two sweeps; the sweep alone blocks a refused run whose release did not; TR-1318 replayed (in_review, woken by a comment, with and without a review participant, refused _ended twice then _closed): stays in_review, one note per code, no action, nothing requeued; separate wait series; a blocked-ticket refusal is held without retry. Release decision cases in wake-queue policy.test.ts. On fb1ad740 the 7 new real-path tests fail and the 26 others pass. With recovery-classifiers, issue-recovery-actions and the wake-queue module: 13 files, 498 of 499 passed; the one failure (issue-recovery-actions, a hold on a task waiting on a person's question) passes alone and in its whole file (141 passed), and passes on fb1ad740: load-dependent. tsc: no error in a changed file.",
       "migration": "None.",
-      "rollback": "Switch cli/current back to the previous install folder; the refused runs are then retried and recovered as before.",
+      "rollback": "Switch cli/current back to the previous install folder; refused runs are then retried and recovered as before.",
       "retireWhen": "The worker router stops returning these codes, or upstream offers a declared refusal contract for adapters.",
       "upgradeDecisions": [],
-      "commits": []
+      "commits": [],
+      "origin": "What: no refusal of the worker router before reservation is retried. _reserved and _mismatch, and _closed or _ended while the issue is todo or in_progress, block the issue at once, at the run's release and in the stranded-work sweep, with a notice naming the code, its meaning and the gesture, and a Board recovery action. _ended and _closed once the issue is in review neither block nor requeue; the status stays and the sweep posts one note per series. router_ticket_blocked stays a bounded wait (12 h). Each kind of wait counts its own series. Why: TR-1261 and TR-1318 (15-16 Nov 2026) and the independent review of the first fix. Origin: studio fork only; to re-apply, keep routerRefusalOutcome, the refusal texts and adapterDeclaredWaitSeriesCodes in adapter-declared-wait.ts, the shared.routerRefusal fact and the router_refusal notice kind in policy.ts, use-cases.ts and heartbeat.ts (buildStrandedRecoveryNoticeForKind), buildRouterRefusalRecoveryNoticeSeed in stranded-notice.ts, and in service.ts the refusal gate of reconcileStrandedAssignedIssues, ensureRouterRefusalNote and the codes argument of readAdapterDeclaredWaitStart; run recovery-adapter-declared-wait.test.ts and wake-queue policy.test.ts."
     }
   ]
 }

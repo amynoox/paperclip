@@ -23,9 +23,12 @@ import { readLegacyDispositionSource } from "./legacy-disposition-read.js";
 import { isAgentAwaitingSetup } from "../../modules/agent-lifecycle/index.js";
 import { onboardingFirstTaskAwaitingUserSql } from "./onboarding-first-task-wait.js";
 import {
-  ADAPTER_DECLARED_WAIT_ERROR_CODES,
   adapterDeclaredWaitMaxMs,
+  adapterDeclaredWaitSeriesCodes,
   isAdapterDeclaredWaitErrorCode,
+  routerRefusalNoteBody,
+  routerRefusalOutcome,
+  routerRefusalText,
 } from "./adapter-declared-wait.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { RESTRICTED_WORKSPACE_SOURCE_REASON } from "../workspace-source-restriction.js";
@@ -177,6 +180,7 @@ import {
   sandboxProviderPluginRemedy,
   buildExecutionReviewParticipantRecoveryNoticeSeed,
   buildExecutionReviewParticipantUnavailableNoticeSeed,
+  buildRouterRefusalRecoveryNoticeSeed,
   buildStrandedRecoveryEscalationNotice,
   type StrandedRecoveryNoticeSeed,
 } from "./stranded-notice.js";
@@ -185,6 +189,7 @@ import {
   isStrandedIssueRecoveryOriginKind,
 } from "./origins.js";
 import { withRecoveryContext } from "./status-only-context.js";
+import { keyValueRow, runLinkRow, systemNoticePresentation } from "./notice-format.js";
 import { currentRunFailureText } from "../native-runtime/native-exact-resume-failure.js";
 import { isAutomaticRecoverySuppressedByPauseHold } from "./pause-hold-guard.js";
 import { rehomeStrandedLegacyWorkspaceTasks } from "./legacy-workspace-rehome.js";
@@ -1011,6 +1016,96 @@ export function recoveryService(
     return run ?? null;
   }
 
+  // The agent's latest STARTED run on the issue, with the fields recovery
+  // needs to escalate from it (STUDIO-0046: a retry cancelled before it
+  // started is not the agent's latest run for this purpose).
+  async function getLatestStartedIssueRunForAgentFull(
+    companyId: string,
+    issueId: string,
+    agentId: string,
+  ): Promise<LatestIssueRun> {
+    return db
+      .select({
+        id: heartbeatRuns.id,
+        agentId: heartbeatRuns.agentId,
+        status: heartbeatRuns.status,
+        error: heartbeatRuns.error,
+        errorCode: heartbeatRuns.errorCode,
+        contextSnapshot: recoveryRunContextColumn,
+        rowVersion: recoveryRunVersionColumn,
+        livenessState: heartbeatRuns.livenessState,
+        resultJson: recoveryRunResultColumn,
+        startedAt: heartbeatRuns.startedAt,
+        createdAt: heartbeatRuns.createdAt,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          eq(heartbeatRuns.agentId, agentId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+          isNotNull(heartbeatRuns.startedAt),
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(1)
+      .then((rows) => rows[0] ?? null);
+  }
+
+  // STUDIO-0059: one note per series of refusals under the same code; the
+  // issue keeps its status and nothing is requeued. The issue row is locked
+  // so two sweeps cannot both post it. A system comment wakes nobody.
+  async function ensureRouterRefusalNote(
+    issue: RecoveryIssue,
+    run: NonNullable<LatestIssueRun>,
+    agentId: string,
+  ): Promise<boolean> {
+    const code = run.errorCode;
+    if (!code) return false;
+    const seriesStart = await readAdapterDeclaredWaitStart(issue.companyId, issue.id, agentId, [code]);
+    const body = routerRefusalNoteBody(code);
+    return db.transaction(async (tx) => {
+      const [current] = await tx
+        .select({ id: issues.id, hiddenAt: issues.hiddenAt })
+        .from(issues)
+        .where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)))
+        .for("update")
+        .limit(1);
+      if (!current || current.hiddenAt) return false;
+      const [existing] = await tx
+        .select({ id: issueComments.id })
+        .from(issueComments)
+        .where(and(
+          eq(issueComments.companyId, issue.companyId),
+          eq(issueComments.issueId, issue.id),
+          eq(issueComments.authorType, "system"),
+          eq(issueComments.body, body),
+          seriesStart ? gte(issueComments.createdAt, seriesStart) : undefined,
+        ))
+        .limit(1);
+      if (existing) return false;
+      await issueService(tx as unknown as Db).addComment(
+        issue.id,
+        body,
+        {},
+        {
+          authorType: "system",
+          presentation: systemNoticePresentation({ tone: "info", title: routerRefusalText(code).title }),
+          metadata: {
+            version: 1,
+            sourceRunId: run.id,
+            sections: [{
+              title: "Worker router",
+              rows: [runLinkRow("Refused run", run), keyValueRow("Refusal code", code)],
+            }],
+          },
+        },
+        tx,
+      );
+      return true;
+    });
+  }
+
   async function getLatestIssueRunForAgent(
     companyId: string,
     issueId: string,
@@ -1120,8 +1215,14 @@ export function recoveryService(
     companyId: string,
     issueId: string,
     agentId: string,
+    latestCode: string | null,
   ): Promise<Date | null> {
-    const seriesStart = await readAdapterDeclaredWaitStart(companyId, issueId, agentId);
+    const seriesStart = await readAdapterDeclaredWaitStart(
+      companyId,
+      issueId,
+      agentId,
+      adapterDeclaredWaitSeriesCodes(latestCode),
+    );
     if (!seriesStart) return null;
     const [restored] = await db
       .select({ at: issueRecoveryActions.resolvedAt })
@@ -1155,13 +1256,16 @@ export function recoveryService(
 
   // End time (creation time if unfinished) of the oldest run in the latest
   // consecutive series of this agent's runs on the issue that all failed under
-  // an adapter-declared wait code; null when the agent's latest run is not
-  // such a wait.
+  // one of `codes`; null when the agent's latest run is not such a run.
+  // STUDIO-0059: `codes` are those of ONE kind of wait (or one refusal code),
+  // so a run under another kind ends the series.
   async function readAdapterDeclaredWaitStart(
     companyId: string,
     issueId: string,
     agentId: string,
+    codes: readonly string[],
   ): Promise<Date | null> {
+    if (codes.length === 0) return null;
     // STUDIO-0046: a run that never started (a retry cancelled by a gate
     // before dispatch) neither breaks nor ends the series.
     const agentIssueRuns = and(
@@ -1172,7 +1276,7 @@ export function recoveryService(
     );
     const waitRun = and(
       eq(heartbeatRuns.status, "failed"),
-      inArray(heartbeatRuns.errorCode, [...ADAPTER_DECLARED_WAIT_ERROR_CODES]),
+      inArray(heartbeatRuns.errorCode, [...codes]),
     );
     const [lastOther] = await db
       .select({ createdAt: heartbeatRuns.createdAt })
@@ -5114,6 +5218,42 @@ export function recoveryService(
       // review-path recovery, which follows the review participant's runs.
       // STUDIO-0046: a retry cancelled before it started (response, approval
       // or dependency gate) is not the assignee's latest run for this purpose.
+      // STUDIO-0059: a run the worker router refused before any reservation
+      // is never requeued (asking again cannot pass). A code only a person's
+      // gesture lifts blocks the issue now, with a notice naming the code,
+      // its meaning and the gesture; a finished participant's refusal leaves
+      // the issue as it is, with one note per series. In review, the refused
+      // run is the review participant's (or, without one, the assignee's).
+      const refusalRun =
+        issue.status === "in_review" && participantAgentId
+          ? participantLatestRunForRecovery
+          : latestRun?.agentId === agentId && latestRun.startedAt
+            ? latestRun
+            : await getLatestStartedIssueRunForAgentFull(issue.companyId, issue.id, agentId);
+      const refusal =
+        refusalRun?.status === "failed" && refusalRun.agentId === agentId
+          ? routerRefusalOutcome(refusalRun.errorCode, issue.status)
+          : null;
+      if (refusal && refusalRun) {
+        if (refusal === "note") {
+          await ensureRouterRefusalNote(issue, refusalRun, agentId);
+          result.skipped += 1;
+          continue;
+        }
+        const updated = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: issue.status as StrandedPreviousStatus,
+          latestRun: refusalRun,
+          notice: buildRouterRefusalRecoveryNoticeSeed(refusalRun.errorCode!),
+        });
+        if (updated) {
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
       const assigneeLatestRun =
         issue.status === "in_review"
           ? null
@@ -5125,6 +5265,7 @@ export function recoveryService(
           issue.companyId,
           issue.id,
           agentId,
+          assigneeLatestRun!.errorCode,
         );
         const waitDeadline = waitStart
           ? waitStart.getTime() + adapterDeclaredWaitMaxMs(assigneeLatestRun!.errorCode)

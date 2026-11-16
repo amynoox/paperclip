@@ -475,6 +475,52 @@ describe("decideReleaseRecovery", () => {
       },
       expected: { kind: "queue_review_participant_recovery" },
     },
+    // STUDIO-0059: a run the worker router refused before any reservation is never requeued.
+    {
+      name: "blocked with the router notice: an immediate-recovery run refused for a code only a gesture lifts",
+      facts: {
+        ...baseReleaseRecoveryFacts,
+        immediate: { ...baseReleaseRecoveryFacts.immediate, applies: true },
+        shared: { ...baseReleaseRecoveryFacts.shared, routerRefusal: "block" },
+      },
+      expected: { kind: "blocked", notice: "router_refusal" },
+    },
+    {
+      name: "released: an immediate-recovery run refused because this participant's part is finished",
+      facts: {
+        ...baseReleaseRecoveryFacts,
+        immediate: { ...baseReleaseRecoveryFacts.immediate, applies: true },
+        shared: { ...baseReleaseRecoveryFacts.shared, routerRefusal: "note" },
+      },
+      expected: { kind: "released" },
+    },
+    {
+      name: "released: a review participant refused because its part is finished is not requeued (TR-1318)",
+      facts: {
+        ...baseReleaseRecoveryFacts,
+        reviewParticipant: { ...baseReleaseRecoveryFacts.reviewParticipant, applies: true },
+        shared: { ...baseReleaseRecoveryFacts.shared, routerRefusal: "note" },
+      },
+      expected: { kind: "released" },
+    },
+    {
+      name: "blocked with the router notice: a review participant refused for a code only a gesture lifts",
+      facts: {
+        ...baseReleaseRecoveryFacts,
+        reviewParticipant: { ...baseReleaseRecoveryFacts.reviewParticipant, applies: true },
+        shared: { ...baseReleaseRecoveryFacts.shared, routerRefusal: "block" },
+      },
+      expected: { kind: "blocked", notice: "router_refusal" },
+    },
+    {
+      name: "released: a refused run still leaves a live execution path alone",
+      facts: {
+        ...baseReleaseRecoveryFacts,
+        immediate: { ...baseReleaseRecoveryFacts.immediate, applies: true },
+        shared: { ...baseReleaseRecoveryFacts.shared, routerRefusal: "block", hasExistingExecutionPath: true },
+      },
+      expected: { kind: "released" },
+    },
   ];
 
   for (const testCase of cases) {
