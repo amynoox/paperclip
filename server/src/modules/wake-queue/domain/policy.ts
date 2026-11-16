@@ -393,13 +393,17 @@ export function decideReleaseRecovery(facts: ReleaseRecoveryFacts): ReleaseRecov
     ) {
       return { kind: "released" };
     }
+    // STUDIO-0059: the review participant's run gets the same gate as the
+    // assignee's (immediate branch below). A declared wait is neither
+    // requeued nor blocked here (the stranded-work sweep owns its bound); a
+    // reviewer refused by the worker router is not requeued (asking again
+    // cannot pass).
+    if (immediate.isAdapterDeclaredWaitRun) return { kind: "released" };
+    if (shared.routerRefusal === "note") return { kind: "released" };
+    if (shared.routerRefusal === "block") return { kind: "blocked", notice: "router_refusal" };
     if (shared.isStrandedRecoveryOrigin) {
       return { kind: "blocked_recovery_in_place" };
     }
-    // STUDIO-0059: a reviewer refused by the worker router is not requeued
-    // (asking again cannot pass); see the immediate branch below.
-    if (shared.routerRefusal === "note") return { kind: "released" };
-    if (shared.routerRefusal === "block") return { kind: "blocked", notice: "router_refusal" };
     const shouldBlock =
       !shared.recoveryAgentInvokable ||
       !shared.recoveryAgentPresent ||

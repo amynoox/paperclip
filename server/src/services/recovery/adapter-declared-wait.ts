@@ -119,10 +119,15 @@ export function routerRefusalNoteBody(code: string): string {
   );
 }
 
+// STUDIO-0059 (second review): router_readmission_not_drained (router 0.30.14)
+// - the router's receipts of an earlier dispatch are not settled yet; the
+// router settles them and the next run passes. Same kind and bound as an
+// unproven stop, on any status.
 export const ADAPTER_DECLARED_WAIT_ERROR_CODES: readonly string[] = Object.freeze([
   "router_waiting_for_resources",
   "router_provider_stop_unverified",
   "router_previous_dispatch_unsettled",
+  "router_readmission_not_drained",
   "router_ticket_blocked",
 ]);
 
@@ -150,6 +155,7 @@ const ADAPTER_DECLARED_WAIT_MAX_MS_BY_CODE: Readonly<Record<string, number>> = O
   router_waiting_for_resources: ADAPTER_DECLARED_WAIT_MAX_MS,
   router_provider_stop_unverified: ADAPTER_DECLARED_STOP_WAIT_MAX_MS,
   router_previous_dispatch_unsettled: ADAPTER_DECLARED_STOP_WAIT_MAX_MS,
+  router_readmission_not_drained: ADAPTER_DECLARED_STOP_WAIT_MAX_MS,
 });
 
 // STUDIO-0059: each kind of wait counts its own series. A run under another
@@ -157,10 +163,17 @@ const ADAPTER_DECLARED_WAIT_MAX_MS_BY_CODE: Readonly<Record<string, number>> = O
 // dependency wait) no longer takes the latest code's bound counted from the
 // first machine wait. The unproven stop and its unsettled dispatch are one
 // stop (the second is the next run's view of the first).
+const ADAPTER_DECLARED_STOP_SERIES: readonly string[] = Object.freeze([
+  "router_provider_stop_unverified",
+  "router_previous_dispatch_unsettled",
+  "router_readmission_not_drained",
+]);
+
 const ADAPTER_DECLARED_WAIT_SERIES_BY_CODE: Readonly<Record<string, readonly string[]>> = Object.freeze({
   router_waiting_for_resources: Object.freeze(["router_waiting_for_resources"]),
-  router_provider_stop_unverified: Object.freeze(["router_provider_stop_unverified", "router_previous_dispatch_unsettled"]),
-  router_previous_dispatch_unsettled: Object.freeze(["router_provider_stop_unverified", "router_previous_dispatch_unsettled"]),
+  router_provider_stop_unverified: ADAPTER_DECLARED_STOP_SERIES,
+  router_previous_dispatch_unsettled: ADAPTER_DECLARED_STOP_SERIES,
+  router_readmission_not_drained: ADAPTER_DECLARED_STOP_SERIES,
   router_ticket_blocked: Object.freeze(["router_ticket_blocked"]),
 });
 
@@ -182,6 +195,7 @@ export function isAdapterDeclaredWaitErrorCode(code: string | null | undefined):
 export const ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES: readonly string[] = Object.freeze([
   "router_waiting_for_resources",
   "router_previous_dispatch_unsettled",
+  "router_readmission_not_drained",
   "router_ticket_blocked",
   ...ROUTER_REFUSAL_ERROR_CODES,
 ]);
@@ -204,4 +218,23 @@ export function suppressesTransientRetry(code: string | null | undefined): boole
 
 export function adapterDeclaredWaitMaxMs(code: string | null | undefined): number {
   return (code && ADAPTER_DECLARED_WAIT_MAX_MS_BY_CODE[code]) || ADAPTER_DECLARED_WAIT_MAX_MS;
+}
+
+// STUDIO-0059 (second review): the note posted once per series of a declared
+// wait, in review as in work, so a held issue is not silent until its bound.
+const ADAPTER_DECLARED_WAIT_MEANINGS: Readonly<Record<string, string>> = Object.freeze({
+  router_waiting_for_resources: "no worker machine is free; the router keeps the request and wakes the assignee when one is",
+  router_provider_stop_unverified: "the link to the worker machine was cut and the engine's stop is not proven yet; the router proves it and wakes the assignee",
+  router_previous_dispatch_unsettled: "the previous dispatch is not settled yet; the router settles it and wakes the assignee",
+  router_readmission_not_drained: "the router's receipts of an earlier dispatch are not settled yet; the next run passes once they are",
+  router_ticket_blocked: "the ticket is blocked; its dependency wake starts it again once unblocked",
+});
+
+export function adapterDeclaredWaitNoteBody(code: string): string {
+  const meaning = ADAPTER_DECLARED_WAIT_MEANINGS[code] ?? "the worker router declared a wait";
+  const hours = adapterDeclaredWaitMaxMs(code) / (60 * 60_000);
+  return (
+    `The worker router held this run (\`${code}\`): ${meaning}. ` +
+    `Nothing is retried meanwhile; past ${hours} h without progress, normal recovery takes over.`
+  );
 }

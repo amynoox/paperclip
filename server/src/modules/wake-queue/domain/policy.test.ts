@@ -513,6 +513,15 @@ describe("decideReleaseRecovery", () => {
       expected: { kind: "blocked", notice: "router_refusal" },
     },
     {
+      name: "released: a review participant's declared wait is not requeued (the sweep owns its bound)",
+      facts: {
+        ...baseReleaseRecoveryFacts,
+        reviewParticipant: { ...baseReleaseRecoveryFacts.reviewParticipant, applies: true },
+        immediate: { ...baseReleaseRecoveryFacts.immediate, isAdapterDeclaredWaitRun: true },
+      },
+      expected: { kind: "released" },
+    },
+    {
       name: "released: a refused run still leaves a live execution path alone",
       facts: {
         ...baseReleaseRecoveryFacts,

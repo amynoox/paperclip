@@ -62,6 +62,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   const MISMATCH = "router_group_participant_mismatch";
   const RESERVED = "router_group_participant_reserved";
   const TICKET_BLOCKED = "router_ticket_blocked";
+  const READMISSION = "router_readmission_not_drained";
   // A cut link to the worker machine (router 0.30.10): the cut run, then the next run.
   const STOP = "router_provider_stop_unverified";
   const UNSETTLED = "router_previous_dispatch_unsettled";
@@ -107,7 +108,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
 
   type PriorRun = { minutesAgo: number; errorCode: string | null; status?: string; retry?: boolean; durationMinutes?: number };
 
-  async function seed(status: "todo" | "in_progress" | "in_review", prior: PriorRun[], opts?: { review?: boolean }) {
+  async function seed(status: "todo" | "in_progress" | "in_review" | "backlog" | "blocked", prior: PriorRun[], opts?: { review?: boolean }) {
     const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
     const userId = `wait-user-${companyId}`;
     await db.insert(authUsers).values({ id: userId, name: "Board user", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
@@ -159,8 +160,10 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   it("declares the router's waits (machine, stop, blocked ticket) and its four group refusals, none retried", () => {
     expect(ROUTER_REFUSAL_ERROR_CODES).toEqual([ENDED, CLOSED, MISMATCH, RESERVED]);
     // Only the dependency wait joins the bounded waits; the group refusals are never a wait.
-    expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT, STOP, UNSETTLED, TICKET_BLOCKED]);
+    expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT, STOP, UNSETTLED, READMISSION, TICKET_BLOCKED]);
     expect(adapterDeclaredWaitMaxMs(TICKET_BLOCKED)).toBe(12 * 60 * 60_000);
+    // Unsettled receipts: the stop kind and its bound.
+    expect(adapterDeclaredWaitMaxMs(READMISSION)).toBe(60 * 60_000);
     expect(routerRefusalOutcome(RESERVED, "in_review")).toBe("block");
     expect(routerRefusalOutcome(MISMATCH, "todo")).toBe("block");
     expect(routerRefusalOutcome(CLOSED, "in_progress")).toBe("block");
@@ -176,7 +179,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     expect(adapterDeclaredWaitMaxMs(STOP)).toBe(60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(UNSETTLED)).toBe(60 * 60_000);
     // The cut run keeps its transient retry (the retried run waits for the link itself).
-    expect(ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES).toEqual([WAIT, UNSETTLED, TICKET_BLOCKED, ...ROUTER_REFUSAL_ERROR_CODES]);
+    expect(ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES).toEqual([WAIT, UNSETTLED, READMISSION, TICKET_BLOCKED, ...ROUTER_REFUSAL_ERROR_CODES]);
   });
 
   // Production, 14 Nov 2026: the responsible coordinates on its executor's
@@ -198,7 +201,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       expect((await issueOf(f.issueId)).status).toBe(status);
       expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
       expect(await actionsOf(f.issueId)).toHaveLength(0);
-      expect(await commentsOf(f.issueId)).toHaveLength(0);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
     }
   }, 180_000);
 
@@ -220,7 +223,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     for (const [f, status] of [[cut, "todo"], [fresh, "in_progress"]] as const) {
       expect((await issueOf(f.issueId)).status).toBe(status);
       expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
-      expect(await commentsOf(f.issueId)).toHaveLength(0);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
       expect(await actionsOf(f.issueId)).toHaveLength(0);
     }
     // STUDIO-0045: the bound runs from the END of the first waiting run.
@@ -280,7 +283,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     for (const [f, status] of [[todo, "todo"], [fresh, "todo"], [working, "in_progress"], [series, "todo"]] as const) {
       expect((await issueOf(f.issueId)).status).toBe(status);
       expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
-      expect(await commentsOf(f.issueId)).toHaveLength(0);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
       expect(await actionsOf(f.issueId)).toHaveLength(0);
     }
     // The sweep re-checks at the bound, counted from the first waiting run of the series.
@@ -401,6 +404,28 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   // refused `_ended` twice, `_closed` after a retry, then blocked by recovery at 02:26:35. A refusal before any
   // reservation is never retried. A code only a gesture lifts blocks AT ONCE, naming the code and the gesture; a
   // finished participant's refusal leaves the issue as it is, with one note per series.
+  // A comment wake, as TR-1318 was woken (a real comment row; the run claims it).
+  async function commentWake(f: { companyId: string; agentId: string; issueId: string }) {
+    const [comment] = await db.insert(issueComments).values({
+      companyId: f.companyId, issueId: f.issueId, authorType: "user", authorUserId: `wait-user-${f.companyId}`,
+      body: "Can you confirm the result?",
+    }).returning();
+    const run = await heartbeat.wakeup(f.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      payload: { issueId: f.issueId, commentId: comment!.id },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented", commentId: comment!.id, wakeCommentId: comment!.id },
+    });
+    expect(run).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    await expect.poll(async () => {
+      const row = (await runsOf(f)).find(r => r.id === run!.id);
+      return `${row?.status}:${row?.errorCode}`;
+    }, { timeout: 30_000 }).toMatch(/^failed:/);
+    return run!;
+  }
+  // STUDIO-0059: a declared wait posts one note per series; other comments are counted apart.
+  const nonWaitComments = async (issueId: string) => (await commentsOf(issueId)).filter(row => !row.body.includes("The worker router held this run"));
+  const waitNotes = async (issueId: string) => (await commentsOf(issueId)).filter(row => row.body.includes("The worker router held this run"));
   const routerNotices = async (issueId: string) => (await commentsOf(issueId)).filter(row => row.body.includes("The worker router refused this run"));
 
   it("blocks at once, with the code and the gesture, a run the router refused for a code only a gesture lifts", async () => {
@@ -409,6 +434,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       [RESERVED, "todo", "Replace the already-reserved participant"],
       [MISMATCH, "todo", "Correct the `worker-router` block"],
       [CLOSED, "in_progress", "Remove the finished or cancelled participant"],
+      [CLOSED, "todo", "Remove the finished or cancelled participant"],
       // Nothing changes without a retry: a finished participant whose issue still has work to do is blocked now too.
       [ENDED, "todo", "move the issue to review or done"],
       [ENDED, "in_progress", "move the issue to review or done"],
@@ -463,24 +489,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     for (const review of [true, false]) {
       const f = await seed("in_review", [], { review });
       refusals.set(f.issueId, ENDED);
-      const commented = async () => {
-        const [comment] = await db.insert(issueComments).values({
-          companyId: f.companyId, issueId: f.issueId, authorType: "user", authorUserId: `wait-user-${f.companyId}`,
-          body: "Can you confirm the result?",
-        }).returning();
-        const run = await heartbeat.wakeup(f.agentId, {
-          source: "automation", triggerDetail: "system", reason: "issue_commented",
-          payload: { issueId: f.issueId, commentId: comment!.id },
-          contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented", commentId: comment!.id, wakeCommentId: comment!.id },
-        });
-        expect(run).not.toBeNull();
-        await heartbeat.drainActiveRunExecutions();
-        await expect.poll(async () => {
-          const row = (await runsOf(f)).find(r => r.id === run!.id);
-          return `${row?.status}:${row?.errorCode}:${row?.error}`;
-        }, { timeout: 30_000 }).toMatch(/^failed:/);
-        return run!;
-      };
+      const commented = () => commentWake(f);
       const ended = await commented();
       for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
       await heartbeat.drainActiveRunExecutions();
@@ -509,6 +518,82 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       expect(notes.some(row => row.body.includes(CLOSED))).toBe(true);
     }
   }, 240_000);
+
+  it("blocks at once a review participant refused for a code only a gesture lifts", async () => {
+    for (const code of [RESERVED, MISMATCH]) {
+      const f = await seed("in_review", [], { review: true });
+      refusals.set(f.issueId, code);
+      const run = await commentWake(f);
+      // A comment wake is not the review path's run, so its release leaves it; the sweep blocks it at once (no
+      // bound), and no review recovery is requeued.
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      expect((await issueOf(f.issueId)).status).toBe("blocked");
+      expect((await runsOf(f)).map(row => row.id)).toEqual([run.id]);
+      expect((await routerNotices(f.issueId))[0]?.body).toContain(code);
+      expect(await actionsOf(f.issueId)).toHaveLength(1);
+    }
+  }, 180_000);
+
+  it("leaves a refusal on a backlog or blocked issue alone (a status that calls for no run, or is already visible)", async () => {
+    for (const status of ["backlog", "blocked"] as const) {
+      const f = await seed(status, [{ minutesAgo: 5, errorCode: CLOSED }]);
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      expect((await issueOf(f.issueId)).status).toBe(status);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect((await runsOf(f)).map(run => run.id)).toEqual(f.runIds);
+    }
+  }, 180_000);
+
+  // The second review's verified defect (TR-1318): on an `in_review` issue with a pending reviewer, a declared wait
+  // fell into the review path, which requeued a review recovery run, refused again, then blocked at its release.
+  it("holds a declared wait of the review participant like the assignee's, with one note, then the normal path", async () => {
+    for (const code of [TICKET_BLOCKED, READMISSION]) {
+      const f = await seed("in_review", [], { review: true });
+      refusals.set(f.issueId, code);
+      const run = await commentWake(f);
+      for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      expect((await issueOf(f.issueId)).status).toBe("in_review");
+      expect((await runsOf(f)).map(row => row.id)).toEqual([run.id]);
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      const notes = await waitNotes(f.issueId);
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toContain(code);
+      refusals.delete(f.issueId);
+    }
+    // Past its bound, the review path takes over again.
+    const old = await seed("in_review", [
+      { minutesAgo: ADAPTER_DECLARED_STOP_WAIT_MAX_MS / 60_000 + 30, errorCode: READMISSION },
+      { minutesAgo: 10, errorCode: READMISSION, retry: true },
+    ], { review: true });
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: old.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    const moved = (await issueOf(old.issueId)).status === "blocked" || (await runsOf(old)).length > old.runIds.length;
+    expect(moved).toBe(true);
+  }, 240_000);
+
+  it("posts one note per series for a blocked-ticket wait on an issue at work", async () => {
+    const f = await seed("todo", [{ minutesAgo: 20, durationMinutes: 1, errorCode: TICKET_BLOCKED }, { minutesAgo: 5, durationMinutes: 1, errorCode: TICKET_BLOCKED, retry: true }]);
+    for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    expect((await issueOf(f.issueId)).status).toBe("todo");
+    expect((await waitNotes(f.issueId)).map(row => row.body.includes(TICKET_BLOCKED))).toEqual([true]);
+    await heartbeat.drainActiveRunExecutions();
+  }, 180_000);
+
+  it("does not block again on a refusal older than the Board's return of the issue", async () => {
+    const f = await seed("todo", [{ minutesAgo: 10, errorCode: RESERVED }]);
+    // The Board fixed the group and returned the issue to todo, without a wake.
+    await boardReturnedToTodo(f, 5);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await issueOf(f.issueId)).status).not.toBe("blocked");
+    expect(await routerNotices(f.issueId)).toHaveLength(0);
+    expect(await actionsOf(f.issueId)).toHaveLength(0);
+    // The normal path follows: the assignee is served again.
+    expect((await runsOf(f)).length).toBeGreaterThan(f.runIds.length);
+  }, 180_000);
 
   it("counts each kind of wait in its own series: a wait after another kind gets its own bound", async () => {
     const bound = ADAPTER_DECLARED_WAIT_MAX_MS / 60_000;
@@ -542,7 +627,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     expect((await runsOf(f)).map(row => row.id)).toEqual([run.id]);
     expect((await issueOf(f.issueId)).status).toBe(leftStatus);
     expect(await actionsOf(f.issueId)).toHaveLength(0);
-    expect(await commentsOf(f.issueId)).toHaveLength(0);
+    expect((await waitNotes(f.issueId)).map(row => row.body.includes(TICKET_BLOCKED))).toEqual([true]);
   }, 180_000);
 
   it("does not re-block an issue the Board returned to todo whose new run ends waiting (production race)", async () => {
@@ -564,7 +649,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     await heartbeat.drainActiveRunExecutions();
     expect((await issueOf(f.issueId)).status).toBe(afterRun);
     expect((await runsOf(f)).map(row => row.id).sort()).toEqual([...f.runIds, run.id].sort());
-    expect(await commentsOf(f.issueId)).toHaveLength(0);
+    expect(await nonWaitComments(f.issueId)).toHaveLength(0);
     expect(await actionsOf(f.issueId)).toHaveLength(0);
   }, 180_000);
 
@@ -588,7 +673,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       await heartbeat.drainActiveRunExecutions();
       expect((await issueOf(f.issueId)).status).toBe("todo");
       expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
-      expect(await commentsOf(f.issueId)).toHaveLength(0);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
     }
     expect(await actionsOf(statusChanged.issueId)).toHaveLength(0);
 

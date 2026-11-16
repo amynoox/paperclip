@@ -26,6 +26,7 @@ import {
   adapterDeclaredWaitMaxMs,
   adapterDeclaredWaitSeriesCodes,
   isAdapterDeclaredWaitErrorCode,
+  adapterDeclaredWaitNoteBody,
   routerRefusalNoteBody,
   routerRefusalOutcome,
   routerRefusalText,
@@ -1001,25 +1002,10 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
   }
 
-  async function getLatestStartedIssueRunForAgent(companyId: string, issueId: string, agentId: string) {
-    const [run] = await db
-      .select({ status: heartbeatRuns.status, errorCode: heartbeatRuns.errorCode })
-      .from(heartbeatRuns)
-      .where(and(
-        eq(heartbeatRuns.companyId, companyId),
-        eq(heartbeatRuns.agentId, agentId),
-        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
-        isNotNull(heartbeatRuns.startedAt),
-      ))
-      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
-      .limit(1);
-    return run ?? null;
-  }
-
-  // The agent's latest STARTED run on the issue, with the fields recovery
-  // needs to escalate from it (STUDIO-0046: a retry cancelled before it
-  // started is not the agent's latest run for this purpose).
-  async function getLatestStartedIssueRunForAgentFull(
+  // The agent's latest STARTED run on the issue (STUDIO-0046: a retry
+  // cancelled before it started is not the agent's latest run for this
+  // purpose), with the fields recovery needs to escalate from it (STUDIO-0059).
+  async function getLatestStartedIssueRunForAgent(
     companyId: string,
     issueId: string,
     agentId: string,
@@ -1052,18 +1038,23 @@ export function recoveryService(
       .then((rows) => rows[0] ?? null);
   }
 
-  // STUDIO-0059: one note per series of refusals under the same code; the
-  // issue keeps its status and nothing is requeued. The issue row is locked
-  // so two sweeps cannot both post it. A system comment wakes nobody.
-  async function ensureRouterRefusalNote(
+  // STUDIO-0059: one note per series, for a finished participant's refusal
+  // (one code a series) and for a declared wait (one kind a series); nothing
+  // is requeued. The issue row is locked so two sweeps cannot both post it. A
+  // system comment wakes nobody.
+  async function ensureRouterNote(
     issue: RecoveryIssue,
     run: NonNullable<LatestIssueRun>,
     agentId: string,
+    kind: "refusal" | "wait",
   ): Promise<boolean> {
     const code = run.errorCode;
     if (!code) return false;
-    const seriesStart = await readAdapterDeclaredWaitStart(issue.companyId, issue.id, agentId, [code]);
-    const body = routerRefusalNoteBody(code);
+    const seriesCodes = kind === "wait" ? [...adapterDeclaredWaitSeriesCodes(code)] : [code];
+    const noteBody = kind === "wait" ? adapterDeclaredWaitNoteBody : routerRefusalNoteBody;
+    const seriesStart = await readAdapterDeclaredWaitStart(issue.companyId, issue.id, agentId, seriesCodes);
+    const body = noteBody(code);
+    const seriesBodies = seriesCodes.map(noteBody);
     return db.transaction(async (tx) => {
       const [current] = await tx
         .select({ id: issues.id, hiddenAt: issues.hiddenAt })
@@ -1079,7 +1070,7 @@ export function recoveryService(
           eq(issueComments.companyId, issue.companyId),
           eq(issueComments.issueId, issue.id),
           eq(issueComments.authorType, "system"),
-          eq(issueComments.body, body),
+          inArray(issueComments.body, seriesBodies),
           seriesStart ? gte(issueComments.createdAt, seriesStart) : undefined,
         ))
         .limit(1);
@@ -1090,13 +1081,16 @@ export function recoveryService(
         {},
         {
           authorType: "system",
-          presentation: systemNoticePresentation({ tone: "info", title: routerRefusalText(code).title }),
+          presentation: systemNoticePresentation({
+            tone: "info",
+            title: kind === "wait" ? "Worker router: waiting" : routerRefusalText(code).title,
+          }),
           metadata: {
             version: 1,
             sourceRunId: run.id,
             sections: [{
               title: "Worker router",
-              rows: [runLinkRow("Refused run", run), keyValueRow("Refusal code", code)],
+              rows: [runLinkRow(kind === "wait" ? "Held run" : "Refused run", run), keyValueRow("Router code", code)],
             }],
           },
         },
@@ -1224,6 +1218,14 @@ export function recoveryService(
       adapterDeclaredWaitSeriesCodes(latestCode),
     );
     if (!seriesStart) return null;
+    const returnedAt = await readBoardReturnAt(companyId, issueId);
+    return returnedAt && returnedAt > seriesStart ? returnedAt : seriesStart;
+  }
+
+  // The Board's latest return of the issue: a `restored` recovery-action
+  // resolution, or a user's status change to `todo` or `in_progress` (STUDIO-0059:
+  // `in_progress` too, the other status a person returns blocked work to).
+  async function readBoardReturnAt(companyId: string, issueId: string): Promise<Date | null> {
     const [restored] = await db
       .select({ at: issueRecoveryActions.resolvedAt })
       .from(issueRecoveryActions)
@@ -1244,14 +1246,13 @@ export function recoveryService(
         eq(activityLog.entityId, issueId),
         eq(activityLog.actorType, "user"),
         eq(activityLog.action, "issue.updated"),
-        sql`${activityLog.details} ->> 'status' = 'todo'`,
-        sql`coalesce(${activityLog.details} -> '_previous' ->> 'status', ${activityLog.details} -> 'changes' -> 'status' ->> 'from') is distinct from 'todo'`,
+        sql`${activityLog.details} ->> 'status' in ('todo', 'in_progress')`,
+        sql`coalesce(${activityLog.details} -> '_previous' ->> 'status', ${activityLog.details} -> 'changes' -> 'status' ->> 'from') is distinct from ${activityLog.details} ->> 'status'`,
       ))
       .orderBy(desc(activityLog.createdAt))
       .limit(1);
-    return [seriesStart, restored?.at ?? null, returned?.at ?? null]
-      .filter((at): at is Date => at instanceof Date)
-      .reduce((latest, at) => (at > latest ? at : latest));
+    const dates = [restored?.at ?? null, returned?.at ?? null].filter((at): at is Date => at instanceof Date);
+    return dates.length ? dates.reduce((latest, at) => (at > latest ? at : latest)) : null;
   }
 
   // End time (creation time if unfinished) of the oldest run in the latest
@@ -5214,29 +5215,37 @@ export function recoveryService(
       // the router). Past the bound, normal recovery applies.
       // The issue's latest run can be another agent's (the responsible
       // coordinating on its executor's issue during the wait): read the
-      // assignee's own latest run on the issue then. `in_review` keeps its
-      // review-path recovery, which follows the review participant's runs.
+      // assignee's own latest run on the issue then (in review, the review
+      // participant's: STUDIO-0059 below).
       // STUDIO-0046: a retry cancelled before it started (response, approval
       // or dependency gate) is not the assignee's latest run for this purpose.
-      // STUDIO-0059: a run the worker router refused before any reservation
-      // is never requeued (asking again cannot pass). A code only a person's
-      // gesture lifts blocks the issue now, with a notice naming the code,
-      // its meaning and the gesture; a finished participant's refusal leaves
-      // the issue as it is, with one note per series. In review, the refused
-      // run is the review participant's (or, without one, the assignee's).
-      const refusalRun =
-        issue.status === "in_review" && participantAgentId
-          ? participantLatestRunForRecovery
-          : latestRun?.agentId === agentId && latestRun.startedAt
-            ? latestRun
-            : await getLatestStartedIssueRunForAgentFull(issue.companyId, issue.id, agentId);
+      // STUDIO-0059: the gate of the worker router's codes reads the latest
+      // started run of the agent this pass serves: the assignee, or in
+      // review the review participant (the same gate on both paths).
+      const ownLatestRun =
+        latestRun?.agentId === agentId && latestRun.startedAt
+          ? latestRun
+          : await getLatestStartedIssueRunForAgent(issue.companyId, issue.id, agentId);
+      // A run the worker router refused before any reservation is never
+      // requeued (asking again cannot pass). A code only a person's gesture
+      // lifts blocks the issue now, with a notice naming the code, its
+      // meaning and the gesture; a finished participant's refusal in review
+      // leaves the issue as it is, with one note per series. Only a refusal
+      // newer than the Board's latest return counts: after a return the issue
+      // follows the normal path, and a new refusal blocks it again.
+      const boardReturnedAt =
+        ownLatestRun?.status === "failed" && routerRefusalOutcome(ownLatestRun.errorCode, issue.status)
+          ? await readBoardReturnAt(issue.companyId, issue.id)
+          : null;
+      const refusalRun = ownLatestRun;
       const refusal =
-        refusalRun?.status === "failed" && refusalRun.agentId === agentId
+        refusalRun?.status === "failed" &&
+        !(boardReturnedAt && refusalRun.createdAt <= boardReturnedAt)
           ? routerRefusalOutcome(refusalRun.errorCode, issue.status)
           : null;
       if (refusal && refusalRun) {
         if (refusal === "note") {
-          await ensureRouterRefusalNote(issue, refusalRun, agentId);
+          await ensureRouterNote(issue, refusalRun, agentId, "refusal");
           result.skipped += 1;
           continue;
         }
@@ -5254,23 +5263,27 @@ export function recoveryService(
         }
         continue;
       }
-      const assigneeLatestRun =
-        issue.status === "in_review"
-          ? null
-          : latestRun?.agentId === agentId && latestRun.startedAt
-            ? latestRun
-            : await getLatestStartedIssueRunForAgent(issue.companyId, issue.id, agentId);
-      if (isAdapterDeclaredWaitRun(assigneeLatestRun)) {
+      // A declared wait, in review as in work (STUDIO-0059: the review
+      // participant's waiting run is no longer requeued as a review recovery):
+      // within its bound neither requeue nor block, with one note per series;
+      // past the bound, the normal path.
+      // An `in_review` issue with no pending review participant is left to
+      // the review path's own skip, as before (no signal there, by design).
+      if (
+        isAdapterDeclaredWaitRun(ownLatestRun) &&
+        (issue.status !== "in_review" || participantAgentId)
+      ) {
         const waitStart = await readAdapterDeclaredWaitBoundStart(
           issue.companyId,
           issue.id,
           agentId,
-          assigneeLatestRun!.errorCode,
+          ownLatestRun!.errorCode,
         );
         const waitDeadline = waitStart
-          ? waitStart.getTime() + adapterDeclaredWaitMaxMs(assigneeLatestRun!.errorCode)
+          ? waitStart.getTime() + adapterDeclaredWaitMaxMs(ownLatestRun!.errorCode)
           : null;
         if (waitDeadline !== null && recoveryNow.getTime() < waitDeadline) {
+          await ensureRouterNote(issue, ownLatestRun!, agentId, "wait");
           opts?.onDeferredDeadline?.(waitDeadline);
           result.skipped += 1;
           continue;
