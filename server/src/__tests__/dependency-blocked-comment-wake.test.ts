@@ -455,6 +455,52 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
     expect((run.contextSnapshot as any).wakeReason).toBe("issue_blockers_resolved");
   }, 120_000);
 
+  // Third review, point 6 (kept by the owner): one system note per series says that an agent's comment waits, and how
+  // to get an answer before. It wakes nobody.
+  it("notes once per series that an agent's comment waits, and the note wakes nobody", async () => {
+    const f = await seed();
+    await devAtRest(f);
+    const notes = () => db.select({ body: issueComments.body }).from(issueComments).where(and(
+      eq(issueComments.issueId, f.taskId), eq(issueComments.authorType, "system"),
+      sql`${issueComments.body} like '%held-dependency-comment-notice%'`));
+    const companyWakes = () => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+    const taskRuns = () => db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${f.taskId}`));
+    const wakesBefore = (await companyWakes()).length;
+    await heldComment(f, "First held note.");
+    await heldComment(f, "Second held note.");
+    const [note, ...more] = await notes();
+    expect(more).toEqual([]);
+    expect(note!.body).toContain("A comment from CTO waits for");
+    expect(note!.body).toContain("Dev");
+    expect(note!.body).toContain("question card");
+    // Only the two held comment wakes were recorded (the gate's own skips); no wake and no run for anyone else.
+    const wakesAfter = await companyWakes();
+    expect(wakesAfter.length - wakesBefore).toBe(2);
+    expect(wakesAfter.slice(-2).every(row => row.status === "skipped" && row.reason === "issue_dependencies_blocked")).toBe(true);
+    expect(await taskRuns()).toEqual([]);
+    // The lift: the Dev's qualified run settles the series; a new hold starts a new series and a new note.
+    await setStatus(f, f.blockerId, "done");
+    await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.wakeReason === "issue_blockers_resolved");
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blocker2Id] }).expect(200);
+    await devAtRest(f);
+    // Let the Dev's follow-up runs (the fake adapter leaves no disposition, so repairs follow) all end first.
+    const pending = async () => (await devRuns(f)).filter(run => ["queued", "running", "scheduled_retry"].includes(run.status)).length
+      + (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.devId),
+        sql`${agentWakeupRequests.status} in ('queued', 'deferred_issue_execution')`))).length;
+    for (let attempt = 0; attempt < 120 && (await pending()) > 0; attempt += 1) {
+      await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 1000) })
+        .where(and(eq(heartbeatRuns.agentId, f.devId), eq(heartbeatRuns.status, "scheduled_retry")));
+      await heartbeat.promoteDueScheduledRetries(new Date());
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      await new Promise(resolve => setTimeout(resolve, 250));
+    }
+    expect(await pending()).toBe(0);
+    await heldComment(f, "Held in the next series.");
+    expect(await notes()).toHaveLength(2);
+  }, 180_000);
+
   it("keeps a person's comment as a bounded interaction run on the blocked issue", async () => {
     const f = await seed();
     await request(app(f.companyId)).post(`/api/issues/${f.taskId}/comments`).send({ body: "Explain the dependency." }).expect(201);

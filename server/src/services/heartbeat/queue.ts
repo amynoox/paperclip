@@ -3,6 +3,7 @@ import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { agentCommentHeldByDependencies, allUnresolvedBlockersCancelled, HELD_DEPENDENCY_COMMENT_IDS_KEY,
   HELD_DEPENDENCY_OLDER_COUNT_KEY, isDependencyHandoffWake, readCommentsToHandOver,
   wakeContextCommentIds } from "./held-dependency-comments.js";
+import { noteHeldAgentComment } from "./held-dependency-notice.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed } from "./run-admission.js";
 import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
@@ -1160,11 +1161,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         !(await verifyNonAssigneeAddresseeInteractionWake(db, { companyId: run.companyId,
           issueId, agentId: run.agentId, contextSnapshot: context }))
       ) {
-        await cancelQueuedRunForBlockedDependencies(
+        const cancelled = await cancelQueuedRunForBlockedDependencies(
           run,
           issueId,
           readiness?.unresolvedBlockerIssueIds ?? [],
         );
+        // STUDIO-0063: the thread says that an agent's comment waits (one note per series; it wakes nobody).
+        if (cancelled && agentCommentHeld) {
+          await noteHeldAgentComment(db, { companyId: run.companyId, issueId, assigneeAgentId: run.agentId, context,
+            unresolvedBlockerIssueIds: readiness?.unresolvedBlockerIssueIds ?? [] })
+            .catch(err => logger.warn({ err, runId: run.id, issueId }, "failed to note a held agent comment"));
+        }
         logger.info(
           { runId: run.id, issueId, unresolvedBlockerCount },
           "claimQueuedRun: cancelled blocked queued run",
@@ -4709,6 +4716,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 finishedAt: new Date(),
               },
             });
+            // STUDIO-0063: the thread says that an agent's comment waits (one note per series; it wakes nobody).
+            // A savepoint: a failed note never undoes the hold.
+            if (agentCommentHeld && issue.assigneeAgentId) {
+              const assigneeAgentId = issue.assigneeAgentId;
+              await tx.transaction(async (savepoint) => {
+                await noteHeldAgentComment(savepoint as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
+                  assigneeAgentId, context: enrichedContextSnapshot,
+                  unresolvedBlockerIssueIds: dependencyReadiness.unresolvedBlockerIssueIds });
+              }).catch(err => logger.warn({ err, issueId: issue.id }, "failed to note a held agent comment"));
+            }
             return { kind: "skipped" as const };
           }
 
