@@ -2650,6 +2650,35 @@ export function recoveryService(
     };
   }
 
+  // STUDIO-0062: when stranded-work recovery blocks a task under the active hold of a cut legacy run, the block is
+  // this hold's own, as when the hold's settlement blocks it (execution-recovery-resolution.ts). Record the same
+  // receipt, so that the Board's reconciliation can return the task to its previous status. Without it the later
+  // settlement finds the task already blocked and writes none. Production 15 Nov 2026, TR-1168: run 05e3ab6a cut
+  // at 14:29:13, task blocked by this path at 14:29:43 under action bbb8ce70, settled at 14:29:46 without a receipt.
+  async function recordStrandedLegacyCancellationBlock(
+    database: DbOrTransaction,
+    action: { id: string; cause: string | null; evidence: unknown },
+    issue: RecoveryIssue,
+    previousStatus: StrandedPreviousStatus,
+  ) {
+    const evidence = parseObject(action.evidence);
+    const runId = readNonEmptyString(evidence.runId);
+    if (action.cause !== "legacy_execution_requires_reconciliation" || !runId || evidence.legacyCancellationBlock) return;
+    if (!["todo", "in_progress", "in_review"].includes(previousStatus)) return;
+    const [run] = await database.select({ agentId: heartbeatRuns.agentId, status: heartbeatRuns.status, runtimeMode: heartbeatRuns.runtimeMode })
+      .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId), eq(heartbeatRuns.id, runId)));
+    if (!run || run.runtimeMode !== "legacy" || run.status !== "cancelled" || run.agentId !== issue.assigneeAgentId) return;
+    const [current] = await database.select({ status: issues.status, statusVersion: issues.statusVersion })
+      .from(issues).where(and(eq(issues.companyId, issue.companyId), eq(issues.id, issue.id)));
+    if (current?.status !== "blocked") return;
+    await database.update(issueRecoveryActions).set({
+      evidence: sql`coalesce(${issueRecoveryActions.evidence}, '{}'::jsonb) || jsonb_build_object('legacyCancellationBlock',
+        jsonb_build_object('runId', ${runId}::text, 'statusVersion', ${current.statusVersion}::bigint, 'previousStatus', ${previousStatus}::text))`,
+      updatedAt: new Date(),
+    }).where(and(eq(issueRecoveryActions.id, action.id),
+      sql`not (coalesce(${issueRecoveryActions.evidence}, '{}'::jsonb) ? 'legacyCancellationBlock')`));
+  }
+
   async function ensureSourceScopedStrandedRecoveryAction(input: {
     issue: RecoveryIssue;
     latestRun: LatestIssueRun;
@@ -4250,6 +4279,7 @@ export function recoveryService(
     }, tx, publications, postCommitActions);
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
+    await recordStrandedLegacyCancellationBlock(tx, recoveryAction, input.issue, input.previousStatus);
     const sourceAssigneePreserved =
       updated.assigneeAgentId === input.issue.assigneeAgentId &&
       updated.assigneeUserId === input.issue.assigneeUserId;

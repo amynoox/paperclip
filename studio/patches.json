@@ -1567,6 +1567,31 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: an agent never rewrites its own AGENTS.md (refused or set aside), and writes the rest of its own managed folder without agents:* rights. Why: rights hardening of the studio roles (V329, 15 Nov 2026). Origin: studio fork only; to re-apply, keep assertNotOwnEntryEdit in agent-instruction-authorization.ts and its calls in agent-instruction-revisions.ts (commit) and agent-file-store.ts (write, setOwnEntryAside, and the entry set-aside in apply with entryEditDiscarded), the setOwnEntryAside calls and the receipt field in agent-directory-working-copies.ts, the texts in agent-conversations.ts, authorization.ts, owner-chat-instruction-authority.ts and agent-instruction-working-copies.ts, and the ownManagedFile / ownManagedDelete exemptions in routes/agents.ts; run agent-instruction-own-entry.test.ts, agent-directory-working-copies.test.ts, owner-chat-instruction-authority.test.ts, heartbeat-instruction-working-copy.test.ts and agent-instruction-working-copies.test.ts (refusal lifted there by vi.mock)."
+    },
+    {
+      "id": "STUDIO-0062",
+      "title": "Stranded-work recovery records the legacy cancellation receipt when it blocks a task under the hold of its cut run",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production 15 Nov 2026, TR-1168: the assignee's legacy run 05e3ab6a was cut at 14:29:13 (active hold bbb8ce70, cause legacy_execution_requires_reconciliation), the assignee was paused, and stranded-work recovery blocked the task at 14:29:43 under that same hold. The hold's settlement at 14:29:46 found the task already blocked and wrote no legacyCancellationBlock receipt (execution-recovery-resolution.ts writes it only for a transition it makes), so the Board's reconciliation tool could not tell this block from one the role set itself and refused to return the task to todo.",
+      "reason": "Requested by the studio setup session for the 16 Nov update (V412); the operator tool got a history-based option (fe485d7) as a workaround.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "stranded-work recovery (recovery/service.ts) and the legacy reconciliation hold (STUDIO-0048)",
+      "paths": [
+        "server/src/services/recovery/service.ts",
+        "server/src/__tests__/issue-recovery-actions.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-16",
+        "repository": "paperclipai/paperclip",
+        "details": "The legacyCancellationBlock receipt and its reconciliation are studio patches (STUDIO-0048 family): no upstream counterpart.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. Real path: cut legacy run with its active hold, assignee paused, reconcileStrandedAssignedIssues blocks the task under the same hold and records {runId, statusVersion, previousStatus: in_progress}; no receipt for a hold whose run is not a cancelled legacy run of the assignee; on fb1ad740 no receipt. issue-recovery-actions, addressee-wake-recovery-hold, recovery-adapter-declared-wait, issue-recovery-assignments, ownership-hold-readmission, execution-projection: 6 files, 220 passed. tsc: no error in a changed file. The status version moves only on a status change (trigger paperclip_bump_issue_status_version), so the later settlement keeps the receipt valid.",
+      "migration": "None. Tasks already blocked this way keep no receipt; the operator tool's --blocked-by-this-recovery covers them.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "The studio's legacy reconciliation hold is retired, or upstream offers an equivalent.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
