@@ -6,6 +6,9 @@
  * Each case runs the REAL codex_local adapter against a fake CLI, stores the run as the heartbeat stores it (status,
  * error code, result), and calls what the end of a failed run calls (run-lifecycle.ts, classifyAndPersistRunLiveness):
  * connectionIntentService.requestForRunAuthFailure. The heartbeat's own execution loop is not driven here.
+ *
+ * The login-loss sentences and the stderr trace are Codex's own, read in the installed binaries (codex-cli 0.156.1 on
+ * the server, 0.166.0 on the worker machines, Linux x64; read only). The real CLI was not run in a login-loss state.
  */
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { randomUUID } from "node:crypto";
@@ -132,6 +135,24 @@ const transcript = [
 ];
 const failed = (message: string) => [event({ type: "error", message }), event({ type: "turn.failed", error: { message } })];
 const intact = { repair: null, grantStatus: "active", marks: 0 };
+const loggedOut = { grantStatus: "needs_reauthorization", health: "error", marks: 1 };
+
+// Codex's own sentences on a login loss, and the trace it writes on stderr next to them.
+const REUSED = "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.";
+const EXPIRED = "Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.";
+const REVOKED = "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again.";
+const OTHER_ACCOUNT = "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.";
+const NOT_REFRESHED = "Your access token could not be refreshed. Please log out and sign in again.";
+const AUTH_SESSION = "Your authentication session could not be refreshed automatically. Please log out and sign in again.";
+const TRACE = "ERROR codex_login::auth::manager: Failed to refresh token status=401 Unauthorized\n";
+const REAL_SENTENCES = [
+  ["refresh token already used", REUSED, "refresh_token_reused"],
+  ["refresh token expired", EXPIRED, "refresh_token_expired"],
+  ["refresh token revoked", REVOKED, "refresh_token_invalidated"],
+  ["logged out or signed in to another account", OTHER_ACCOUNT, "refresh_token_invalidated"],
+  ["access token could not be refreshed", NOT_REFRESHED, "refresh_token_invalidated"],
+  ["authentication session could not be refreshed", AUTH_SESSION, "refresh_token_invalidated"],
+] as const;
 
 describe("Codex login-loss detection by the real path (STUDIO-0065)", () => {
   it("ends a usage-limit run as a limit and leaves the shared account connected", async () => {
@@ -158,6 +179,7 @@ describe("Codex login-loss detection by the real path (STUDIO-0065)", () => {
     // An MCP server, a hook or the ssh client of a routed run writes there: not the AI account's words.
     const stderr = [
       "ERROR mcp server linear requires OAuth login: 401 Unauthorized",
+      "The MCP authorization server rejected the enterprise grant: invalid_grant",
       "OAuth failed: refresh token has expired",
       "amyne@worker: Permission denied (publickey).",
       "Received disconnect from 10.0.0.12 port 22:2: Too many authentication failures",
@@ -209,14 +231,114 @@ describe("Codex login-loss detection by the real path (STUDIO-0065)", () => {
       event({ type: "thread.started", thread_id: "codex-session-1" }),
       event({ type: "item.completed", item: { type: "command_execution", command: "cat notes.txt", aggregated_output: `${LIMIT}\n`, exit_code: 0 } }),
       event({ type: "item.completed", item: { type: "agent_message", text: LIMIT } }),
-      ...failed("OAuth failed: refresh_token_reused"),
-    ] });
+      ...failed(REUSED),
+    ], stderr: TRACE });
     expect(result.errorCode).toBe("refresh_token_reused");
     const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
-    expect(ended).toMatchObject({ grantStatus: "needs_reauthorization", health: "error", marks: 1 });
+    expect(ended).toMatchObject(loggedOut);
   }, 120_000);
 
-  // The known real forms of a Codex login loss. Each one still marks the account.
+  // A real login loss, as Codex writes it: thread.started, turn.started, the `error` event, turn.failed, and the trace
+  // on stderr. On the baseline these were caught by the stderr trace alone; stderr is no longer read once the
+  // protocol started, so the sentences themselves must classify.
+  it.each(REAL_SENTENCES)("marks the account for Codex's own sentence in the protocol error: %s", async (_form, sentence, code) => {
+    const result = await runFakeCli({ stdout: [...transcript, ...failed(sentence)], stderr: TRACE });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe(code);
+    expect(result.errorMessage).toBe(sentence);
+    const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+    expect(ended.repair).toMatchObject({ state: "needs_user_action", service: "openai" });
+    expect(ended).toMatchObject(loggedOut);
+  }, 120_000);
+
+  // Live steering through the worker router: the adapter receives a stdout composed in the `codex exec` format
+  // (thread.started, turn.started, turn.failed) and an empty stderr. The login loss is seen only if that turn.failed
+  // carries Codex's message word for word.
+  it.each(REAL_SENTENCES)("marks the account for a composed turn.failed that carries Codex's sentence, without stderr: %s", async (_form, sentence, code) => {
+    const result = await runFakeCli({ stdout: [
+      event({ type: "thread.started", thread_id: "codex-session-1" }),
+      event({ type: "turn.started" }),
+      event({ type: "turn.failed", error: { message: sentence } }),
+    ], stderr: "" });
+    expect(result.errorCode).toBe(code);
+    const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+    expect(ended.repair).toMatchObject({ state: "needs_user_action", service: "openai" });
+    expect(ended).toMatchObject(loggedOut);
+  }, 120_000);
+
+  it("does not see a login loss behind the router's fixed turn.failed text (a limit of the composed stdout)", async () => {
+    // Router 0.30.x composes this text whatever the provider said, and returns an empty stderr.
+    const result = await runFakeCli({ stdout: [
+      event({ type: "thread.started", thread_id: "codex-session-1" }),
+      event({ type: "turn.started" }),
+      event({ type: "turn.failed", error: { message: "Interactive provider turn did not complete successfully." } }),
+    ], stderr: "" });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode ?? "").not.toMatch(/^refresh_token_/);
+    const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+    expect(ended).toMatchObject(intact);
+  }, 120_000);
+
+  it("marks the account when the CLI failed before the protocol with the trace on stderr or a sentence on stdout", async () => {
+    for (const [output, code] of [
+      [{ stdout: [], stderr: TRACE }, "refresh_token_invalidated"],
+      [{ stdout: [EXPIRED], stderr: "" }, "refresh_token_expired"],
+      [{ stdout: [], stderr: `${REUSED}\n` }, "refresh_token_reused"],
+    ] as const) {
+      const result = await runFakeCli({ stdout: [...output.stdout], stderr: output.stderr });
+      expect(result.errorCode).toBe(code);
+      const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+      expect(ended).toMatchObject(loggedOut);
+    }
+  }, 120_000);
+
+  it("retries as a harness crash a run that died after the protocol started with the trace only on stderr", async () => {
+    // No protocol error: the login loss is not classified on this run. It is retried, and the next run meets the
+    // login loss through the protocol.
+    const result = await runFakeCli({ stdout: transcript, stderr: TRACE });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).toBe("codex_harness_crash");
+    const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+    expect(ended).toMatchObject(intact);
+  }, 120_000);
+
+  it("does not mark the account for an MCP server's OAuth refusal, wherever Codex writes it", async () => {
+    const mcpGrant = "The MCP authorization server rejected the enterprise grant: invalid_grant";
+    for (const output of [
+      { stdout: [...transcript, ...failed(mcpGrant)], stderr: "" },
+      { stdout: [], stderr: `${mcpGrant}\n` },
+      { stdout: [mcpGrant], stderr: "" },
+    ]) {
+      const result = await runFakeCli(output);
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode ?? "").not.toMatch(/^refresh_token_/);
+      const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+      expect(ended).toMatchObject(intact);
+    }
+  }, 120_000);
+
+  it("does not classify the error of an earlier turn after a turn that completed", async () => {
+    const result = await runFakeCli({ stdout: [
+      event({ type: "thread.started", thread_id: "codex-session-1" }),
+      event({ type: "turn.started" }),
+      event({ type: "error", message: REUSED }),
+      event({ type: "turn.completed", usage: { input_tokens: 10, output_tokens: 2, cached_input_tokens: 0 } }),
+    ], stderr: "" });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode ?? "").not.toMatch(/^refresh_token_/);
+    const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+    expect(ended).toMatchObject(intact);
+  }, 120_000);
+
+  it("keeps reading stderr when a wrapper wrote a JSON object that is not a Codex event", async () => {
+    const result = await runFakeCli({ stdout: [event({ type: "log", message: "connected" })], stderr: TRACE });
+    expect(result.errorCode).toBe("refresh_token_invalidated");
+    const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+    expect(ended).toMatchObject(loggedOut);
+  }, 120_000);
+
+  // The code forms of the baseline's tests. Codex 0.156.1 and 0.166.0 do not write these codes; the patterns are
+  // kept, and each form still marks the account.
   it.each([
     ["refresh_token_reused in the protocol error", { stdout: [...transcript, ...failed("OAuth failed: refresh_token_reused")] }, "refresh_token_reused"],
     ["refresh_token_expired in the protocol error", { stdout: [...transcript, ...failed("OAuth failed: refresh token has expired")] }, "refresh_token_expired"],
@@ -225,7 +347,7 @@ describe("Codex login-loss detection by the real path (STUDIO-0065)", () => {
     ["a 401 from the API on the credential", { stdout: [...transcript, ...failed("credential refresh returned 401 Unauthorized")] }, "refresh_token_invalidated"],
     ["a login loss on stderr, the CLI failing before the protocol", { stdout: [], stderr: "OAuth failed: refresh token has expired\n" }, "refresh_token_expired"],
     ["a plain stdout line, the CLI failing before the protocol", { stdout: ["OAuth failed: refresh_token_reused"] }, "refresh_token_reused"],
-  ] as const)("still marks the account for %s", async (_form, output, code) => {
+  ] as const)("still marks the account for the baseline's form: %s", async (_form, output, code) => {
     const result = await runFakeCli({ stdout: [...output.stdout], stderr: "stderr" in output ? output.stderr : undefined });
     expect(result.exitCode).toBe(1);
     expect(result.errorCode).toBe(code);

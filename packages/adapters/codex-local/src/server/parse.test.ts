@@ -189,6 +189,93 @@ describe("classifyCodexAuthRefreshFailure", () => {
     const failed = (message: string) => [event({ type: "error", message }), event({ type: "turn.failed", error: { message } })];
     const quoted = "< HTTP/1.1 401 Unauthorized\n< www-authenticate: Bearer error=\"invalid_token\", the bearer token expired";
     const limit = "You've hit your usage limit for GPT-5.3-Codex. Switch to another model now, or try again at 11:31 PM.";
+    // The sentences Codex writes on a login loss, read in the installed binaries (codex-cli 0.156.1 and 0.166.0).
+    const REUSED = "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again.";
+    const EXPIRED = "Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again.";
+    const REVOKED = "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again.";
+    const OTHER_ACCOUNT = "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again.";
+    const NOT_REFRESHED = "Your access token could not be refreshed. Please log out and sign in again.";
+    const SESSION = "Your authentication session could not be refreshed automatically. Please log out and sign in again.";
+    // The trace Codex writes on stderr next to them.
+    const TRACE = "ERROR codex_login::auth::manager: Failed to refresh token status=401 Unauthorized";
+    const turn = [event({ type: "thread.started", thread_id: "t" }), event({ type: "turn.started" })];
+
+    it.each([
+      [REUSED, "refresh_token_reused"],
+      [EXPIRED, "refresh_token_expired"],
+      [REVOKED, "refresh_token_invalidated"],
+      [OTHER_ACCOUNT, "refresh_token_invalidated"],
+      [NOT_REFRESHED, "refresh_token_invalidated"],
+      [SESSION, "refresh_token_invalidated"],
+    ])("classifies Codex's own sentence in the protocol error: %s", (sentence, expected) => {
+      // The real order: thread.started, turn.started, the `error` event, turn.failed; the trace on stderr.
+      const stdout = [...turn, ...failed(sentence)].join("\n");
+      const input = { stdout, stderr: `${TRACE}\n`, errorMessage: parseCodexJsonl(stdout).errorMessage };
+      expect(classifyCodexAuthRefreshFailure(input)).toBe(expected);
+      expect(isCodexProviderQuotaError(input)).toBe(false);
+      expect(isCodexTransientUpstreamError(input)).toBe(false);
+      // The protocol alone is enough: a stdout composed by the router carries no stderr.
+      expect(classifyCodexAuthRefreshFailure({ stdout: [...turn, event({ type: "turn.failed", error: { message: sentence } })].join("\n"), stderr: "" }))
+        .toBe(expected);
+      // The same sentence quoted by a command or by the model classifies nothing.
+      const quotedOnly = [...turn, commandOutput(sentence), agentText(sentence), ...failed("The model rejected the request.")].join("\n");
+      expect(classifyCodexAuthRefreshFailure({ stdout: quotedOnly, stderr: "" })).toBeNull();
+    });
+
+    it("reads the stderr trace only when the protocol never started", () => {
+      // Before the stream the CLI's stderr is its own words.
+      expect(classifyCodexAuthRefreshFailure({ stdout: "", stderr: `${TRACE}\n` })).toBe("refresh_token_invalidated");
+      expect(classifyCodexAuthRefreshFailure({ stdout: `${EXPIRED}\n`, stderr: "" })).toBe("refresh_token_expired");
+      // Once the protocol started, the trace alone, without a protocol error, classifies nothing: the run is a
+      // harness crash, retried; the next run meets the login loss through the protocol.
+      expect(classifyCodexAuthRefreshFailure({ stdout: turn.join("\n"), stderr: `${TRACE}\n` })).toBeNull();
+      // A refresh that failed for another reason, and a sign-in mode mismatch, are not a login loss of the account.
+      expect(classifyCodexAuthRefreshFailure({ stdout: "", stderr: "Failed to refresh token: error sending request for url" })).toBeNull();
+      expect(classifyCodexAuthRefreshFailure({ stdout: "", stderr: "ChatGPT login is required, but an API key is currently being used. Logging out." })).toBeNull();
+    });
+
+    it("does not read an MCP server's OAuth words as a login loss of the account", () => {
+      const mcpGrant = "The MCP authorization server rejected the enterprise grant: invalid_grant";
+      const mcpLogin = "ERROR mcp server linear requires OAuth login: 401 Unauthorized";
+      for (const line of [mcpGrant, mcpLogin]) {
+        // As the protocol's last error, on stderr or as a plain line before the protocol, and on stderr after it.
+        expect(classifyCodexAuthRefreshFailure({ stdout: [...turn, ...failed(line)].join("\n") })).toBeNull();
+        expect(classifyCodexAuthRefreshFailure({ stdout: "", stderr: line, errorMessage: line })).toBeNull();
+        expect(classifyCodexAuthRefreshFailure({ stdout: line })).toBeNull();
+        expect(classifyCodexAuthRefreshFailure({ stdout: turn.join("\n"), stderr: line })).toBeNull();
+        // Codex's own sentence next to such a line still classifies.
+        expect(classifyCodexAuthRefreshFailure({ stdout: "", stderr: `${line}\n${REVOKED}` })).toBe("refresh_token_invalidated");
+      }
+      // The generic patterns still work on a line that does not name MCP.
+      expect(classifyCodexAuthRefreshFailure({ stdout: "", stderr: "OAuth failed: invalid_grant" })).toBe("refresh_token_invalidated");
+    });
+
+    it("forgets the errors of an earlier turn", () => {
+      // A non-zero exit after a turn that completed, or during a later turn, must not classify an old error.
+      const completed = [...turn, ...[event({ type: "error", message: REUSED })], event({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } })];
+      expect(classifyCodexAuthRefreshFailure({ stdout: completed.join("\n") })).toBeNull();
+      const laterTurn = [...turn, ...failed(REUSED), event({ type: "turn.started" }), agentText("Working on it.")];
+      expect(classifyCodexAuthRefreshFailure({ stdout: laterTurn.join("\n") })).toBeNull();
+      const limitThenTurn = [...turn, ...failed(limit), event({ type: "turn.started" })];
+      expect(isCodexProviderQuotaError({ stdout: limitThenTurn.join("\n") })).toBe(false);
+      expect(extractCodexRetryNotBefore({ stdout: limitThenTurn.join("\n") })).toBeNull();
+      // The error of the current turn counts.
+      const current = [...turn, ...failed("The model rejected the request."), event({ type: "turn.started" }), ...failed(REUSED)];
+      expect(classifyCodexAuthRefreshFailure({ stdout: current.join("\n") })).toBe("refresh_token_reused");
+    });
+
+    it("starts the protocol on a Codex event only, not on another JSON object", () => {
+      // A wrapper that writes JSON on stdout must not switch off the reading of stderr.
+      for (const wrapper of [event({ type: "log", message: "connected" }), event({ level: "info", msg: "connected" }), event({ type: "result", ok: false })]) {
+        expect(classifyCodexAuthRefreshFailure({ stdout: wrapper, stderr: `${TRACE}\n` })).toBe("refresh_token_invalidated");
+        expect(isCodexProviderQuotaError({ stdout: wrapper, stderr: limit })).toBe(true);
+        // Followed by Codex events, the protocol started: stderr is not read.
+        expect(classifyCodexAuthRefreshFailure({ stdout: [wrapper, ...turn].join("\n"), stderr: `${TRACE}\n` })).toBeNull();
+      }
+      for (const type of ["thread.started", "turn.started", "turn.completed", "turn.failed", "item.started", "item.updated", "item.completed", "error"]) {
+        expect(classifyCodexAuthRefreshFailure({ stdout: event({ type }), stderr: `${TRACE}\n` })).toBeNull();
+      }
+    });
 
     it.each([
       "Invalid or expired refresh token",
@@ -227,7 +314,7 @@ describe("classifyCodexAuthRefreshFailure", () => {
         event({ type: "thread.started", thread_id: "t" }),
         commandOutput(`${limit}\nWe're currently experiencing high demand, remote compact task failed`),
         agentText(limit),
-        ...failed("OAuth failed: refresh_token_reused"),
+        ...failed(REUSED),
       ].join("\n");
       const input = { stdout, stderr: "", errorMessage: parseCodexJsonl(stdout).errorMessage };
       expect(isCodexProviderQuotaError(input)).toBe(false);
@@ -242,7 +329,7 @@ describe("classifyCodexAuthRefreshFailure", () => {
       ["OAuth failed: refresh_token_invalidated", "refresh_token_invalidated"],
       ["OAuth failed: invalid_grant", "refresh_token_invalidated"],
       ["credential refresh returned 401 Unauthorized", "refresh_token_invalidated"],
-    ])("still classifies a real protocol failure: %s", (message, expected) => {
+    ])("still classifies the baseline's code forms in a protocol error (kept; Codex does not write them): %s", (message, expected) => {
       const stdout = [event({ type: "thread.started", thread_id: "auth-thread" }), ...failed(message)].join("\n");
       expect(classifyCodexAuthRefreshFailure({ stdout })).toBe(expected);
       expect(isCodexProviderQuotaError({ stdout })).toBe(false);
@@ -271,7 +358,7 @@ describe("classifyCodexAuthRefreshFailure", () => {
         expect(isCodexProviderQuotaError({ stdout, stderr: limit })).toBe(false);
       }
       // The protocol's own last error still decides.
-      const stdout = [...started, ...failed("OAuth failed: refresh_token_reused")].join("\n");
+      const stdout = [...started, ...failed(REUSED)].join("\n");
       expect(classifyCodexAuthRefreshFailure({ stdout, stderr: mcp })).toBe("refresh_token_reused");
     });
 
@@ -309,6 +396,12 @@ describe("classifyCodexAuthRefreshFailure", () => {
       expect(classifyCodexAuthRefreshFailure({ stdout })).toBeNull();
       // The same words on a real first line of a short capture are the CLI's own plain text.
       expect(classifyCodexAuthRefreshFailure({ stdout: `${fragment}\n` })).toBe("refresh_token_invalidated");
+      // A capture cut by bytes is shorter in characters than the cap: the comparison is made in bytes.
+      const wide = `${"\u00e9".repeat(1024)}\n`;
+      const cutByBytes = `${fragment}\n${wide.repeat(Math.ceil((4 * 1024 * 1024) / Buffer.byteLength(wide, "utf8")))}`;
+      expect(cutByBytes.length).toBeLessThan(4 * 1024 * 1024);
+      expect(Buffer.byteLength(cutByBytes, "utf8")).toBeGreaterThanOrEqual(4 * 1024 * 1024);
+      expect(classifyCodexAuthRefreshFailure({ stdout: cutByBytes })).toBeNull();
     });
   });
 

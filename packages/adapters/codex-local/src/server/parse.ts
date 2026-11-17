@@ -12,13 +12,30 @@ const CODEX_USAGE_LIMIT_RE =
   /you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now,\s+or try again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
 const CODEX_PROVIDER_QUOTA_RE =
   /(?:you(?:'|’)ve hit your usage limit|usage limit|model (?:is )?at capacity|at capacity for this model|capacity limit)/i;
+// STUDIO-0065: the sentences Codex itself writes on a login loss, read in the installed binaries (codex-cli 0.156.1 on
+// the server, 0.166.0 on the worker machines, Linux x64). The binary holds no `refresh_token_reused`,
+// `refresh_token_expired` or `refresh_token_invalidated` code as text: the code forms below are those of the
+// baseline, kept, and they are no proof of a real form.
+//   "Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."
+//   "Your access token could not be refreshed because your refresh token has expired. Please log out and sign in again."
+//   "Your access token could not be refreshed because your refresh token was revoked. Please log out and sign in again."
+//   "Your access token could not be refreshed because you have since logged out or signed in to another account. Please sign in again."
+//   "Your access token could not be refreshed. Please log out and sign in again."
+//   "Your authentication session could not be refreshed automatically. Please log out and sign in again."
+// The specific sentences are tried first: every one of the first five starts with the same words.
 const CODEX_REFRESH_TOKEN_REUSED_RE =
-  /(?:refresh[_\s-]?token[_\s-]?reused|refresh token (?:has )?already been used|token reuse detected)/i;
+  /(?:refresh[_\s-]?token[_\s-]?reused|refresh token (?:has |was )?already (?:been )?used|token reuse detected)/i;
 const CODEX_REFRESH_TOKEN_EXPIRED_RE =
   /(?:refresh[_\s-]?token[_\s-]?expired|refresh token (?:has )?expired|expired refresh token)/i;
 const CODEX_REFRESH_TOKEN_INVALIDATED_RE =
-  /(?:refresh[_\s-]?token[_\s-]?(?:invalidated|revoked|invalid)|refresh token (?:has been )?(?:invalidated|revoked|invalid)|invalid refresh token|missing bearer)/i;
+  /(?:refresh[_\s-]?token[_\s-]?(?:invalidated|revoked|invalid)|refresh token (?:has been |was )?(?:invalidated|revoked|invalid)|invalid refresh token|missing bearer|access token could not be refreshed|authentication session could not be refreshed|signed in to another account)/i;
 const CODEX_OAUTH_INVALID_GRANT_RE = /\binvalid_grant\b/i;
+// A line that names MCP is about a tool server's own OAuth (in the binary, `invalid_grant` only appears in such
+// texts: "The MCP authorization server rejected the enterprise grant: invalid_grant"). The generic patterns
+// (`invalid_grant`, an auth word near 401 or unauthorized) are not tried on it; Codex's own sentences still are.
+const CODEX_MCP_LINE_RE = /\bmcp\b/i;
+// The events of the `codex exec --json` protocol. Another JSON object on stdout (a wrapper's) is a plain line.
+const CODEX_PROTOCOL_EVENT_TYPE_RE = /^(?:error|thread\.[a-z_.]+|turn\.[a-z_.]+|item\.[a-z_.]+)$/;
 const CODEX_CONTEXTUAL_REFRESH_AUTH_INVALIDATED_RE =
   /(?:(?:oauth|refresh|access[_\s-]?token|bearer|credential).{0,80}(?:\b401\b|unauthori[sz]ed|\binvalid[\s-]grant\b)|(?:\b401\b|unauthori[sz]ed|\binvalid[\s-]grant\b).{0,80}(?:oauth|refresh|access[_\s-]?token|bearer|credential))/i;
 
@@ -151,17 +168,21 @@ export function isCodexUnknownSessionError(stdout: string, stderr: string): bool
 // merely quotes "401 Unauthorized ... bearer token" (an HTTP log, a source file under review) must not decide that the
 // account lost its login: one failed run would put every role that shares the account in error.
 //
-// - Once the protocol started (a JSON event with a type was seen), the CLI reports a failure through the protocol:
-//   only the LAST protocol error counts (an `error` event, or `turn.failed`; a recovered earlier error does not).
-//   stderr, the plain stdout lines and the fallback error message built from stderr are NOT read then: stderr also
-//   carries the words of MCP servers, hooks and the ssh client of a routed run ("401 Unauthorized", an OAuth prompt),
-//   which are not about the AI account.
+// - Once the protocol started (an event of the Codex protocol was seen: thread.*, turn.*, item.*, error), the CLI
+//   reports a failure through the protocol: only the LAST protocol error of the CURRENT turn counts (an `error`
+//   event, or `turn.failed`; a recovered earlier error does not, and `turn.started` or `turn.completed` forgets the
+//   errors before it). stderr, the plain stdout lines and the fallback error message built from stderr are NOT read
+//   then: stderr also carries the words of MCP servers, hooks and the ssh client of a routed run ("401
+//   Unauthorized", an OAuth prompt), which are not about the AI account. Codex reports a login loss through the
+//   protocol too (the sentences above, in the `error` event and in `turn.failed`).
 // - When the protocol never started, the CLI failed before the stream: the error message the caller passes, the
-//   plain stdout lines and stderr are its own words.
+//   plain stdout lines and stderr are its own words. A JSON object that is not a Codex event does not start the
+//   protocol: a wrapper that writes JSON must not switch off the reading of stderr.
 // Never read: the content of an item, whatever its type.
 //
-// The capture keeps the last MAX_CAPTURE_BYTES of stdout, so its first line can be the cut tail of an event: that
-// fragment is not plain text.
+// The capture keeps the tail of stdout (runChildProcess, appendWithCap: the last MAX_CAPTURE_BYTES characters), so
+// its first line can be the cut tail of an event: that fragment is not plain text. The comparison is made in bytes,
+// which also covers a capture cut by bytes (appendWithByteCap drops up to three more bytes).
 function codexStdoutErrorSurface(stdout: string): {
   protocolStarted: boolean;
   lastProtocolError: string;
@@ -171,24 +192,30 @@ function codexStdoutErrorSurface(stdout: string): {
   let lastProtocolError = "";
   let protocolStarted = false;
   const lines = stdout.split(/\r?\n/);
-  const firstLineMayBeCut = stdout.length >= MAX_CAPTURE_BYTES;
+  const firstLineMayBeCut = stdout.length >= MAX_CAPTURE_BYTES
+    || (stdout.length * 3 >= MAX_CAPTURE_BYTES - 3 && Buffer.byteLength(stdout, "utf8") >= MAX_CAPTURE_BYTES - 3);
 
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index]!.trim();
     if (!line) continue;
 
     const parsedLine = parseJson(line) as unknown;
-    const event = parsedLine !== null && typeof parsedLine === "object" && !Array.isArray(parsedLine)
+    const parsedObject = parsedLine !== null && typeof parsedLine === "object" && !Array.isArray(parsedLine)
       ? (parsedLine as Record<string, unknown>)
       : null;
+    const type = parsedObject ? asString(parsedObject.type, "") : "";
+    const event = parsedObject && CODEX_PROTOCOL_EVENT_TYPE_RE.test(type) ? parsedObject : null;
     if (!event) {
       if (index === 0 && firstLineMayBeCut) continue;
       plainLines.push(line);
       continue;
     }
 
-    const type = asString(event.type, "");
-    if (type) protocolStarted = true;
+    protocolStarted = true;
+    if (type === "turn.started" || type === "turn.completed") {
+      lastProtocolError = "";
+      continue;
+    }
     const message = type === "error"
       ? asString(event.message, "").trim()
       : type === "turn.failed"
@@ -227,8 +254,9 @@ export function classifyCodexAuthRefreshFailure(input: {
   if (CODEX_REFRESH_TOKEN_REUSED_RE.test(haystack)) return "refresh_token_reused";
   if (CODEX_REFRESH_TOKEN_EXPIRED_RE.test(haystack)) return "refresh_token_expired";
   if (CODEX_REFRESH_TOKEN_INVALIDATED_RE.test(haystack)) return "refresh_token_invalidated";
-  if (CODEX_OAUTH_INVALID_GRANT_RE.test(haystack)) return "refresh_token_invalidated";
-  if (CODEX_CONTEXTUAL_REFRESH_AUTH_INVALIDATED_RE.test(haystack)) return "refresh_token_invalidated";
+  const withoutMcpLines = haystack.split("\n").filter((line) => !CODEX_MCP_LINE_RE.test(line)).join("\n");
+  if (CODEX_OAUTH_INVALID_GRANT_RE.test(withoutMcpLines)) return "refresh_token_invalidated";
+  if (CODEX_CONTEXTUAL_REFRESH_AUTH_INVALIDATED_RE.test(withoutMcpLines)) return "refresh_token_invalidated";
   return null;
 }
 
