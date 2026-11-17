@@ -40,19 +40,24 @@ export function isAiConnectionConfigurationFailure(run: AuthenticationFailure): 
 }
 
 /**
- * STUDIO-0064: the run's own result reports a provider limit (HTTP 429, a usage or rate limit, a quota family).
+ * STUDIO-0064: the run's own result reports a provider limit (HTTP 429, a usage or rate limit, a quota family, or
+ * the adapter's own mark, STUDIO-0065).
  * Such a run did not prove that the provider refused the credentials, whatever error code it carries, so it must
  * never mark the account as needing a new sign-in (production, 17 Nov 2026, run 21529e7e: a weekly-limit run sealed
  * as claude_auth_required put the role's account in error until its owner signed in again).
  */
-export function runResultReportsProviderLimit(resultJson: unknown): boolean {
+export function runResultReportsProviderLimit(resultJson: unknown, adapterType?: string | null): boolean {
   const result = record(resultJson);
   if (!result) return false;
   if (Number(result.api_error_status) === 429 || Number(result.error_status) === 429) return true;
   if (result.errorFamily === "provider_quota") return true;
   const apiError = typeof result.api_error === "string" ? result.api_error
     : result.api_error && typeof result.api_error === "object" ? JSON.stringify(result.api_error) : "";
-  return /(?:usage|rate)[_\s-]?limit/i.test(apiError);
+  if (/(?:usage|rate)[_\s-]?limit/i.test(apiError)) return true;
+  // STUDIO-0065: a Codex result carries no status; its adapter writes this mark when it classified a limit. The
+  // guard reads structured fields only, never the run's output, and honours the mark for a codex_local run only:
+  // it is that adapter's word, and no other adapter's result is read through it.
+  return adapterType === "codex_local" && result.providerLimitObserved === true;
 }
 
 export function isAiAuthenticationRepairable(run: AuthenticationFailure): boolean {
