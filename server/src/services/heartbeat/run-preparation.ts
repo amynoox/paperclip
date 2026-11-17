@@ -1867,6 +1867,29 @@ export function mergeCoalescedContextSnapshot(
     ...existing,
     ...incoming,
   };
+  // STUDIO-0063: a dependency-resolved wake admitted with the issue ready, merged into a bounded run still waiting
+  // (a person's comment run queued while the issue was blocked), makes it a run of the ready issue: the bounded mode
+  // and its blocker snapshot go, so the run works the issue and can settle the held comments it carries.
+  // Only for a run that has not started (the callers pass preserveExistingInteractionContinuation for a queued or
+  // scheduled run): a started run keeps the mode and the hand-over it was started with, since its engine never sees
+  // what a later wake computed; that hand-over stays due and the next run (or the backstop) delivers it.
+  const targetNotStarted = options.preserveExistingInteractionContinuation === true;
+  if (!targetNotStarted) {
+    for (const key of ["heldDependencyCommentIds", "heldDependencyOlderCount", "heldDependencyReason", "heldDependencyHandoverAt"]) {
+      if (key in existing) merged[key] = existing[key]; else delete merged[key];
+    }
+  }
+  if (
+    targetNotStarted &&
+    existing.dependencyBlockedInteraction === true &&
+    incoming.dependencyBlockedInteraction !== true &&
+    readNonEmptyString(incoming.wakeReason) === "issue_blockers_resolved"
+  ) {
+    delete merged.dependencyBlockedInteraction;
+    delete merged.unresolvedBlockerIssueIds;
+    delete merged.unresolvedBlockerCount;
+    delete merged.unresolvedBlockerSummaries;
+  }
   // Only executeRun can mint this proof. Coalescence may retain an unchanged
   // admitted proof, but must never accept a new marker from an incoming wake.
   delete merged[PAPERCLIP_EXTERNAL_CHAT_EXECUTION_BOUND_KEY];
@@ -2322,7 +2345,19 @@ export async function buildPaperclipWakePayload(input: {
   simplifiedEnglishInteractions?: boolean;
 }) {
   const executionStage = parseObject(input.contextSnapshot.executionStage);
-  const commentIds = extractWakeCommentIds(input.contextSnapshot);
+  const wakeCommentIds = extractWakeCommentIds(input.contextSnapshot);
+  // STUDIO-0063: agent comments the assignee may not have seen (held while the issue waited on its blockers), handed
+  // over by the run that can act on them. Shown like the wake's own comments, after them: the latest 20; the count of
+  // older ones (heldDependencyOlderCount) is written in the payload and marks it truncated, so the agent reads the
+  // thread.
+  const allHeldDependencyCommentIds = (Array.isArray(input.contextSnapshot.heldDependencyCommentIds)
+    ? input.contextSnapshot.heldDependencyCommentIds : [])
+    .map((id) => readNonEmptyString(id)).filter((id): id is string => Boolean(id) && !wakeCommentIds.includes(id!));
+  const heldDependencyCommentIds = allHeldDependencyCommentIds.slice(-20);
+  const heldDependencyOlderCount = allHeldDependencyCommentIds.length - heldDependencyCommentIds.length
+    + (typeof input.contextSnapshot.heldDependencyOlderCount === "number" && input.contextSnapshot.heldDependencyOlderCount > 0
+      ? Math.floor(input.contextSnapshot.heldDependencyOlderCount) : 0);
+  const commentIds = [...wakeCommentIds, ...heldDependencyCommentIds];
   const annotationCommentId = readNonEmptyString(
     input.contextSnapshot.annotationCommentId,
   );
@@ -2361,9 +2396,14 @@ export async function buildPaperclipWakePayload(input: {
   )
     return null;
 
-  const commentRows = input.wakeCommentRows
-    ? input.wakeCommentRows.filter(row => row.companyId === input.companyId && (!issueId || row.issueId === issueId) && commentIds.includes(row.id))
-    : await readHeartbeatWakeComments(input.db, input.companyId, issueId, commentIds);
+  const commentRows = [
+    ...(input.wakeCommentRows
+      ? input.wakeCommentRows.filter(row => row.companyId === input.companyId && (!issueId || row.issueId === issueId) && wakeCommentIds.includes(row.id))
+      : await readHeartbeatWakeComments(input.db, input.companyId, issueId, wakeCommentIds)),
+    ...(heldDependencyCommentIds.length
+      ? await readHeartbeatWakeComments(input.db, input.companyId, issueId, heldDependencyCommentIds)
+      : []),
+  ];
 
   const commentsById = new Map(
     commentRows.map((comment) => [comment.id, comment]),
@@ -2623,6 +2663,7 @@ export async function buildPaperclipWakePayload(input: {
     : null;
   const payloadTruncated =
     truncated ||
+    heldDependencyOlderCount > 0 ||
     issueDescriptionTruncated ||
     planReviewContext?.truncated === true ||
     documentReviewContext?.truncated === true;
@@ -2867,6 +2908,16 @@ export async function buildPaperclipWakePayload(input: {
       includedCount: comments.length,
       missingCount: missingCommentCount,
     },
+    ...(allHeldDependencyCommentIds.length > 0 ? {
+      heldDependencyComments: {
+        heldCount: heldDependencyCommentIds.length + heldDependencyOlderCount,
+        shownCount: heldDependencyCommentIds.length,
+        olderInThreadCount: heldDependencyOlderCount,
+        note: input.contextSnapshot.heldDependencyReason === "reassignment"
+          ? "Comments from other agents written on this issue before you took it over, since your last completed run on it."
+          : "Comments from other agents written while this issue waited on its blockers, since your last completed run on it.",
+      },
+    } : {}),
     truncated: payloadTruncated,
     fallbackFetchNeeded: payloadTruncated || missingCommentCount > 0,
   };

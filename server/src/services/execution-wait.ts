@@ -18,6 +18,8 @@ export async function recordExecutionWait(
     request: WakeRequest;
     condition: Record<string, unknown>;
     coalesce: boolean;
+    /** Merged into the payload of the earlier row a coalesced wait is folded into. */
+    coalescedPayloadPatch?: Record<string, unknown>;
   },
 ): Promise<{ created: boolean }> {
   const { request, issueId, condition } = input;
@@ -38,6 +40,9 @@ export async function recordExecutionWait(
     if (existing) {
       await tx.update(agentWakeupRequests).set({
         coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1`,
+        ...(input.coalescedPayloadPatch ? {
+          payload: sql`coalesce(${agentWakeupRequests.payload}, '{}'::jsonb) || ${JSON.stringify(input.coalescedPayloadPatch)}::jsonb`,
+        } : {}),
         updatedAt: new Date(),
       }).where(and(
         eq(agentWakeupRequests.companyId, request.companyId),

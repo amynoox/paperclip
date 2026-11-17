@@ -82,6 +82,7 @@ import {
   deriveCommentId,
   isNonAssigneeWorkspaceBusyRetry,
   isResolvedInteractionContinuationWakeContext,
+  HELD_DEPENDENCY_TRACE_KEY,
 } from "../domain/wake-context.js";
 import type {
   CancelStaleQueuedRunInput,
@@ -978,6 +979,10 @@ export function createPostgresRunDispatchAdapter(
         ...(pauseSuppression ? {
           resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify(pauseSuppression)}::jsonb`,
         } : {}),
+        // STUDIO-0063: a retry the dependency gate refused is a marked hold (see HELD_DEPENDENCY_TRACE_KEY).
+        ...(input.errorCode === "issue_dependencies_blocked" ? {
+          resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ [HELD_DEPENDENCY_TRACE_KEY]: true })}::jsonb`,
+        } : {}),
         updatedAt: input.now,
       })
       .where(
@@ -1328,6 +1333,7 @@ export function createPostgresRunDispatchAdapter(
           resultJson: {
             ...parseObject(run.resultJson),
             stopReason: decision.errorCode,
+            ...(decision.errorCode === "issue_dependencies_blocked" ? { [HELD_DEPENDENCY_TRACE_KEY]: true } : {}),
             ...(providerDispatchNotStarted && decision.errorCode === "issue_waiting_for_response"
               ? { preDispatchResponseWait: { version: 1, providerWorkStarted: false } }
               : {}),

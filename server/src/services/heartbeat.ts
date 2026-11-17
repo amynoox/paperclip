@@ -511,6 +511,7 @@ import {
   type StrandedRecoveryNoticeSeed,
 } from "./recovery/stranded-notice.js";
 
+import { reconcileHeldCommentHandover as reconcileHeldCommentHandoverForIssue } from "./recovery/held-comment-handover-backstop.js";
 import { recoveryService } from "./recovery/service.js";
 import {
   createRunDispatch,
@@ -1750,6 +1751,27 @@ export function heartbeatService(
 
   async function reconcileResolvedDependencyWakes(opts?: Parameters<typeof recovery.reconcileResolvedDependencyWakeBackstop>[0]) {
     return recovery.reconcileResolvedDependencyWakeBackstop(opts);
+  }
+
+  // STUDIO-0063: the periodic hand-over backstop for one issue (held-comment-handover-backstop.ts). Run by the
+  // stranded-assignment and resolved-dependency recovery queues before their own pass; never fails that pass.
+  async function reconcileHeldCommentHandover(scope: {
+    companyId: string; issueId: string; now?: Date; onDeferredDeadline?: (at: number) => void;
+  }) {
+    try {
+      return await reconcileHeldCommentHandoverForIssue(db, {
+        companyId: scope.companyId,
+        issueId: scope.issueId,
+        now: scope.now,
+        onDeferredDeadline: scope.onDeferredDeadline,
+        wake: (agentId, request) => enqueueWakeup(agentId, request as Parameters<typeof enqueueWakeup>[1]),
+        invocationBlocked: async (agentId, issueId) =>
+          Boolean(await budgets.getInvocationBlock(scope.companyId, agentId, { issueId, projectId: null })),
+      });
+    } catch (err) {
+      logger.warn({ err, issueId: scope.issueId }, "held comment hand-over backstop failed; the next pass retries");
+      return null;
+    }
   }
 
   // Await every background heartbeat execution that is currently in flight. A
@@ -4477,10 +4499,16 @@ export function heartbeatService(
     readIdleWatchdogSchedule: taskWatchdogs.readIdleSchedule,
     registerIssueStateRecoveryWork: (coordinator: Parameters<typeof registerIssueRecoveryWork>[1], canRun: () => boolean) =>
       registerIssueRecoveryWork(db, coordinator, {
-        stranded: scope => reconcileStrandedAssignedIssues({ ...scope, skipExternalConversationSettlement: true, skipRelatedRecovery: true }),
+        stranded: async scope => {
+          await reconcileHeldCommentHandover(scope);
+          return reconcileStrandedAssignedIssues({ ...scope, skipExternalConversationSettlement: true, skipRelatedRecovery: true });
+        },
         orphanBlockers: recovery.reconcileUnassignedBlockingIssues,
         recoveryActions: recovery.reconcileActiveRecoveryActions,
-        dependencies: reconcileResolvedDependencyWakes,
+        dependencies: async scope => {
+          await reconcileHeldCommentHandover(scope);
+          return reconcileResolvedDependencyWakes(scope);
+        },
         locks: sweepStaleIssueLocks,
         watchdogs: reconcileTaskWatchdogs,
         schedulingSuppressed: async () => (await getSchedulingSuppression(true)).suppressed,
@@ -4524,6 +4552,7 @@ export function heartbeatService(
     sweepStaleIssueLocks,
 
     reconcileResolvedDependencyWakes,
+    reconcileHeldCommentHandover,
 
     scanSilentActiveRuns,
 

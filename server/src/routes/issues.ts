@@ -1,4 +1,5 @@
 import { assertAgentInteraction } from "../services/agent-interaction-policy.js";
+import { wakeDependentsAfterDependencyChange } from "../services/dependency-change-wakes.js";
 import { assertQueuedCommentInteractionDelivery, recheckQueuedCommentInteractionDelivery } from "../services/agent-interaction-delivery.js";
 import { listStalledDependencies } from "../services/recovery/blocker-stall-wakeups.js";
 import { confirmMcpAttachmentCleanup, recordMcpAttachmentCleanup, type McpAttachmentCleanup } from "../services/public-mcp/upload-cleanup.js";
@@ -16821,6 +16822,28 @@ export function issueRoutes(
           if (wakeIssueId === issue.id && issue.externalConversationState && issue.identifier) {
             wakeup.contextSnapshot = { ...wakeup.contextSnapshot, taskKey: issue.identifier };
           }
+          // STUDIO-0063: a later wake for the same agent and issue (a dependency wake after a person's comment, in
+          // one PATCH) merges the earlier wake's comments instead of dropping them.
+          const earlier = wakeups.get(`${agentId}:${wakeIssueId}`)?.wakeup;
+          if (earlier && earlier !== wakeup) {
+            const earlierContext = (earlier.contextSnapshot ?? {}) as Record<string, unknown>;
+            const earlierPayload = (earlier.payload ?? {}) as Record<string, unknown>;
+            const nextContext = { ...((wakeup.contextSnapshot ?? {}) as Record<string, unknown>) };
+            const nextPayload = { ...((wakeup.payload ?? {}) as Record<string, unknown>) };
+            const ids = [earlierContext.wakeCommentIds, nextContext.wakeCommentIds]
+              .flatMap((value) => (Array.isArray(value) ? value : []))
+              .concat([earlierContext.wakeCommentId, earlierContext.commentId, nextContext.wakeCommentId, nextContext.commentId])
+              .filter((value): value is string => typeof value === "string" && value.length > 0);
+            const commentIds = [...new Set(ids)];
+            if (commentIds.length > 0) {
+              const latest = (nextContext.wakeCommentId ?? nextContext.commentId ?? earlierContext.wakeCommentId
+                ?? earlierContext.commentId) as string | undefined;
+              nextContext.wakeCommentIds = commentIds;
+              if (latest) { nextContext.wakeCommentId = latest; nextContext.commentId = latest; nextPayload.commentId = latest; }
+              if (!nextPayload.commentId && earlierPayload.commentId) nextPayload.commentId = earlierPayload.commentId;
+              wakeup = { ...wakeup, contextSnapshot: nextContext, payload: nextPayload } as WakeupRequest;
+            }
+          }
           wakeups.set(`${agentId}:${wakeIssueId}`, { agentId, wakeup });
         };
         const addDependencyResolvedWakeup = async (input: {
@@ -17034,17 +17057,22 @@ export function issueRoutes(
         const becameDone =
           existing.status !== "done" && issue.status === "done";
         if (becameDone) {
-          const dependents = await svc.listWakeableBlockedDependents(issue.id);
-          for (const dependent of dependents) {
-            await addDependencyResolvedWakeup({
-              agentId: dependent.assigneeAgentId,
-              dependentIssueId: dependent.id,
-              resolvedBlockerIssueId: issue.id,
-              blockerIssueIds: dependent.blockerIssueIds,
-              blockedTransitionAt: dependent.blockedTransitionAt,
-              source: "issue.blockers_resolved",
-              mutation: "blocker_done",
+          // STUDIO-0063: one function decides the dependents' wakes (ready, or left with cancelled blockers only).
+          try {
+            await wakeDependentsAfterDependencyChange(db, {
+              companyId: issue.companyId,
+              dependentIssueIds: await Promise.resolve()
+                .then(() => svc.getRelationSummaries(issue.id))
+                .then((relations) => relations?.blocks?.map((dependent) => dependent.id) ?? []).catch(() => []),
+              readyDependents: await svc.listWakeableBlockedDependents(issue.id),
+              kind: "blocker_done",
+              changedBlocker: { id: issue.id, identifier: issue.identifier ?? null, completedAt: issue.completedAt ?? null },
+              actor: { type: actor.actorType as "user" | "agent" | "system", id: actor.actorId ?? null },
+              at: new Date(issue.updatedAt),
+              wake: (agentId, request) => addWakeup(agentId, request as WakeupRequest),
             });
+          } catch (err) {
+            logger.warn({ err, issueId: issue.id }, "failed to wake the dependents of a done blocker");
           }
         }
 
@@ -17149,6 +17177,29 @@ export function issueRoutes(
               source: "issue.blockers_restored",
               mutation: "blocked_dependency_restored",
             });
+          }
+        }
+
+        // STUDIO-0063: every edit that changes the blocker set goes through the same function (ready, or only
+        // cancelled blockers left). If the restored-blocked path above already woke the assignee, the two wakes merge
+        // in addWakeup (same agent, same issue); the key carries the edit's time, so each such edit wakes once. A
+        // request that sends the same set again is no change: this call sends nothing (the restored-blocked path
+        // above keeps its own rule).
+        const previousBlockerIds = (existingRelations?.blockedBy ?? []).map((relation) => relation.id).sort();
+        const nextBlockerIds = Array.isArray(req.body.blockedByIssueIds)
+          ? [...new Set(req.body.blockedByIssueIds as string[])].sort() : previousBlockerIds;
+        if (Array.isArray(req.body.blockedByIssueIds) && previousBlockerIds.join(",") !== nextBlockerIds.join(",")) {
+          try {
+            await wakeDependentsAfterDependencyChange(db, {
+              companyId: issue.companyId,
+              dependentIssueIds: [issue.id],
+              kind: "blockers_edited",
+              actor: { type: actor.actorType as "user" | "agent" | "system", id: actor.actorId ?? null },
+              at: new Date(issue.updatedAt),
+              wake: (agentId, request) => addWakeup(agentId, request as WakeupRequest),
+            });
+          } catch (err) {
+            logger.warn({ err, issueId: issue.id }, "failed to wake an issue whose blocker set was edited");
           }
         }
 
@@ -17328,6 +17379,10 @@ export function issueRoutes(
     if (!existing) return;
     if (!(await assertAgentIssueMutationAllowed(req, res, existing))) return;
     const attachments = await svc.listAttachments(id);
+    // STUDIO-0063: deleting an unresolved blocker can make its dependents ready without any other wake.
+    const dependentsBefore = existing.status !== "done"
+      ? (await svc.getRelationSummaries(id)).blocks
+      : [];
 
     const issue = await svc.remove(id, req.actor.type === "agent" ? req.actor.agentId : null);
     if (!issue) {
@@ -17335,6 +17390,26 @@ export function issueRoutes(
       return;
     }
 
+    // STUDIO-0063: a dependent made ready by this delete (or left with cancelled blockers only) is decided by the
+    // same function.
+    if (dependentsBefore.length > 0) {
+      try {
+        await wakeDependentsAfterDependencyChange(db, {
+          companyId: existing.companyId,
+          dependentIssueIds: dependentsBefore.map((dependent) => dependent.id),
+          kind: "blocker_deleted",
+          changedBlocker: { id, identifier: existing.identifier ?? null, completedAt: null },
+          actor: req.actor.type === "agent"
+            ? { type: "agent", id: req.actor.agentId ?? null }
+            : { type: "user", id: req.actor.userId ?? null },
+          at: new Date(),
+          wake: (agentId, request) => { void heartbeat.wakeup(agentId, request as any).catch((err: unknown) =>
+            logger.warn({ err, issueId: id }, "failed to wake a dependent made ready by a delete")); },
+        });
+      } catch (err) {
+        logger.warn({ err, issueId: id }, "failed to wake the dependents of a deleted blocker");
+      }
+    }
     for (const attachment of attachments) {
       try {
         await storage.deleteObject(attachment.companyId, attachment.objectKey);
@@ -20798,17 +20873,23 @@ export function issueRoutes(
           issueBeforeCommentDecision.status !== "done" &&
           currentIssue.status === "done";
         if (becameDone) {
-          const dependents = await svc.listWakeableBlockedDependents(
-            currentIssue.id,
-          );
-          for (const dependent of dependents) {
-            await addDependencyResolvedWakeup({
-              agentId: dependent.assigneeAgentId,
-              dependentIssueId: dependent.id,
-              resolvedBlockerIssueId: currentIssue.id,
-              blockerIssueIds: dependent.blockerIssueIds,
-              blockedTransitionAt: dependent.blockedTransitionAt,
+          // STUDIO-0063: one function decides the dependents' wakes (ready, or left with cancelled blockers only).
+          try {
+            await wakeDependentsAfterDependencyChange(db, {
+              companyId: currentIssue.companyId,
+              dependentIssueIds: await Promise.resolve()
+                .then(() => svc.getRelationSummaries(currentIssue.id))
+                .then((relations) => relations?.blocks?.map((dependent) => dependent.id) ?? []).catch(() => []),
+              readyDependents: await svc.listWakeableBlockedDependents(currentIssue.id),
+              kind: "blocker_done",
+              changedBlocker: { id: currentIssue.id, identifier: currentIssue.identifier ?? null,
+                completedAt: currentIssue.completedAt ?? null },
+              actor: { type: actor.actorType as "user" | "agent" | "system", id: actor.actorId ?? null },
+              at: new Date(currentIssue.updatedAt),
+              wake: (agentId, request) => addWakeup(agentId, request as WakeupRequest),
             });
+          } catch (err) {
+            logger.warn({ err, issueId: currentIssue.id }, "failed to wake the dependents of a done blocker");
           }
         }
 
