@@ -1381,6 +1381,26 @@ describe("codex_local ACP lane", () => {
     });
   });
 
+  // STUDIO-0065: the ACP lane's summary is the model's last text. It never decides a login loss.
+  it("does not classify a login loss from the model's last text on a failed ACP run", async () => {
+    const root = await makeTempRoot("paperclip-codex-acp-quoted-auth-");
+    const execute = createCodexAcpExecutor({
+      createRuntime: (options: FakeRuntimeOptions) => new FakeRuntime(
+        options,
+        [{ type: "text_delta", text: "The API answered 401 Unauthorized: the bearer token expired, refresh_token_reused.",
+          stream: "output", tag: "agent_message_chunk" }],
+        { status: "failed", error: { message: "The model rejected the request." } } as unknown as FakeRuntimeTurnResult,
+      ) as never,
+    });
+
+    const result = await execute(buildContext(root));
+
+    expect(result.exitCode).toBe(1);
+    expect(result.summary).toContain("refresh_token_reused");
+    expect(result.errorCode ?? "").not.toMatch(/^refresh_token_/);
+    expect(result.errorFamily ?? "").not.toMatch(/^refresh_token_/);
+  });
+
   it("classifies ACP refresh-token auth failures", async () => {
     const root = await makeTempRoot("paperclip-codex-acp-refresh-token-");
     const execute = createCodexAcpExecutor({

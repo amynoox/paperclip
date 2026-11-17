@@ -199,6 +199,10 @@ describe("Claude login detection by the real path (STUDIO-0064)", () => {
     ["a 401 status alone", { stdout: [
       event({ type: "result", subtype: "success", session_id: SESSION, is_error: true, api_error_status: 401, result: "API Error: 401" }),
     ] }],
+    // STUDIO-0065: the server guard reads no output, so a usage-limit line on stderr cannot hide a real login loss.
+    ["a 401 status with a usage-limit line on stderr", { stdout: [
+      event({ type: "result", subtype: "success", session_id: SESSION, is_error: true, api_error_status: 401, result: "API Error: 401" }),
+    ], stderr: "You've hit your usage limit for GPT-5.3-Codex. Switch to another model now, or try again at 11:31 PM.\n" }],
     ["an expired OAuth token in the terminal fields", { stdout: [
       event({ type: "result", subtype: "success", session_id: SESSION, is_error: true,
         result: "OAuth token has expired. Please obtain a new token or refresh your existing token." }),
@@ -212,6 +216,14 @@ describe("Claude login detection by the real path (STUDIO-0064)", () => {
     const result = await runFakeCli({ stdout: [...output.stdout], stderr: "stderr" in output ? output.stderr : undefined });
     expect(result.errorCode).toBe("claude_auth_required");
     const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+    expect(ended.repair).toMatchObject({ state: "needs_user_action", service: "anthropic" });
+    expect(ended).toMatchObject({ grantStatus: "needs_reauthorization", health: "error", marks: 1 });
+  }, 120_000);
+
+  // STUDIO-0065: the limit mark is the Codex adapter's word. On a claude_local run it is not honoured.
+  it("does not honour the Codex adapter's limit mark on a claude_local run", async () => {
+    const ended = await endFailedRun({ errorCode: "claude_auth_required",
+      resultJson: { is_error: true, result: "Not logged in \u00b7 Please run /login", providerLimitObserved: true } });
     expect(ended.repair).toMatchObject({ state: "needs_user_action", service: "anthropic" });
     expect(ended).toMatchObject({ grantStatus: "needs_reauthorization", health: "error", marks: 1 });
   }, 120_000);
