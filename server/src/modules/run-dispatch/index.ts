@@ -31,6 +31,7 @@ export {
   readWorkspaceBusyWait,
   workspaceBusyWaitKey,
   extractWakeCommentIds,
+  HELD_DEPENDENCY_TRACE_KEY,
   deriveCommentId,
   allowsIssueInteractionWake,
   allowsDependencyBlockedWake,
