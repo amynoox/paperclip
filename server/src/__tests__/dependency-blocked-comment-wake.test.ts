@@ -18,6 +18,7 @@ import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
+  activityLog,
   agentWakeupRequests,
   agents,
   authUsers,
@@ -998,6 +999,155 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
     const secondLift = await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.wakeReason === "issue_blockers_resolved", lifts);
     expect(handedOver(secondLift)).toEqual([third]);
   }, 180_000);
+
+  // Cold review (B5): the hand-back comment's deduplication ignores a wake that failed, was skipped or was cancelled,
+  // and the new wake is not swallowed by the comment's fixed key. A delivered wake is not repeated.
+  it("wakes the hand-back comment again when its earlier wake failed, was skipped or was cancelled, not when it was delivered", async () => {
+    const f = await seed({ blocked: false });
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId, f.blocker2Id] }).expect(200);
+    await setStatus(f, f.blocker2Id, "cancelled");
+    await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.cancelledBlockerIssueId === f.blocker2Id);
+    await taskQuiet(f);
+    const handBackComments = () => db.select({ id: issueComments.id }).from(issueComments)
+      .where(and(eq(issueComments.issueId, f.taskId), sql`${issueComments.body} like '%cancelled-blockers-left:%'`));
+    await setStatus(f, f.blockerId, "done");
+    await expect.poll(async () => (await handBackComments()).length, { timeout: 20_000 }).toBe(1);
+    const [comment] = await handBackComments();
+    await runWhere(f.devId, f.taskId, run => JSON.stringify(run.contextSnapshot).includes(comment!.id));
+    const runsOnComment = async () => (await devRuns(f)).filter(run => JSON.stringify(run.contextSnapshot).includes(comment!.id)).length;
+    // Each edit changes the blocker set and leaves the same cancelled blocker as the only unresolved one.
+    const edit = async (ids: string[]) => {
+      await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: ids }).expect(200);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      await taskQuiet(f);
+    };
+    await taskQuiet(f);
+    expect(await runsOnComment()).toBe(1);
+    await edit([f.blocker2Id]);
+    expect(await runsOnComment()).toBe(1);
+    let expected = 1;
+    for (const [status, ids] of [["failed", [f.blockerId, f.blocker2Id]], ["skipped", [f.blocker2Id]],
+      ["cancelled", [f.blockerId, f.blocker2Id]]] as const) {
+      await db.update(agentWakeupRequests).set({ status }).where(and(eq(agentWakeupRequests.agentId, f.devId),
+        sql`${agentWakeupRequests.payload}->>'commentId' = ${comment!.id}`));
+      await edit([...ids]);
+      expected += 1;
+      expect(await runsOnComment()).toBe(expected);
+      expect(await handBackComments()).toHaveLength(1);
+    }
+  }, 240_000);
+
+  // Cold review (P7): a PATCH that writes the same blocker set again is no change for the one function: it sends no
+  // edit wake. (The restored-blocked path of before this change keeps its own rule for a `blocked` issue.)
+  it("sends no edit wake when a PATCH writes the same blocker set again", async () => {
+    const f = await seed();
+    const held = await heldComment(f, "Held before the lift.");
+    await setStatus(f, f.blockerId, "done");
+    await runWhere(f.devId, f.taskId, carrying(held));
+    await taskQuiet(f);
+    const patch = async (ids: string[]) => {
+      await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: ids }).expect(200);
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      await taskQuiet(f);
+    };
+    // The edit wakes the function sent for the task, whatever became of them.
+    const editWakes = async () => (await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, f.devId), sql`${agentWakeupRequests.payload}->>'issueId' = ${f.taskId}`,
+      sql`${agentWakeupRequests.payload}->>'mutation' = 'blockers_edited'`))).length;
+    await patch([f.blockerId]);
+    expect(await editWakes()).toBe(0);
+    // A real change (the list emptied) is one wake; the same empty list written twice more adds none.
+    await patch([]);
+    expect(await editWakes()).toBe(1);
+    await patch([]);
+    await patch([]);
+    expect(await editWakes()).toBe(1);
+  }, 120_000);
+
+  // Third review, point 6, under concurrency: several comments held at the same moment write ONE note (the lock on
+  // the issue row), and each keeps its own hold trace.
+  it("writes one note when several agent comments are held at the same moment", async () => {
+    const f = await seed();
+    await taskQuiet(f);
+    const bodies = [1, 2, 3, 4, 5].map(n => `Concurrent held comment ${n}.`);
+    await Promise.all(bodies.map(body => request(cto(f)).post(`/api/issues/${f.taskId}/comments`).send({ body }).expect(201)));
+    for (const body of bodies) {
+      const id = await commentIdOf(f.taskId, body);
+      await expect.poll(() => admissionHeld(f, id), { timeout: 20_000 }).toEqual([{ status: "skipped", reason: "issue_dependencies_blocked" }]);
+    }
+    await heartbeat.drainActiveRunExecutions();
+    await new Promise(resolve => setTimeout(resolve, 500));
+    const notes = await db.select({ id: issueComments.id }).from(issueComments).where(and(
+      eq(issueComments.issueId, f.taskId), eq(issueComments.authorType, "system"),
+      sql`${issueComments.body} like '%held-dependency-comment-notice%'`));
+    expect(notes).toHaveLength(1);
+    expect(await devRuns(f)).toEqual([]);
+  }, 120_000);
+
+  // Cold review (P6, B4): the wake of one dependent fails; the other dependents are still woken, and the lost one is
+  // the backstop's.
+  it("still wakes the other dependents when the wake of one fails, and the backstop takes the lost one", async () => {
+    const { wakeDependentsAfterDependencyChange } = await import("../services/dependency-change-wakes.js");
+    const f = await seed();
+    const task2Id = randomUUID();
+    const [task] = await db.select({ identifier: issues.identifier }).from(issues).where(eq(issues.id, f.taskId));
+    await db.insert(issues).values({ id: task2Id, companyId: f.companyId, title: "Dev2 task", status: "todo", assigneeAgentId: f.dev2Id,
+      issueNumber: 5, identifier: task!.identifier!.replace(/-2$/, "-5"), responsibleUserId: "board-user" });
+    await request(app(f.companyId)).patch(`/api/issues/${task2Id}`).send({ blockedByIssueIds: [f.blockerId] }).expect(200);
+    const held = await heldComment(f, "Held; the lift's wake will be lost.");
+    // The blocker becomes done outside the routes; the function is called as a writer would, with a sender whose
+    // first wake (the Dev's) fails.
+    await db.update(issues).set({ status: "done", completedAt: new Date() }).where(eq(issues.id, f.blockerId));
+    const attempts: string[] = [];
+    await wakeDependentsAfterDependencyChange(db, {
+      companyId: f.companyId, dependentIssueIds: [f.taskId, task2Id], kind: "blocker_done",
+      changedBlocker: { id: f.blockerId, identifier: null }, actor: { type: "system", id: null }, at: new Date(),
+      wake: async (agentId, wake) => {
+        attempts.push(agentId);
+        if (agentId === f.devId) throw new Error("injected: wake lost");
+        await heartbeat.wakeup(agentId, wake as never);
+      },
+    });
+    expect(attempts).toEqual([f.devId, f.dev2Id]);
+    const other = await runWhere(f.dev2Id, task2Id, run => (run.contextSnapshot as any)?.wakeReason === "issue_blockers_resolved");
+    expect(other.status).toBe("succeeded");
+    await heartbeat.drainActiveRunExecutions();
+    expect(await devRuns(f)).toEqual([]);
+    expect(await heartbeat.reconcileHeldCommentHandover({ companyId: f.companyId, issueId: f.taskId })).toBe("woken");
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect(run.status).toBe("succeeded");
+  }, 120_000);
+
+  // Cold review (B7): a case handoff moves the issue with a service write and its own `issue.reassigned` activity (no
+  // `issue.updated`). The same two writes here (not the handoff service itself): the new assignee's first run gets the
+  // agents' thread with the reassignment text; without the activity it gets nothing.
+  it("takes a case handoff's issue.reassigned activity as a reassignment trace", async () => {
+    for (const withActivity of [false, true]) {
+      const f = await seed({ blocked: false });
+      // Written straight into the thread: the first owner never runs, so no run of its own holds the task.
+      const [comment] = await db.insert(issueComments).values({ companyId: f.companyId, issueId: f.taskId, authorType: "agent",
+        authorAgentId: f.ctoId, body: `Written to the first owner (${withActivity}).` }).returning();
+      const before = comment!.id;
+      await issueService(db).update(f.taskId, { assigneeAgentId: f.dev2Id, assigneeUserId: null, status: "todo" } as never);
+      if (withActivity) {
+        await db.insert(activityLog).values({ companyId: f.companyId, actorType: "agent", actorId: f.ctoId, agentId: f.ctoId,
+          action: "issue.reassigned", entityType: "issue", entityId: f.taskId,
+          details: { previousAssigneeAgentId: f.devId, previousAssigneeUserId: null, assigneeAgentId: f.dev2Id,
+            assigneeUserId: null, changed: true } });
+      }
+      const admitted = await heartbeat.wakeup(f.dev2Id, {
+        source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+        payload: { issueId: f.taskId, mutation: "update" }, requestedByActorType: "system", requestedByActorId: "case_handoff",
+        contextSnapshot: { issueId: f.taskId, taskId: f.taskId, wakeReason: "issue_assigned", source: "issue.update" },
+      });
+      expect(admitted).not.toBeNull();
+      await heartbeat.drainActiveRunExecutions();
+      const run = (await runById(admitted!.id))!;
+      expect(run.status).toBe("succeeded");
+      expect(handedOver(run)).toEqual(withActivity ? [before] : []);
+      expect((run.contextSnapshot as any).heldDependencyReason).toBe(withActivity ? "reassignment" : undefined);
+    }
+  }, 120_000);
 
   it("keeps a person's comment as a bounded interaction run on the blocked issue", async () => {
     const f = await seed();

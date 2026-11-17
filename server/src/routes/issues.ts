@@ -17183,7 +17183,8 @@ export function issueRoutes(
         // STUDIO-0063: every edit that changes the blocker set goes through the same function (ready, or only
         // cancelled blockers left). If the restored-blocked path above already woke the assignee, the two wakes merge
         // in addWakeup (same agent, same issue); the key carries the edit's time, so each such edit wakes once. A
-        // request that sends the same set again changes nothing and wakes nobody.
+        // request that sends the same set again is no change: this call sends nothing (the restored-blocked path
+        // above keeps its own rule).
         const previousBlockerIds = (existingRelations?.blockedBy ?? []).map((relation) => relation.id).sort();
         const nextBlockerIds = Array.isArray(req.body.blockedByIssueIds)
           ? [...new Set(req.body.blockedByIssueIds as string[])].sort() : previousBlockerIds;
