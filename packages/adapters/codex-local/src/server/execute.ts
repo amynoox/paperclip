@@ -1565,22 +1565,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
               errorMessage: fallbackErrorMessage,
             })
           : null;
+      // STUDIO-0065: a usage limit outranks a login failure. Both read the run's own error surface (parse.ts), so a
+      // transcript that quotes one cannot hide the other.
+      const providerQuota =
+        (attempt.proc.exitCode ?? 0) !== 0 &&
+        isCodexProviderQuotaError({
+          stdout: attempt.proc.stdout,
+          stderr: attempt.proc.stderr,
+          errorMessage: fallbackErrorMessage,
+        });
       const authRefreshFailure =
-        (attempt.proc.exitCode ?? 0) !== 0
+        (attempt.proc.exitCode ?? 0) !== 0 && !providerQuota
           ? classifyCodexAuthRefreshFailure({
               stdout: attempt.proc.stdout,
               stderr: attempt.proc.stderr,
               errorMessage: fallbackErrorMessage,
             })
           : null;
-      const providerQuota =
-        (attempt.proc.exitCode ?? 0) !== 0 &&
-        !authRefreshFailure &&
-        isCodexProviderQuotaError({
-          stdout: attempt.proc.stdout,
-          stderr: attempt.proc.stderr,
-          errorMessage: fallbackErrorMessage,
-        });
       const transientUpstream =
         (attempt.proc.exitCode ?? 0) !== 0 &&
         !authRefreshFailure &&

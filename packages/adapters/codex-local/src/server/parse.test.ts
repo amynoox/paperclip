@@ -177,6 +177,113 @@ describe("classifyCodexAuthRefreshFailure", () => {
     );
   });
 
+  // STUDIO-0065 (adapted from paperclipai/paperclip#15832, head 10be54bcba, and extended): the login and limit
+  // classifiers read the run's own error surface, never the output of a command nor the model's text.
+  describe("classifiers and the transcript (STUDIO-0065)", () => {
+    const event = (value: Record<string, unknown>) => JSON.stringify(value);
+    const commandOutput = (output: string) => event({
+      type: "item.completed",
+      item: { type: "command_execution", command: "curl -v https://api.example", aggregated_output: output, exit_code: 0 },
+    });
+    const agentText = (text: string) => event({ type: "item.completed", item: { type: "agent_message", text } });
+    const failed = (message: string) => [event({ type: "error", message }), event({ type: "turn.failed", error: { message } })];
+    const quoted = "< HTTP/1.1 401 Unauthorized\n< www-authenticate: Bearer error=\"invalid_token\", the bearer token expired";
+    const limit = "You've hit your usage limit for GPT-5.3-Codex. Switch to another model now, or try again at 11:31 PM.";
+
+    it.each([
+      "Invalid or expired refresh token",
+      "refresh_token_reused",
+      "credential refresh returned 401 Unauthorized",
+      quoted,
+      "OAuth failed: invalid_grant",
+    ])("does not classify a login loss when a failed run only quotes %s", (quotedError) => {
+      const providerError = "This content was flagged for possible cybersecurity risk.";
+      const stdout = [
+        event({ type: "thread.started", thread_id: "review-thread" }),
+        commandOutput(`throw unauthorized('${quotedError}');`),
+        agentText(quotedError),
+        ...failed(providerError),
+      ].join("\n");
+      expect(classifyCodexAuthRefreshFailure({ stdout, errorMessage: parseCodexJsonl(stdout).errorMessage })).toBeNull();
+      expect(parseCodexJsonl(stdout).errorMessage).toBe(providerError);
+    });
+
+    it("classifies a usage limit as a limit although the transcript quotes a login failure", () => {
+      const stdout = [
+        event({ type: "thread.started", thread_id: "t" }),
+        commandOutput(quoted),
+        agentText(`The API answered: ${quoted}`),
+        ...failed(limit),
+      ].join("\n");
+      const input = { stdout, stderr: "", errorMessage: parseCodexJsonl(stdout).errorMessage };
+      expect(isCodexProviderQuotaError(input)).toBe(true);
+      expect(classifyCodexAuthRefreshFailure(input)).toBeNull();
+      expect(extractCodexRetryNotBefore(input, new Date(2026, 3, 22, 22, 29, 2))?.getHours()).toBe(23);
+    });
+
+    it("does not classify a limit, a transient error or a retry time from the transcript alone", () => {
+      // The limit outranks the login failure, so a transcript that quotes a limit must not hide a real login loss.
+      const stdout = [
+        event({ type: "thread.started", thread_id: "t" }),
+        commandOutput(`${limit}\nWe're currently experiencing high demand, remote compact task failed`),
+        agentText(limit),
+        ...failed("OAuth failed: refresh_token_reused"),
+      ].join("\n");
+      const input = { stdout, stderr: "", errorMessage: parseCodexJsonl(stdout).errorMessage };
+      expect(isCodexProviderQuotaError(input)).toBe(false);
+      expect(isCodexTransientUpstreamError(input)).toBe(false);
+      expect(extractCodexRetryNotBefore(input)).toBeNull();
+      expect(classifyCodexAuthRefreshFailure(input)).toBe("refresh_token_reused");
+    });
+
+    it.each([
+      ["refresh_token_reused", "refresh_token_reused"],
+      ["refresh token has expired", "refresh_token_expired"],
+      ["OAuth failed: refresh_token_invalidated", "refresh_token_invalidated"],
+      ["OAuth failed: invalid_grant", "refresh_token_invalidated"],
+      ["credential refresh returned 401 Unauthorized", "refresh_token_invalidated"],
+    ])("still classifies a real protocol failure: %s", (message, expected) => {
+      const stdout = [event({ type: "thread.started", thread_id: "auth-thread" }), ...failed(message)].join("\n");
+      expect(classifyCodexAuthRefreshFailure({ stdout })).toBe(expected);
+      expect(isCodexProviderQuotaError({ stdout })).toBe(false);
+    });
+
+    it("still reads a login loss on stderr and on a plain stdout line, with or without protocol events", () => {
+      const transcript = [event({ type: "thread.started", thread_id: "t" }), agentText("Application error: refresh_token_reused")];
+      expect(classifyCodexAuthRefreshFailure({ stdout: transcript.join("\n"), stderr: "OAuth failed: refresh token has expired" }))
+        .toBe("refresh_token_expired");
+      expect(classifyCodexAuthRefreshFailure({ stdout: [...transcript, "OAuth failed: invalid_grant"].join("\n") }))
+        .toBe("refresh_token_invalidated");
+      expect(classifyCodexAuthRefreshFailure({ stdout: "OAuth failed: refresh_token_reused" })).toBe("refresh_token_reused");
+    });
+
+    it("uses the final protocol failure rather than a recovered earlier error", () => {
+      const stdout = [
+        event({ type: "error", message: "refresh_token_expired" }),
+        event({ type: "turn.failed", error: { message: "Unrelated provider failure" } }),
+      ].join("\n");
+      expect(classifyCodexAuthRefreshFailure({ stdout })).toBeNull();
+    });
+
+    it("ignores quoted login errors when the protocol stops without a terminal error", () => {
+      const stdout = commandOutput("Invalid or expired refresh token");
+      expect(classifyCodexAuthRefreshFailure({ stdout, stderr: "Process terminated unexpectedly" })).toBeNull();
+    });
+
+    it("does not read the cut head of a capped capture as plain text", () => {
+      // The capture keeps the last 4 MiB of stdout: its first line can be the tail of a command's output.
+      const fragment = `www-authenticate: Bearer error=\\"invalid_token\\" 401 Unauthorized","exit_code":0}}`;
+      const filler = `${agentText("x".repeat(1024))}\n`;
+      const body = filler.repeat(Math.ceil((4 * 1024 * 1024) / filler.length));
+      const stdout = `${fragment}\n${body}${failed("The model rejected the request.").join("\n")}`;
+      expect(stdout.length).toBeGreaterThanOrEqual(4 * 1024 * 1024);
+      expect(classifyCodexAuthRefreshFailure({ stdout })).toBeNull();
+      // The same words on a real first line of a short capture are the CLI's own plain text.
+      expect(classifyCodexAuthRefreshFailure({ stdout: "credential refresh returned 401 Unauthorized\n" }))
+        .toBe("refresh_token_invalidated");
+    });
+  });
+
   it("does not classify bare 401 or quota messages as auth-refresh failures", () => {
     expect(classifyCodexAuthRefreshFailure({ errorMessage: "chatgpt wham api returned 401" })).toBeNull();
     expect(classifyCodexAuthRefreshFailure({ errorMessage: "You've hit your usage limit for GPT-5." })).toBeNull();

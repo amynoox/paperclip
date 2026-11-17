@@ -2,6 +2,7 @@ import {
   asString,
   parseObject,
   parseJson,
+  MAX_CAPTURE_BYTES,
 } from "@paperclipai/adapter-utils/server-utils";
 
 const CODEX_TRANSIENT_UPSTREAM_RE =
@@ -142,6 +143,52 @@ export function isCodexUnknownSessionError(stdout: string, stderr: string): bool
   );
 }
 
+// STUDIO-0065 (adapted from paperclipai/paperclip#15832, head 10be54bcba, and extended): reduce a Codex stdout
+// stream to the run's own error surface.
+//
+// `codex exec --json` puts the whole transcript on stdout: the output of every command the agent ran
+// (`command_execution`), the model's text (`agent_message`), and the CLI's own protocol events. A transcript line that
+// merely quotes "401 Unauthorized ... bearer token" (an HTTP log, a source file under review) must not decide that the
+// account lost its login: one failed run would put every role that shares the account in error. Kept are:
+// - the last protocol error the CLI reported (an `error` event, or `turn.failed`): a recovered earlier error does
+//   not count;
+// - every stdout line that is not a JSON event: a CLI that fails before the protocol starts reports it as plain text.
+// Never kept: the content of an item, whatever its type.
+//
+// The capture keeps the last MAX_CAPTURE_BYTES of stdout, so its first line can be the cut tail of an event: that
+// fragment is not plain text.
+function codexStdoutErrorSurface(stdout: string): string {
+  const plainLines: string[] = [];
+  let lastProtocolError = "";
+  const lines = stdout.split(/\r?\n/);
+  const firstLineMayBeCut = stdout.length >= MAX_CAPTURE_BYTES;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!.trim();
+    if (!line) continue;
+
+    const parsedLine = parseJson(line) as unknown;
+    const event = parsedLine !== null && typeof parsedLine === "object" && !Array.isArray(parsedLine)
+      ? (parsedLine as Record<string, unknown>)
+      : null;
+    if (!event) {
+      if (index === 0 && firstLineMayBeCut) continue;
+      plainLines.push(line);
+      continue;
+    }
+
+    const type = asString(event.type, "");
+    const message = type === "error"
+      ? asString(event.message, "").trim()
+      : type === "turn.failed"
+      ? asString(parseObject(event.error).message, "").trim()
+      : "";
+    if (message) lastProtocolError = message;
+  }
+
+  return [...plainLines, lastProtocolError].filter(Boolean).join("\n");
+}
+
 function buildCodexErrorHaystack(input: {
   stdout?: string | null;
   stderr?: string | null;
@@ -149,7 +196,7 @@ function buildCodexErrorHaystack(input: {
 }): string {
   return [
     input.errorMessage ?? "",
-    input.stdout ?? "",
+    codexStdoutErrorSurface(input.stdout ?? ""),
     input.stderr ?? "",
   ]
     .join("\n")

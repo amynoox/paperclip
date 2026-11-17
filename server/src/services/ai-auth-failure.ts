@@ -1,4 +1,5 @@
 import { AI_PROVIDERS, AI_CONNECTION_CAPABILITIES, isAiConnectionCompatible, type AiConnectionBinding, type AiProvider } from "@paperclipai/shared";
+import { isCodexProviderQuotaError } from "@paperclipai/adapter-codex-local/server";
 
 type AuthenticationFailure = {
   errorCode?: string | null;
@@ -52,7 +53,12 @@ export function runResultReportsProviderLimit(resultJson: unknown): boolean {
   if (result.errorFamily === "provider_quota") return true;
   const apiError = typeof result.api_error === "string" ? result.api_error
     : result.api_error && typeof result.api_error === "object" ? JSON.stringify(result.api_error) : "";
-  return /(?:usage|rate)[_\s-]?limit/i.test(apiError);
+  if (/(?:usage|rate)[_\s-]?limit/i.test(apiError)) return true;
+  // STUDIO-0065: a Codex result stores the raw output and no status. The adapter's limit classifier reads only the
+  // run's own error surface (its last protocol error, the plain stdout lines, stderr), never the transcript.
+  const stdout = typeof result.stdout === "string" ? result.stdout : "";
+  const stderr = typeof result.stderr === "string" ? result.stderr : "";
+  return Boolean(stdout || stderr) && isCodexProviderQuotaError({ stdout, stderr });
 }
 
 export function isAiAuthenticationRepairable(run: AuthenticationFailure): boolean {

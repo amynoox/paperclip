@@ -316,10 +316,13 @@ function withCodexAcpDefaults(options: CodexAcpExecutorOptions): AcpxEngineExecu
 
 function withCodexAuthRefreshFailureClassification(result: AdapterExecutionResult): AdapterExecutionResult {
   if ((result.exitCode ?? 0) === 0) return result;
+  // STUDIO-0065: a run already classified as a usage limit stays a limit.
+  if (result.errorFamily === "provider_quota" || result.errorCode === "provider_quota") return result;
   const resultJson = parseObject(result.resultJson);
   const stopReason = asString(resultJson.stopReason, "");
+  // The run's own error and stop reason. Never `result.summary`: it is the model's last text (STUDIO-0065).
   const authFailure = classifyCodexAuthRefreshFailure({
-    errorMessage: [result.errorMessage ?? "", result.summary ?? "", stopReason]
+    errorMessage: [result.errorMessage ?? "", stopReason]
       .map((line) => line.trim())
       .filter(Boolean)
       .join("\n"),
