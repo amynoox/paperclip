@@ -952,6 +952,115 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
     expect(await heartbeat.reconcileHeldCommentHandover({ companyId: f.companyId, issueId: f.taskId })).toBe("live_path");
   }, 120_000);
 
+  // Bench, studio.22 candidate: the blocker is also a CHILD of the dependent (its parent). Each wired path gives the
+  // parent's assignee exactly ONE wake request for the finished or cancelled child, and the held comment reaches it.
+  const childBlocksParent = async () => {
+    const f = await seed();
+    await db.update(issues).set({ parentId: f.taskId }).where(eq(issues.id, f.blockerId));
+    return f;
+  };
+  // The parent's wake requests about its blocker, as "reason:actor". Apart: the delivery rows of the native wake
+  // dispatcher and the backstop's own wake.
+  const blockerWakes = async (f: Fixture) => (await db.select().from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.agentId, f.devId), sql`${agentWakeupRequests.payload}->>'issueId' = ${f.taskId}`,
+    sql`${agentWakeupRequests.reason} in ('issue_children_completed', 'issue_blockers_resolved', 'issue_commented')`)))
+    .filter(row => !String(row.requestedByActorId ?? "").startsWith("native-status-wake-dispatch:"))
+    .filter(row => row.requestedByActorId !== "held_comment_handover_backstop")
+    .filter(row => row.reason !== "issue_commented" || Boolean((row.payload as any)?.cancelledBlockerIssueId))
+    .map(row => `${row.reason}:${row.requestedByActorId}`).sort();
+
+  it("gives the parent one wake when a native decision finishes a child that blocks it, and that wake hands the comment over", async () => {
+    const f = await childBlocksParent();
+    const held = await heldComment(f, "Held until the child that blocks this task is done (native).");
+    await taskQuiet(f);
+    await nativeDecision(f, "done");
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    // The decision's own transaction woke the parent, with `issue_children_completed`; nothing is added after commit.
+    expect(await blockerWakes(f)).toEqual(["issue_children_completed:native-status-committer"]);
+    // That wake, delivered by the native wake dispatcher, is admitted with the hand-over.
+    await heartbeat.dispatchPendingNativeStatusWakeups({ companyId: f.companyId });
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect((run.contextSnapshot as any).wakeReason).toBe("issue_children_completed");
+    expect(run.status).toBe("succeeded");
+    expect(await blockerWakes(f)).toEqual(["issue_children_completed:native-status-committer"]);
+  }, 120_000);
+
+  it("hands the comment over through the backstop when the native decision's own wake is not delivered", async () => {
+    const f = await childBlocksParent();
+    const held = await heldComment(f, "Held; the native wake of the parent is lost.");
+    await taskQuiet(f);
+    await nativeDecision(f, "done");
+    const scope = { companyId: f.companyId, issueId: f.taskId };
+    expect(await heartbeat.reconcileHeldCommentHandover(scope)).toBe("live_path");
+    await db.update(agentWakeupRequests).set({ status: "failed", finishedAt: new Date() }).where(and(
+      eq(agentWakeupRequests.agentId, f.devId), eq(agentWakeupRequests.requestedByActorId, "native-status-committer")));
+    expect(await heartbeat.reconcileHeldCommentHandover(scope)).toBe("woken");
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect((run.contextSnapshot as any).source).toBe("issue.held_comment_handover_backstop");
+    expect(await blockerWakes(f)).toEqual(["issue_children_completed:native-status-committer"]);
+  }, 120_000);
+
+  it("gives the parent one wake, the hand-back, when a native decision cancels the child that blocks it", async () => {
+    const f = await childBlocksParent();
+    const held = await heldComment(f, "Held until the child that blocks this task is cancelled (native).");
+    await taskQuiet(f);
+    await nativeDecision(f, "cancelled");
+    const run = await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.cancelledBlockerIssueId === f.blockerId);
+    expect(handedOver(run)).toEqual([held]);
+    await taskQuiet(f);
+    expect(await blockerWakes(f)).toEqual(["issue_commented:cancelled_blocker_handoff"]);
+  }, 120_000);
+
+  it("gives the parent one wake when the route makes the child that blocks it done", async () => {
+    const f = await childBlocksParent();
+    const held = await heldComment(f, "Held until the child that blocks this task is done (route).");
+    await taskQuiet(f);
+    await setStatus(f, f.blockerId, "done");
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect(run.status).toBe("succeeded");
+    await taskQuiet(f);
+    expect(await blockerWakes(f)).toHaveLength(1);
+  }, 120_000);
+
+  // The route keeps one wake per agent and issue in a request, as before this change. When it cancels a child that
+  // blocks its parent, the parent's `issue_children_completed` wake takes the slot of the STUDIO-0029 hand-back wake,
+  // and the dependency gate holds it (the cancelled blocker stays unresolved): on fb1ad740 the parent's assignee is
+  // then never woken. Here the route still sends ONE request, and the backstop hands the dependency back.
+  it("sends one request when the route cancels the child that blocks its parent, and the backstop hands it back", async () => {
+    const f = await childBlocksParent();
+    const held = await heldComment(f, "Held until the child that blocks this task is cancelled (route).");
+    await taskQuiet(f);
+    const before = (await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests)
+      .where(eq(agentWakeupRequests.agentId, f.devId))).map(row => row.id);
+    await setStatus(f, f.blockerId, "cancelled");
+    await new Promise(resolve => setTimeout(resolve, 1500));
+    await taskQuiet(f);
+    const sent = (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.devId),
+      sql`${agentWakeupRequests.payload}->>'issueId' = ${f.taskId}`))).filter(row => !before.includes(row.id));
+    expect(sent.map(row => ({ status: row.status, reason: row.reason }))).toEqual([{ status: "skipped", reason: "issue_dependencies_blocked" }]);
+    expect((await devRuns(f)).filter(carrying(held))).toEqual([]);
+    expect(await heartbeat.reconcileHeldCommentHandover({ companyId: f.companyId, issueId: f.taskId })).toBe("handed_back");
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect((run.contextSnapshot as any).cancelledBlockerIssueId).toBe(f.blockerId);
+    expect(run.status).toBe("succeeded");
+  }, 120_000);
+
+  for (const [name, effect] of [
+    ["update_issue_status", (f: Fixture) => ({ type: "update_issue_status", targetIssueId: f.blockerId, staleness: "lenient", status: "done" })],
+    ["cancel_issue_tree", (f: Fixture) => ({ type: "cancel_issue_tree", targetIssueId: f.blockerId, staleness: "lenient", reasonComment: "cleanup" })],
+  ] as const) {
+    it(`gives the parent one wake when a ${name} decision ends the child that blocks it`, async () => {
+      const f = await childBlocksParent();
+      const held = await heldComment(f, `Held until a ${name} decision ends the child that blocks this task.`);
+      await taskQuiet(f);
+      await decide(f, effect(f));
+      const run = await runWhere(f.devId, f.taskId, carrying(held));
+      expect(run.status).toBe("succeeded");
+      await taskQuiet(f);
+      expect(await blockerWakes(f)).toHaveLength(1);
+    }, 120_000);
+  }
+
   // The pilot's silence: D waits on A and B, a comment is held, A is cancelled by a native decision, then B is done.
   it("hands the dependency back when a native decision cancels a blocker, then again when only cancelled ones are left", async () => {
     const f = await seed({ blocked: false });

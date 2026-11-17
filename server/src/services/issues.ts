@@ -344,6 +344,8 @@ export type IssueDependenciesChangedAction = {
   completedAt: Date | string | null;
   at: Date | string;
   actor: { type: "user" | "agent" | "system"; id: string | null };
+  /** The committing transaction already woke the ready dependents (see wakeDependentsAfterDependencyChange). */
+  readyAlreadyWoken?: boolean;
 };
 
 /** Execute side effects that must never run before the issue transaction commits. */
@@ -374,6 +376,7 @@ export async function executeIssuePostCommitActions(
             : { id: action.issueId, identifier: action.identifier, completedAt: action.completedAt },
           actor: action.actor,
           at: new Date(action.at),
+          readyAlreadyWoken: action.readyAlreadyWoken === true,
           wake: async (agentId, request) => {
             await heartbeat.wakeup(agentId, request as never).catch((err: unknown) =>
               logger.warn({ err, issueId: action.issueId, agentId }, "dependency change wake failed"));

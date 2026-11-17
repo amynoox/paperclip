@@ -2633,9 +2633,10 @@ export async function commitNativeStatusDecision(input: {
   for (const publication of publications) publishActivity(publication);
   for (const terminalRun of terminalRunsToEmit)
     await emitAgentTaskRun(input.db, terminalRun);
-  // STUDIO-0063: after commit, the one function decides the dependents' wakes of a blocker this decision made done
-  // or cancelled: ready dependents (already woken in the transaction above for done; deduplicated on the ready state),
-  // and dependents left waiting only on cancelled blockers (handed back, as STUDIO-0029 does for the route).
+  // STUDIO-0063: after commit, the one function handles what this transaction does not for the dependents of a
+  // blocker this decision made done or cancelled: the dependents left waiting only on cancelled blockers (handed
+  // back, as STUDIO-0029 does for the route). The ready dependents of a done blocker were woken in the transaction
+  // above (a dependent that is also this child's parent with `issue_children_completed`): no ready wake is added.
   const committedIssue = (committed as { issue?: typeof issues.$inferSelect | null; replayed?: boolean } | null)?.issue;
   if (committedIssue && !(committed as { replayed?: boolean }).replayed && input.priorStatus !== committedIssue.status &&
     (committedIssue.status === "done" || committedIssue.status === "cancelled")) {
@@ -2645,6 +2646,7 @@ export async function commitNativeStatusDecision(input: {
       issueId: committedIssue.id, identifier: committedIssue.identifier ?? null,
       completedAt: committedIssue.completedAt ?? null, at: committedIssue.updatedAt,
       actor: { type: "system", id: "native_status_decision" },
+      readyAlreadyWoken: committedIssue.status === "done",
     }]);
   }
   return committed;

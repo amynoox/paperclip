@@ -48,6 +48,13 @@ export async function wakeDependentsAfterDependencyChange(db: Db, input: {
    */
   readyDependents?: ReadonlyArray<{ id: string; assigneeAgentId: string; blockerIssueIds: string[];
     blockedTransitionAt?: Date | string | null }>;
+  /**
+   * The caller's own transaction already woke every ready dependent (the native status decision on `done`, which
+   * wakes a dependent that is also the completed child's parent with `issue_children_completed`, a wake the
+   * ready-state lookup does not know). No ready wake is sent here; only the hand-back of the dependents left with
+   * cancelled blockers.
+   */
+  readyAlreadyWoken?: boolean;
 }): Promise<Array<{ dependentIssueId: string; outcome: "ready" | "handed_back" }>> {
   const out: Array<{ dependentIssueId: string; outcome: "ready" | "handed_back" }> = [];
   // An unknown change time (a caller without updatedAt) falls back to now: the key stays unique per change.
@@ -136,6 +143,7 @@ export async function wakeDependentsAfterDependencyChange(db: Db, input: {
       continue;
     }
     if (ready.isDependencyReady) {
+      if (input.readyAlreadyWoken) continue;
       if (ready.blockerIssueIds.length > 0) {
         const existing = await findExistingIssueBlockersResolvedWakeForReadyState(db, {
           companyId: input.companyId, dependentIssueId: id, blockerIssueIds: ready.blockerIssueIds,
