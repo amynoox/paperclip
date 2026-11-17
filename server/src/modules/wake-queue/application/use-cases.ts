@@ -1,5 +1,5 @@
 import { readWakeChatConversationId } from "../../run-dispatch/index.js";
-import { isAdapterDeclaredWaitErrorCode } from "../../../services/recovery/adapter-declared-wait.js";
+import { isAdapterDeclaredWaitErrorCode, routerRefusalOutcome } from "../../../services/recovery/adapter-declared-wait.js";
 import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun } from "../domain/context.js";
 import {
   decideQueuedCommentAction,
@@ -665,6 +665,8 @@ async function runReleaseRecoveryTail(
       isStrandedRecoveryOrigin,
       recoveryAgentPresent: recoveryAgent !== null,
       recoveryAgentInvokable: recoveryAgent?.invokable ?? false,
+      routerRefusal:
+        run.status === "failed" ? routerRefusalOutcome(run.errorCode, issue.status) : null,
     },
   });
 
