@@ -1,8 +1,8 @@
 // STUDIO-0063 (accepted by the owner): when the dependency gate holds an agent's comment for the assignee, one system
 // note tells the thread (people, the watch, the commenter) that it waits. It gives no advice: a question card
-// addressed to the assignee is refused by the worker router when the assignee is a routed role. It is a signal only; the handover never depends on it. One note per assignee and per series: none for this assignee since
-// the start of its latest qualified run (the handover's base), under a lock on the issue row so two holds cannot both
-// write it. It wakes nobody (a system comment written by the service, outside the comment route). If a cut prevents
+// addressed to the assignee is refused by the worker router when the assignee is a routed role. It is a signal only;
+// the handover never depends on it. One note per assignee and per series: none for this assignee since the start of
+// its latest qualified run (the handover's base), under a lock on the issue row so two holds cannot both write it. It wakes nobody (a system comment written by the service, outside the comment route). If a cut prevents
 // it, the next hold writes it.
 // Not handled here (moved to the next batch): the note's other review points and the dotEvents noise.
 import { and, eq, gt, inArray, like } from "drizzle-orm";
