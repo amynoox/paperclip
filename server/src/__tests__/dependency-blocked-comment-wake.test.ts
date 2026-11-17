@@ -1095,9 +1095,11 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
     await heldComment(f, "Second held note.");
     const [note, ...more] = await notes();
     expect(more).toEqual([]);
-    expect(note!.body).toContain("A comment from CTO waits for");
-    expect(note!.body).toContain("Dev");
-    expect(note!.body).toContain("question card");
+    // The note says that the comment waits, and nothing else: no advice to put a question card, which the worker
+    // router refuses when the assignee is a routed role.
+    expect(note!.body).toMatch(/^A comment from CTO waits for \S+ to resolve before it reaches Dev\.\n\n<!-- held-dependency-comment-notice -->\n<!-- held-dependency-comment-notice-for:[0-9a-f-]+ -->$/);
+    expect(note!.body).not.toContain("question card");
+    expect(note!.body).not.toContain("For an answer before");
     // Only the two held comment wakes were recorded (the gate's own skips); no wake and no run for anyone else.
     const wakesAfter = await companyWakes();
     expect(wakesAfter.length - wakesBefore).toBe(2);

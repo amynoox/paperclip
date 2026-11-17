@@ -1,6 +1,6 @@
 // STUDIO-0063 (accepted by the owner): when the dependency gate holds an agent's comment for the assignee, one system
-// note tells the thread (people, the watch, the commenter) that it waits, and how to get an answer before. It is a
-// signal only; the handover never depends on it. One note per assignee and per series: none for this assignee since
+// note tells the thread (people, the watch, the commenter) that it waits. It gives no advice: a question card
+// addressed to the assignee is refused by the worker router when the assignee is a routed role. It is a signal only; the handover never depends on it. One note per assignee and per series: none for this assignee since
 // the start of its latest qualified run (the handover's base), under a lock on the issue row so two holds cannot both
 // write it. It wakes nobody (a system comment written by the service, outside the comment route). If a cut prevents
 // it, the next hold writes it.
@@ -59,8 +59,7 @@ async function writeNoticeOnce(db: Db, input: Parameters<typeof noteHeldAgentCom
   const blockerList = blockers.map(row => row.identifier ?? row.id).join(", ") || "its blockers";
   const body =
     `A comment from ${commenter?.name ?? "another agent"} waits for ${blockerList} to resolve before it reaches ` +
-    `${assignee?.name ?? "the assignee"}. For an answer before, put a question card addressed to ` +
-    `${assignee?.name ?? "the assignee"} on your own task.\n\n${HELD_DEPENDENCY_NOTICE_MARKER}\n` +
+    `${assignee?.name ?? "the assignee"}.\n\n${HELD_DEPENDENCY_NOTICE_MARKER}\n` +
     noticeAssigneeMarker(input.assigneeAgentId);
   await insertIssueComment(db, { companyId: input.companyId, issueId: input.issueId, authorType: "system", body });
   return true;

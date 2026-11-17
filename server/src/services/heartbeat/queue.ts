@@ -4662,7 +4662,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // the CTO set a blocker and commented in one call at 21:03:58; the assignment wake was held as
           // issue_dependencies_blocked but the comment wake started the Dev's run at 21:04:02). An agent that needs
           // the blocked assignee puts a card on its OWN issue addressed to that assignee: the assignee answers it there
-          // as a named responder (verifyNonAssigneeAddresseeInteractionWake), whatever its own issue waits on.
+          // as a named responder (verifyNonAssigneeAddresseeInteractionWake), whatever its own issue waits on. That
+          // path is refused when the assignee is a routed role: the worker router rejects the card addressee's run
+          // (router_ticket_not_assigned_to_agent) before any reservation.
           // Only the assignee is held, and a run carrying a person's comment keeps the exception
           // (agentCommentHeldByDependencies, shared with the claim gate).
           const agentCommentHeld = Boolean(dependencyReadiness && !dependencyReadiness.isDependencyReady) &&
