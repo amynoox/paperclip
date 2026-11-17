@@ -1,7 +1,8 @@
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { agentCommentHeldByDependencies, allUnresolvedBlockersCancelled, HELD_DEPENDENCY_COMMENT_IDS_KEY,
-  HELD_DEPENDENCY_OLDER_COUNT_KEY, HELD_DEPENDENCY_REASON_KEY, isDependencyHandoffWake, readCommentsToHandOver,
+  HELD_DEPENDENCY_HANDOVER_AT_KEY, HELD_DEPENDENCY_OLDER_COUNT_KEY, HELD_DEPENDENCY_REASON_KEY, isDependencyHandoffWake,
+  readCommentsToHandOver,
   wakeContextCommentIds } from "./held-dependency-comments.js";
 import { noteHeldAgentComment } from "./held-dependency-notice.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
@@ -4748,7 +4749,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           // blockers done or removed, reassignment, reopening), when every unresolved blocker is cancelled, or when it
           // is asked to act on a stalled or cancelled blocker. The thread is the record (held-dependency-comments.ts):
           // every agent comment after the start of the assignee's latest qualified run; the latest twenty named, the
-          // older ones counted. Nothing is lost if a run fails: the next one carries them again.
+          // older ones counted, and only after a trace of a hold or a reassignment. Nothing is lost if a run fails:
+          // the next one carries them again.
           if (
             issue.assigneeAgentId && agentId === issue.assigneeAgentId &&
             (dependencyReadiness?.isDependencyReady !== false ||
@@ -4756,13 +4758,22 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               await allUnresolvedBlockersCancelled(tx as unknown as Db, { companyId: issue.companyId,
                 unresolvedBlockerIssueIds: dependencyReadiness?.unresolvedBlockerIssueIds ?? [] }))
           ) {
+            // The time of this computation is the run's hand-over base if it qualifies (taken before the read, so a
+            // comment written meanwhile stays after it).
+            const handoverAt = new Date();
             const handOver = await readCommentsToHandOver(tx as unknown as Db, {
               companyId: issue.companyId, issueId: issue.id, assigneeAgentId: agentId,
               excludeCommentIds: wakeContextCommentIds(enrichedContextSnapshot),
             });
+            enrichedContextSnapshot[HELD_DEPENDENCY_HANDOVER_AT_KEY] = handoverAt.toISOString();
+            delete enrichedContextSnapshot[HELD_DEPENDENCY_COMMENT_IDS_KEY];
+            delete enrichedContextSnapshot[HELD_DEPENDENCY_REASON_KEY];
+            delete enrichedContextSnapshot[HELD_DEPENDENCY_OLDER_COUNT_KEY];
+            // The trace found is recorded even when no comment is due: this run then settles every trace up to its
+            // hand-over time (readHandOverBase).
+            if (handOver.reason) enrichedContextSnapshot[HELD_DEPENDENCY_REASON_KEY] = handOver.reason;
             if (handOver.ids.length) {
               enrichedContextSnapshot[HELD_DEPENDENCY_COMMENT_IDS_KEY] = handOver.ids;
-              enrichedContextSnapshot[HELD_DEPENDENCY_REASON_KEY] = handOver.reason;
               if (handOver.olderCount > 0) enrichedContextSnapshot[HELD_DEPENDENCY_OLDER_COUNT_KEY] = handOver.olderCount;
             }
           }

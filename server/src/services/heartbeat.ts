@@ -1750,11 +1750,15 @@ export function heartbeatService(
 
   // STUDIO-0063: the periodic hand-over backstop for one issue (held-comment-handover-backstop.ts). Run by the
   // stranded-assignment and resolved-dependency recovery queues before their own pass; never fails that pass.
-  async function reconcileHeldCommentHandover(scope: { companyId: string; issueId: string }) {
+  async function reconcileHeldCommentHandover(scope: {
+    companyId: string; issueId: string; now?: Date; onDeferredDeadline?: (at: number) => void;
+  }) {
     try {
       return await reconcileHeldCommentHandoverForIssue(db, {
         companyId: scope.companyId,
         issueId: scope.issueId,
+        now: scope.now,
+        onDeferredDeadline: scope.onDeferredDeadline,
         wake: (agentId, request) => enqueueWakeup(agentId, request as Parameters<typeof enqueueWakeup>[1]),
         invocationBlocked: async (agentId, issueId) =>
           Boolean(await budgets.getInvocationBlock(scope.companyId, agentId, { issueId, projectId: null })),

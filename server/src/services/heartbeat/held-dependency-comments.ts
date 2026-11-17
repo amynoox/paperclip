@@ -1,13 +1,22 @@
 // STUDIO-0063: an agent's comment on an issue that waits on unresolved blockers does not start the assignee's run
 // (production 15 Nov 2026, TR-1258); it waits with the issue and is handed to the assignee later.
-// - One decision for both gates (admission and claim): agentCommentHeldByDependencies. Nothing is recorded.
-// - Handover, only after an atomic trace of a hold of the current assignee (or a reassignment to it) since the BASE: the start of the current
-//   assignee's latest QUALIFIED run on the issue (admitted with the issue ready, not under a person's, card's or
-//   stall's bounded exception; processStartedAt set; succeeded), or the whole thread without one. The traces are the
-//   admission's skipped `issue_dependencies_blocked` request (written in the hold's own transaction), the claim
-//   gate's run cancelled with errorCode `issue_dependencies_blocked` (one write), and an `issue.updated` activity
-//   that moved the issue to the current assignee. The run then carries every agent comment (not the assignee's own)
-//   written after the base. Without a trace nothing is computed: an issue that was never held is unchanged.
+// - One decision for both gates (admission and claim): agentCommentHeldByDependencies.
+// - The hand-over BASE of the current assignee on the issue: the time its latest QUALIFIED run was given its
+//   hand-over. A run qualifies when it succeeded with its engine process started (processStartedAt) and its admission
+//   computed a hand-over (it then carries heldDependencyHandoverAt, the time of that computation: the issue was ready,
+//   or every unresolved blocker cancelled, or it was a stall or cancel hand-off wake). A run of before this change
+//   (no such key) qualifies when it was not a bounded dependency run, with its start as the time. The base is the
+//   ADMISSION time, not the start: a comment held after a queued run's admission stays after the base.
+// - Hand-over, only after a trace since the base: a hold (the admission's skipped `issue_dependencies_blocked`
+//   request, written in the hold's own transaction; or a run the claim gate cancelled with that errorCode, one
+//   write) or an activity that reassigned the issue to the assignee. The run then carries every agent comment (not
+//   the assignee's own) written since the base. Without a trace no comment is read: an issue that was never held is
+//   unchanged (its runs only get the hand-over time in their context, which no prompt shows).
+// - Times: the hand-over time and the hold traces are stamped by the server while it works on the issue. A run
+//   whose admission found a trace read every comment committed before it, so it settles every trace up to its
+//   hand-over time. A run whose admission found none settles traces only up to HANDOVER_CLOCK_MARGIN_MS before its
+//   hand-over time (a hold being written at that very moment), and comments are always read from that margin
+//   before the base: an error can only repeat a comment, never lose one.
 // - For a routed run, processStartedAt means "the command left for the worker machine" (the router passes onSpawn
 //   through before the engine starts there); succeeded is the real proof. A run that succeeded without
 //   processStartedAt (its write is only logged when it fails) does not qualify: at worst a repeat, never a loss.
@@ -20,6 +29,13 @@ import { insertIssueComment } from "../issue-comment-writes.js";
 export const HELD_DEPENDENCY_COMMENT_IDS_KEY = "heldDependencyCommentIds";
 export const HELD_DEPENDENCY_OLDER_COUNT_KEY = "heldDependencyOlderCount";
 export const HELD_DEPENDENCY_REASON_KEY = "heldDependencyReason";
+export const HELD_DEPENDENCY_HANDOVER_AT_KEY = "heldDependencyHandoverAt";
+/** The context keys of a hand-over, kept as one set when run contexts are merged. */
+export const HELD_DEPENDENCY_CONTEXT_KEYS = [
+  HELD_DEPENDENCY_COMMENT_IDS_KEY, HELD_DEPENDENCY_OLDER_COUNT_KEY, HELD_DEPENDENCY_REASON_KEY, HELD_DEPENDENCY_HANDOVER_AT_KEY,
+] as const;
+/** Margin for interleaved transactions and small clock differences between the server and the database. */
+export const HANDOVER_CLOCK_MARGIN_MS = 10_000;
 export const HELD_DEPENDENCY_COMMENTS_SHOWN_MAX = 20;
 
 type Reader = Pick<Db, "select">;
@@ -102,55 +118,101 @@ export function isDependencyHandoffWake(context: Record<string, unknown>): boole
     || readString(context.cancelledBlockerIssueId) !== null;
 }
 
-/** Start of the assignee's latest qualified run on the issue (see the header); null without one. */
-export async function readLatestQualifiedRunStart(db: Reader, input: {
+export type HandOverBase = {
+  /** The hand-over time of the assignee's latest qualified run; null without one. */
+  since: Date | null;
+  /** Hold traces and reassignments after this time are still due (see the header for the margin). */
+  traceSince: Date | null;
+  /** Comments the latest qualified runs already carried: never repeated, although comments are read from the margin. */
+  carriedCommentIds: string[];
+};
+
+/** The assignee's hand-over base on the issue (see the header). */
+export async function readHandOverBase(db: Reader, input: {
   companyId: string;
   issueId: string;
   agentId: string;
-}): Promise<Date | null> {
-  const [run] = await db.select({ startedAt: heartbeatRuns.startedAt }).from(heartbeatRuns).where(and(
+}): Promise<HandOverBase> {
+  const context = heartbeatRuns.contextSnapshot;
+  const hasMarker = sql`(jsonb_typeof(${context}->'heldDependencyHandoverAt') = 'string'
+    and ${context}->>'heldDependencyHandoverAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T')`;
+  const handedOverAt = sql`(case when ${hasMarker}
+    then (${context}->>'heldDependencyHandoverAt')::timestamptz else ${heartbeatRuns.startedAt} end)`;
+  // The latest qualified runs: the first gives the base; the few within the margin of it refine what is settled.
+  const rows = await db.select({
+    handedOverAt: sql<string>`${handedOverAt}`,
+    foundTrace: sql<boolean>`(${hasMarker} and jsonb_typeof(${context}->'heldDependencyReason') = 'string')`,
+    context,
+  }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.agentId, input.agentId),
-    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
+    sql`${context}->>'issueId' = ${input.issueId}`,
     eq(heartbeatRuns.status, "succeeded"),
     isNotNull(heartbeatRuns.processStartedAt),
     isNotNull(heartbeatRuns.startedAt),
-    sql`coalesce(${heartbeatRuns.contextSnapshot}->>'dependencyBlockedInteraction', 'false') <> 'true'`,
-  )).orderBy(desc(heartbeatRuns.startedAt), desc(heartbeatRuns.id)).limit(1);
-  return run?.startedAt ?? null;
+    sql`(${hasMarker} or coalesce(${context}->>'dependencyBlockedInteraction', 'false') <> 'true')`,
+  )).orderBy(sql`${handedOverAt} desc`).limit(8);
+  const runs = rows.map(row => ({ at: new Date(row.handedOverAt), foundTrace: row.foundTrace === true,
+    context: (row.context ?? {}) as Record<string, unknown> })).filter(run => !Number.isNaN(run.at.getTime()));
+  if (runs.length === 0) return { since: null, traceSince: null, carriedCommentIds: [] };
+  const since = runs[0]!.at;
+  const traceSince = new Date(Math.max(...runs.map(run => run.at.getTime() - (run.foundTrace ? 0 : HANDOVER_CLOCK_MARGIN_MS))));
+  const carried = new Set<string>();
+  for (const run of runs) {
+    if (run.at.getTime() < since.getTime() - HANDOVER_CLOCK_MARGIN_MS) continue;
+    for (const id of wakeContextCommentIds(run.context)) carried.add(id);
+    const held = run.context[HELD_DEPENDENCY_COMMENT_IDS_KEY];
+    if (Array.isArray(held)) for (const value of held) { const id = readString(value); if (id) carried.add(id); }
+  }
+  return { since, traceSince, carriedCommentIds: [...carried] };
 }
 
 /**
- * The agent comments the assignee may not have seen: after the start of its latest qualified run (or the whole
- * thread). The latest twenty, oldest first, and how many older ones the thread holds.
+ * Whether the issue carries a hold trace still due: the admission's skipped `issue_dependencies_blocked` request (a
+ * coalesced automatic hold only moves `updatedAt`), or a run the claim gate cancelled with that errorCode (at its
+ * cancellation time). The assignee's own holds; and, while it has no base on the issue (it never completed a run
+ * here), a hold of any agent: the issue was held for a previous assignee.
  */
+export async function hasHoldTraceSince(db: Reader, input: {
+  companyId: string;
+  issueId: string;
+  assigneeAgentId: string;
+  base: HandOverBase;
+}): Promise<boolean> {
+  const floor = input.base.traceSince;
+  const ownOnly = input.base.since !== null;
+  const [skipped] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, input.companyId),
+    ownOnly ? eq(agentWakeupRequests.agentId, input.assigneeAgentId) : undefined,
+    eq(agentWakeupRequests.status, "skipped"),
+    eq(agentWakeupRequests.reason, "issue_dependencies_blocked"),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
+    floor ? or(gt(agentWakeupRequests.requestedAt, floor), gt(agentWakeupRequests.updatedAt, floor),
+      gt(agentWakeupRequests.finishedAt, floor)) : undefined,
+  )).limit(1);
+  if (skipped) return true;
+  const [cancelledAtClaim] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, input.companyId),
+    ownOnly ? eq(heartbeatRuns.agentId, input.assigneeAgentId) : undefined,
+    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
+    eq(heartbeatRuns.status, "cancelled"),
+    eq(heartbeatRuns.errorCode, "issue_dependencies_blocked"),
+    floor ? sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.updatedAt}) > ${floor.toISOString()}::timestamptz` : undefined,
+  )).limit(1);
+  return Boolean(cancelledAtClaim);
+}
+
 export type HandOverReason = "dependency_hold" | "reassignment";
 
-/** The trace that calls for a handover since the base (see the header), or null. */
+/** The trace that calls for a hand-over since the base (see the header), or null. */
 export async function readHandOverReason(db: Reader, input: {
   companyId: string;
   issueId: string;
   assigneeAgentId: string;
-  since: Date | null;
+  base: HandOverBase;
 }): Promise<HandOverReason | null> {
-  const [skipped] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, input.companyId),
-    eq(agentWakeupRequests.agentId, input.assigneeAgentId),
-    eq(agentWakeupRequests.status, "skipped"),
-    eq(agentWakeupRequests.reason, "issue_dependencies_blocked"),
-    sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
-    input.since ? gt(agentWakeupRequests.requestedAt, input.since) : undefined,
-  )).limit(1);
-  if (skipped) return "dependency_hold";
-  const [cancelledAtClaim] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-    eq(heartbeatRuns.companyId, input.companyId),
-    eq(heartbeatRuns.agentId, input.assigneeAgentId),
-    sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
-    eq(heartbeatRuns.status, "cancelled"),
-    eq(heartbeatRuns.errorCode, "issue_dependencies_blocked"),
-    input.since ? gt(heartbeatRuns.createdAt, input.since) : undefined,
-  )).limit(1);
-  if (cancelledAtClaim) return "dependency_hold";
+  if (await hasHoldTraceSince(db, input)) return "dependency_hold";
+  const floor = input.base.traceSince;
   const [reassigned] = await db.select({ id: activityLog.id }).from(activityLog).where(and(
     eq(activityLog.companyId, input.companyId),
     eq(activityLog.entityType, "issue"),
@@ -168,32 +230,37 @@ export async function readHandOverReason(db: Reader, input: {
         sql`${activityLog.details}->>'previousAssigneeAgentId' is distinct from ${input.assigneeAgentId}`,
       ),
     ),
-    input.since ? gt(activityLog.createdAt, input.since) : undefined,
+    floor ? gt(activityLog.createdAt, floor) : undefined,
   )).limit(1);
   return reassigned ? "reassignment" : null;
 }
 
+/**
+ * The agent comments the assignee may not have seen: written since its base (or the whole thread), when a trace calls
+ * for a hand-over. The latest twenty, oldest first, and how many older ones the thread holds.
+ */
 export async function readCommentsToHandOver(db: Reader, input: {
   companyId: string;
   issueId: string;
   assigneeAgentId: string;
   excludeCommentIds?: readonly string[];
 }): Promise<{ ids: string[]; olderCount: number; reason: HandOverReason | null }> {
-  const since = await readLatestQualifiedRunStart(db, {
+  const base = await readHandOverBase(db, {
     companyId: input.companyId, issueId: input.issueId, agentId: input.assigneeAgentId,
   });
-  // Nothing without a trace: an issue that was never held (nor reassigned) gets no handover. The trace reads above
-  // run on every admitted wake of the assignee (a few indexed reads); the comment read only after a trace.
-  const reason = await readHandOverReason(db, { ...input, since });
+  // Nothing without a trace: an issue that was never held (nor reassigned) gets no hand-over. The base and trace
+  // reads run on every admitted wake of the assignee that can act (a few reads); the comments only after a trace.
+  const reason = await readHandOverReason(db, { ...input, base });
   if (!reason) return { ids: [], olderCount: 0, reason: null };
-  const exclude = [...new Set(input.excludeCommentIds ?? [])];
+  const floor = base.since ? new Date(base.since.getTime() - HANDOVER_CLOCK_MARGIN_MS) : null;
+  const exclude = [...new Set([...(input.excludeCommentIds ?? []), ...base.carriedCommentIds])];
   const where = and(
     eq(issueComments.companyId, input.companyId),
     eq(issueComments.issueId, input.issueId),
     eq(issueComments.authorType, "agent"),
     or(isNull(issueComments.authorAgentId), ne(issueComments.authorAgentId, input.assigneeAgentId)),
     isNull(issueComments.deletedAt),
-    since ? gt(issueComments.createdAt, since) : undefined,
+    floor ? gt(issueComments.createdAt, floor) : undefined,
     exclude.length ? sql`${issueComments.id} not in (${sql.join(exclude.map(id => sql`${id}::uuid`), sql`, `)})` : undefined,
   );
   const latest = await db.select({ id: issueComments.id }).from(issueComments).where(where)
@@ -214,6 +281,8 @@ export async function readCommentsToHandOver(db: Reader, input: {
 export async function handBackDependentsLeftWithCancelledBlockers(db: Db, input: {
   companyId: string;
   dependentIds: readonly string[];
+  /** The backstop wakes again on the hand-back comment even when an earlier wake of it exists. */
+  evenIfWoken?: boolean;
 }): Promise<Array<{ dependentId: string; assigneeAgentId: string; commentId: string; cancelledBlockerIssueId: string }>> {
   const out: Array<{ dependentId: string; assigneeAgentId: string; commentId: string; cancelledBlockerIssueId: string }> = [];
   for (const dependentId of [...new Set(input.dependentIds)]) {
@@ -249,7 +318,7 @@ export async function handBackDependentsLeftWithCancelledBlockers(db: Db, input:
           sql`${agentWakeupRequests.payload}->>'commentId' = ${existing.id}`,
           sql`${agentWakeupRequests.status} not in ('skipped', 'failed', 'cancelled')`,
         )).limit(1);
-        return woken ? null : existing;
+        return woken && !input.evenIfWoken ? null : existing;
       }
       const [inserted] = await insertIssueComment(tx, { companyId: input.companyId, issueId: dependentId, authorType: "system", body });
       return inserted ?? null;

@@ -1870,7 +1870,17 @@ export function mergeCoalescedContextSnapshot(
   // STUDIO-0063: a dependency-resolved wake admitted with the issue ready, merged into a bounded run still waiting
   // (a person's comment run queued while the issue was blocked), makes it a run of the ready issue: the bounded mode
   // and its blocker snapshot go, so the run works the issue and can settle the held comments it carries.
+  // Only for a run that has not started (the callers pass preserveExistingInteractionContinuation for a queued or
+  // scheduled run): a started run keeps the mode and the hand-over it was started with, since its engine never sees
+  // what a later wake computed; that hand-over stays due and the next run (or the backstop) delivers it.
+  const targetNotStarted = options.preserveExistingInteractionContinuation === true;
+  if (!targetNotStarted) {
+    for (const key of ["heldDependencyCommentIds", "heldDependencyOlderCount", "heldDependencyReason", "heldDependencyHandoverAt"]) {
+      if (key in existing) merged[key] = existing[key]; else delete merged[key];
+    }
+  }
   if (
+    targetNotStarted &&
     existing.dependencyBlockedInteraction === true &&
     incoming.dependencyBlockedInteraction !== true &&
     readNonEmptyString(incoming.wakeReason) === "issue_blockers_resolved"

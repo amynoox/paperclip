@@ -17180,10 +17180,14 @@ export function issueRoutes(
           }
         }
 
-        // STUDIO-0063: every edit of the blocker set goes through the same function (ready, or only cancelled
-        // blockers left). If the restored-blocked path above already woke the assignee, the two wakes merge in
-        // addWakeup (same agent, same issue); the key carries the edit's time, so each such edit wakes once.
-        if (Array.isArray(req.body.blockedByIssueIds)) {
+        // STUDIO-0063: every edit that changes the blocker set goes through the same function (ready, or only
+        // cancelled blockers left). If the restored-blocked path above already woke the assignee, the two wakes merge
+        // in addWakeup (same agent, same issue); the key carries the edit's time, so each such edit wakes once. A
+        // request that sends the same set again changes nothing and wakes nobody.
+        const previousBlockerIds = (existingRelations?.blockedBy ?? []).map((relation) => relation.id).sort();
+        const nextBlockerIds = Array.isArray(req.body.blockedByIssueIds)
+          ? [...new Set(req.body.blockedByIssueIds as string[])].sort() : previousBlockerIds;
+        if (Array.isArray(req.body.blockedByIssueIds) && previousBlockerIds.join(",") !== nextBlockerIds.join(",")) {
           try {
             await wakeDependentsAfterDependencyChange(db, {
               companyId: issue.companyId,

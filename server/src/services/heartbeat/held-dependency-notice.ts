@@ -8,7 +8,7 @@
 import { and, eq, gt, inArray, like } from "drizzle-orm";
 import { agents, issueComments, issues, type Db } from "@paperclipai/db";
 import { insertIssueComment } from "../issue-comment-writes.js";
-import { readLatestQualifiedRunStart, wakeContextCommentIds } from "./held-dependency-comments.js";
+import { readHandOverBase, wakeContextCommentIds } from "./held-dependency-comments.js";
 
 export const HELD_DEPENDENCY_NOTICE_MARKER = "<!-- held-dependency-comment-notice -->";
 const noticeAssigneeMarker = (assigneeAgentId: string) => `<!-- held-dependency-comment-notice-for:${assigneeAgentId} -->`;
@@ -29,7 +29,7 @@ export async function noteHeldAgentComment(db: Db, input: {
 }
 
 async function writeNoticeOnce(db: Db, input: Parameters<typeof noteHeldAgentComment>[1]): Promise<boolean> {
-  const since = await readLatestQualifiedRunStart(db, {
+  const { since } = await readHandOverBase(db, {
     companyId: input.companyId, issueId: input.issueId, agentId: input.assigneeAgentId,
   });
   const [existing] = await db.select({ id: issueComments.id }).from(issueComments).where(and(

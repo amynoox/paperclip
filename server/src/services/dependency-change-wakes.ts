@@ -52,14 +52,18 @@ export async function wakeDependentsAfterDependencyChange(db: Db, input: {
   const out: Array<{ dependentIssueId: string; outcome: "ready" | "handed_back" }> = [];
   // An unknown change time (a caller without updatedAt) falls back to now: the key stays unique per change.
   if (Number.isNaN(input.at.getTime())) input = { ...input, at: new Date() };
+  const send = sender(input);
   if (input.readyDependents) {
     for (const dependent of input.readyDependents) {
       const existing = await findExistingIssueBlockersResolvedWakeForReadyState(db, {
         companyId: input.companyId, dependentIssueId: dependent.id, blockerIssueIds: dependent.blockerIssueIds,
         blockedTransitionAt: dependent.blockedTransitionAt,
-      }).catch(() => null);
+      }).catch((err: unknown) => {
+        logger.warn({ err, dependentIssueId: dependent.id }, "dependency wake lookup failed; waking anyway");
+        return null;
+      });
       if (existing) continue;
-      await input.wake(dependent.assigneeAgentId, {
+      await send(dependent.assigneeAgentId, {
         ...readyWake(dependent.id, dependent.blockerIssueIds, input),
         idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
           dependentIssueId: dependent.id, blockerIssueIds: dependent.blockerIssueIds,
@@ -90,7 +94,7 @@ export async function wakeDependentsAfterDependencyChange(db: Db, input: {
       .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.changedBlocker.id)));
     if (blocker) {
       for (const { comment, dependent } of await issueService(db).addCancelledBlockerHandoffComments(blocker)) {
-        await input.wake(dependent.assigneeAgentId, {
+        await send(dependent.assigneeAgentId, {
           source: "automation",
           triggerDetail: "system",
           reason: "issue_commented",
@@ -126,7 +130,7 @@ export async function wakeDependentsAfterDependencyChange(db: Db, input: {
     if (!ready) {
       // No relation left at all (the last blocker removed or deleted): ready.
       if (input.kind === "blockers_edited" || input.kind === "blocker_deleted") {
-        await input.wake(dependent.assigneeAgentId, readyWake(id, [], input));
+        await send(dependent.assigneeAgentId, readyWake(id, [], input));
         out.push({ dependentIssueId: id, outcome: "ready" });
       }
       continue;
@@ -136,16 +140,19 @@ export async function wakeDependentsAfterDependencyChange(db: Db, input: {
         const existing = await findExistingIssueBlockersResolvedWakeForReadyState(db, {
           companyId: input.companyId, dependentIssueId: id, blockerIssueIds: ready.blockerIssueIds,
           blockedTransitionAt: dependent.blockedTransitionAt,
-        }).catch(() => null);
+        }).catch((err: unknown) => {
+          logger.warn({ err, dependentIssueId: id }, "dependency wake lookup failed; waking anyway");
+          return null;
+        });
         if (existing) continue;
-        await input.wake(dependent.assigneeAgentId, {
+        await send(dependent.assigneeAgentId, {
           ...readyWake(id, ready.blockerIssueIds, input),
           idempotencyKey: buildIssueBlockersResolvedWakeStateKey({
             dependentIssueId: id, blockerIssueIds: ready.blockerIssueIds, blockedTransitionAt: dependent.blockedTransitionAt,
           }),
         });
       } else {
-        await input.wake(dependent.assigneeAgentId, readyWake(id, [], input));
+        await send(dependent.assigneeAgentId, readyWake(id, [], input));
       }
       out.push({ dependentIssueId: id, outcome: "ready" });
       continue;
@@ -156,13 +163,26 @@ export async function wakeDependentsAfterDependencyChange(db: Db, input: {
   return out;
 }
 
+// One failing wake never stops the wakes of the other dependents; the hand-over backstop retries what failed.
+function sender(input: { companyId: string; wake: DependencyChangeWakeSender }) {
+  return async (agentId: string, request: DependencyChangeWakeRequest) => {
+    try {
+      await input.wake(agentId, request);
+    } catch (err) {
+      logger.warn({ err, companyId: input.companyId, agentId, issueId: request.payload.issueId },
+        "dependency change wake failed; left to the hand-over backstop");
+    }
+  };
+}
+
 async function handBack(db: Db, input: { companyId: string; wake: DependencyChangeWakeSender }, dependentIds: string[]) {
+  const send = sender(input);
   const out: Array<{ dependentIssueId: string; outcome: "handed_back" }> = [];
   {
     for (const handoff of await handBackDependentsLeftWithCancelledBlockers(db, {
       companyId: input.companyId, dependentIds,
     })) {
-      await input.wake(handoff.assigneeAgentId, {
+      await send(handoff.assigneeAgentId, {
         source: "automation",
         triggerDetail: "system",
         reason: "issue_commented",
