@@ -5,11 +5,13 @@ import {
   asBoolean,
   parseObject,
   parseJson,
+  MAX_CAPTURE_BYTES,
 } from "@paperclipai/adapter-utils/server-utils";
 
-// The legacy login-prompt markers. The Claude CLI prints these words when it
-// asks the user to log in. The detector matches them against any probe output
-// line, which includes the raw stdout and stderr. This scope is pre-existing.
+// The login-prompt markers. The Claude CLI prints these words when it asks the
+// user to log in. The detector matches them only against the run's own error
+// surface (STUDIO-0064, see detectClaudeLoginRequired): never against text a
+// tool or the model produced.
 const CLAUDE_LOGIN_PROMPT_RE =
   /(?:not\s+logged\s+in|please\s+log\s+in|please\s+run\s+(?:`?claude\s+login`?|\/login)|login\s+required|requires\s+login|unauthorized|authentication\s+required|invalid\s+api\s+key[\s\S]{0,120}(?:\/login|claude\s+login|log\s+in))/i;
 
@@ -316,19 +318,109 @@ export function extractClaudeLoginUrl(text: string): string | null {
   return match[0]?.replace(/[\])}.!,?;:'\"]+$/g, "") ?? null;
 }
 
+// Read a structured field the CLI wrote as a string, or as a small object.
+function claudeFieldText(value: unknown): string {
+  if (typeof value === "string") return value;
+  if (value === null || value === undefined) return "";
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return "";
+    }
+  }
+  return String(value);
+}
+
 // Collect the parsed terminal result fields that carry an auth failure. The
 // CLI writes the token-failure text to the result event, so the detector reads
-// the result string, the top-level error field, and the errors array. It never
+// the result string, the top-level error fields, and the errors array. It never
 // reads the raw stdout, so an assistant event cannot inject a token marker.
+// The result of a turn-budget stop is the model's last answer, not a CLI error.
 function collectClaudeTerminalText(parsed: Record<string, unknown>): string {
   return [
-    asString(parsed.result, ""),
+    isClaudeMaxTurnsResult(parsed) ? "" : asString(parsed.result, ""),
     asString(parsed.error, ""),
+    claudeFieldText(parsed.api_error),
     ...extractClaudeErrorMessages(parsed),
   ]
     .map((field) => field.trim())
     .filter(Boolean)
     .join("\n");
+}
+
+// STUDIO-0064 (production, 17 Nov 2026, run 21529e7e): a terminal result that
+// reports a usage limit is a limit, never a login request. That run ended on
+// the weekly limit (api_error_status 429) while a tool result in its transcript
+// quoted "System.UnauthorizedAccessException"; it was sealed as
+// claude_auth_required and the account was marked as needing a new sign-in.
+function claudeResultReportsUsageLimit(parsed: Record<string, unknown>): boolean {
+  const status =
+    asNumber(parsed.api_error_status, 0) || asNumber(parsed.error_status, 0);
+  if (status === 429) return true;
+  if (/(?:usage|rate)[_\s-]?limit/i.test(claudeFieldText(parsed.api_error))) return true;
+  return (
+    claudeResultIndicatesAuthFailure(parsed) &&
+    CLAUDE_PROVIDER_QUOTA_RE.test(collectClaudeTerminalText(parsed))
+  );
+}
+
+// Reduce a Claude CLI stdout stream to what the CLI itself wrote about a login
+// (STUDIO-0064; adapted from paperclipai/paperclip#13647, commit 306451274e).
+//
+// `--output-format stream-json` puts the agent's whole transcript on stdout:
+// tool results, the model's text, and the CLI's own events. A transcript line
+// that merely quotes "Unauthorized" (a test log, an HTTP status the agent read)
+// must not decide that the account is logged out. Kept are:
+// - every line that is not a JSON event: a CLI that refuses to start writes its
+//   login prompt as plain text, before or outside the stream;
+// - when the stream has NO result event (it was cut): the `error` field the CLI
+//   sets on its own events (`authentication_failed` on an assistant or system
+//   event). With a result event, that event's fields are the authority.
+// Never kept: the content of a message, whatever its role.
+//
+// The capture keeps the last MAX_CAPTURE_BYTES of stdout, so its first line can
+// be the cut tail of an event: that fragment is not plain text.
+// A stdout line that is a JSON object is a stream event; anything else is plain text.
+function parseClaudeStreamEvent(line: string): Record<string, unknown> | null {
+  const event = parseJson(line) as unknown;
+  return event !== null && typeof event === "object" && !Array.isArray(event)
+    ? (event as Record<string, unknown>)
+    : null;
+}
+
+function claudeStdoutEventErrors(stdout: string): string {
+  const errors: string[] = [];
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const event = parseClaudeStreamEvent(rawLine.trim());
+    if (!event) continue;
+    const eventError = asString(event.error, "").trim();
+    if (eventError) errors.push(eventError);
+  }
+  return errors.join("\n");
+}
+
+function claudeStdoutLoginSurface(stdout: string, hasResult: boolean): string {
+  const surface: string[] = [];
+  const lines = stdout.split(/\r?\n/);
+  const firstLineMayBeCut = stdout.length >= MAX_CAPTURE_BYTES;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!.trim();
+    if (!line) continue;
+
+    const event = parseClaudeStreamEvent(line);
+    if (!event) {
+      if (index === 0 && firstLineMayBeCut) continue;
+      surface.push(line);
+      continue;
+    }
+    if (hasResult) continue;
+    const eventError = asString(event.error, "").trim();
+    if (eventError) surface.push(eventError);
+  }
+
+  return surface.join("\n");
 }
 
 // Report whether the parsed terminal result marks the run as an auth failure.
@@ -351,12 +443,24 @@ export function detectClaudeLoginRequired(input: {
   stderr: string;
 }): { requiresLogin: boolean; loginUrl: string | null } {
   const parsed = input.parsed ?? null;
-  const resultText = asString(parsed?.result, "").trim();
+  // The login URL keeps its broad scope: it can sit in the model's own turn.
+  const loginUrl = extractClaudeLoginUrl([input.stdout, input.stderr].join("\n"));
 
-  // The legacy login-prompt markers keep their broad scope. They match against
-  // every output line, which includes the parsed result, the parsed errors, and
-  // the raw stdout and stderr.
-  const promptLines = [resultText, ...extractClaudeErrorMessages(parsed ?? {}), input.stdout, input.stderr]
+  // A usage limit outranks every login marker (STUDIO-0064).
+  if (parsed !== null && claudeResultReportsUsageLimit(parsed)) {
+    return { requiresLogin: false, loginUrl };
+  }
+
+  // The terminal fields count only for a failed run: the result of a success
+  // is the model's answer.
+  const failedResult = parsed !== null && claudeResultIndicatesAuthFailure(parsed);
+  const terminalText = failedResult ? collectClaudeTerminalText(parsed) : "";
+  const stdoutSurface = claudeStdoutLoginSurface(input.stdout, parsed !== null);
+
+  // The login-prompt markers match the run's own error surface: the terminal
+  // fields of a failed run, the plain stdout lines, and the stderr. A tool
+  // result or a message that quotes the same words never reaches this scan.
+  const promptLines = [terminalText, stdoutSurface, input.stderr]
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())
@@ -366,14 +470,20 @@ export function detectClaudeLoginRequired(input: {
   // The token-failure markers match only against the parsed terminal fields of
   // a failed run. The raw stdout is untrusted, so a model that prints a token
   // phrase, or a successful run that repeats one, does not flip the classifier.
-  const tokenFailure =
-    parsed !== null &&
-    claudeResultIndicatesAuthFailure(parsed) &&
-    CLAUDE_AUTH_TOKEN_FAILURE_RE.test(collectClaudeTerminalText(parsed));
+  // A cut stream has no result event: the CLI's own event-level `error` field
+  // (never a message) is then the evidence.
+  const tokenFailure = failedResult
+    ? CLAUDE_AUTH_TOKEN_FAILURE_RE.test(terminalText)
+    : parsed === null && CLAUDE_AUTH_TOKEN_FAILURE_RE.test(claudeStdoutEventErrors(input.stdout));
+
+  // The provider refused the credentials: a 401 on the terminal result.
+  const unauthorizedStatus =
+    failedResult &&
+    (asNumber(parsed.api_error_status, 0) === 401 || asNumber(parsed.error_status, 0) === 401);
 
   return {
-    requiresLogin: loginPrompt || tokenFailure,
-    loginUrl: extractClaudeLoginUrl([input.stdout, input.stderr].join("\n")),
+    requiresLogin: loginPrompt || tokenFailure || unauthorizedStatus,
+    loginUrl,
   };
 }
 
