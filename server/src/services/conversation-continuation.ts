@@ -92,6 +92,13 @@ export function conversationRecoveryActionPredicate() {
   );
 }
 
+// STUDIO-0066: the two next actions of a hold by the previous run's own process or environment lease. Admission
+// keeps a hand-over wake behind exactly these two (queue.ts), and no other `execution_owner_active` hold.
+export const OWNER_PROCESS_STILL_RUNNING_ACTION =
+  "The previous provider process is still running. Stop it before continuing this task.";
+export const OWNER_LEASE_NOT_RELEASED_ACTION =
+  "The previous execution has not released its environment lease. Wait for cleanup before continuing this task.";
+
 /** OS liveness probes do not signal or stop the process. Unknown ownership holds. */
 function processMayBeAlive(pid: number): boolean {
   try {
@@ -164,9 +171,7 @@ export async function getConversationOwnershipBlocker(db: Db, companyId: string,
         runId: run.id,
         agentId: run.agentId,
         cause: "execution_owner_active",
-        nextAction: pidAlive || groupAlive
-          ? "The previous provider process is still running. Stop it before continuing this task."
-          : "The previous execution has not released its environment lease. Wait for cleanup before continuing this task.",
+        nextAction: pidAlive || groupAlive ? OWNER_PROCESS_STILL_RUNNING_ACTION : OWNER_LEASE_NOT_RELEASED_ACTION,
       };
     }
   }
