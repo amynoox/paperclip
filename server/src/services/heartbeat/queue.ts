@@ -2373,25 +2373,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               waitingSince: wake.requestedAt });
           continue;
         }
-        // STUDIO-0066: a hand-over wake kept without a comment or a card carries nothing a run must read. If the
-        // assignee already ran on the task after the wake was asked for (another wake got through), that run
-        // served it: retire the kept copy instead of starting a second run.
-        if (wake.payload?.[OWNERSHIP_HANDOVER_WAKE_KEY] === true) {
-          const [served] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
-            eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
-            eq(heartbeatRuns.status, "succeeded"), isNotNull(heartbeatRuns.startedAt),
-            gt(heartbeatRuns.createdAt, wake.requestedAt),
-            sql`(${heartbeatRuns.contextSnapshot}->>'issueId' = ${heldIssueId} or ${heartbeatRuns.nativeIssueId}::text = ${heldIssueId})`,
-          )).limit(1);
-          if (served) {
-            const servedAt = new Date();
-            await db.update(agentWakeupRequests).set({ status: "coalesced", finishedAt: servedAt, updatedAt: servedAt,
-              error: `Served by run ${served.id}, which started after this hand-over wake was kept` })
-              .where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.companyId, wake.companyId),
-                eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId)));
-            continue;
-          }
-        }
         // STUDIO-0051: behind a reconciled hold, a blocker added after the
         // reconciliation would make admission consume the wake; keep it held
         // until the task's dependencies are ready.

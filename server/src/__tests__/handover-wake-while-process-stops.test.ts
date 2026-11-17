@@ -205,6 +205,13 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(mockAdapterExecute.mock.calls.filter(([context]) => context?.agent.id === f.cto)).toHaveLength(0);
 
     await f.release();
+    // The stand-in adapter returns no stop receipt, so the stopped run leaves a reconciliation action that a real
+    // provider's acknowledged stop does not leave. Production shows that action cancelled after a reassignment
+    // (TR-702, the fixture of STUDIO-0041): put it in that state, by hand. The issue update route is not driven.
+    expect(await getExecutionBlocker(db, ids.companyId, ids.issueId)).toMatchObject({ runId: devRun!.id,
+      cause: "legacy_execution_requires_reconciliation" });
+    await db.update(issueRecoveryActions).set({ status: "cancelled", outcome: "cancelled", resolvedAt: new Date() })
+      .where(and(eq(issueRecoveryActions.companyId, ids.companyId), eq(issueRecoveryActions.sourceIssueId, ids.issueId)));
     expect(await getExecutionBlocker(db, ids.companyId, ids.issueId)).toBeNull();
     await heartbeat.resumeQueuedRuns();
     const run = await startsOnce(f, f.cto);
@@ -298,8 +305,9 @@ const support = await getEmbeddedPostgresTestSupport();
     await heartbeat.resumeQueuedRuns();
     await heartbeat.resumeQueuedRuns();
     expect(await assignmentRuns(f, f.cto)).toHaveLength(1);                       // no second run for the same hand-over
-    expect(await wakeRow(kept.id)).toMatchObject({ status: "coalesced", runId: null,
+    expect(await wakeRow(kept.id)).toMatchObject({ status: "cancelled", runId: null,
       error: expect.stringContaining(`Served by run ${direct!.id}`) });
+    expect(await keptWakes(f, f.cto)).toHaveLength(0);
   });
 
   it("leaves a wake of an agent that is not the assignee as a skipped receipt", async () => {

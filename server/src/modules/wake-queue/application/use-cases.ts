@@ -175,6 +175,26 @@ async function runReleaseDrain(
       continue;
     }
 
+    // STUDIO-0066: a hand-over wake kept only because the previous run's process or lease still held the task
+    // (heartbeat/queue.ts) carries no comment and no card: nothing a run must read. The run that releases the task
+    // here is the same agent's, on this task, and it succeeded: it started after the hold was gone and served the
+    // hand-over. Retire the kept copy instead of promoting it into a second run.
+    if (
+      candidate.payload.ownershipHandoverWake === true &&
+      run.status === "succeeded" &&
+      run.agentId === candidate.agentId &&
+      run.contextSnapshot?.issueId === issue.id
+    ) {
+      await ports.transaction.cancelDeferredWake({
+        companyId: run.companyId,
+        wakeId: candidate.id,
+        agentId: candidate.agentId,
+        reason: `Served by run ${run.id}: the assignee ran on the task after this hand-over wake was kept`,
+        now: input.now,
+      });
+      continue;
+    }
+
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original
     // comment ID so coalesced human or unrelated input is never hidden.
