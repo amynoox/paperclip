@@ -59,6 +59,8 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
   const nextOutcome = new Map<string, Outcome>();
   // Per-issue outcome of EVERY run until cleared (automatic recovery runs included).
   const stickyOutcome = new Map<string, Outcome>();
+  // Per-issue outcomes of the next runs, in order (then the default).
+  const outcomeQueue = new Map<string, Outcome[]>();
   // Per-issue gate: the run waits until released (an assignee busy on its dependency run).
   const holdOpen = new Map<string, Promise<void>>();
 
@@ -73,7 +75,7 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
       execute: async (input) => {
         dispatched.push(input.runId);
         const issueId = String((input.context as any)?.issueId ?? "");
-        const outcome = stickyOutcome.get(issueId) ?? nextOutcome.get(issueId) ?? "spawn-success";
+        const outcome = stickyOutcome.get(issueId) ?? outcomeQueue.get(issueId)?.shift() ?? nextOutcome.get(issueId) ?? "spawn-success";
         nextOutcome.delete(issueId);
         // The worker router refuses before any reservation: no process is started.
         if (outcome.startsWith("refuse:")) {
@@ -517,6 +519,11 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
       await db.insert(heartbeatRuns).values({ id: runId, companyId: f.companyId, agentId: f.ctoId, invocationSource: "assignment",
         status: "running", startedAt: new Date(), contextSnapshot: { issueId: f.ctoTaskId } });
       ids.push(await ctoComment(f, `Held note ${String(i).padStart(2, "0")}.`, runId));
+    }
+    // The route sends a comment's wake after answering: every comment is held before the lift (a wake admitted after
+    // it would be the lift run's own wake comment, shown as such and not counted as held).
+    for (const id of ids) {
+      await expect.poll(() => admissionHeld(f, id), { timeout: 20_000 }).toEqual([{ status: "skipped", reason: "issue_dependencies_blocked" }]);
     }
     await setStatus(f, f.blockerId, "done");
     const resolved = await runWhere(f.devId, f.taskId, run => (run.contextSnapshot as any)?.wakeReason === "issue_blockers_resolved");
@@ -1211,38 +1218,117 @@ type Outcome = "spawn-success" | "no-spawn" | "spawn-255" | `refuse:${string}`;
     expect(handedOver(lift)).toEqual([comment]);
   }, 120_000);
 
-  // Final instruction, 2: the backstop stops on a succeeded run whose admission computed the hand-over, even when the
-  // adapter reported no engine start. The hand-over keeps its strict base: the next run repeats the comment once.
-  it("stops the backstop after a succeeded run that carried the comments without a reported engine start", async () => {
+  // Final review, the blocker: a run the server inserts with a fresh context passes no admission and is shown nothing.
+  // It must not become the hand-over base. Here the runs that carry the hand-over (the lift, then the first
+  // disposition repair) do not qualify, because their engine start is not recorded; the server's second repair run,
+  // inserted with a fresh context, succeeds with its engine started. The comment is still handed over afterwards.
+  it("still hands the comment over after a run inserted with a fresh context succeeded", async () => {
     const f = await seed();
-    const held = await heldComment(f, "Held, then carried by a run without a reported start.");
+    const held = await heldComment(f, "Held; a run without an admission must not settle it.");
+    // Past the clock margin (10 s): a run that starts later settles this hold outright if it becomes the base.
+    await new Promise(resolve => setTimeout(resolve, 11_000));
+    outcomeQueue.set(f.taskId, ["no-spawn", "no-spawn"]);
+    await setStatus(f, f.blockerId, "done");
+    const first = await runWhere(f.devId, f.taskId, carrying(held));
+    expect(first.processStartedAt).toBeNull();
+    const isFresh = (run: typeof heartbeatRuns.$inferSelect) => run.status === "succeeded" && run.processStartedAt !== null
+      && (run.contextSnapshot as any)?.heldDependencyHandoverAt === undefined;
+    await taskQuiet(f);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    await taskQuiet(f);
+    const left = outcomeQueue.get(f.taskId)?.length ?? 0;
+    outcomeQueue.delete(f.taskId);
+    const runs = (await devRuns(f)).sort((x, y) => x.createdAt.getTime() - y.createdAt.getTime());
+    const seen = JSON.stringify({ left, runs: runs.map(run => ({ s: run.status, r: (run.contextSnapshot as any)?.wakeReason,
+      at: (run.contextSnapshot as any)?.heldDependencyHandoverAt ?? null, ids: handedOver(run).length,
+      started: Boolean(run.processStartedAt), retryOf: Boolean(run.retryOfRunId) })) });
+    expect(runs.filter(isFresh).length, seen).toBeGreaterThan(0);
+    // The fresh run carried nothing, and no run that carried the comment has a recorded engine start.
+    for (const run of runs.filter(isFresh)) expect(handedOver(run), seen).toEqual([]);
+    expect(runs.filter(run => run.processStartedAt !== null && handedOver(run).includes(held)), seen).toEqual([]);
+    // Not settled by the fresh run: the backstop wakes, and that run carries the comment.
+    const scope = { companyId: f.companyId, issueId: f.taskId };
+    let outcome = await heartbeat.reconcileHeldCommentHandover(scope);
+    if (outcome === "recovery_action") {
+      await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "restored", resolvedAt: new Date() })
+        .where(eq(issueRecoveryActions.sourceIssueId, f.taskId));
+      outcome = await heartbeat.reconcileHeldCommentHandover(scope);
+    }
+    expect(outcome, seen).toBe("woken");
+    const again = await runWhere(f.devId, f.taskId, run => carrying(held)(run) && run.processStartedAt !== null);
+    expect(again.status).toBe("succeeded");
+    expect((again.contextSnapshot as any).source).toBe("issue.held_comment_handover_backstop");
+  }, 180_000);
+
+  // Final review, point 2: Dev -> Dev2 -> Dev by writers that log no activity. The Dev has a base on the issue; the
+  // comment was held for Dev2. Holds of any agent since the Dev's base count.
+  it("hands over to a returning assignee the comment held for another assignee in between", async () => {
+    const f = await seed({ blocked: false });
+    const note = await ctoComment(f, "A first note; the Dev's run settles it.");
+    const settled = await runWhere(f.devId, f.taskId, run => JSON.stringify(run.contextSnapshot).includes(note));
+    expect(settled.status).toBe("succeeded");
+    expect(settled.processStartedAt).not.toBeNull();
+    expect((settled.contextSnapshot as any).heldDependencyHandoverAt).toEqual(expect.any(String));
+    await taskQuiet(f);
+    // Moved to Dev2 by a service write, blocked, and a comment held for Dev2.
+    await issueService(db).update(f.taskId, { assigneeAgentId: f.dev2Id, status: "todo" } as never);
+    await request(app(f.companyId)).patch(`/api/issues/${f.taskId}`).send({ blockedByIssueIds: [f.blockerId] }).expect(200);
+    await taskQuiet(f);
+    const held = await ctoComment(f, "Held for the second owner.");
+    await expect.poll(() => db.select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
+      .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.dev2Id),
+        sql`${agentWakeupRequests.payload}->>'commentId' = ${held}`)), { timeout: 20_000 })
+      .toEqual([{ status: "skipped", reason: "issue_dependencies_blocked" }]);
+    // Back to the Dev, and the blocker removed, by service writes: nobody is woken.
+    await issueService(db).update(f.taskId, { assigneeAgentId: f.devId } as never);
+    await issueService(db).update(f.taskId, { blockedByIssueIds: [] } as never);
+    await new Promise(resolve => setTimeout(resolve, 1000));
+    await taskQuiet(f);
+    expect((await devRuns(f)).filter(carrying(held))).toEqual([]);
+    const scope = { companyId: f.companyId, issueId: f.taskId };
+    let outcome = await heartbeat.reconcileHeldCommentHandover(scope);
+    if (outcome === "recovery_action") {
+      await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "restored", resolvedAt: new Date() })
+        .where(eq(issueRecoveryActions.sourceIssueId, f.taskId));
+      outcome = await heartbeat.reconcileHeldCommentHandover(scope);
+    }
+    expect(outcome).toBe("woken");
+    const run = await runWhere(f.devId, f.taskId, carrying(held));
+    expect(run.status).toBe("succeeded");
+  }, 180_000);
+
+  // Final review, point 4: the wait between two backstop wakes is counted from the backstop's own attempt rows,
+  // written before the wake. It holds when the admission returns without writing a request, and when it throws.
+  it("keeps the backstop's wait when its wake writes no request, or throws", async () => {
+    const { reconcileHeldCommentHandover } = await import("../services/recovery/held-comment-handover-backstop.js");
+    const f = await seed();
+    await heldComment(f, "Held; the backstop's wake writes nothing.");
     await taskQuiet(f);
     await issueService(db).update(f.taskId, { blockedByIssueIds: [] } as never);
-    // Every run of the task succeeds without reporting its engine start (the server's own follow-up runs too).
-    stickyOutcome.set(f.taskId, "no-spawn");
-    const scope = { companyId: f.companyId, issueId: f.taskId };
-    expect(await heartbeat.reconcileHeldCommentHandover(scope)).toBe("woken");
-    const carried = await runWhere(f.devId, f.taskId, carrying(held));
-    expect(carried.status).toBe("succeeded");
-    expect(carried.processStartedAt).toBeNull();
-    await taskQuiet(f);
-    // No second wake, at the next pass or after any wait.
-    expect(await heartbeat.reconcileHeldCommentHandover(scope)).toBe("no_trace");
-    expect(await heartbeat.reconcileHeldCommentHandover({ ...scope, now: new Date(Date.now() + 7_200_000) })).toBe("no_trace");
-    expect(await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-      eq(agentWakeupRequests.agentId, f.devId), sql`${agentWakeupRequests.idempotencyKey} like 'held-handover-backstop:%'`)))
-      .toHaveLength(1);
-    // The strict base did not move: a later run with a reported start repeats the comment (a duplicate, never a loss).
-    stickyOutcome.delete(f.taskId);
-    await taskQuiet(f);
-    const before = (await devRuns(f)).map(run => run.id);
-    await heartbeat.wakeup(f.devId, {
-      source: "on_demand", triggerDetail: "manual", reason: "issue_status_changed",
-      payload: { issueId: f.taskId }, contextSnapshot: { issueId: f.taskId, taskId: f.taskId },
-    });
-    const next = await runWhere(f.devId, f.taskId, run => run.processStartedAt !== null, before);
-    expect(handedOver(next)).toEqual([held]);
-  }, 180_000);
+    let calls = 0;
+    const silent = async () => { calls += 1; return null; };
+    const throwing = async () => { calls += 1; throw new Error("injected: the admission failed"); };
+    const t0 = Date.now();
+    const pass = (afterMs: number, wake: () => Promise<unknown>) => reconcileHeldCommentHandover(db, {
+      companyId: f.companyId, issueId: f.taskId, now: new Date(t0 + afterMs), wake });
+    expect(await pass(0, silent)).toBe("woken");
+    expect(await pass(5_000, silent)).toBe("waiting");
+    expect(calls).toBe(1);
+    await expect(pass(31_000, throwing)).rejects.toThrow("injected: the admission failed");
+    expect(calls).toBe(2);
+    // The second attempt was recorded before its wake threw: the next wait (one minute) runs from it.
+    expect(await pass(40_000, silent)).toBe("waiting");
+    expect(await pass(90_000, silent)).toBe("waiting");
+    expect(calls).toBe(2);
+    expect(await pass(92_000, silent)).toBe("woken");
+    expect(calls).toBe(3);
+    // No wake request was written: the three attempt rows alone carried the wait.
+    const rows = await db.select({ reason: agentWakeupRequests.reason, status: agentWakeupRequests.status })
+      .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, f.devId),
+        sql`${agentWakeupRequests.payload}->>'issueId' = ${f.taskId}`,
+        sql`${agentWakeupRequests.reason} <> 'issue_dependencies_blocked'`));
+    expect(rows).toEqual(Array.from({ length: 3 }, () => ({ reason: "held_comment_handover_backstop_attempt", status: "skipped" })));
+  }, 120_000);
 
   it("keeps a person's comment as a bounded interaction run on the blocked issue", async () => {
     const f = await seed();

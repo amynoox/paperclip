@@ -4,8 +4,10 @@
 // - The hand-over BASE of the current assignee on the issue: the time its latest QUALIFIED run was given its
 //   hand-over. A run qualifies when it succeeded with its engine process started (processStartedAt) and its admission
 //   computed a hand-over (it then carries heldDependencyHandoverAt, the time of that computation: the issue was ready,
-//   or every unresolved blocker cancelled, or it was a stall or cancel hand-off wake). A run of before this change
-//   (no such key) qualifies when it was not a bounded dependency run, with its start as the time. The base is the
+//   or every unresolved blocker cancelled, or it was a stall or cancel hand-off wake). A run WITHOUT that key never
+//   qualifies: a recovery run inserted with a fresh context (the immediate recovery after a release, the review
+//   participant's, provider_quota_recovery) passed no admission and was shown nothing, and so was a run of before
+//   this change (the first hand-over after the install reads the whole thread: at worst a repeat). The base is the
 //   ADMISSION time, not the start: a comment held after a queued run's admission stays after the base.
 // - Hand-over, only after a trace since the base: a hold (the admission's skipped `issue_dependencies_blocked`
 //   request, written in the hold's own transaction; or a run cancelled with that errorCode, one write) or an
@@ -129,39 +131,29 @@ export type HandOverBase = {
   carriedCommentIds: string[];
 };
 
-/**
- * The assignee's hand-over base on the issue (see the header).
- * `succeededIsEnough` is the hand-over backstop's stop rule: a succeeded run whose admission computed a hand-over
- * counts even without processStartedAt (an adapter that does not report the start; `succeeded` is the real proof).
- * The hand-over itself keeps the strict base: at worst the next run repeats a comment, and no backstop wake loops.
- */
+/** The assignee's hand-over base on the issue (see the header). */
 export async function readHandOverBase(db: Reader, input: {
   companyId: string;
   issueId: string;
   agentId: string;
-  succeededIsEnough?: boolean;
 }): Promise<HandOverBase> {
   const context = heartbeatRuns.contextSnapshot;
   const hasMarker = sql`(jsonb_typeof(${context}->'heldDependencyHandoverAt') = 'string'
     and ${context}->>'heldDependencyHandoverAt' ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T')`;
-  const handedOverAt = sql`(case when ${hasMarker}
-    then (${context}->>'heldDependencyHandoverAt')::timestamptz else ${heartbeatRuns.startedAt} end)`;
+  // Cast only where the marker is a timestamp (the filter below keeps no other run).
+  const handedOverAt = sql`(case when ${hasMarker} then (${context}->>'heldDependencyHandoverAt')::timestamptz end)`;
   // The latest qualified runs: the first gives the base; the few within the margin of it refine what is settled.
   const rows = await db.select({
     handedOverAt: sql<string>`${handedOverAt}`,
-    foundTrace: sql<boolean>`(${hasMarker} and jsonb_typeof(${context}->'heldDependencyReason') = 'string')`,
+    foundTrace: sql<boolean>`(jsonb_typeof(${context}->'heldDependencyReason') = 'string')`,
     context,
   }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId),
     eq(heartbeatRuns.agentId, input.agentId),
     sql`${context}->>'issueId' = ${input.issueId}`,
     eq(heartbeatRuns.status, "succeeded"),
-    isNotNull(heartbeatRuns.startedAt),
-    input.succeededIsEnough
-      ? sql`(${hasMarker} or (${heartbeatRuns.processStartedAt} is not null
-          and coalesce(${context}->>'dependencyBlockedInteraction', 'false') <> 'true'))`
-      : and(isNotNull(heartbeatRuns.processStartedAt),
-          sql`(${hasMarker} or coalesce(${context}->>'dependencyBlockedInteraction', 'false') <> 'true')`),
+    isNotNull(heartbeatRuns.processStartedAt),
+    sql`${hasMarker}`,
   )).orderBy(sql`${handedOverAt} desc`).limit(8);
   const runs = rows.map(row => ({ at: new Date(row.handedOverAt), foundTrace: row.foundTrace === true,
     context: (row.context ?? {}) as Record<string, unknown> })).filter(run => !Number.isNaN(run.at.getTime()));
@@ -181,8 +173,8 @@ export async function readHandOverBase(db: Reader, input: {
 /**
  * Whether the issue carries a MARKED hold trace still due: the admission's skipped `issue_dependencies_blocked`
  * request (a coalesced automatic hold only moves `updatedAt`, and marks the row), or a run cancelled with that
- * errorCode (at its cancellation time). The assignee's own holds; and, while it has no base on the issue (it never completed a run
- * here), a hold of any agent: the issue was held for a previous assignee.
+ * errorCode (at its cancellation time). A hold of ANY agent since the current assignee's base: the issue may have
+ * been held for another assignee meanwhile and moved back by a writer that logs no activity (at worst a repeat).
  */
 export async function hasHoldTraceSince(db: Reader, input: {
   companyId: string;
@@ -191,10 +183,8 @@ export async function hasHoldTraceSince(db: Reader, input: {
   base: HandOverBase;
 }): Promise<boolean> {
   const floor = input.base.traceSince;
-  const ownOnly = input.base.since !== null;
   const [skipped] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, input.companyId),
-    ownOnly ? eq(agentWakeupRequests.agentId, input.assigneeAgentId) : undefined,
     eq(agentWakeupRequests.status, "skipped"),
     eq(agentWakeupRequests.reason, "issue_dependencies_blocked"),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
@@ -205,7 +195,6 @@ export async function hasHoldTraceSince(db: Reader, input: {
   if (skipped) return true;
   const [cancelledAtClaim] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId),
-    ownOnly ? eq(heartbeatRuns.agentId, input.assigneeAgentId) : undefined,
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
     eq(heartbeatRuns.status, "cancelled"),
     eq(heartbeatRuns.errorCode, "issue_dependencies_blocked"),
