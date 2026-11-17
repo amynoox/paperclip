@@ -39,6 +39,22 @@ export function isAiConnectionConfigurationFailure(run: AuthenticationFailure): 
   );
 }
 
+/**
+ * STUDIO-0064: the run's own result reports a provider limit (HTTP 429, a usage or rate limit, a quota family).
+ * Such a run did not prove that the provider refused the credentials, whatever error code it carries, so it must
+ * never mark the account as needing a new sign-in (production, 17 Nov 2026, run 21529e7e: a weekly-limit run sealed
+ * as claude_auth_required put the role's account in error until its owner signed in again).
+ */
+export function runResultReportsProviderLimit(resultJson: unknown): boolean {
+  const result = record(resultJson);
+  if (!result) return false;
+  if (Number(result.api_error_status) === 429 || Number(result.error_status) === 429) return true;
+  if (result.errorFamily === "provider_quota") return true;
+  const apiError = typeof result.api_error === "string" ? result.api_error
+    : result.api_error && typeof result.api_error === "object" ? JSON.stringify(result.api_error) : "";
+  return /(?:usage|rate)[_\s-]?limit/i.test(apiError);
+}
+
 export function isAiAuthenticationRepairable(run: AuthenticationFailure): boolean {
   return isAiAuthenticationFailure(run.errorCode) || isAiConnectionConfigurationFailure(run);
 }

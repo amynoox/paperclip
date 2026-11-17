@@ -136,6 +136,188 @@ describe("detectClaudeLoginRequired", () => {
     expect(isClaudeTransientUpstreamError(input)).toBe(true);
   });
 
+  // STUDIO-0064 (adapted from paperclipai/paperclip#13647, commit 306451274e, and extended): the login markers read
+  // the run's own error surface, never text a tool or the model produced.
+  describe("login markers and the transcript (STUDIO-0064)", () => {
+    const event = (value: Record<string, unknown>) => JSON.stringify(value);
+    const toolResult = (content: string) => event({
+      type: "user",
+      message: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_1", content }] },
+    });
+    const assistantText = (text: string, extra: Record<string, unknown> = {}) => event({
+      type: "assistant",
+      message: { role: "assistant", content: [{ type: "text", text }] },
+      ...extra,
+    });
+
+    it("classifies the weekly-limit run 21529e7e as a limit, not a login request", () => {
+      // Production, 17 Nov 2026: the run ended on the weekly limit; a Unity test log in a tool result quoted
+      // "System.UnauthorizedAccessException", and the run was sealed as claude_auth_required.
+      const parsed = {
+        type: "result",
+        subtype: "success",
+        is_error: true,
+        api_error_status: 429,
+        api_error: "usage_limit_reached",
+        terminal_reason: "api_error",
+        result: "You've hit your weekly limit · resets 6am",
+      };
+      const stdout = [
+        event({ type: "system", subtype: "init", session_id: "s" }),
+        toolResult("SaveIndexGuardTests\n  Expected: no exception\n  But was: <System.UnauthorizedAccessException>\n"),
+        assistantText("The save index test fails with an unauthorized access error; login required to the vault?"),
+        event(parsed),
+      ].join("\n");
+      const input = { parsed, stdout, stderr: "" };
+      expect(detectClaudeLoginRequired(input).requiresLogin).toBe(false);
+      expect(isClaudeProviderQuotaError(input)).toBe(true);
+    });
+
+    it("does not classify 'Unauthorized' quoted in a tool result as login required", () => {
+      const parsed = {
+        is_error: true,
+        subtype: "success",
+        api_error_status: 429,
+        result: "You've hit your session limit · resets 4:20am (Europe/Zurich)",
+      };
+      const stdout = [toolResult("=== TCP-Router ===\n401 Unauthorized\n"), event({ type: "result", ...parsed })].join("\n");
+      const input = { parsed, stdout, stderr: "" };
+      expect(detectClaudeLoginRequired(input).requiresLogin).toBe(false);
+      expect(isClaudeProviderQuotaError(input)).toBe(true);
+    });
+
+    it("lets a usage limit outrank a login word on stderr or in a plain stdout line", () => {
+      for (const parsed of [
+        { is_error: true, subtype: "success", api_error_status: 429, result: "API Error: 429" },
+        { is_error: true, subtype: "success", api_error: "usage_limit_reached", result: "Limit reached" },
+        { is_error: true, subtype: "success", api_error: { type: "rate_limit_error" }, result: "Limit reached" },
+        { is_error: true, subtype: "success", result: "You've hit your weekly limit · resets 6am" },
+      ]) {
+        expect(detectClaudeLoginRequired({
+          parsed,
+          stdout: ["warning: unauthorized plugin skipped", event({ type: "result", ...parsed })].join("\n"),
+          stderr: "hook failed: 401 Unauthorized",
+        }).requiresLogin).toBe(false);
+      }
+    });
+
+    it("does not read the text of an assistant or user message, with or without a result event", () => {
+      const transcript = [
+        assistantText("Not logged in · Please run /login"),
+        toolResult("Invalid API key · Please run /login"),
+        event({ type: "user", message: { role: "user", content: "please log in, authentication required" } }),
+      ].join("\n");
+      const failed = { is_error: true, subtype: "error_during_execution", result: "API Error: 500 internal error" };
+      expect(detectClaudeLoginRequired({ parsed: failed, stdout: transcript, stderr: "" }).requiresLogin).toBe(false);
+      expect(detectClaudeLoginRequired({ parsed: null, stdout: transcript, stderr: "" }).requiresLogin).toBe(false);
+    });
+
+    it("does not read the answer of a successful run or of a turn-budget stop", () => {
+      expect(detectClaudeLoginRequired({
+        parsed: { is_error: false, subtype: "success", result: "The API answered 401 Unauthorized: please log in." },
+        stdout: "",
+        stderr: "",
+      }).requiresLogin).toBe(false);
+      expect(detectClaudeLoginRequired({
+        parsed: { is_error: true, subtype: "error_max_turns", result: "Next step: the user is not logged in, login required." },
+        stdout: "",
+        stderr: "",
+      }).requiresLogin).toBe(false);
+    });
+
+    it("does not read the cut head of a capped capture as plain text", () => {
+      // The capture keeps the last 4 MiB of stdout: its first line can be the tail of a tool result.
+      const fragment = `But was: <System.UnauthorizedAccessException>"}]}}`;
+      const parsed = { is_error: true, subtype: "error_during_execution", result: "API Error: 500 internal error" };
+      const filler = `${event({ type: "assistant", message: { content: [{ type: "text", text: "x".repeat(1024) }] } })}\n`;
+      const body = filler.repeat(Math.ceil((4 * 1024 * 1024) / filler.length));
+      const stdout = `${fragment}\n${body}${event({ type: "result", ...parsed })}`;
+      expect(stdout.length).toBeGreaterThanOrEqual(4 * 1024 * 1024);
+      expect(detectClaudeLoginRequired({ parsed, stdout, stderr: "" }).requiresLogin).toBe(false);
+      // The same words on a real first line of a short capture are the CLI's own plain text.
+      expect(detectClaudeLoginRequired({ parsed: null, stdout: "401 Unauthorized\n", stderr: "" }).requiresLogin).toBe(true);
+    });
+
+    // The real forms of a login request. Each one must still be seen.
+    it.each([
+      ["a plain stdout line before the stream", { parsed: null, stdout: "Not logged in · Please run /login\n", stderr: "" }],
+      ["a plain stdout line with `claude login`", { parsed: null, stdout: "Please log in with `claude login` to continue.", stderr: "" }],
+      ["stderr", { parsed: null, stdout: "", stderr: "Invalid API key · Please run /login" }],
+      ["a plain line among stream events", {
+        parsed: null,
+        stdout: [event({ type: "system", subtype: "init" }), "Not logged in · Please run /login"].join("\n"),
+        stderr: "",
+      }],
+      ["the result field of a failed result", {
+        parsed: { is_error: true, subtype: "success", result: "Not logged in · Please run /login" },
+        stdout: "",
+        stderr: "",
+      }],
+      ["an invalid API key in the result field", {
+        parsed: { is_error: true, subtype: "success", result: "Invalid API key · Please run /login" },
+        stdout: "",
+        stderr: "",
+      }],
+      ["the errors list of a failed result", {
+        parsed: { is_error: true, subtype: "error_during_execution", errors: [{ message: "Not logged in · Please run /login" }] },
+        stdout: "",
+        stderr: "",
+      }],
+      ["a 401 status with a refused bearer token", {
+        parsed: {
+          is_error: true,
+          subtype: "success",
+          api_error_status: 401,
+          error: "authentication_failed",
+          result: "Failed to authenticate. API Error: 401 Invalid bearer token",
+        },
+        stdout: "",
+        stderr: "",
+      }],
+      ["a 401 status alone", {
+        parsed: { is_error: true, subtype: "success", api_error_status: 401, result: "API Error: 401" },
+        stdout: "",
+        stderr: "",
+      }],
+      ["an expired OAuth token in the terminal fields", {
+        parsed: {
+          is_error: true,
+          subtype: "success",
+          result: "OAuth token has expired. Please obtain a new token or refresh your existing token.",
+        },
+        stdout: "",
+        stderr: "",
+      }],
+      ["a cut stream whose assistant event carries the CLI's error field", {
+        parsed: null,
+        stdout: [
+          event({ type: "system", subtype: "init" }),
+          assistantText("Failed to authenticate. API Error: 401 Invalid bearer token", { error: "authentication_failed" }),
+        ].join("\n"),
+        stderr: "",
+      }],
+      ["a cut stream whose retry event carries the CLI's error field", {
+        parsed: null,
+        stdout: event({ type: "system", subtype: "api_retry", attempt: 1, error_status: 401, error: "authentication_failed: bearer is invalid" }),
+        stderr: "",
+      }],
+    ])("still sees a login request in %s", (_form, input) => {
+      expect(detectClaudeLoginRequired(input).requiresLogin).toBe(true);
+      expect(isClaudeProviderQuotaError(input)).toBe(false);
+    });
+
+    it("still finds a login URL quoted in the transcript although requiresLogin ignores it", () => {
+      const parsed = { is_error: false, subtype: "success", result: "done" };
+      const result = detectClaudeLoginRequired({
+        parsed,
+        stdout: assistantText("Visit https://claude.ai/login to re-authenticate."),
+        stderr: "",
+      });
+      expect(result.requiresLogin).toBe(false);
+      expect(result.loginUrl).toBe("https://claude.ai/login");
+    });
+  });
+
   it("does not treat a bare token phrase in raw stdout with no parsed result as login required", () => {
     // Untrusted stdout alone must not satisfy a token-failure marker. Only the
     // parsed terminal result fields of a failed run can trip the token markers.
