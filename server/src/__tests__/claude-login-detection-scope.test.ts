@@ -150,6 +150,26 @@ describe("Claude login detection by the real path (STUDIO-0064)", () => {
     expect(ended).toEqual({ repair: null, grantStatus: "active", health: expect.not.stringMatching(/^error$/), marks: 0 });
   }, 120_000);
 
+  it("lets the limit outrank a login word the CLI process wrote on stderr", async () => {
+    const result = await runFakeCli({ stdout: weeklyLimitTranscript, stderr: "hook failed: 401 Unauthorized\n" });
+    expect(result.errorCode).toBe("provider_quota");
+    const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+    expect(ended).toMatchObject({ repair: null, grantStatus: "active", marks: 0 });
+  }, 120_000);
+
+  it("ends a failed run whose transcript quotes login words as its own failure, not as a login request", async () => {
+    // No limit here: only the scope of the login markers keeps the transcript out.
+    const result = await runFakeCli({ stdout: [
+      ...weeklyLimitTranscript.slice(0, 3),
+      event({ type: "result", subtype: "error_during_execution", session_id: SESSION, is_error: true,
+        result: "The engine stopped on an internal error." }),
+    ] });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode).not.toBe("claude_auth_required");
+    const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+    expect(ended).toMatchObject({ repair: null, grantStatus: "active", marks: 0 });
+  }, 120_000);
+
   it("does not mark the account for a run stored as claude_auth_required whose result reports a limit", async () => {
     // The run as fb1ad740 stored it: the adapter's old code, with the limit in its result.
     const ended = await endFailedRun({ errorCode: "claude_auth_required",
