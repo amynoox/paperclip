@@ -145,6 +145,14 @@ describe("Codex login-loss detection by the real path (STUDIO-0065)", () => {
     expect(ended.health).not.toBe("error");
   }, 120_000);
 
+  it("lets the limit outrank a login word the CLI process wrote on stderr", async () => {
+    const result = await runFakeCli({ stdout: [...transcript, ...failed(LIMIT)],
+      stderr: "WARN mcp server answered 401 Unauthorized to the bearer token\n" });
+    expect(result.errorCode).toBe("provider_quota");
+    const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+    expect(ended).toMatchObject(intact);
+  }, 120_000);
+
   it("does not mark the account for a failed run without a limit whose command output quotes a login failure", async () => {
     const result = await runFakeCli({ stdout: [...transcript, ...failed("The model rejected the request.")] });
     expect(result.exitCode).toBe(1);
