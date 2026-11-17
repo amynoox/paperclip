@@ -1371,6 +1371,12 @@ export function pluginLoader(
       const manifestUrl = pathToFileURL(manifestPath);
       const manifestStat = await stat(manifestPath);
       manifestUrl.searchParams.set("mtime", String(Math.trunc(manifestStat.mtimeMs)));
+      // STUDIO-0060: npm-packed files all carry the same fixed mtime (1985-10-26), so an in-place upgrade kept the
+      // URL of the manifest the process had already imported and re-read the old version (production, 15 Nov 2026,
+      // prompt-memory 0.1.2 recorded as 0.1.1). The change time is set by the file system on every write or
+      // replacement and cannot be carried by an archive.
+      manifestUrl.searchParams.set("ctime", String(Math.trunc(manifestStat.ctimeMs)));
+      manifestUrl.searchParams.set("size", String(manifestStat.size));
       const mod = await import(manifestUrl.href) as Record<string, unknown>;
       // The manifest may be the default export or the module itself
       raw = mod["default"] ?? mod;

@@ -1599,6 +1599,31 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: no refusal of the worker router before reservation is retried. _reserved and _mismatch, and _closed or _ended while the issue is todo or in_progress, block the issue at once, at the run's release (both branches of decideReleaseRecovery) and in the stranded-work sweep, with a notice naming the code, its meaning and the gesture, and a Board recovery action; only a refusal newer than the Board's latest return (readBoardReturnAt) counts. _ended and _closed on an in_review issue neither block nor requeue; one note per series. Declared waits, in review (pending reviewer) as at work: no requeue within the bound, one note per series, then the normal path; router_ticket_blocked 12 h, router_readmission_not_drained in the stop series (1 h). Each kind of wait counts its own series. Why: TR-1261 and TR-1318 (15-16 Nov 2026) and two independent reviews. Origin: studio fork only; to re-apply, keep routerRefusalOutcome, the refusal and wait texts, adapterDeclaredWaitSeriesCodes and the router_readmission_not_drained entries in adapter-declared-wait.ts, the shared.routerRefusal fact, the router_refusal notice and the review-branch declared-wait release in policy.ts, use-cases.ts and heartbeat.ts (buildStrandedRecoveryNoticeForKind), buildRouterRefusalRecoveryNoticeSeed in stranded-notice.ts, and in service.ts the gate on ownLatestRun in reconcileStrandedAssignedIssues, readBoardReturnAt, ensureRouterNote, the full-row getLatestStartedIssueRunForAgent and the codes argument of readAdapterDeclaredWaitStart; run recovery-adapter-declared-wait.test.ts and wake-queue policy.test.ts."
+    },
+    {
+      "id": "STUDIO-0060",
+      "title": "An in-place plugin upgrade records the version of the replaced manifest",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production 15 Nov 2026: the prompt-memory plugin files were replaced in place by 0.1.2 (and later 0.1.3) and POST /api/plugins/:id/upgrade answered 200, but the plugin record kept version 0.1.1. The loader imports the manifest module with the file's mtime in the URL to avoid Node's module cache; npm-packed files all carry the same fixed mtime (1985-10-26), so the new manifest had the URL of the module the process had already imported.",
+      "reason": "Requested by the studio setup session for the 16 Nov update (V412).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "plugin loader manifest import",
+      "paths": [
+        "server/src/services/plugin-loader.ts",
+        "server/src/__tests__/plugin-manifest-reread.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-16",
+        "repository": "paperclipai/paperclip",
+        "details": "Searched pull requests for plugin manifest cache, mtime and upgrade version: no counterpart found.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2. The manifest URL also carries the file's ctime (set by the file system on every write, not carried by an archive) and size. Real loader: a package whose files are replaced in place with the same fixed date and the same length reads 0.1.2 after 0.1.1; on fb1ad740 it reads 0.1.1 again. plugin-manifest-reread 1 passed, plugin-loader-error-retry passed; bundled-plugin-registration (4 failed) and plugin-install-autobuild (3 failed) fail identically on fb1ad740 in the same test tree (setup, 15 Nov full run).",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Upstream keys the manifest import on content or change time.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }
