@@ -20,18 +20,20 @@ export async function noteStalledExecutionOwner(db: Db, input: {
   nextAction: string;
   waitingSince: Date;
 }): Promise<boolean> {
+  const alreadyTold = async (reader: Db) => (await reader.select({ id: issueComments.id }).from(issueComments).where(and(
+    eq(issueComments.companyId, input.companyId),
+    eq(issueComments.issueId, input.issueId),
+    eq(issueComments.authorType, "system"),
+    like(issueComments.body, `%${noticeRunMarker(input.ownerRunId)}%`),
+  )).limit(1)).length > 0;
+  // The sweep comes back every 30 s for as long as the owner holds: once the note is there, take no lock.
+  if (await alreadyTold(db)) return false;
   return db.transaction(async (tx) => {
     const lockDb = tx as unknown as Db;
     // The issue row lock keeps two sweeps from both writing the note.
     await lockDb.select({ id: issues.id }).from(issues)
       .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("update");
-    const [existing] = await lockDb.select({ id: issueComments.id }).from(issueComments).where(and(
-      eq(issueComments.companyId, input.companyId),
-      eq(issueComments.issueId, input.issueId),
-      eq(issueComments.authorType, "system"),
-      like(issueComments.body, `%${noticeRunMarker(input.ownerRunId)}%`),
-    )).limit(1);
-    if (existing) return false;
+    if (await alreadyTold(lockDb)) return false;
     const [waiting] = await lockDb.select({ name: agents.name }).from(agents)
       .where(and(eq(agents.companyId, input.companyId), eq(agents.id, input.waitingAgentId))).limit(1);
     const [owner] = await lockDb.select({ name: agents.name }).from(heartbeatRuns)
