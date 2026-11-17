@@ -200,6 +200,37 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await agentExecutionsHaveStopped(db, [fresh.agentId], { pauseStop: true })).toBe(false);
   });
 
+  // STUDIO-0061: production 15 Nov 2026, run 998a6dc0 (* Game Tester): cancelled at 07:25:29 by another path than a
+  // stop request (no executionCancellation; conversationContinuation set; local lease released), legacy, settled,
+  // no process, no session, no execution-start event. The pause stayed `pausing` until a database write.
+  it("completes a pause held by a settled run cancelled without a stop request and never started", async () => {
+    const finishedAt = new Date(Date.now() - 5 * 60_000);
+    const f = await seed({ errorCode: "legacy_disposition_repair_suppressed", startedAt: new Date(finishedAt.getTime() - 4_500), finishedAt,
+      resultJson: { conversationContinuation: "continue_conversation_v1" } });
+    await db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.run.id, provider: "local",
+      status: "expired", leasePolicy: "ephemeral", releasedAt: new Date(finishedAt.getTime() + 1_000), metadata: { agentId: f.agentId } });
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: f.run.id, agentId: f.agentId, seq: 1,
+      eventType: "lifecycle", stream: "system", level: "info", message: "run cancelled" });
+    // Outside a pause nothing changes: the run is not proven stopped and no marker is written.
+    expect(await markCancelledBeforeProcessLaunch(db, f.run.id)).toBe(false);
+    expect(await agentExecutionsHaveStopped(db, [f.agentId])).toBe(false);
+    // The pause records the stop and completes.
+    expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(true);
+    const [marked] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id));
+    expect(marked!.resultJson).toMatchObject({ preDispatchCancellation: { source: "stopped_before_process_launch", providerWorkStarted: false } });
+
+    // Not for a run whose adapter control had not settled, nor once an execution started, nor with a remote lease.
+    const remote = await seed({ finishedAt, resultJson: { conversationContinuation: "continue_conversation_v1" } });
+    await sshLease(remote);
+    expect(await agentExecutionsHaveStopped(db, [remote.agentId], { pauseStop: true })).toBe(false);
+    const unsettled = await seed({ executionStage: "running", finishedAt, resultJson: { conversationContinuation: "continue_conversation_v1" } });
+    expect(await agentExecutionsHaveStopped(db, [unsettled.agentId], { pauseStop: true })).toBe(false);
+    const started = await seed({ finishedAt, resultJson: { conversationContinuation: "continue_conversation_v1" } });
+    await db.insert(heartbeatRunEvents).values({ companyId: started.companyId, runId: started.run.id, agentId: started.agentId, seq: 1,
+      eventType: "adapter.invoke", stream: "system", level: "info", message: "adapter.invoke" });
+    expect(await agentExecutionsHaveStopped(db, [started.agentId], { pauseStop: true })).toBe(false);
+  });
+
   it("marks at pause time only the paused agent's cancelled runs without any process, session or execution event", async () => {
     const stamp = async (f: { run: typeof heartbeatRuns.$inferSelect }, values: Partial<typeof heartbeatRuns.$inferInsert>) =>
       db.update(heartbeatRuns).set(values).where(eq(heartbeatRuns.id, f.run.id));

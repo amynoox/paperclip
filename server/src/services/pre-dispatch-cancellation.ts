@@ -13,14 +13,20 @@
 // turn, provider or tool event). adapter.invoke alone proves nothing: ACP adapters write it after launching
 // their engine; the proof rests on the absence of a recorded process.
 import { and, eq, inArray, isNull, lt, notExists, sql } from "drizzle-orm";
-import { heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { executionStartedEventPredicate } from "./pre-dispatch-execution-evidence.js";
 
 export const PRE_DISPATCH_CANCELLATION_KEY = "preDispatchCancellation";
 
 export type PreDispatchCancellationSource = "stale_queued_run_gate" | "stale_execution_continuation" | "stopped_before_process_launch";
 
-function stoppedBeforeProcessLaunchCondition(db: Db) {
+// STUDIO-0061: a pause also accepts a settled legacy run cancelled WITHOUT a stop request (another cancellation path:
+// disposition repair, conversation continuation), on the same evidence: no process identity, no session, no
+// execution-start event, its adapter control has settled, and no remote lease was taken for it (a remote run keeps the
+// receipt or ssh-client rule of agent-execution-stop.ts). Production 15 Nov 2026: run 998a6dc0 (* Game Tester,
+// cancelled 07:25:29, no executionCancellation, conversationContinuation set, local lease) kept the pause in `pausing`.
+function stoppedBeforeProcessLaunchCondition(db: Db, options: { settledWithoutStopRequest?: boolean } = {}) {
+  const cancellation = sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state'`;
   return and(
     eq(heartbeatRuns.status, "cancelled"),
     eq(heartbeatRuns.runtimeMode, "legacy"),
@@ -28,7 +34,11 @@ function stoppedBeforeProcessLaunchCondition(db: Db) {
     isNull(heartbeatRuns.processGroupId),
     isNull(heartbeatRuns.processStartedAt),
     isNull(heartbeatRuns.sessionIdAfter),
-    sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state' = 'requested'`,
+    options.settledWithoutStopRequest
+      ? sql`(${cancellation} = 'requested' or (${cancellation} is null and ${heartbeatRuns.executionStage} = 'settled'
+          and not exists (select 1 from ${environmentLeases} where ${environmentLeases.companyId} = ${heartbeatRuns.companyId}
+            and ${environmentLeases.heartbeatRunId} = ${heartbeatRuns.id} and coalesce(${environmentLeases.provider}, 'local') <> 'local')))`
+      : sql`${cancellation} = 'requested'`,
     sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? ${PRE_DISPATCH_CANCELLATION_KEY}::text)`,
     notExists(db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
       eq(heartbeatRunEvents.companyId, heartbeatRuns.companyId), eq(heartbeatRunEvents.runId, heartbeatRuns.id),
@@ -70,7 +80,7 @@ export async function markSettledStopsBeforeProcessLaunch(db: Db, agentIds: stri
     updatedAt: at,
   })
     .where(and(inArray(heartbeatRuns.agentId, agentIds), lt(heartbeatRuns.finishedAt, new Date(at.getTime() - SETTLED_STOP_MARK_DELAY_MS)),
-      stoppedBeforeProcessLaunchCondition(db)))
+      stoppedBeforeProcessLaunchCondition(db, { settledWithoutStopRequest: true })))
     .returning({ id: heartbeatRuns.id });
   return rows.length;
 }

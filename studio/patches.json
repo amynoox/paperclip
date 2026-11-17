@@ -1624,6 +1624,33 @@
       "retireWhen": "Upstream keys the manifest import on content or change time.",
       "upgradeDecisions": [],
       "commits": []
+    },
+    {
+      "id": "STUDIO-0061",
+      "title": "A pause completes over a settled local run cancelled without a stop request, and a resume during a pause says it is deferred",
+      "status": "implemented-locally-validated-not-deployed",
+      "problem": "Production 15 Nov 2026: after the update window two roles stayed `pausing` until a database write. The * Game Tester's run 998a6dc0 had been cancelled at 07:25:29 by another path than a stop request (no executionCancellation, conversationContinuation set, local lease released): legacy, settled, no process, no session, no execution-start event; STUDIO-0053 only marks runs whose cancellation state is `requested`. POST /agents/:id/resume on those agents answered 200 while they stayed `pausing`.",
+      "reason": "Requested by the studio setup session for the 16 Nov update (V412); diagnosis drafts/reveil-questions/reprise-roles/diagnostic-pausing-20261115.md.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "agent pause stop proof (STUDIO-0043, STUDIO-0053) and the agent resume route",
+      "paths": [
+        "server/src/services/pre-dispatch-cancellation.ts",
+        "server/src/routes/agents.ts",
+        "server/src/__tests__/pause-pre-dispatch-cancellation.test.ts",
+        "server/src/__tests__/agent-cross-tenant-authz-routes.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-16",
+        "repository": "paperclipai/paperclip",
+        "details": "Builds on studio patches STUDIO-0043 and STUDIO-0053, which have no upstream counterpart.",
+        "selected": null
+      },
+      "validation": "Linux, Node 24.22.2, embedded PostgreSQL. Real stop proof: the 998a6dc0 shape is proven and marked by a pause only (not outside a pause), never with an unsettled adapter control, an execution-start event or a remote lease; on fb1ad740 the pause stays unproven. Resume route: 202 with resumeDeferred while pausing (with or without remaining holds), 200 as before otherwise; activity details record the deferral. pause-pre-dispatch-cancellation, agent-cross-tenant-authz-routes, run-control and the agent-lifecycle module: 12 files, 339 passed. tsc: no error in a changed file. Not covered: an ssh run with adapter.invoke and no recorded process (c85ad17d) stays unproven; it needs the engine stop receipt (STUDIO-0056).",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder.",
+      "retireWhen": "Upstream proves the stop of runs that never launched a process, and reports a deferred resume.",
+      "upgradeDecisions": [],
+      "commits": []
     }
   ]
 }

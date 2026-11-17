@@ -5942,8 +5942,26 @@ export function agentRoutes(
       action: "agent.resumed",
       entityType: "agent",
       entityId: agent.id,
+      ...(agent.lifecycleState === "pausing" ? { details: { deferredUntilPauseCompletes: true, remainingHolds: agent.lifecycleHolds } } : {}),
     });
 
+    // STUDIO-0061: a resume while the pause is still stopping the agent's runs lifts the holds it may lift, and the
+    // agent resumes by itself once the pause completes if no hold remains (agent-lifecycle postgres.ts, `complete`).
+    // Say so instead of answering as if the agent were running again (production, 15 Nov 2026: two roles stayed
+    // `pausing` after a 200).
+    if (agent.lifecycleState === "pausing") {
+      res.status(202).json({
+        ...redactAgentRowForResponse(agent),
+        resumeDeferred: {
+          reason: "pause_in_progress",
+          remainingHolds: agent.lifecycleHolds,
+          message: agent.lifecycleHolds.length
+            ? "The pause is still stopping this agent's runs, and holds remain: the agent stays paused after the pause completes."
+            : "The pause is still stopping this agent's runs: the agent resumes by itself when the pause completes.",
+        },
+      });
+      return;
+    }
     res.json(redactAgentRowForResponse(agent));
   });
 
