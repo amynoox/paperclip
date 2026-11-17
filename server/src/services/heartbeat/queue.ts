@@ -1,8 +1,8 @@
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { agentCommentHeldByDependencies, allUnresolvedBlockersCancelled, HELD_DEPENDENCY_COMMENT_IDS_KEY,
-  HELD_DEPENDENCY_HANDOVER_AT_KEY, HELD_DEPENDENCY_OLDER_COUNT_KEY, HELD_DEPENDENCY_REASON_KEY, isDependencyHandoffWake,
-  readCommentsToHandOver,
+  HELD_DEPENDENCY_HANDOVER_AT_KEY, HELD_DEPENDENCY_OLDER_COUNT_KEY, HELD_DEPENDENCY_REASON_KEY, HELD_DEPENDENCY_TRACE_KEY,
+  isDependencyHandoffWake, readCommentsToHandOver,
   wakeContextCommentIds } from "./held-dependency-comments.js";
 import { noteHeldAgentComment } from "./held-dependency-notice.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
@@ -2091,6 +2091,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       resultJson: {
         ...parseObject(run.resultJson),
         stopReason: "issue_dependencies_blocked",
+        // STUDIO-0063: a hold of this change, the only kind the hand-over counts.
+        [HELD_DEPENDENCY_TRACE_KEY]: true,
         effectiveTimeoutSec: 0,
         timeoutConfigured: false,
         timeoutSource: "dependency_gate",
@@ -4710,6 +4712,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             await recordExecutionWait(tx as unknown as Db, {
               issueId: issue.id,
               coalesce: coalesceExecutionWait,
+              // STUDIO-0063: a hold of this change, the only kind the hand-over counts (a repeated automatic hold
+              // marks the earlier row it is merged into).
+              coalescedPayloadPatch: { [HELD_DEPENDENCY_TRACE_KEY]: true },
               condition: { unresolvedBlockerIssueIds: [...dependencyReadiness.unresolvedBlockerIssueIds].sort() },
               request: {
                 ...durableReceiptFields,
@@ -4723,6 +4728,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   issueId,
                   unresolvedBlockerIssueIds:
                     dependencyReadiness.unresolvedBlockerIssueIds,
+                  [HELD_DEPENDENCY_TRACE_KEY]: true,
                 },
                 status: "skipped",
                 requestedByActorType: opts.requestedByActorType ?? null,

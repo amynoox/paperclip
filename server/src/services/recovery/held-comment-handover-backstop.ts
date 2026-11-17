@@ -7,12 +7,13 @@
 // no live wake (queued, deferred, claimed) nor live run (queued, running, scheduled retry) of the assignee on it.
 // Action: a wake whose admitted run carries the held comments. When only cancelled blockers are left, the wake is on
 // the STUDIO-0029 hand-back comment (written if missing).
-// Stop: a QUALIFIED run of the assignee after the trace moves the base past it (never "a wake was queued"). A run
-// that fails, or never reaches the engine, leaves the issue eligible and a later pass wakes it again.
+// Stop: a succeeded run of the assignee whose admission computed the hand-over, after the trace (never "a wake was
+// queued"). `succeeded` is the proof here, even without processStartedAt (an adapter that does not report the start):
+// the hand-over keeps its strict base, so at worst the next run repeats a comment, and this pass does not wake again.
+// A run that fails leaves the issue eligible and a later pass wakes it again.
 // Never a loop: the first re-wake comes at the next pass, then the wait between two backstop wakes of the same issue
 // doubles (30 s, 1 min, 2 min... up to 1 h), counted from the backstop's own wake requests since the base. An issue
-// whose runs never qualify (a router that refuses for hours, an adapter that reports no process start) is retried at
-// most hourly, forever: late, never silent.
+// whose runs never succeed (a router that refuses for hours) is retried at most hourly, forever: late, never silent.
 // Left alone: an issue with an active recovery action (its owner, the Board for a blocked execution path, decides the
 // continuation; resolving it runs this pass again), and an assignee that is not invocable or over budget (the pass
 // resumes when it is).
@@ -75,7 +76,8 @@ export async function reconcileHeldCommentHandover(db: Db, input: {
     || ["done", "cancelled", "backlog"].includes(issue.status)) return "not_target";
   const assigneeAgentId = issue.assigneeAgentId;
   // The cheap reads first: a hold trace since the assignee's base. Most issues stop here.
-  const base = await readHandOverBase(db, { companyId: input.companyId, issueId: issue.id, agentId: assigneeAgentId });
+  const base = await readHandOverBase(db, { companyId: input.companyId, issueId: issue.id, agentId: assigneeAgentId,
+    succeededIsEnough: true });
   if (!(await hasHoldTraceSince(db, { companyId: input.companyId, issueId: issue.id, assigneeAgentId, base }))) return "no_trace";
   const readiness = (await issueService(db).listDependencyReadiness(input.companyId, [issue.id])).get(issue.id);
   const ready = !readiness || readiness.isDependencyReady;

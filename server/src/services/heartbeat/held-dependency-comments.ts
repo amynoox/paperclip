@@ -8,8 +8,9 @@
 //   (no such key) qualifies when it was not a bounded dependency run, with its start as the time. The base is the
 //   ADMISSION time, not the start: a comment held after a queued run's admission stays after the base.
 // - Hand-over, only after a trace since the base: a hold (the admission's skipped `issue_dependencies_blocked`
-//   request, written in the hold's own transaction; or a run the claim gate cancelled with that errorCode, one
-//   write) or an activity that reassigned the issue to the assignee. The run then carries every agent comment (not
+//   request, written in the hold's own transaction; or a run cancelled with that errorCode, one write) or an
+//   activity that reassigned the issue to the assignee. Only a hold MARKED by this change counts
+//   (HELD_DEPENDENCY_TRACE_KEY, written by every writer of that code): the holds of before never held a comment. The run then carries every agent comment (not
 //   the assignee's own) written since the base. Without a trace no comment is read: an issue that was never held is
 //   unchanged (its runs only get the hand-over time in their context, which no prompt shows).
 // - Times: the hand-over time and the hold traces are stamped by the server while it works on the issue. A run
@@ -23,13 +24,14 @@
 import { and, desc, eq, gt, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
 import { activityLog, agentWakeupRequests, heartbeatRuns, issueComments, issueRelations, issues, type Db } from "@paperclipai/db";
 import { ISSUE_BLOCKER_STALLED_WAKE_REASON } from "@paperclipai/shared";
-import { extractWakeCommentIds } from "../../modules/run-dispatch/index.js";
+import { extractWakeCommentIds, HELD_DEPENDENCY_TRACE_KEY } from "../../modules/run-dispatch/index.js";
 import { insertIssueComment } from "../issue-comment-writes.js";
 
 export const HELD_DEPENDENCY_COMMENT_IDS_KEY = "heldDependencyCommentIds";
 export const HELD_DEPENDENCY_OLDER_COUNT_KEY = "heldDependencyOlderCount";
 export const HELD_DEPENDENCY_REASON_KEY = "heldDependencyReason";
 export const HELD_DEPENDENCY_HANDOVER_AT_KEY = "heldDependencyHandoverAt";
+export { HELD_DEPENDENCY_TRACE_KEY };
 /** The context keys of a hand-over, kept as one set when run contexts are merged. */
 export const HELD_DEPENDENCY_CONTEXT_KEYS = [
   HELD_DEPENDENCY_COMMENT_IDS_KEY, HELD_DEPENDENCY_OLDER_COUNT_KEY, HELD_DEPENDENCY_REASON_KEY, HELD_DEPENDENCY_HANDOVER_AT_KEY,
@@ -127,11 +129,17 @@ export type HandOverBase = {
   carriedCommentIds: string[];
 };
 
-/** The assignee's hand-over base on the issue (see the header). */
+/**
+ * The assignee's hand-over base on the issue (see the header).
+ * `succeededIsEnough` is the hand-over backstop's stop rule: a succeeded run whose admission computed a hand-over
+ * counts even without processStartedAt (an adapter that does not report the start; `succeeded` is the real proof).
+ * The hand-over itself keeps the strict base: at worst the next run repeats a comment, and no backstop wake loops.
+ */
 export async function readHandOverBase(db: Reader, input: {
   companyId: string;
   issueId: string;
   agentId: string;
+  succeededIsEnough?: boolean;
 }): Promise<HandOverBase> {
   const context = heartbeatRuns.contextSnapshot;
   const hasMarker = sql`(jsonb_typeof(${context}->'heldDependencyHandoverAt') = 'string'
@@ -148,9 +156,12 @@ export async function readHandOverBase(db: Reader, input: {
     eq(heartbeatRuns.agentId, input.agentId),
     sql`${context}->>'issueId' = ${input.issueId}`,
     eq(heartbeatRuns.status, "succeeded"),
-    isNotNull(heartbeatRuns.processStartedAt),
     isNotNull(heartbeatRuns.startedAt),
-    sql`(${hasMarker} or coalesce(${context}->>'dependencyBlockedInteraction', 'false') <> 'true')`,
+    input.succeededIsEnough
+      ? sql`(${hasMarker} or (${heartbeatRuns.processStartedAt} is not null
+          and coalesce(${context}->>'dependencyBlockedInteraction', 'false') <> 'true'))`
+      : and(isNotNull(heartbeatRuns.processStartedAt),
+          sql`(${hasMarker} or coalesce(${context}->>'dependencyBlockedInteraction', 'false') <> 'true')`),
   )).orderBy(sql`${handedOverAt} desc`).limit(8);
   const runs = rows.map(row => ({ at: new Date(row.handedOverAt), foundTrace: row.foundTrace === true,
     context: (row.context ?? {}) as Record<string, unknown> })).filter(run => !Number.isNaN(run.at.getTime()));
@@ -168,9 +179,9 @@ export async function readHandOverBase(db: Reader, input: {
 }
 
 /**
- * Whether the issue carries a hold trace still due: the admission's skipped `issue_dependencies_blocked` request (a
- * coalesced automatic hold only moves `updatedAt`), or a run the claim gate cancelled with that errorCode (at its
- * cancellation time). The assignee's own holds; and, while it has no base on the issue (it never completed a run
+ * Whether the issue carries a MARKED hold trace still due: the admission's skipped `issue_dependencies_blocked`
+ * request (a coalesced automatic hold only moves `updatedAt`, and marks the row), or a run cancelled with that
+ * errorCode (at its cancellation time). The assignee's own holds; and, while it has no base on the issue (it never completed a run
  * here), a hold of any agent: the issue was held for a previous assignee.
  */
 export async function hasHoldTraceSince(db: Reader, input: {
@@ -187,6 +198,7 @@ export async function hasHoldTraceSince(db: Reader, input: {
     eq(agentWakeupRequests.status, "skipped"),
     eq(agentWakeupRequests.reason, "issue_dependencies_blocked"),
     sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`,
+    sql`${agentWakeupRequests.payload}->>${HELD_DEPENDENCY_TRACE_KEY} = 'true'`,
     floor ? or(gt(agentWakeupRequests.requestedAt, floor), gt(agentWakeupRequests.updatedAt, floor),
       gt(agentWakeupRequests.finishedAt, floor)) : undefined,
   )).limit(1);
@@ -197,6 +209,7 @@ export async function hasHoldTraceSince(db: Reader, input: {
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`,
     eq(heartbeatRuns.status, "cancelled"),
     eq(heartbeatRuns.errorCode, "issue_dependencies_blocked"),
+    sql`${heartbeatRuns.resultJson}->>${HELD_DEPENDENCY_TRACE_KEY} = 'true'`,
     floor ? sql`coalesce(${heartbeatRuns.finishedAt}, ${heartbeatRuns.updatedAt}) > ${floor.toISOString()}::timestamptz` : undefined,
   )).limit(1);
   return Boolean(cancelledAtClaim);
