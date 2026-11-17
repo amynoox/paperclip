@@ -755,6 +755,52 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     },
   );
 
+  // STUDIO-0062: production 15 Nov 2026, TR-1168. The assignee's run 05e3ab6a was cut at 14:29:13 (active legacy
+  // hold bbb8ce70), the assignee paused, and stranded-work recovery blocked the task at 14:29:43 under that same
+  // hold; its settlement at 14:29:46 found the task already blocked and wrote no receipt, so the Board's
+  // reconciliation tool could not tell this block from one the role set itself.
+  it("records the legacy cancellation receipt when stranded recovery blocks a task under the hold of its cut run", async () => {
+    const { companyId, coderId, sourceIssue } = await seedCompany();
+    const observed = (await issueService(db).update(sourceIssue.id, { status: "in_progress" }))!;
+    const cutRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: cutRunId, companyId, agentId: coderId, invocationSource: "assignment",
+      status: "cancelled", runtimeMode: "legacy", errorCode: "cancelled", startedAt: new Date(Date.now() - 120_000),
+      finishedAt: new Date(Date.now() - 60_000), contextSnapshot: { issueId: observed.id } });
+    const [hold] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: observed.id, kind: "active_run_watchdog",
+      status: "active", ownerType: "board", returnOwnerAgentId: coderId, previousOwnerAgentId: coderId,
+      cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${cutRunId}`,
+      nextAction: "Reconcile the cut run.", evidence: { runId: cutRunId },
+    }).returning();
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+    const enqueueWakeup = vi.fn(async () => null);
+    const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+    expect(result).toMatchObject({ escalated: 1, issueIds: [observed.id] });
+    const [blocked] = await db.select().from(issues).where(eq(issues.id, observed.id));
+    expect(blocked).toMatchObject({ status: "blocked", assigneeAgentId: coderId });
+    const actions = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, observed.id));
+    expect(actions.map((action) => action.id)).toEqual([hold!.id]);
+    expect(actions[0]!.evidence).toMatchObject({
+      runId: cutRunId,
+      legacyCancellationBlock: { runId: cutRunId, statusVersion: blocked!.statusVersion, previousStatus: "in_progress" },
+    });
+
+    // No receipt for a hold whose run is not a cancelled legacy run of the assignee.
+    const other = await seedCompany();
+    const otherIssue = (await issueService(db).update(other.sourceIssue.id, { status: "in_progress" }))!;
+    const failedRunId = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: failedRunId, companyId: other.companyId, agentId: other.coderId, invocationSource: "assignment",
+      status: "failed", runtimeMode: "legacy", errorCode: "adapter_failed", startedAt: new Date(Date.now() - 120_000),
+      finishedAt: new Date(Date.now() - 60_000), contextSnapshot: { issueId: otherIssue.id } });
+    await db.insert(issueRecoveryActions).values({ companyId: other.companyId, sourceIssueId: otherIssue.id, kind: "active_run_watchdog",
+      status: "active", ownerType: "board", returnOwnerAgentId: other.coderId, previousOwnerAgentId: other.coderId,
+      cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${failedRunId}`,
+      nextAction: "Reconcile the run.", evidence: { runId: failedRunId } });
+    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, other.coderId));
+    await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
+    const [otherAction] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, otherIssue.id));
+    expect(otherAction!.evidence).not.toHaveProperty("legacyCancellationBlock");
+  });
+
   it("escalates an unchanged paused-assignee snapshot and publishes its committed notice", async () => {
     const { companyId, coderId, sourceIssue } = await seedCompany();
     const observed = (await issueService(db).update(sourceIssue.id, { status: "todo" }))!;
