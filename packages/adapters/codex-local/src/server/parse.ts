@@ -143,23 +143,33 @@ export function isCodexUnknownSessionError(stdout: string, stderr: string): bool
   );
 }
 
-// STUDIO-0065 (adapted from paperclipai/paperclip#15832, head 10be54bcba, and extended): reduce a Codex stdout
-// stream to the run's own error surface.
+// STUDIO-0065 (adapted from paperclipai/paperclip#15832, head 10be54bcba, and extended): reduce a Codex run's
+// output to its own error surface.
 //
 // `codex exec --json` puts the whole transcript on stdout: the output of every command the agent ran
 // (`command_execution`), the model's text (`agent_message`), and the CLI's own protocol events. A transcript line that
 // merely quotes "401 Unauthorized ... bearer token" (an HTTP log, a source file under review) must not decide that the
-// account lost its login: one failed run would put every role that shares the account in error. Kept are:
-// - the last protocol error the CLI reported (an `error` event, or `turn.failed`): a recovered earlier error does
-//   not count;
-// - every stdout line that is not a JSON event: a CLI that fails before the protocol starts reports it as plain text.
-// Never kept: the content of an item, whatever its type.
+// account lost its login: one failed run would put every role that shares the account in error.
+//
+// - Once the protocol started (a JSON event with a type was seen), the CLI reports a failure through the protocol:
+//   only the LAST protocol error counts (an `error` event, or `turn.failed`; a recovered earlier error does not).
+//   stderr, the plain stdout lines and the fallback error message built from stderr are NOT read then: stderr also
+//   carries the words of MCP servers, hooks and the ssh client of a routed run ("401 Unauthorized", an OAuth prompt),
+//   which are not about the AI account.
+// - When the protocol never started, the CLI failed before the stream: the error message the caller passes, the
+//   plain stdout lines and stderr are its own words.
+// Never read: the content of an item, whatever its type.
 //
 // The capture keeps the last MAX_CAPTURE_BYTES of stdout, so its first line can be the cut tail of an event: that
 // fragment is not plain text.
-function codexStdoutErrorSurface(stdout: string): string {
+function codexStdoutErrorSurface(stdout: string): {
+  protocolStarted: boolean;
+  lastProtocolError: string;
+  plainLines: string[];
+} {
   const plainLines: string[] = [];
   let lastProtocolError = "";
+  let protocolStarted = false;
   const lines = stdout.split(/\r?\n/);
   const firstLineMayBeCut = stdout.length >= MAX_CAPTURE_BYTES;
 
@@ -178,6 +188,7 @@ function codexStdoutErrorSurface(stdout: string): string {
     }
 
     const type = asString(event.type, "");
+    if (type) protocolStarted = true;
     const message = type === "error"
       ? asString(event.message, "").trim()
       : type === "turn.failed"
@@ -186,7 +197,7 @@ function codexStdoutErrorSurface(stdout: string): string {
     if (message) lastProtocolError = message;
   }
 
-  return [...plainLines, lastProtocolError].filter(Boolean).join("\n");
+  return { protocolStarted, lastProtocolError, plainLines };
 }
 
 function buildCodexErrorHaystack(input: {
@@ -194,11 +205,11 @@ function buildCodexErrorHaystack(input: {
   stderr?: string | null;
   errorMessage?: string | null;
 }): string {
-  return [
-    input.errorMessage ?? "",
-    codexStdoutErrorSurface(input.stdout ?? ""),
-    input.stderr ?? "",
-  ]
+  const surface = codexStdoutErrorSurface(input.stdout ?? "");
+  const parts = surface.protocolStarted
+    ? [surface.lastProtocolError]
+    : [input.errorMessage ?? "", ...surface.plainLines, input.stderr ?? ""];
+  return parts
     .join("\n")
     .split(/\r?\n/)
     .map((line) => line.trim())

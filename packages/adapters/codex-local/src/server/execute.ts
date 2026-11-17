@@ -1646,6 +1646,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           stdout: attempt.proc.stdout,
           stderr: attempt.proc.stderr,
           ...(errorFamily ? { errorFamily } : {}),
+          // STUDIO-0065: a structured mark of the limit, which the run-end auth repair guard reads (it reads no text).
+          ...(providerQuota ? { providerLimitObserved: true } : {}),
           ...(transientRetryNotBefore ? { retryNotBefore: transientRetryNotBefore.toISOString() } : {}),
           ...(transientRetryNotBefore ? { transientRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),
           ...(providerQuota && transientRetryNotBefore ? { providerQuotaRetryNotBefore: transientRetryNotBefore.toISOString() } : {}),

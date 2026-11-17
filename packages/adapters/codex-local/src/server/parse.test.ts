@@ -248,13 +248,42 @@ describe("classifyCodexAuthRefreshFailure", () => {
       expect(isCodexProviderQuotaError({ stdout })).toBe(false);
     });
 
-    it("still reads a login loss on stderr and on a plain stdout line, with or without protocol events", () => {
-      const transcript = [event({ type: "thread.started", thread_id: "t" }), agentText("Application error: refresh_token_reused")];
-      expect(classifyCodexAuthRefreshFailure({ stdout: transcript.join("\n"), stderr: "OAuth failed: refresh token has expired" }))
+    it("reads stderr, plain stdout lines and the caller's message when the protocol never started", () => {
+      // The CLI failed before its stream: these are its own words.
+      expect(classifyCodexAuthRefreshFailure({ stdout: "", stderr: "OAuth failed: refresh token has expired" }))
         .toBe("refresh_token_expired");
-      expect(classifyCodexAuthRefreshFailure({ stdout: [...transcript, "OAuth failed: invalid_grant"].join("\n") }))
-        .toBe("refresh_token_invalidated");
+      expect(classifyCodexAuthRefreshFailure({ stdout: "OAuth failed: invalid_grant" })).toBe("refresh_token_invalidated");
       expect(classifyCodexAuthRefreshFailure({ stdout: "OAuth failed: refresh_token_reused" })).toBe("refresh_token_reused");
+      expect(classifyCodexAuthRefreshFailure({ errorMessage: "credential refresh returned 401 Unauthorized" }))
+        .toBe("refresh_token_invalidated");
+      expect(isCodexProviderQuotaError({ stdout: "", stderr: limit })).toBe(true);
+    });
+
+    it("reads only the protocol's last error once the protocol started", () => {
+      // stderr also carries the words of MCP servers, hooks and the ssh client: they are not about the AI account.
+      const started = [event({ type: "thread.started", thread_id: "t" }), agentText("Working on it.")];
+      const mcp = "ERROR mcp server linear requires OAuth login: 401 Unauthorized";
+      for (const stdout of [started.join("\n"), [...started, ...failed("The model rejected the request.")].join("\n")]) {
+        expect(classifyCodexAuthRefreshFailure({ stdout, stderr: mcp })).toBeNull();
+        expect(classifyCodexAuthRefreshFailure({ stdout, stderr: "OAuth failed: refresh token has expired" })).toBeNull();
+        expect(classifyCodexAuthRefreshFailure({ stdout, errorMessage: mcp })).toBeNull();
+        expect(classifyCodexAuthRefreshFailure({ stdout: `${stdout}\nOAuth failed: invalid_grant` })).toBeNull();
+        expect(isCodexProviderQuotaError({ stdout, stderr: limit })).toBe(false);
+      }
+      // The protocol's own last error still decides.
+      const stdout = [...started, ...failed("OAuth failed: refresh_token_reused")].join("\n");
+      expect(classifyCodexAuthRefreshFailure({ stdout, stderr: mcp })).toBe("refresh_token_reused");
+    });
+
+    it("matches no ssh client message of a routed run, which is about the machine's key", () => {
+      for (const stderr of [
+        "amyne@worker: Permission denied (publickey).",
+        "Received disconnect from 10.0.0.12 port 22:2: Too many authentication failures",
+        "Host key verification failed.",
+      ]) {
+        expect(classifyCodexAuthRefreshFailure({ stdout: "", stderr, errorMessage: stderr })).toBeNull();
+        expect(isCodexProviderQuotaError({ stdout: "", stderr, errorMessage: stderr })).toBe(false);
+      }
     });
 
     it("uses the final protocol failure rather than a recovered earlier error", () => {
@@ -271,16 +300,15 @@ describe("classifyCodexAuthRefreshFailure", () => {
     });
 
     it("does not read the cut head of a capped capture as plain text", () => {
-      // The capture keeps the last 4 MiB of stdout: its first line can be the tail of a command's output.
+      // The capture keeps the last 4 MiB of stdout: its first line can be the tail of a command's output. Here no
+      // protocol event is left in the capture, so the plain lines are read: all but that cut first line.
       const fragment = `www-authenticate: Bearer error=\\"invalid_token\\" 401 Unauthorized","exit_code":0}}`;
-      const filler = `${agentText("x".repeat(1024))}\n`;
-      const body = filler.repeat(Math.ceil((4 * 1024 * 1024) / filler.length));
-      const stdout = `${fragment}\n${body}${failed("The model rejected the request.").join("\n")}`;
+      const filler = `${"x".repeat(1024)}\n`;
+      const stdout = `${fragment}\n${filler.repeat(Math.ceil((4 * 1024 * 1024) / filler.length))}`;
       expect(stdout.length).toBeGreaterThanOrEqual(4 * 1024 * 1024);
       expect(classifyCodexAuthRefreshFailure({ stdout })).toBeNull();
       // The same words on a real first line of a short capture are the CLI's own plain text.
-      expect(classifyCodexAuthRefreshFailure({ stdout: "credential refresh returned 401 Unauthorized\n" }))
-        .toBe("refresh_token_invalidated");
+      expect(classifyCodexAuthRefreshFailure({ stdout: `${fragment}\n` })).toBe("refresh_token_invalidated");
     });
   });
 

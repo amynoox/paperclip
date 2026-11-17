@@ -1,5 +1,4 @@
 import { AI_PROVIDERS, AI_CONNECTION_CAPABILITIES, isAiConnectionCompatible, type AiConnectionBinding, type AiProvider } from "@paperclipai/shared";
-import { isCodexProviderQuotaError } from "@paperclipai/adapter-codex-local/server";
 
 type AuthenticationFailure = {
   errorCode?: string | null;
@@ -41,7 +40,8 @@ export function isAiConnectionConfigurationFailure(run: AuthenticationFailure): 
 }
 
 /**
- * STUDIO-0064: the run's own result reports a provider limit (HTTP 429, a usage or rate limit, a quota family).
+ * STUDIO-0064: the run's own result reports a provider limit (HTTP 429, a usage or rate limit, a quota family, or
+ * the adapter's own mark, STUDIO-0065).
  * Such a run did not prove that the provider refused the credentials, whatever error code it carries, so it must
  * never mark the account as needing a new sign-in (production, 17 Nov 2026, run 21529e7e: a weekly-limit run sealed
  * as claude_auth_required put the role's account in error until its owner signed in again).
@@ -54,11 +54,9 @@ export function runResultReportsProviderLimit(resultJson: unknown): boolean {
   const apiError = typeof result.api_error === "string" ? result.api_error
     : result.api_error && typeof result.api_error === "object" ? JSON.stringify(result.api_error) : "";
   if (/(?:usage|rate)[_\s-]?limit/i.test(apiError)) return true;
-  // STUDIO-0065: a Codex result stores the raw output and no status. The adapter's limit classifier reads only the
-  // run's own error surface (its last protocol error, the plain stdout lines, stderr), never the transcript.
-  const stdout = typeof result.stdout === "string" ? result.stdout : "";
-  const stderr = typeof result.stderr === "string" ? result.stderr : "";
-  return Boolean(stdout || stderr) && isCodexProviderQuotaError({ stdout, stderr });
+  // STUDIO-0065: a Codex result carries no status; its adapter writes this mark when it classified a limit. The
+  // guard reads structured fields only, never the run's output.
+  return result.providerLimitObserved === true;
 }
 
 export function isAiAuthenticationRepairable(run: AuthenticationFailure): boolean {

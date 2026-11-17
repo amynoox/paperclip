@@ -140,15 +140,43 @@ describe("Codex login-loss detection by the real path (STUDIO-0065)", () => {
     expect(result.errorCode).toBe("provider_quota");
     expect(result.errorFamily).toBe("provider_quota");
     expect(result.errorMessage).toContain("usage limit");
+    // The structured mark the server guard reads.
+    expect(result.resultJson).toMatchObject({ errorFamily: "provider_quota", providerLimitObserved: true });
     const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
     expect(ended).toMatchObject(intact);
     expect(ended.health).not.toBe("error");
   }, 120_000);
 
-  it("lets the limit outrank a login word the CLI process wrote on stderr", async () => {
-    const result = await runFakeCli({ stdout: [...transcript, ...failed(LIMIT)],
-      stderr: "WARN mcp server answered 401 Unauthorized to the bearer token\n" });
+  it("lets the limit outrank a login loss when the CLI failed before the protocol and wrote both", async () => {
+    const result = await runFakeCli({ stdout: [LIMIT], stderr: "credential refresh returned 401 Unauthorized\n" });
     expect(result.errorCode).toBe("provider_quota");
+    const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+    expect(ended).toMatchObject(intact);
+  }, 120_000);
+
+  it("does not mark the account for login words on stderr once the protocol started", async () => {
+    // An MCP server, a hook or the ssh client of a routed run writes there: not the AI account's words.
+    const stderr = [
+      "ERROR mcp server linear requires OAuth login: 401 Unauthorized",
+      "OAuth failed: refresh token has expired",
+      "amyne@worker: Permission denied (publickey).",
+      "Received disconnect from 10.0.0.12 port 22:2: Too many authentication failures",
+      "Host key verification failed.",
+    ].map(line => `${line}\n`).join("");
+    for (const stdout of [[...transcript, ...failed("The model rejected the request.")], transcript]) {
+      const result = await runFakeCli({ stdout, stderr });
+      expect(result.exitCode).toBe(1);
+      expect(result.errorCode ?? "").not.toMatch(/^refresh_token_/);
+      const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
+      expect(ended).toMatchObject(intact);
+    }
+  }, 120_000);
+
+  it("does not mark the account for the ssh client's messages when the CLI never started", async () => {
+    const result = await runFakeCli({ stdout: [], stderr:
+      "amyne@worker: Permission denied (publickey).\nToo many authentication failures\nHost key verification failed.\n" });
+    expect(result.exitCode).toBe(1);
+    expect(result.errorCode ?? "").not.toMatch(/^refresh_token_/);
     const ended = await endFailedRun({ errorCode: result.errorCode ?? null, resultJson: result.resultJson });
     expect(ended).toMatchObject(intact);
   }, 120_000);
@@ -162,13 +190,17 @@ describe("Codex login-loss detection by the real path (STUDIO-0065)", () => {
     expect(ended.health).not.toBe("error");
   }, 120_000);
 
-  it("does not mark the account for a run stored with a login code whose own error is a usage limit", async () => {
-    // The run as fb1ad740 stored it: the adapter's old code, with the limit as its last protocol error.
+  it("does not mark the account for a run whose result carries the structured limit mark, and reads no text", async () => {
     const stdout = [...transcript, ...failed(LIMIT)].map(line => `${line}\n`).join("");
-    const ended = await endFailedRun({ errorCode: "refresh_token_invalidated",
+    // A login code with the adapter's limit mark: the guard keeps the account.
+    const marked = await endFailedRun({ errorCode: "refresh_token_invalidated",
+      resultJson: { stdout, stderr: "", errorFamily: "refresh_token_invalidated", providerLimitObserved: true } });
+    expect(marked).toMatchObject(intact);
+    expect(marked.health).not.toBe("error");
+    // The guard reads structured fields only: the same output without the mark is not re-read.
+    const unmarked = await endFailedRun({ errorCode: "refresh_token_invalidated",
       resultJson: { stdout, stderr: "", errorFamily: "refresh_token_invalidated" } });
-    expect(ended).toMatchObject(intact);
-    expect(ended.health).not.toBe("error");
+    expect(unmarked).toMatchObject({ grantStatus: "needs_reauthorization", health: "error", marks: 1 });
   }, 120_000);
 
   it("still marks the account when a transcript that quotes a usage limit ends on a real login loss", async () => {
@@ -191,9 +223,8 @@ describe("Codex login-loss detection by the real path (STUDIO-0065)", () => {
     ["refresh_token_invalidated in the protocol error", { stdout: [...transcript, ...failed("OAuth failed: refresh_token_invalidated")] }, "refresh_token_invalidated"],
     ["invalid_grant in the protocol error", { stdout: failed("OAuth failed: invalid_grant") }, "refresh_token_invalidated"],
     ["a 401 from the API on the credential", { stdout: [...transcript, ...failed("credential refresh returned 401 Unauthorized")] }, "refresh_token_invalidated"],
-    ["a login loss on stderr", { stdout: transcript, stderr: "OAuth failed: refresh token has expired\n" }, "refresh_token_expired"],
+    ["a login loss on stderr, the CLI failing before the protocol", { stdout: [], stderr: "OAuth failed: refresh token has expired\n" }, "refresh_token_expired"],
     ["a plain stdout line, the CLI failing before the protocol", { stdout: ["OAuth failed: refresh_token_reused"] }, "refresh_token_reused"],
-    ["a plain stdout line among protocol events", { stdout: [...transcript, "OAuth failed: invalid_grant"] }, "refresh_token_invalidated"],
   ] as const)("still marks the account for %s", async (_form, output, code) => {
     const result = await runFakeCli({ stdout: [...output.stdout], stderr: "stderr" in output ? output.stderr : undefined });
     expect(result.exitCode).toBe(1);
