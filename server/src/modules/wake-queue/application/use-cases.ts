@@ -170,6 +170,22 @@ async function runReleaseDrain(
     }
     processedWakeIds.add(candidate.id);
 
+    // STUDIO-0066: a hand-over wake kept behind the previous run's process or lease (heartbeat/queue.ts) is for
+    // the assignee it was written for. If the task was handed to someone else before the owner let go, the sweep
+    // never re-admits that row (it follows the current assignee), and it carries no comment and no card that
+    // another drain rule would retire. Promoting it here would start a former assignee on a task that is no
+    // longer its own: retire it.
+    if (candidate.payload.ownershipHandoverWake === true && candidate.agentId !== issue.assigneeAgentId) {
+      await ports.transaction.cancelDeferredWake({
+        companyId: run.companyId,
+        wakeId: candidate.id,
+        agentId: candidate.agentId,
+        reason: "The task was handed to another assignee after this hand-over wake was kept",
+        now: input.now,
+      });
+      continue;
+    }
+
     if (locked.handoffAssigneeAgentId && candidate.agentId !== locked.handoffAssigneeAgentId) {
       preservedWakeIds.push(candidate.id);
       continue;

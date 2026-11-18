@@ -208,8 +208,22 @@ const support = await getEmbeddedPostgresTestSupport();
     // The stand-in adapter returns no stop receipt, so the stopped run leaves a reconciliation action that a real
     // provider's acknowledged stop does not leave. Production shows that action cancelled after a reassignment
     // (TR-702, the fixture of STUDIO-0041): put it in that state, by hand. The issue update route is not driven.
-    expect(await getExecutionBlocker(db, ids.companyId, ids.issueId)).toMatchObject({ runId: devRun!.id,
-      cause: "legacy_execution_requires_reconciliation" });
+    const reconciliation = await getExecutionBlocker(db, ids.companyId, ids.issueId);
+    expect(reconciliation).toMatchObject({ runId: devRun!.id, cause: "legacy_execution_requires_reconciliation" });
+    // While that action is open the kept wake waits. It must not wait in silence: past the limit the thread is told,
+    // once, what holds; the wake stays kept and nothing starts.
+    await heartbeat.resumeQueuedRuns();
+    expect(await notes(f)).toHaveLength(0);
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 11 * 60_000) }).where(eq(agentWakeupRequests.id, kept.id));
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.resumeQueuedRuns();
+    const held = await notes(f);
+    expect(held).toHaveLength(1);
+    expect(held[0].body).toContain("CTO has not started on this task: its wake has waited 11 minutes behind the previous run of Dev Unity");
+    expect(held[0].body).toContain(reconciliation!.nextAction);
+    expect(held[0].body).toContain(`<!-- execution-owner-stall-notice-for:${devRun!.id}:${reconciliation!.recoveryActionId} -->`);
+    expect(await wakeRow(kept.id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(await assignmentRuns(f, f.cto)).toHaveLength(0);
     await db.update(issueRecoveryActions).set({ status: "cancelled", outcome: "cancelled", resolvedAt: new Date() })
       .where(and(eq(issueRecoveryActions.companyId, ids.companyId), eq(issueRecoveryActions.sourceIssueId, ids.issueId)));
     expect(await getExecutionBlocker(db, ids.companyId, ids.issueId)).toBeNull();
@@ -226,7 +240,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await heartbeat.resumeQueuedRuns();
     expect(await assignmentRuns(f, f.cto)).toHaveLength(1);
     expect(await keptWakes(f, f.cto)).toHaveLength(0);
-    expect(await notes(f)).toHaveLength(0);
+    expect(await notes(f)).toHaveLength(1);
   }, 90_000);
 
   it.each(["process", "lease"] as const)("keeps and then starts the wake behind the stopped run's %s", async owner => {
@@ -269,10 +283,11 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 11 * 60_000) }).where(eq(agentWakeupRequests.id, kept.id));
     await heartbeat.resumeQueuedRuns();
     const [note] = await notes(f);
-    expect(note.body).toContain("CTO has not started on this task: its wake has waited 11 minutes for the previous run of Dev Unity");
+    expect(note.body).toContain("CTO has not started on this task: its wake has waited 11 minutes behind the previous run of Dev Unity");
     expect(note.body).toContain(`(${f.devRunId.slice(0, 8)})`);
     expect(note.body).toContain("The previous provider process is still running. Stop it before continuing this task.");
-    expect(note.body).toContain(`<!-- execution-owner-stall-notice-for:${f.devRunId} -->`);
+    expect(note.body).toContain("CTO starts by itself as soon as this hold is gone.");
+    expect(note.body).toContain(`<!-- execution-owner-stall-notice-for:${f.devRunId}:owner -->`);
     expect(note).toMatchObject({ authorType: "system", authorAgentId: null });
     expect(await wakeRow(kept.id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
     // No loop: later sweeps write nothing more and start nothing; the note wakes nobody.
@@ -308,6 +323,46 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await wakeRow(kept.id)).toMatchObject({ status: "cancelled", runId: null,
       error: expect.stringContaining(`Served by run ${direct!.id}`) });
     expect(await keptWakes(f, f.cto)).toHaveLength(0);
+  });
+
+  it("retires the kept wake of a former assignee at once when the task is handed on while the owner still holds", async () => {
+    // Handed to the CTO (wake kept), then to the Game Tester before the developer's process has stopped.
+    const f = await seedStoppedOwner("process");
+    const first = await keptWake(f);
+    await db.update(issues).set({ assigneeAgentId: f.other, updatedAt: new Date() }).where(eq(issues.id, f.issueId));
+    expect(await assignmentWake(f, f.other)).toBeNull();
+    expect(await wakeRow(first.id)).toMatchObject({ status: "cancelled", runId: null,
+      error: "The task was handed to another assignee after this hand-over wake was kept" });
+    const second = await keptWakes(f, f.other);
+    expect(second).toHaveLength(1);
+    expect(await keptWakes(f, f.cto)).toHaveLength(0);
+    await f.release();
+    await heartbeat.resumeQueuedRuns();
+    await startsOnce(f, f.other);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.resumeQueuedRuns();
+    expect(await assignmentRuns(f, f.cto)).toHaveLength(0);                         // the former assignee never runs
+    expect(mockAdapterExecute.mock.calls.filter(([context]) => context?.agent.id === f.cto)).toHaveLength(0);
+    expect(await assignmentRuns(f, f.other)).toHaveLength(1);
+  });
+
+  it("never promotes the kept wake of a former assignee when a run releases the task", async () => {
+    // Handed to the CTO (wake kept), then to the Game Tester once the developer's process has stopped: the Game
+    // Tester's wake meets no hold and starts at once, so nothing retires the CTO's kept wake at admission. When the
+    // Game Tester's run releases the task, the drain reads the oldest deferred wake of the task: the CTO's.
+    const f = await seedStoppedOwner("process");
+    const orphan = await keptWake(f);
+    await f.release();
+    await db.update(issues).set({ assigneeAgentId: f.other, updatedAt: new Date() }).where(eq(issues.id, f.issueId));
+    expect(await assignmentWake(f, f.other)).not.toBeNull();
+    await startsOnce(f, f.other);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.resumeQueuedRuns();
+    expect(await wakeRow(orphan.id)).toMatchObject({ status: "cancelled", runId: null,
+      error: "The task was handed to another assignee after this hand-over wake was kept" });
+    expect(await assignmentRuns(f, f.cto)).toHaveLength(0);
+    expect(mockAdapterExecute.mock.calls.filter(([context]) => context?.agent.id === f.cto)).toHaveLength(0);
+    expect(await assignmentRuns(f, f.other)).toHaveLength(1);
   });
 
   it("leaves a wake of an agent that is not the assignee as a skipped receipt", async () => {

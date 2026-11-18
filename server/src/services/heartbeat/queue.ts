@@ -2365,11 +2365,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         const stillHeld = await getExecutionBlocker(db, wake.companyId, heldIssueId);
         if (stillHeld) {
           // STUDIO-0066: bounded. The previous run's process or lease is still there long after the wake was asked
-          // for: the wake stays kept (it starts as soon as the owner is gone) and the thread is told once per run.
-          if (isPreviousOwnerHold(stillHeld) && stillHeld.runId
+          // for, or, for a kept hand-over wake, any other hold (the stopped run left a reconciliation action open,
+          // for example): the wake stays kept (it starts as soon as the hold is gone) and the thread is told once
+          // per hold.
+          if ((isPreviousOwnerHold(stillHeld) || wake.payload?.[OWNERSHIP_HANDOVER_WAKE_KEY] === true)
+              && (stillHeld.runId || stillHeld.recoveryActionId)
               && Date.now() - wake.requestedAt.getTime() >= EXECUTION_OWNER_STALL_NOTICE_MS)
             await noteStalledExecutionOwner(db, { companyId: wake.companyId, issueId: heldIssueId,
-              waitingAgentId: wake.agentId, ownerRunId: stillHeld.runId, nextAction: stillHeld.nextAction,
+              waitingAgentId: wake.agentId, ownerRunId: stillHeld.runId ?? null,
+              recoveryActionId: stillHeld.recoveryActionId, nextAction: stillHeld.nextAction,
               waitingSince: wake.requestedAt });
           continue;
         }
@@ -4278,6 +4282,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               // 17 Nov 2026: no run for 58 min). Keep the wake; the sweep of STUDIO-0041 (resumeDeferredExecutionReceipts)
               // re-admits it through ordinary admission once the task has no execution blocker left.
               // One kept wake per assignee and task: a later one of the same kind is counted on it.
+              // A kept wake of ANOTHER agent on this task belongs to an assignee the task has left since: retire
+              // it now, so that no release ever promotes a former assignee.
+              const supersededAt = new Date();
+              await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: supersededAt, updatedAt: supersededAt,
+                error: "The task was handed to another assignee after this hand-over wake was kept" })
+                .where(and(eq(agentWakeupRequests.companyId, agent.companyId), ne(agentWakeupRequests.agentId, agentId),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+                  sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+                  sql`${agentWakeupRequests.payload}->>${OWNERSHIP_HANDOVER_WAKE_KEY} = 'true'`));
               const [kept] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
                 eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.agentId, agentId),
                 eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
