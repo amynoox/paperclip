@@ -22,7 +22,11 @@ export interface PluginJobSchedulerOptions {
   jobTimeoutMs?: number;
   settlementTimeoutMs?: number;
   maxConcurrentJobs?: number;
+  /** STUDIO-0069: age past which an outstanding run that this process does not hold is abandoned. */
+  abandonedRunAfterMs?: number;
 }
+/** STUDIO-0069: the error recorded on a run whose server process stopped before the run was settled. */
+export const ABANDONED_PLUGIN_JOB_RUN_ERROR = "Abandoned: the server process that held this run stopped before it settled";
 export interface TriggerJobResult { runId: string; jobId: string }
 export interface SchedulerDiagnostics {
   running: boolean;
@@ -48,6 +52,9 @@ function nextCron(schedule: string, now: Date): Date | null {
 export function createPluginJobScheduler(options: PluginJobSchedulerOptions): PluginJobScheduler {
   const { db, jobStore, workerManager, tickIntervalMs = 30_000,
     jobTimeoutMs = 5 * 60_000, settlementTimeoutMs = 30_000, maxConcurrentJobs = 10 } = options;
+  // STUDIO-0069: a live process keeps a run outstanding for its call (jobTimeoutMs) and the write of its result
+  // (settlementTimeoutMs, tried again once) at most. Past that, a run this process does not hold has no owner left.
+  const abandonedRunAfterMs = options.abandonedRunAfterMs ?? jobTimeoutMs + 2 * settlementTimeoutMs;
   const log = logger.child({ service: "plugin-job-scheduler" });
   const activeJobs = new Set<string>();
   const pendingSettlements = new Map<string, { persist: () => Promise<void>; running?: Promise<void> }>();
@@ -143,21 +150,53 @@ export function createPluginJobScheduler(options: PluginJobSchedulerOptions): Pl
     } catch (err) { activeJobs.delete(job.id); throw err; }
   }
 
+  /**
+   * STUDIO-0069: settle a run no live process holds any more. Read again under its row lock: its owner may have
+   * settled it since the listing. Returns whether the run no longer blocks its job.
+   */
+  async function settleAbandonedRun(runId: string, now: Date): Promise<boolean> {
+    return db.transaction(async tx => {
+      const [current] = await tx.select().from(pluginJobRuns).where(eq(pluginJobRuns.id, runId)).for("update");
+      if (!current || !["pending", "queued", "running"].includes(current.status)) return true;
+      if (activeJobs.has(current.jobId) || pendingSettlements.has(current.jobId)) return false;
+      const since = current.startedAt ?? current.createdAt;
+      if (since.getTime() + abandonedRunAfterMs > now.getTime()) return false;
+      await pluginJobStore(tx).completeRun(current.id, { status: "failed", error: ABANDONED_PLUGIN_JOB_RUN_ERROR,
+        durationMs: current.startedAt ? now.getTime() - current.startedAt.getTime() : null });
+      log.warn({ runId: current.id, jobId: current.jobId, pluginId: current.pluginId, status: current.status,
+        since: since.toISOString() }, "plugin job run abandoned by a stopped server process; settled as failed");
+      return true;
+    });
+  }
+
   async function refresh(signal?: AbortSignal) {
     const settlements = await Promise.allSettled([...pendingSettlements.keys()].map(settle));
     const jobs = await db.select().from(pluginJobs).where(eq(pluginJobs.status, "active"));
     const runnable = jobs.filter(job => !unregistered.has(job.pluginId) && workerManager.isRunning(job.pluginId)
       && !activeJobs.has(job.id) && !pendingSettlements.has(job.id) && job.schedule && !validateCron(job.schedule));
-    const outstanding = runnable.length === 0 ? [] : await db.select({ jobId: pluginJobRuns.jobId })
+    const outstanding = runnable.length === 0 ? [] : await db.select({ id: pluginJobRuns.id, jobId: pluginJobRuns.jobId,
+      startedAt: pluginJobRuns.startedAt, createdAt: pluginJobRuns.createdAt })
       .from(pluginJobRuns).where(and(inArray(pluginJobRuns.jobId, runnable.map(job => job.id)),
         inArray(pluginJobRuns.status, ["pending", "queued", "running"])));
-    const blocked = new Set(outstanding.map(run => run.jobId));
     const now = new Date();
+    // STUDIO-0069: the jobs in `runnable` are not held by this process, so their outstanding runs belong to another
+    // process. One that is still young may be executing: the job waits for it, and for the moment it would be
+    // abandoned. An older one has no owner left (production, 18 Nov 2026: a server that died mid-job left runs
+    // `running`, their jobs were skipped at every start and the scheduler, with no deadline left, slept): it is
+    // settled as failed and its job runs again in this pass.
+    const blockedUntil = new Map<string, number>();
+    for (const run of outstanding) {
+      const abandonedAt = (run.startedAt ?? run.createdAt).getTime() + abandonedRunAfterMs;
+      if (abandonedAt <= now.getTime() && await settleAbandonedRun(run.id, now)) continue;
+      blockedUntil.set(run.jobId, Math.max(blockedUntil.get(run.jobId) ?? 0, abandonedAt, now.getTime() + 1000));
+    }
     const dispatches: Promise<unknown>[] = [];
     next = null;
     for (const job of runnable) {
       if (!canRun() || signal?.aborted) break;
-      if (blocked.has(job.id) || activeJobs.has(job.id) || pendingSettlements.has(job.id)) continue;
+      const waitsUntil = blockedUntil.get(job.id);
+      if (waitsUntil !== undefined) { next = next === null ? waitsUntil : Math.min(next, waitsUntil); continue; }
+      if (activeJobs.has(job.id) || pendingSettlements.has(job.id)) continue;
       if (!job.nextRunAt) {
         const deadline = nextCron(job.schedule, now);
         if (!deadline) continue;
