@@ -458,12 +458,76 @@ describe("isCodexTransientUpstreamError", () => {
     );
   });
 
-  it("classifies model-capacity messages as provider quota without reset metadata", () => {
-    const errorMessage = "The requested model is at capacity. Please try again later.";
+  // STUDIO-0067: this case said "provider quota" on the baseline. A saturated model is not an exhausted account:
+  // classified as a limit, it held every later run of the role for an hour.
+  it("classifies model-capacity messages as a transient upstream error, not as a provider quota", () => {
+    for (const errorMessage of [
+      "The requested model is at capacity. Please try again later.",
+      "Selected model is at capacity. Please try a different model.",
+      "We're at capacity for this model. Try again soon.",
+    ]) {
+      expect(isCodexProviderQuotaError({ errorMessage })).toBe(false);
+      expect(isCodexTransientUpstreamError({ errorMessage })).toBe(true);
+      expect(extractCodexRetryNotBefore({ errorMessage })).toBeNull();
+    }
+  });
 
-    expect(isCodexProviderQuotaError({ errorMessage })).toBe(true);
-    expect(isCodexTransientUpstreamError({ errorMessage })).toBe(false);
-    expect(extractCodexRetryNotBefore({ errorMessage })).toBeNull();
+  describe("a stream that ends on Codex's own retry announcement (STUDIO-0067)", () => {
+    const event = (value: Record<string, unknown>) => JSON.stringify(value);
+    const started = [event({ type: "thread.started", thread_id: "t" }), event({ type: "turn.started" })];
+    const error = (message: string) => event({ type: "error", message });
+    const limit = "You've hit your usage limit for GPT-5.3-Codex. Switch to another model now, or try again at 11:31 PM.";
+    // The line of production, 18 Nov 2026, Feedback Manager.
+    const CAPACITY = "Reconnecting... 2/5 (Selected model is at capacity. Please try a different model.)";
+
+    it("is a transient error, never a quota, whatever cause the announcement quotes", () => {
+      for (const announcement of [
+        CAPACITY,
+        "Reconnecting... 1/5 (stream disconnected before completion)",
+        `Reconnecting... 3/5 (${limit})`,
+        "Reconnecting... 5/5",
+      ]) {
+        const stdout = [...started, error(announcement)].join("\n");
+        const input = { stdout, stderr: "", errorMessage: announcement };
+        expect(isCodexProviderQuotaError(input)).toBe(false);
+        expect(extractCodexRetryNotBefore(input)).toBeNull();
+        expect(isCodexTransientUpstreamError(input)).toBe(true);
+      }
+    });
+
+    it("still classifies from the provider's final error after the announcements", () => {
+      // Codex gave up: its final error is the verdict.
+      const failedOnLimit = [...started, error(CAPACITY), error(limit), event({ type: "turn.failed", error: { message: limit } })].join("\n");
+      expect(isCodexProviderQuotaError({ stdout: failedOnLimit })).toBe(true);
+      expect(isCodexTransientUpstreamError({ stdout: failedOnLimit })).toBe(false);
+      expect(extractCodexRetryNotBefore({ stdout: failedOnLimit }, new Date(2026, 3, 22, 22, 29, 2))?.getHours()).toBe(23);
+      const failedOnCapacity = [...started, error(CAPACITY),
+        event({ type: "turn.failed", error: { message: "Selected model is at capacity. Please try a different model." } })].join("\n");
+      expect(isCodexProviderQuotaError({ stdout: failedOnCapacity })).toBe(false);
+      expect(isCodexTransientUpstreamError({ stdout: failedOnCapacity })).toBe(true);
+    });
+
+    it("keeps a real usage limit a quota, in the protocol error and before the protocol", () => {
+      const stdout = [...started, error(limit), event({ type: "turn.failed", error: { message: limit } })].join("\n");
+      expect(isCodexProviderQuotaError({ stdout })).toBe(true);
+      expect(isCodexTransientUpstreamError({ stdout })).toBe(false);
+      expect(isCodexProviderQuotaError({ stdout: "", stderr: limit })).toBe(true);
+      // An announcement quoted by a command or by the model decides nothing.
+      const quoted = [...started, event({ type: "item.completed", item: { type: "agent_message", text: CAPACITY } }),
+        event({ type: "turn.failed", error: { message: "The model rejected the request." } })].join("\n");
+      expect(isCodexProviderQuotaError({ stdout: quoted })).toBe(false);
+      expect(isCodexTransientUpstreamError({ stdout: quoted })).toBe(false);
+    });
+
+    it("forgets the announcements of a turn that completed", () => {
+      // A successful turn can carry error lines Codex recovered from, before its turn.completed.
+      const recovered = [...started, error(CAPACITY), error(`Reconnecting... 2/5 (${limit})`),
+        event({ type: "turn.completed", usage: { input_tokens: 1, output_tokens: 1 } })].join("\n");
+      expect(isCodexProviderQuotaError({ stdout: recovered })).toBe(false);
+      expect(isCodexTransientUpstreamError({ stdout: recovered })).toBe(false);
+      expect(extractCodexRetryNotBefore({ stdout: recovered })).toBeNull();
+      expect(classifyCodexAuthRefreshFailure({ stdout: recovered })).toBeNull();
+    });
   });
 
   it("parses explicit timezone hints on usage-limit retry windows", () => {

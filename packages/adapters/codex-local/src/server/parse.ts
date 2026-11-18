@@ -10,8 +10,18 @@ const CODEX_TRANSIENT_UPSTREAM_RE =
 const CODEX_REMOTE_COMPACTION_RE = /remote\s+compact\s+task/i;
 const CODEX_USAGE_LIMIT_RE =
   /you(?:'|’)ve hit your usage limit for .+\.\s+switch to another model now,\s+or try again at\s+([^.!\n]+)(?:[.!]|\n|$)/i;
+// STUDIO-0067: a saturated model is not an exhausted account. "Selected model is at capacity. Please try a
+// different model." was classified with the usage limits, so one such failure held every later run of the role for
+// an hour (the server's default wait when a limit reports no reset time), although the account had allowance left
+// (production, 18 Nov 2026, Feedback Manager, 07:00 to 08:23 UTC). It is a passing condition of the provider: a
+// transient upstream error, retried after a short delay. The ACP lane already treats it so (acp.ts).
 const CODEX_PROVIDER_QUOTA_RE =
-  /(?:you(?:'|’)ve hit your usage limit|usage limit|model (?:is )?at capacity|at capacity for this model|capacity limit)/i;
+  /(?:you(?:'|’)ve hit your usage limit|usage limit|capacity limit)/i;
+const CODEX_MODEL_CAPACITY_RE = /(?:model (?:is )?at capacity|at capacity for this model)/i;
+// "Reconnecting... 2/5 (cause)": Codex announces its own next attempt. When the stream ends on such a line the CLI
+// stopped while it was still retrying: the line is no verdict on the account, whatever cause it quotes. If the cause
+// is real, the next run ends on the provider's final error and is classified from it.
+const CODEX_RETRY_ANNOUNCEMENT_RE = /^reconnecting\.{3}\s*\d+\s*\/\s*\d+/i;
 // STUDIO-0065: the sentences Codex itself writes on a login loss, read in the installed binaries (codex-cli 0.156.1 on
 // the server, 0.166.0 on the worker machines, Linux x64). The binary holds no `refresh_token_reused`,
 // `refresh_token_expired` or `refresh_token_invalidated` code as text: the code forms below are those of the
@@ -394,11 +404,18 @@ function parseLocalClockTime(clockText: string, now: Date): Date | null {
   return retryAt;
 }
 
+/** The protocol's last error is Codex's own announcement of a next attempt (STUDIO-0067). */
+function codexEndedOnRetryAnnouncement(input: { stdout?: string | null }): boolean {
+  const surface = codexStdoutErrorSurface(input.stdout ?? "");
+  return surface.protocolStarted && CODEX_RETRY_ANNOUNCEMENT_RE.test(surface.lastProtocolError);
+}
+
 export function extractCodexRetryNotBefore(input: {
   stdout?: string | null;
   stderr?: string | null;
   errorMessage?: string | null;
 }, now = new Date()): Date | null {
+  if (codexEndedOnRetryAnnouncement(input)) return null;
   const haystack = buildCodexErrorHaystack(input);
   const usageLimitMatch = haystack.match(CODEX_USAGE_LIMIT_RE);
   if (!usageLimitMatch) return null;
@@ -413,6 +430,8 @@ export function isCodexTransientUpstreamError(input: {
   const haystack = buildCodexErrorHaystack(input);
 
   if (isCodexProviderQuotaError(input)) return false;
+  // STUDIO-0067: a saturated model, or a stream that ended while Codex was still announcing its next attempt.
+  if (codexEndedOnRetryAnnouncement(input) || CODEX_MODEL_CAPACITY_RE.test(haystack)) return true;
   if (!CODEX_TRANSIENT_UPSTREAM_RE.test(haystack)) return false;
   // Keep automatic retries scoped to the observed remote-compaction/high-demand
   // failure shape.
@@ -424,6 +443,7 @@ export function isCodexProviderQuotaError(input: {
   stderr?: string | null;
   errorMessage?: string | null;
 }): boolean {
+  if (codexEndedOnRetryAnnouncement(input)) return false;
   const haystack = buildCodexErrorHaystack(input);
   return CODEX_PROVIDER_QUOTA_RE.test(haystack) || extractCodexRetryNotBefore(input) != null;
 }
