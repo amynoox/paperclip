@@ -99,6 +99,18 @@ describe("a saturated Codex model is not an exhausted account (STUDIO-0067)", ()
     expect(await nextRunHold([{ exitCode: result.exitCode, errorCode: result.errorCode, resultJson: result.resultJson }])).toBeNull();
   }, 120_000);
 
+  it("does not take a retry announcement for a verdict, whatever cause it quotes", async () => {
+    // The stream ended while Codex was still retrying. The cause it quotes here is a usage limit: if it is real, the
+    // next run ends on the provider's final error and holds the role then.
+    for (const announcement of [`Reconnecting... 3/5 (${LIMIT})`, "Reconnecting... 1/5 (stream disconnected before completion)"]) {
+      const result = await runFakeCli({ stdout: [...started, event({ type: "error", message: announcement })], exitCode: 1 });
+      expect(result.errorCode).toBe("codex_transient_upstream");
+      expect(result.retryNotBefore ?? null).toBeNull();
+      expect(result.resultJson).not.toHaveProperty("providerLimitObserved");
+      expect(await nextRunHold([{ exitCode: result.exitCode, errorCode: result.errorCode, resultJson: result.resultJson }])).toBeNull();
+    }
+  }, 120_000);
+
   it("does the same when Codex gave up on the saturated model", async () => {
     const result = await runFakeCli({ stdout: [...started, event({ type: "error", message: ANNOUNCEMENT }),
       event({ type: "error", message: CAPACITY }), event({ type: "turn.failed", error: { message: CAPACITY } })], exitCode: 1 });
