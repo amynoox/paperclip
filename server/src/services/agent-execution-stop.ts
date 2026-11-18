@@ -5,7 +5,36 @@ import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } fro
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
-import { isPreDispatchCancellation, markSettledStopsBeforeProcessLaunch } from "./pre-dispatch-cancellation.js";
+import { isPreDispatchCancellation, markSettledStopsBeforeProcessLaunch, PRE_DISPATCH_CANCELLATION_KEY } from "./pre-dispatch-cancellation.js";
+
+// STUDIO-0068: the stop proof reads every run the agents ever had. Production, 18 Nov 2026: with whole rows
+// (result_json, usage_json, context_snapshot...) the runs of one long-lived role were 864 MB compressed in the
+// database; four pausing roles were read at once, twice each, every 2 s, and the server died of heap exhaustion at
+// every start. Only the columns the proof reads are selected. Of result_json, two short fragments are extracted
+// in SQL: the pre-dispatch marker (isPreDispatchCancellation reads `version` and `providerWorkStarted`) and
+// `executionCancellation.state`. Every run is still read, whatever its status: the proof is about finished runs.
+// The whole row of ONE run is read only where a helper needs it (readWholeRun below).
+const stopProofRunColumns = {
+  id: heartbeatRuns.id,
+  companyId: heartbeatRuns.companyId,
+  status: heartbeatRuns.status,
+  runtimeMode: heartbeatRuns.runtimeMode,
+  executionStage: heartbeatRuns.executionStage,
+  startedAt: heartbeatRuns.startedAt,
+  finishedAt: heartbeatRuns.finishedAt,
+  processPid: heartbeatRuns.processPid,
+  processGroupId: heartbeatRuns.processGroupId,
+  processStartedAt: heartbeatRuns.processStartedAt,
+  controllerLeaseExpiresAt: heartbeatRuns.controllerLeaseExpiresAt,
+  resultJson: sql<Record<string, unknown> | null>`case when ${heartbeatRuns.resultJson} is null then null else jsonb_build_object(
+    ${PRE_DISPATCH_CANCELLATION_KEY}::text, jsonb_build_object(
+      'version', ${heartbeatRuns.resultJson}->${PRE_DISPATCH_CANCELLATION_KEY}::text->'version',
+      'providerWorkStarted', ${heartbeatRuns.resultJson}->${PRE_DISPATCH_CANCELLATION_KEY}::text->'providerWorkStarted'),
+    'executionCancellation', jsonb_build_object(
+      'state', ${heartbeatRuns.resultJson}->'executionCancellation'->'state')) end`,
+};
+type StopProofRun = Pick<typeof heartbeatRuns.$inferSelect, Exclude<keyof typeof stopProofRunColumns, "resultJson">>
+  & { resultJson: Record<string, unknown> | null };
 
 // STUDIO-0043, pause only: a cancelled run that executed over the built-in
 // `ssh` environment driver gets no remote termination receipt (the driver has
@@ -33,7 +62,10 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], opt
   // STUDIO-0053: a pause also records the stop of runs that settled without any process after the stop wait
   // timed out, or across a server restart.
   if (options.pauseStop) await markSettledStopsBeforeProcessLaunch(db, agentIds, options.now ?? new Date());
-  const runs = await db.select().from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
+  const runs: StopProofRun[] = await db.select(stopProofRunColumns).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
+  // One whole row at a time, for the helpers that read more of a run than the proof itself does.
+  const readWholeRun = async (runId: string) =>
+    (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId)))[0] ?? null;
   const runIds = db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(inArray(heartbeatRuns.agentId, agentIds));
   const leases = await db.select().from(environmentLeases).where(or(
     inArray(environmentLeases.heartbeatRunId, runIds),
@@ -80,15 +112,21 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], opt
     if (processAlive || groupAlive) return false;
     if (run.status !== "cancelled" || !run.startedAt) continue;
     if (run.runtimeMode === "native" && !run.processPid && !run.processGroupId &&
-        !await hasNativeLocalProcessStop(db, run.companyId, run.id) &&
-        !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
+        !await hasNativeLocalProcessStop(db, run.companyId, run.id)) {
+      const whole = await readWholeRun(run.id);
+      // A run that is gone cannot be proven stopped here: the proof is asked again.
+      if (!whole || !await isCancelledNativeStartup(db, whole, coordinators.find(row => row.runId === run.id))) return false;
+    }
     if (run.runtimeMode === "legacy" && !run.processPid && !run.processGroupId && !cancelledBeforeDispatch &&
-        (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged" &&
-        !(run.executionStage === "settled" && !await runUsedConversationAdapter(db, run)) &&
-        !await isCancelledNativeStartup(db, run, coordinators.find(row => row.runId === run.id))) return false;
+        (run.resultJson?.executionCancellation as Record<string, unknown> | undefined)?.state !== "acknowledged") {
+      const whole = await readWholeRun(run.id);
+      if (!whole) return false;
+      if (!(run.executionStage === "settled" && !await runUsedConversationAdapter(db, whole)) &&
+          !await isCancelledNativeStartup(db, whole, coordinators.find(row => row.runId === run.id))) return false;
+    }
   }
   async function sshClientStopProvesPause(
-    run: typeof heartbeatRuns.$inferSelect, runLeases: (typeof environmentLeases.$inferSelect)[], at: Date,
+    run: StopProofRun, runLeases: (typeof environmentLeases.$inferSelect)[], at: Date,
   ) {
     if (run.runtimeMode !== "legacy" || !run.finishedAt ||
         at.getTime() - run.finishedAt.getTime() < SSH_CLIENT_STOP_PAUSE_PROOF_DELAY_MS) return false;
