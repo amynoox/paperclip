@@ -5,6 +5,8 @@ import { agentCommentHeldByDependencies, allUnresolvedBlockersCancelled, HELD_DE
   isDependencyHandoffWake, readCommentsToHandOver,
   wakeContextCommentIds } from "./held-dependency-comments.js";
 import { noteHeldAgentComment } from "./held-dependency-notice.js";
+import { EXECUTION_OWNER_STALL_NOTICE_MS, noteStalledExecutionOwner } from "./execution-owner-stall-notice.js";
+import { OWNER_LEASE_NOT_RELEASED_ACTION, OWNER_PROCESS_STILL_RUNNING_ACTION } from "../conversation-continuation.js";
 import { CONTEXT_COMPACTION_WAKE_REASON, ContextCompactionError, isContextCompactionRun, readContextCompactionRequest } from "../context-compaction.js";
 import { isProcessRunAdmissionClosed } from "./run-admission.js";
 import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
@@ -261,6 +263,15 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
 
 
 export const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+// STUDIO-0066: marks a wake kept only because the previous run's process or environment lease still held the task.
+export const OWNERSHIP_HANDOVER_WAKE_KEY = "ownershipHandoverWake";
+// Keys the sweep of STUDIO-0041 leaves to their own path: a wake under one of them is not kept here.
+const OWNERSHIP_HOLD_UNSWEPT_KEY_RE = /^(?:chat-inbound|stale-addressee-requeue|task-retry|chat-completion):/;
+/** The previous run's own process or lease holds the task, and no recovery action does. */
+function isPreviousOwnerHold(blocker: { cause: string; recoveryActionId: string | null; nextAction: string }) {
+  return blocker.cause === "execution_owner_active" && blocker.recoveryActionId === null
+    && (blocker.nextAction === OWNER_PROCESS_STILL_RUNNING_ACTION || blocker.nextAction === OWNER_LEASE_NOT_RELEASED_ACTION);
+}
 
 export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -2351,7 +2362,21 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (ownershipVisited.has(issueKey)) continue;
       ownershipVisited.add(issueKey);
       try {
-        if (await getExecutionBlocker(db, wake.companyId, heldIssueId)) continue;
+        const stillHeld = await getExecutionBlocker(db, wake.companyId, heldIssueId);
+        if (stillHeld) {
+          // STUDIO-0066: bounded. The previous run's process or lease is still there long after the wake was asked
+          // for, or, for a kept hand-over wake, any other hold (the stopped run left a reconciliation action open,
+          // for example): the wake stays kept (it starts as soon as the hold is gone) and the thread is told once
+          // per hold.
+          if ((isPreviousOwnerHold(stillHeld) || wake.payload?.[OWNERSHIP_HANDOVER_WAKE_KEY] === true)
+              && (stillHeld.runId || stillHeld.recoveryActionId)
+              && Date.now() - wake.requestedAt.getTime() >= EXECUTION_OWNER_STALL_NOTICE_MS)
+            await noteStalledExecutionOwner(db, { companyId: wake.companyId, issueId: heldIssueId,
+              waitingAgentId: wake.agentId, ownerRunId: stillHeld.runId ?? null,
+              recoveryActionId: stillHeld.recoveryActionId, nextAction: stillHeld.nextAction,
+              waitingSince: wake.requestedAt });
+          continue;
+        }
         // STUDIO-0051: behind a reconciled hold, a blocker added after the
         // reconciliation would make admission consume the wake; keep it held
         // until the task's dependencies are ready.
@@ -2375,7 +2400,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           }
         }
         const context = parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]);
-        const { executionWait: _wait, [DEFERRED_WAKE_CONTEXT_KEY]: _context, ...payload } = parseObject(wake.payload);
+        const { executionWait: _wait, [DEFERRED_WAKE_CONTEXT_KEY]: _context, [OWNERSHIP_HANDOVER_WAKE_KEY]: _handover,
+          ...payload } = parseObject(wake.payload);
         // Retire the held row first: `skipped` is outside every partial unique
         // index on (companyId, idempotencyKey) that has a status condition
         // (`interaction:`, `question-response:`, `connection-intent:`,
@@ -4248,6 +4274,52 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 requestedByActorId: opts.requestedByActorId ?? null,
                 idempotencyKey: opts.idempotencyKey ?? null,
               });
+            } else if (isPreviousOwnerHold(executionBlocker) && issue.assigneeAgentId === agentId
+                && !OWNERSHIP_HOLD_UNSWEPT_KEY_RE.test(opts.idempotencyKey ?? "")) {
+              // STUDIO-0066 (the idea of paperclipai/paperclip#18510, adapted): the previous run's process is still
+              // stopping, or its environment lease is not released yet, and this wake is for the current assignee. A
+              // skipped receipt is read by nobody: a hand-over made by a change of assignee alone was lost (TR-1526,
+              // 17 Nov 2026: no run for 58 min). Keep the wake; the sweep of STUDIO-0041 (resumeDeferredExecutionReceipts)
+              // re-admits it through ordinary admission once the task has no execution blocker left.
+              // One kept wake per assignee and task: a later one of the same kind is counted on it.
+              // A kept wake of ANOTHER agent on this task belongs to an assignee the task has left since: retire
+              // it now, so that no release ever promotes a former assignee.
+              const supersededAt = new Date();
+              await tx.update(agentWakeupRequests).set({ status: "cancelled", finishedAt: supersededAt, updatedAt: supersededAt,
+                error: "The task was handed to another assignee after this hand-over wake was kept" })
+                .where(and(eq(agentWakeupRequests.companyId, agent.companyId), ne(agentWakeupRequests.agentId, agentId),
+                  eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+                  sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+                  sql`${agentWakeupRequests.payload}->>${OWNERSHIP_HANDOVER_WAKE_KEY} = 'true'`));
+              const [kept] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+                eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.agentId, agentId),
+                eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
+                sql`${agentWakeupRequests.payload}->>'issueId' = ${issue.id}`,
+                sql`${agentWakeupRequests.payload}->>${OWNERSHIP_HANDOVER_WAKE_KEY} = 'true'`,
+              )).limit(1);
+              if (kept) {
+                // `updatedAt` is left alone: the deferred-receipt worker counts its next check from it.
+                await tx.update(agentWakeupRequests).set({ coalescedCount: sql`${agentWakeupRequests.coalescedCount} + 1` })
+                  .where(and(eq(agentWakeupRequests.companyId, agent.companyId), eq(agentWakeupRequests.id, kept.id)));
+              } else {
+                const [saved] = await tx.insert(agentWakeupRequests).values({
+                  ...durableReceiptFields,
+                  companyId: agent.companyId, agentId, source, triggerDetail, reason,
+                  payload: {
+                    ...payload,
+                    issueId: issue.id,
+                    [DEFERRED_WAKE_CONTEXT_KEY]: enrichedContextSnapshot,
+                    [OWNERSHIP_HANDOVER_WAKE_KEY]: true,
+                    // The sweep selects on this reason; the hold itself is the previous owner, whatever else waits.
+                    executionWait: { ...condition, reason: "execution_recovery" },
+                  },
+                  status: "deferred_issue_execution",
+                  requestedByActorType: opts.requestedByActorType ?? null,
+                  requestedByActorId: opts.requestedByActorId ?? null,
+                  idempotencyKey: opts.idempotencyKey ?? null,
+                }).returning({ id: agentWakeupRequests.id });
+                await notifyDeferredExecutionWork(tx, { companyId: agent.companyId, requestId: saved.id });
+              }
             } else {
               await recordExecutionWait(tx as unknown as Db, {
                 issueId: issue.id, condition, coalesce: coalesceExecutionWait,

@@ -170,8 +170,44 @@ async function runReleaseDrain(
     }
     processedWakeIds.add(candidate.id);
 
+    // STUDIO-0066: a hand-over wake kept behind the previous run's process or lease (heartbeat/queue.ts) is for
+    // the assignee it was written for. If the task was handed to someone else before the owner let go, the sweep
+    // never re-admits that row (it follows the current assignee), and it carries no comment and no card that
+    // another drain rule would retire. Promoting it here would start a former assignee on a task that is no
+    // longer its own: retire it.
+    if (candidate.payload.ownershipHandoverWake === true && candidate.agentId !== issue.assigneeAgentId) {
+      await ports.transaction.cancelDeferredWake({
+        companyId: run.companyId,
+        wakeId: candidate.id,
+        agentId: candidate.agentId,
+        reason: "The task was handed to another assignee after this hand-over wake was kept",
+        now: input.now,
+      });
+      continue;
+    }
+
     if (locked.handoffAssigneeAgentId && candidate.agentId !== locked.handoffAssigneeAgentId) {
       preservedWakeIds.push(candidate.id);
+      continue;
+    }
+
+    // STUDIO-0066: a hand-over wake kept only because the previous run's process or lease still held the task
+    // (heartbeat/queue.ts) carries no comment and no card: nothing a run must read. The run that releases the task
+    // here is the same agent's, on this task, and it succeeded: it started after the hold was gone and served the
+    // hand-over. Retire the kept copy instead of promoting it into a second run.
+    if (
+      candidate.payload.ownershipHandoverWake === true &&
+      run.status === "succeeded" &&
+      run.agentId === candidate.agentId &&
+      run.contextSnapshot?.issueId === issue.id
+    ) {
+      await ports.transaction.cancelDeferredWake({
+        companyId: run.companyId,
+        wakeId: candidate.id,
+        agentId: candidate.agentId,
+        reason: `Served by run ${run.id}: the assignee ran on the task after this hand-over wake was kept`,
+        now: input.now,
+      });
       continue;
     }
 
