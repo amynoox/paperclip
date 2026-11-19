@@ -50,6 +50,7 @@ import { caseHandoffService } from "../services/case-handoffs.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { withNativeWorkspaceFinalizationOwnership } from "../services/native-runtime/native-workspace-finalization-ownership.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
+import { EXECUTION_HOLD_CONFIRMATIONS_AT_ONCE, listExecutionHolds } from "../services/execution-hold.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_RECOVERY_ACTION_TEST_DATABASE_URL");
 const embeddedPostgresSupport = external ? { supported: true, reason: undefined } : await getEmbeddedPostgresTestSupport();
@@ -4178,5 +4179,204 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.id, action.id));
     expect(actionRow?.status).toBe("active");
+  });
+
+  // STUDIO-0071: production, 19 Nov 2026. Two runs cut by a pause each left a hold that was settled `resolved` with
+  // replay blocked: it kept every run of the task from starting, yet `activeRecoveryAction` was null, the task lists
+  // showed nothing and the task stayed `todo`.
+  async function seedSettledHoldOfCutRun() {
+    const seeded = await seedCompany();
+    const runId = randomUUID();
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, seeded.sourceIssueId));
+    await db.insert(heartbeatRuns).values({ id: runId, companyId: seeded.companyId, agentId: seeded.coderId,
+      invocationSource: "manual", status: "cancelled", errorCode: "agent_paused", runtimeMode: "legacy", executionStage: "settled",
+      startedAt: new Date(Date.now() - 600_000), finishedAt: new Date(Date.now() - 300_000),
+      contextSnapshot: { issueId: seeded.sourceIssueId },
+      runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+      resultJson: { cancellation: { initiator: { type: "system" }, expected: true, reason: "Cancelled due to agent pause" },
+        pauseStop: { holds: ["manual"], companyPauseReason: null } } });
+    const [hold] = await db.insert(issueRecoveryActions).values({ companyId: seeded.companyId, sourceIssueId: seeded.sourceIssueId,
+      kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+      status: "resolved", outcome: "blocked", ownerType: "board", nextAction: "Reconcile the cut run before any continuation.",
+      evidence: { runId, automaticRecovery: { policy: "preserve_without_replay_v1", runId, replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    // A second task of the same company that nothing holds.
+    const freeIssueId = randomUUID();
+    await db.insert(issues).values({ id: freeIssueId, companyId: seeded.companyId, title: "Free task", status: "todo",
+      priority: "medium", assigneeAgentId: seeded.coderId, issueNumber: 2, identifier: `${seeded.prefix}-2` });
+    return { ...seeded, runId, hold, freeIssueId };
+  }
+  const listRows = async (app: ReturnType<typeof createApp>, companyId: string, query: string) => {
+    const response = await request(app).get(`/api/companies/${companyId}/issues${query}`).expect(200);
+    const rows: Array<Record<string, any>> = Array.isArray(response.body) ? response.body : response.body.issues ?? response.body.items ?? response.body.data;
+    return new Map(rows.map(row => [row.id as string, row]));
+  };
+
+  it("lists in the task's detail the settled hold that still blocks its execution", async () => {
+    const { sourceIssueId, hold, runId } = await seedSettledHoldOfCutRun();
+    const detail = await request(createApp()).get(`/api/issues/${sourceIssueId}`).expect(200);
+    // Nothing else says the task is held.
+    expect(detail.body.status).toBe("todo");
+    expect(detail.body.activeRecoveryAction).toBeNull();
+    expect(detail.body.executionHold).toMatchObject({ recoveryActionId: hold.id, runId,
+      cause: "legacy_execution_requires_reconciliation", listedAsActiveAction: false });
+    expect(typeof detail.body.executionHold.nextAction).toBe("string");
+    expect(detail.body.executionHold.nextAction.length).toBeGreaterThan(0);
+    // The same hold admission reports.
+    expect(detail.body.executionBlocker).toMatchObject({ recoveryActionId: hold.id });
+  });
+
+  it("lists the same hold in the task lists, and nothing on a task that is not held", async () => {
+    const { companyId, sourceIssueId, freeIssueId, hold, runId } = await seedSettledHoldOfCutRun();
+    const app = createApp();
+    for (const query of ["", "?view=compact", `?view=rows&ids=${sourceIssueId},${freeIssueId}`]) {
+      const rows = await listRows(app, companyId, query);
+      expect(rows.get(sourceIssueId)?.executionHold, query).toMatchObject({ recoveryActionId: hold.id, runId,
+        cause: "legacy_execution_requires_reconciliation", listedAsActiveAction: false });
+      expect(rows.get(sourceIssueId)?.activeRecoveryAction ?? null, query).toBeNull();
+      expect(rows.get(freeIssueId), query).toBeDefined();
+      expect(rows.get(freeIssueId)?.executionHold, query).toBeNull();
+    }
+  });
+
+  it("stops listing the hold once it no longer blocks execution", async () => {
+    const { companyId, sourceIssueId, hold } = await seedSettledHoldOfCutRun();
+    // What a reconciliation writes on the hold: its replay is no longer blocked.
+    await db.update(issueRecoveryActions).set({ evidence: sql`jsonb_set(${issueRecoveryActions.evidence}, '{automaticRecovery,replay}', '"allowed"'::jsonb)` })
+      .where(eq(issueRecoveryActions.id, hold.id));
+    const app = createApp();
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+    expect(detail.body.executionBlocker).toBeNull();
+    expect(detail.body.executionHold).toBeNull();
+    expect((await listRows(app, companyId, "?view=compact")).get(sourceIssueId)?.executionHold).toBeNull();
+  });
+
+  it("says when the hold is also the task's active recovery action", async () => {
+    const { companyId, sourceIssueId, hold } = await seedSettledHoldOfCutRun();
+    await db.update(issueRecoveryActions).set({ status: "active", outcome: null, resolvedAt: null }).where(eq(issueRecoveryActions.id, hold.id));
+    const app = createApp();
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+    expect(detail.body.activeRecoveryAction).toMatchObject({ id: hold.id });
+    expect(detail.body.executionHold).toMatchObject({ recoveryActionId: hold.id, listedAsActiveAction: true });
+    expect((await listRows(app, companyId, "?view=compact")).get(sourceIssueId)?.executionHold)
+      .toMatchObject({ recoveryActionId: hold.id, listedAsActiveAction: true });
+  });
+
+  it("still returns the task list, without the field, when the holds cannot be read", async () => {
+    const { companyId, sourceIssueId, hold } = await seedSettledHoldOfCutRun();
+    // A database whose grouped read of the holds fails, as a stub that does not know it.
+    const failing = new Proxy(db, { get(target, property, receiver) {
+      if (property === "selectDistinct") return () => { throw new Error("holds unavailable"); };
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { (req as any).actor = { type: "board", source: "local_implicit" }; next(); });
+    app.use("/api", issueRoutes(failing as typeof db, {} as any, {}));
+    app.use(errorHandler);
+    for (const query of ["", "?view=compact", `?view=rows&ids=${sourceIssueId}`]) {
+      const rows = await listRows(app, companyId, query);
+      expect(rows.get(sourceIssueId), query).toBeDefined();
+      // Absent, not null: the field was not read. Null would say that nothing holds the task.
+      expect(Object.hasOwn(rows.get(sourceIssueId)!, "executionHold"), query).toBe(false);
+    }
+    // The detail does not use the grouped read.
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+    expect(detail.body.executionHold).toMatchObject({ recoveryActionId: hold.id, listedAsActiveAction: false });
+  });
+
+  /** `count` more tasks of the same company, each held like the first: a run cut by a pause, its hold settled. */
+  async function seedMoreHeldTasks(seeded: { companyId: string; coderId: string; prefix: string }, count: number) {
+    const holdByIssue = new Map<string, string>();
+    for (let index = 0; index < count; index += 1) {
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId: seeded.companyId, title: `Held task ${index}`, status: "todo",
+        priority: "medium", assigneeAgentId: seeded.coderId, issueNumber: 10 + index, identifier: `${seeded.prefix}-${10 + index}` });
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: seeded.companyId, agentId: seeded.coderId,
+        invocationSource: "manual", status: "cancelled", errorCode: "agent_paused", runtimeMode: "legacy", executionStage: "settled",
+        startedAt: new Date(Date.now() - 600_000), finishedAt: new Date(Date.now() - 300_000),
+        contextSnapshot: { issueId },
+        runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+        resultJson: { cancellation: { initiator: { type: "system" }, expected: true, reason: "Cancelled due to agent pause" },
+          pauseStop: { holds: ["manual"], companyPauseReason: null } } });
+      const [hold] = await db.insert(issueRecoveryActions).values({ companyId: seeded.companyId, sourceIssueId: issueId,
+        kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+        status: "resolved", outcome: "blocked", ownerType: "board", nextAction: "Reconcile the cut run before any continuation.",
+        evidence: { runId, automaticRecovery: { policy: "preserve_without_replay_v1", runId, replay: "blocked", actionOutcome: "unknown" } },
+      }).returning();
+      holdByIssue.set(issueId, hold!.id);
+    }
+    return holdByIssue;
+  }
+  /**
+   * The database seen through a wrapper that calls `onQuery` each time a query starts and counts the queries that
+   * are waiting for their answer at the same moment.
+   */
+  function observedDb(onQuery: (name: string) => void = () => {}) {
+    const seen = { inFlight: 0, most: 0 };
+    const wrap = (value: any): any => {
+      if (value === null || (typeof value !== "object" && typeof value !== "function")) return value;
+      return new Proxy(value, { get(target, property) {
+        const member = Reflect.get(target, property, target);
+        if (typeof member !== "function" || typeof property === "symbol" || property === "constructor") return member;
+        if (property === "then") return (resolve: (rows: unknown) => unknown, reject: (error: unknown) => unknown) => {
+          seen.inFlight += 1;
+          seen.most = Math.max(seen.most, seen.inFlight);
+          return (target as PromiseLike<unknown>).then(
+            rows => { seen.inFlight -= 1; return rows; },
+            error => { seen.inFlight -= 1; throw error; },
+          ).then(resolve, reject);
+        };
+        return (...args: unknown[]) => {
+          if (target === db) onQuery(property);
+          return wrap(member.apply(target, args));
+        };
+      } });
+    };
+    return { db: wrap(db) as typeof db, seen };
+  }
+
+  it("confirms the holds of a list several at once, never more than the bound, each task keeping its own hold", async () => {
+    const seeded = await seedSettledHoldOfCutRun();
+    const holdByIssue = new Map([[seeded.sourceIssueId, seeded.hold.id], ...await seedMoreHeldTasks(seeded, 11)]);
+    const issueIds = [...holdByIssue.keys(), seeded.freeIssueId];
+    const observed = observedDb();
+    const holds = await listExecutionHolds(observed.db, seeded.companyId, issueIds, () => null);
+    expect(observed.seen.most).toBeGreaterThan(1);
+    expect(observed.seen.most).toBeLessThanOrEqual(EXECUTION_HOLD_CONFIRMATIONS_AT_ONCE);
+    expect(observed.seen.inFlight).toBe(0);
+    expect(holds.size).toBe(12);
+    for (const [issueId, holdId] of holdByIssue) expect(holds.get(issueId)?.recoveryActionId, issueId).toBe(holdId);
+    // The same through the list route.
+    const rows = await listRows(createApp(), seeded.companyId, `?view=rows&ids=${issueIds.join(",")}`);
+    for (const [issueId, holdId] of holdByIssue) expect(rows.get(issueId)?.executionHold?.recoveryActionId, issueId).toBe(holdId);
+    expect(rows.get(seeded.freeIssueId)?.executionHold).toBeNull();
+  });
+
+  it("fails the whole read of the holds when one confirmation fails, and the list then carries no field", async () => {
+    const seeded = await seedSettledHoldOfCutRun();
+    const holdByIssue = new Map([[seeded.sourceIssueId, seeded.hold.id], ...await seedMoreHeldTasks(seeded, 11)]);
+    const issueIds = [...holdByIssue.keys(), seeded.freeIssueId];
+    // The grouped read answers; one query of the confirmations that follow it fails, while others are in flight.
+    let confirmationQueries: number | null = null;
+    const failing = observedDb(name => {
+      if (name === "selectDistinct") confirmationQueries = 0;
+      else if (name === "select" && confirmationQueries !== null && (confirmationQueries += 1) === 7) {
+        throw new Error("confirmation unavailable");
+      }
+    });
+    await expect(listExecutionHolds(failing.db, seeded.companyId, issueIds, () => null)).rejects.toThrow("confirmation unavailable");
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { (req as any).actor = { type: "board", source: "local_implicit" }; next(); });
+    app.use("/api", issueRoutes(failing.db, {} as any, {}));
+    app.use(errorHandler);
+    confirmationQueries = null;
+    const rows = await listRows(app, seeded.companyId, `?view=rows&ids=${issueIds.join(",")}`);
+    expect(rows.size).toBe(issueIds.length);
+    // No task says "nothing holds" (null) because its confirmation did not run.
+    for (const issueId of issueIds) expect(Object.hasOwn(rows.get(issueId)!, "executionHold"), issueId).toBe(false);
   });
 });
