@@ -61,6 +61,7 @@ import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { executionHoldOf, listExecutionHolds } from "../services/execution-hold.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -8748,6 +8749,22 @@ export function issueRoutes(
     };
   }
 
+
+  /**
+   * STUDIO-0071: the holds of a task list are information added to the list. If they cannot be read, the list is
+   * still returned, WITHOUT the `executionHold` field (absent means "not read"; null means "nothing holds"), and
+   * the failure is logged: a task list never fails because of this read.
+   */
+  async function readListExecutionHolds(companyId: string, issueIds: string[],
+    activeRecoveryActionId: (issueId: string) => string | null | undefined) {
+    try {
+      return await listExecutionHolds(db, companyId, issueIds, activeRecoveryActionId);
+    } catch (error) {
+      logger.warn({ err: error, companyId, issueCount: issueIds.length },
+        "execution holds of a task list could not be read; the list is returned without the executionHold field");
+      return null;
+    }
+  }
   async function prepareIssueListForActor(
     req: Request,
     companyId: string,
@@ -8814,13 +8831,16 @@ export function issueRoutes(
           else recoveryActionByIssue.delete(issue.id);
         }),
       );
+      // STUDIO-0071: read after the revalidation above, which can clear a hold.
+      const executionHolds = await readListExecutionHolds(companyId, issueIds, id => recoveryActionByIssue.get(id)?.id);
       const compactResult = result.map((issue) =>
         ({ ...toCompactIssue({
           ...issue,
           activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
           interruption: interruptions.get(issue.id) ?? null,
           successfulRunHandoff: handoffStates.get(issue.id) ?? null,
-        }), ...(view === "rows" ? { listProjection: "rows" as const } : {}) }),
+        }), ...(executionHolds ? { executionHold: executionHolds.get(issue.id) ?? null } : {}),
+        ...(view === "rows" ? { listProjection: "rows" as const } : {}) }),
       );
       return {
         kind: "compact",
@@ -8850,12 +8870,15 @@ export function issueRoutes(
         else recoveryActionByIssue.delete(issue.id);
       }),
     );
+    // STUDIO-0071: read after the revalidation above, which can clear a hold.
+    const executionHolds = await readListExecutionHolds(companyId, issueIds, id => recoveryActionByIssue.get(id)?.id);
     return {
       kind: "full",
       body: result.map((issue) => ({
         ...issue,
         successfulRunHandoff: handoffStates.get(issue.id) ?? null,
         activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
+        ...(executionHolds ? { executionHold: executionHolds.get(issue.id) ?? null } : {}),
         interruption: interruptions.get(issue.id) ?? null,
       })),
       pagination,
@@ -10054,6 +10077,8 @@ export function issueRoutes(
       ...(reviewAttention ? { reviewAttention } : {}),
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,
       executionBlocker,
+      // STUDIO-0071: the same hold as the lists carry, in the same shape.
+      executionHold: executionHoldOf(executionBlocker, revalidatedActiveRecoveryAction?.id),
       interruption: await taskInterruptionPresentation(db, issue),
       scheduledRetry,
       activeRecoveryAction: revalidatedActiveRecoveryAction,
