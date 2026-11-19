@@ -56,6 +56,39 @@ export type AgentExecutionStopOptions = {
   now?: Date;
 };
 
+function absent(pid: number) {
+  try { process.kill(pid, 0); return false; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
+}
+
+/**
+ * STUDIO-0043: the stop proof a PAUSE accepts for a cancelled legacy run that executed over the built-in `ssh`
+ * environment driver, which gives no remote termination receipt: the run finished more than
+ * SSH_CLIENT_STOP_PAUSE_PROOF_DELAY_MS ago, every lease is an ssh lease released without a failed cleanup, and the
+ * local ssh client is recorded and proven gone. STUDIO-0073: exported, because a person's continuation of a run
+ * that a pause cut accepts the same proof (explicit-native-continuation.ts).
+ */
+export async function sshClientStopProvesPause(
+  run: Pick<typeof heartbeatRuns.$inferSelect, "runtimeMode" | "finishedAt" | "processPid" | "processStartedAt" | "processGroupId">,
+  runLeases: Pick<typeof environmentLeases.$inferSelect, "provider" | "releasedAt" | "status" | "cleanupStatus">[], at: Date,
+) {
+  if (run.runtimeMode !== "legacy" || !run.finishedAt ||
+      at.getTime() - run.finishedAt.getTime() < SSH_CLIENT_STOP_PAUSE_PROOF_DELAY_MS) return false;
+  if (!runLeases.every(lease => lease.provider === "ssh" && lease.releasedAt &&
+      ["released", "expired"].includes(lease.status) && lease.cleanupStatus !== "failed")) return false;
+  // The local ssh client must be recorded and proven gone (absent, or its pid
+  // now belongs to another program).
+  if (!run.processPid) return false;
+  let clientAlive = !absent(run.processPid);
+  if (clientAlive && run.processStartedAt) {
+    const observed = await readProcessStartedAt(run.processPid).catch(() => null);
+    if (observed && new Date(observed).getTime() !== run.processStartedAt.getTime()) clientAlive = false;
+  }
+  if (clientAlive) return false;
+  if (run.processGroupId && run.processGroupId !== run.processPid && !absent(-run.processGroupId)) return false;
+  return true;
+}
+
 /** Cancellation changes admission. Process and lease evidence controls cleanup. */
 export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], options: AgentExecutionStopOptions = {}) {
   if (!agentIds.length) return true;
@@ -78,10 +111,6 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], opt
   const abandoned = coordinators.filter(row => row.leaseOwner);
   if (abandoned.some(row => !row.leaseExpiresAt || row.leaseExpiresAt > now || row.resultId ||
       runs.find(run => run.id === row.runId)?.status !== "cancelled")) return false;
-  const absent = (pid: number) => {
-    try { process.kill(pid, 0); return false; }
-    catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
-  };
   for (const coordinator of abandoned) {
     if (!coordinator.controllerPid || absent(coordinator.controllerPid)) continue;
     const observed = await readProcessStartedAt(coordinator.controllerPid).catch(() => null);
@@ -124,25 +153,6 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], opt
       if (!(run.executionStage === "settled" && !await runUsedConversationAdapter(db, whole)) &&
           !await isCancelledNativeStartup(db, whole, coordinators.find(row => row.runId === run.id))) return false;
     }
-  }
-  async function sshClientStopProvesPause(
-    run: StopProofRun, runLeases: (typeof environmentLeases.$inferSelect)[], at: Date,
-  ) {
-    if (run.runtimeMode !== "legacy" || !run.finishedAt ||
-        at.getTime() - run.finishedAt.getTime() < SSH_CLIENT_STOP_PAUSE_PROOF_DELAY_MS) return false;
-    if (!runLeases.every(lease => lease.provider === "ssh" && lease.releasedAt &&
-        ["released", "expired"].includes(lease.status) && lease.cleanupStatus !== "failed")) return false;
-    // The local ssh client must be recorded and proven gone (absent, or its pid
-    // now belongs to another program).
-    if (!run.processPid) return false;
-    let clientAlive = !absent(run.processPid);
-    if (clientAlive && run.processStartedAt) {
-      const observed = await readProcessStartedAt(run.processPid).catch(() => null);
-      if (observed && new Date(observed).getTime() !== run.processStartedAt.getTime()) clientAlive = false;
-    }
-    if (clientAlive) return false;
-    if (run.processGroupId && run.processGroupId !== run.processPid && !absent(-run.processGroupId)) return false;
-    return true;
   }
   // Release an expired owner only after its cancelled execution has stop proof.
   for (const coordinator of abandoned) {
