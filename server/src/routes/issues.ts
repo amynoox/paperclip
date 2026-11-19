@@ -61,6 +61,7 @@ import { resolveChatTaskAssignment } from "../services/chat-task-assignment.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { inspectWorkspaceSource } from "../services/workspace-source-inspection.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { executionHoldOf, listExecutionHolds } from "../services/execution-hold.js";
 import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
@@ -8814,13 +8815,16 @@ export function issueRoutes(
           else recoveryActionByIssue.delete(issue.id);
         }),
       );
+      // STUDIO-0071: read after the revalidation above, which can clear a hold.
+      const executionHolds = await listExecutionHolds(db, companyId, issueIds, id => recoveryActionByIssue.get(id)?.id);
       const compactResult = result.map((issue) =>
         ({ ...toCompactIssue({
           ...issue,
           activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
           interruption: interruptions.get(issue.id) ?? null,
           successfulRunHandoff: handoffStates.get(issue.id) ?? null,
-        }), ...(view === "rows" ? { listProjection: "rows" as const } : {}) }),
+        }), executionHold: executionHolds.get(issue.id) ?? null,
+        ...(view === "rows" ? { listProjection: "rows" as const } : {}) }),
       );
       return {
         kind: "compact",
@@ -8850,12 +8854,15 @@ export function issueRoutes(
         else recoveryActionByIssue.delete(issue.id);
       }),
     );
+    // STUDIO-0071: read after the revalidation above, which can clear a hold.
+    const executionHolds = await listExecutionHolds(db, companyId, issueIds, id => recoveryActionByIssue.get(id)?.id);
     return {
       kind: "full",
       body: result.map((issue) => ({
         ...issue,
         successfulRunHandoff: handoffStates.get(issue.id) ?? null,
         activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
+        executionHold: executionHolds.get(issue.id) ?? null,
         interruption: interruptions.get(issue.id) ?? null,
       })),
       pagination,
@@ -10054,6 +10061,8 @@ export function issueRoutes(
       ...(reviewAttention ? { reviewAttention } : {}),
       successfulRunHandoff: successfulRunHandoffStates.get(issue.id) ?? null,
       executionBlocker,
+      // STUDIO-0071: the same hold as the lists carry, in the same shape.
+      executionHold: executionHoldOf(executionBlocker, revalidatedActiveRecoveryAction?.id),
       interruption: await taskInterruptionPresentation(db, issue),
       scheduledRetry,
       activeRecoveryAction: revalidatedActiveRecoveryAction,
