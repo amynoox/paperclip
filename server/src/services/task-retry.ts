@@ -235,6 +235,8 @@ type TaskRetryRequest = {
 };
 
 const TASK_RETRY_CONTENTION_ATTEMPTS = 10;
+/** STUDIO-0070: the statuses of an assignee's run that a Retry made on another agent's run may continue. */
+const TASK_RETRY_INTERRUPTED_RUN_STATUSES = ["failed", "cancelled", "timed_out"];
 const TASK_RETRY_CONTENTION_DELAY_MS = 100;
 
 function isTaskRetryContention(error: unknown) {
@@ -295,8 +297,14 @@ function admitTaskRetry(input: TaskRetryRequest) {
     const [latest] = issue.assigneeAgentId ? await tx.select().from(heartbeatRuns)
       .where(and(onTask, eq(heartbeatRuns.agentId, issue.assigneeAgentId)))
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1) : [];
+    // A click that names another agent's run (the task's latest) was made on that agent's state. It may continue
+    // the assignee only when the assignee's own latest run is itself interrupted: otherwise it would start the
+    // assignee again on finished work, and the agent whose failure the person saw would not be retried.
+    const namesAssigneeRun = latest !== undefined && input.observedRunId === latest.id;
+    const namesTaskRun = latest !== undefined && input.observedRunId === latestOnTask?.id
+      && TASK_RETRY_INTERRUPTED_RUN_STATUSES.includes(latest.status);
     if (["done", "cancelled"].includes(issue.status) || !issue.assigneeAgentId || !latest ||
-        (input.observedRunId !== latest.id && input.observedRunId !== latestOnTask?.id)) {
+        !(namesAssigneeRun || namesTaskRun)) {
       return { requestId: null, accepted: false, stale: true, observedRunId: latestOnTask?.id ?? null, chatActionId: undefined };
     }
     let active = (await tx.select().from(agentWakeupRequests).where(and(

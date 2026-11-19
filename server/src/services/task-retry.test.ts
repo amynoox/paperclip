@@ -956,6 +956,23 @@ describe("durable task Retry admission", () => {
       .toMatchObject({ accepted: true, stale: false, observedRunId: newer.id });
   });
 
+  it("refuses a click on another agent's failed run when the assignee's own work is finished", async () => {
+    const { input, cut, review, reviewerId } = await seedCutByPauseThenReviewed();
+    // The assignee's latest run succeeded; then the other agent failed on the same task.
+    await db.update(heartbeatRuns).set({ status: "succeeded", errorCode: null, resultJson: {} }).where(eq(heartbeatRuns.id, cut.id));
+    await db.update(heartbeatRuns).set({ status: "failed", errorCode: "adapter_failed" }).where(eq(heartbeatRuns.id, review.id));
+    expect(await requestTaskRetry({ ...input, observedRunId: review.id }))
+      .toMatchObject({ accepted: false, stale: true, observedRunId: review.id });
+    // Nothing was saved: the assignee is not started again on finished work.
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, input.companyId))).toHaveLength(0);
+    for (const status of ["failed", "cancelled", "timed_out"]) {
+      await db.update(heartbeatRuns).set({ status }).where(eq(heartbeatRuns.id, cut.id));
+      expect(await requestTaskRetry({ ...input, observedRunId: review.id, idempotencyKey: randomUUID() }), status)
+        .toMatchObject({ accepted: true, stale: false, observedRunId: cut.id });
+    }
+    expect(reviewerId).not.toBe(cut.agentId);
+  });
+
   it("never lets a task without a run of its assignee be retried through another agent's run", async () => {
     const { input, review, reviewerId } = await seedCutByPauseThenReviewed();
     const newcomer = randomUUID();
