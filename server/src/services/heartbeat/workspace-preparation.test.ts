@@ -20,7 +20,7 @@ import { executionWorkspaceService, toExecutionWorkspace } from "../execution-wo
 import { instanceSettingsService } from "../instance-settings.js";
 import { workspaceOperationService } from "../workspace-operations.js";
 import { nativeWorkspaceSyncInternals, prepareNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
-import { assertGitSensitiveAdapterWorkspaceValid, createHeartbeatWorkspaceResolver, prepareProjectRepositoryWorkspaces, resolveExecutionWorkspaceReuseRequestForIssue } from "./workspaces.js";
+import { assertGitSensitiveAdapterWorkspaceValid, remoteManagedWorkspaceWarning, createHeartbeatWorkspaceResolver, prepareProjectRepositoryWorkspaces, resolveExecutionWorkspaceReuseRequestForIssue } from "./workspaces.js";
 import { prepareHeartbeatWorkspace, type HeartbeatWorkspacePreparationInput } from "./workspace-preparation.js";
 import { buildNativeExecutionInput } from "../native-runtime/native-execution-input.js";
 import { nativeRuntimeContextFixture } from "../native-runtime/runtime-context.test-fixture.js";
@@ -2196,6 +2196,8 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
       remoteManagedWorkspace: true });
     expect(prepared.executionWorkspace.cwd).toBe(resolveManagedProjectWorkspaceDir({ companyId: issue.companyId, projectId: issue.projectId! }));
     await expect(access(join(prepared.executionWorkspace.cwd, ".git"))).rejects.toThrow();
+    // The run says where it starts: the heartbeat writes these warnings to the run's log before the launch check.
+    expect(prepared.resolvedWorkspace.warnings).toContain(remoteManagedWorkspaceWarning(prepared.executionWorkspace.cwd));
     expect(prepared.persistedExecutionWorkspace).toMatchObject({ projectWorkspaceId: issue.projectWorkspaceId, strategyType: "project_primary" });
     for (const adapterType of ["claude_local", "codex_local"]) {
       await expect(gitWorkspaceCheck(input, prepared, adapterType)).resolves.toBeUndefined();
@@ -2223,6 +2225,8 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
     await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, input.agent.id));
     const prepared = await prepareHeartbeatWorkspace(db, input);
     expect(prepared.resolvedWorkspace.remoteManagedWorkspace ?? false).toBe(false);
+    expect(prepared.resolvedWorkspace.warnings.join("
+")).not.toContain("remote-managed workspace");
     expect(prepared.executionWorkspace.cwd).toBe(emptied);
     await expect(gitWorkspaceCheck(input, prepared)).rejects.toMatchObject({
       message: expect.stringContaining("has no .git metadata"),
