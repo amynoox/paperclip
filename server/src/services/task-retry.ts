@@ -197,8 +197,13 @@ async function readBoardMessageRetrySource(db: Db, input: {
 export async function retireSupersededTaskRetry(db: Db, input: {
   companyId: string; issueId: string; requestId: string; sourceRunId: string;
 }) {
+  // STUDIO-0070: newer work is a newer run of the Retry's own agent. A run of another agent on the task (a review,
+  // a card answer, a mention) is not a continuation of the work this Retry continues.
+  const [owner] = await db.select({ agentId: agentWakeupRequests.agentId }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.requestId)));
   const [latest] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, input.companyId),
+    owner ? eq(heartbeatRuns.agentId, owner.agentId) : undefined,
     or(eq(heartbeatRuns.issueId, input.issueId), eq(heartbeatRuns.nativeIssueId, input.issueId),
       sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${input.issueId}`),
   )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
@@ -230,6 +235,8 @@ type TaskRetryRequest = {
 };
 
 const TASK_RETRY_CONTENTION_ATTEMPTS = 10;
+/** STUDIO-0070: the statuses of an assignee's run that a Retry made on another agent's run may continue. */
+const TASK_RETRY_INTERRUPTED_RUN_STATUSES = ["failed", "cancelled", "timed_out"];
 const TASK_RETRY_CONTENTION_DELAY_MS = 100;
 
 function isTaskRetryContention(error: unknown) {
@@ -276,13 +283,29 @@ function admitTaskRetry(input: TaskRetryRequest) {
         observedRunId: intent?.sourceRunId ?? null, chatActionId: intent?.chatActionId,
         ...(coalescedRun?.status === "scheduled_retry" ? { scheduledRetryRunId: coalescedRun.id } : {}) };
     }
-    const [latest] = await tx.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
+    const onTask = and(eq(heartbeatRuns.companyId, issue.companyId),
       or(eq(heartbeatRuns.issueId, issue.id), eq(heartbeatRuns.nativeIssueId, issue.id),
-        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`)))
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`));
+    // The task's latest run, whatever its agent: the run the task's presentation names (observedRunId).
+    const [latestOnTask] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(onTask)
       .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+    // STUDIO-0070: Retry continues the ASSIGNEE's work, so its source is the assignee's latest run on the task.
+    // Production, 19 Nov 2026: after a pause cut the assignee's runs, another agent ran on the same tasks; the
+    // task's latest run was no longer the assignee's and every Retry answered `stale`, even with the run the server
+    // named. The click is still refused unless it names what the person saw: the task's latest run or the
+    // assignee's latest run.
+    const [latest] = issue.assigneeAgentId ? await tx.select().from(heartbeatRuns)
+      .where(and(onTask, eq(heartbeatRuns.agentId, issue.assigneeAgentId)))
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1) : [];
+    // A click that names another agent's run (the task's latest) was made on that agent's state. It may continue
+    // the assignee only when the assignee's own latest run is itself interrupted: otherwise it would start the
+    // assignee again on finished work, and the agent whose failure the person saw would not be retried.
+    const namesAssigneeRun = latest !== undefined && input.observedRunId === latest.id;
+    const namesTaskRun = latest !== undefined && input.observedRunId === latestOnTask?.id
+      && TASK_RETRY_INTERRUPTED_RUN_STATUSES.includes(latest.status);
     if (["done", "cancelled"].includes(issue.status) || !issue.assigneeAgentId || !latest ||
-        latest.agentId !== issue.assigneeAgentId || input.observedRunId !== latest.id) {
-      return { requestId: null, accepted: false, stale: true, observedRunId: latest?.id ?? null, chatActionId: undefined };
+        !(namesAssigneeRun || namesTaskRun)) {
+      return { requestId: null, accepted: false, stale: true, observedRunId: latestOnTask?.id ?? null, chatActionId: undefined };
     }
     let active = (await tx.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.companyId, issue.companyId), eq(agentWakeupRequests.agentId, issue.assigneeAgentId),
