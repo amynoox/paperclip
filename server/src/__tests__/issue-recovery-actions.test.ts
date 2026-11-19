@@ -4260,4 +4260,28 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect((await listRows(app, companyId, "?view=compact")).get(sourceIssueId)?.executionHold)
       .toMatchObject({ recoveryActionId: hold.id, listedAsActiveAction: true });
   });
+
+  it("still returns the task list, without the field, when the holds cannot be read", async () => {
+    const { companyId, sourceIssueId, hold } = await seedSettledHoldOfCutRun();
+    // A database whose grouped read of the holds fails, as a stub that does not know it.
+    const failing = new Proxy(db, { get(target, property, receiver) {
+      if (property === "selectDistinct") return () => { throw new Error("holds unavailable"); };
+      const value = Reflect.get(target, property, receiver);
+      return typeof value === "function" ? value.bind(target) : value;
+    } });
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { (req as any).actor = { type: "board", source: "local_implicit" }; next(); });
+    app.use("/api", issueRoutes(failing as typeof db, {} as any, {}));
+    app.use(errorHandler);
+    for (const query of ["", "?view=compact", `?view=rows&ids=${sourceIssueId}`]) {
+      const rows = await listRows(app, companyId, query);
+      expect(rows.get(sourceIssueId), query).toBeDefined();
+      // Absent, not null: the field was not read. Null would say that nothing holds the task.
+      expect(Object.hasOwn(rows.get(sourceIssueId)!, "executionHold"), query).toBe(false);
+    }
+    // The detail does not use the grouped read.
+    const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
+    expect(detail.body.executionHold).toMatchObject({ recoveryActionId: hold.id, listedAsActiveAction: false });
+  });
 });

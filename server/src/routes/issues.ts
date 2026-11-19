@@ -8749,6 +8749,22 @@ export function issueRoutes(
     };
   }
 
+
+  /**
+   * STUDIO-0071: the holds of a task list are information added to the list. If they cannot be read, the list is
+   * still returned, WITHOUT the `executionHold` field (absent means "not read"; null means "nothing holds"), and
+   * the failure is logged: a task list never fails because of this read.
+   */
+  async function readListExecutionHolds(companyId: string, issueIds: string[],
+    activeRecoveryActionId: (issueId: string) => string | null | undefined) {
+    try {
+      return await listExecutionHolds(db, companyId, issueIds, activeRecoveryActionId);
+    } catch (error) {
+      logger.warn({ err: error, companyId, issueCount: issueIds.length },
+        "execution holds of a task list could not be read; the list is returned without the executionHold field");
+      return null;
+    }
+  }
   async function prepareIssueListForActor(
     req: Request,
     companyId: string,
@@ -8816,14 +8832,14 @@ export function issueRoutes(
         }),
       );
       // STUDIO-0071: read after the revalidation above, which can clear a hold.
-      const executionHolds = await listExecutionHolds(db, companyId, issueIds, id => recoveryActionByIssue.get(id)?.id);
+      const executionHolds = await readListExecutionHolds(companyId, issueIds, id => recoveryActionByIssue.get(id)?.id);
       const compactResult = result.map((issue) =>
         ({ ...toCompactIssue({
           ...issue,
           activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
           interruption: interruptions.get(issue.id) ?? null,
           successfulRunHandoff: handoffStates.get(issue.id) ?? null,
-        }), executionHold: executionHolds.get(issue.id) ?? null,
+        }), ...(executionHolds ? { executionHold: executionHolds.get(issue.id) ?? null } : {}),
         ...(view === "rows" ? { listProjection: "rows" as const } : {}) }),
       );
       return {
@@ -8855,14 +8871,14 @@ export function issueRoutes(
       }),
     );
     // STUDIO-0071: read after the revalidation above, which can clear a hold.
-    const executionHolds = await listExecutionHolds(db, companyId, issueIds, id => recoveryActionByIssue.get(id)?.id);
+    const executionHolds = await readListExecutionHolds(companyId, issueIds, id => recoveryActionByIssue.get(id)?.id);
     return {
       kind: "full",
       body: result.map((issue) => ({
         ...issue,
         successfulRunHandoff: handoffStates.get(issue.id) ?? null,
         activeRecoveryAction: recoveryActionByIssue.get(issue.id) ?? null,
-        executionHold: executionHolds.get(issue.id) ?? null,
+        ...(executionHolds ? { executionHold: executionHolds.get(issue.id) ?? null } : {}),
         interruption: interruptions.get(issue.id) ?? null,
       })),
       pagination,
