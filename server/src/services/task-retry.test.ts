@@ -884,10 +884,13 @@ describe("durable task Retry admission", () => {
   async function seedCutByPauseThenReviewed() {
     const input = { ...await seed(), actorSource: "local_implicit" };
     const now = Date.now();
+    // The studio's roles run a conversation adapter (codex_local, claude_local), routed to a worker machine.
+    const [task] = await db.select().from(issues).where(eq(issues.id, input.issueId));
+    await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, task.assigneeAgentId!));
     const [cut] = await db.update(heartbeatRuns).set({
       runtimeMode: "legacy", status: "cancelled", errorCode: "agent_paused", executionStage: "settled",
       createdAt: new Date(now - 60_000), startedAt: new Date(now - 59_000), finishedAt: new Date(now - 30_000),
-      runnerProfileJson: { adapterDispatch: { adapterType: "paperclip_runner" } },
+      runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
       resultJson: { cancellation: { initiator: { type: "system" }, expected: true, reason: "Cancelled due to agent pause" },
         pauseStop: { holds: ["manual"], companyPauseReason: null } },
     }).where(eq(heartbeatRuns.id, input.observedRunId)).returning();
@@ -909,13 +912,24 @@ describe("durable task Retry admission", () => {
     const receipt = await requestTaskRetry({ ...input, observedRunId: review.id });
     expect(receipt).toMatchObject({ accepted: true, stale: false, observedRunId: cut.id });
     const heartbeat = heartbeatService(db);
+    const wake = async () => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.requestId!)))[0];
+    const queued = () => db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.status, "queued")));
+    // The Retry is not retired by the other agent's run. It waits where every Retry of a cut run waits: on the proof
+    // that the cut run's execution stopped. Nothing starts without it.
     await heartbeat.resumeTaskRetry(input.companyId, receipt.requestId!);
-    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.requestId!));
-    const queued = await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.status, "queued")));
-    expect(queued, JSON.stringify({ status: wake.status, error: wake.error, wait: wake.payload?.executionWait })).toHaveLength(1);
-    expect(queued[0]).toMatchObject({ agentId: cut.agentId });
-    expect(queued[0].contextSnapshot).toMatchObject({ previousRunId: cut.id });
-    expect(wake).toMatchObject({ status: "coalesced", runId: queued[0].id });
+    expect(await wake()).toMatchObject({ status: "deferred_issue_execution", error: null });
+    expect((await wake()).payload?.executionWait).toMatchObject({ reason: "process_identity_missing" });
+    expect(await queued()).toHaveLength(0);
+    // The stop is recorded: the same Retry starts the assignee again, continuing the cut run.
+    await db.insert(heartbeatRunEvents).values({ companyId: input.companyId, agentId: cut.agentId, runId: cut.id, seq: 1,
+      eventType: "native.local_process_stopped", stream: "system", level: "info", message: "stopped" });
+    await heartbeat.resumeTaskRetry(input.companyId, receipt.requestId!);
+    const admitted = await wake();
+    expect(admitted, JSON.stringify(admitted.payload?.executionWait)).toMatchObject({ status: "coalesced" });
+    const [started] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.runId!));
+    expect(started).toMatchObject({ agentId: cut.agentId });
+    expect(started.contextSnapshot).toMatchObject({ previousRunId: cut.id,
+      explicitUserContinuation: { previousRunId: cut.id, taskRetryRequestId: receipt.requestId } });
   });
 
   it("accepts the assignee's own latest run as well, and still refuses a click that names neither run", async () => {
