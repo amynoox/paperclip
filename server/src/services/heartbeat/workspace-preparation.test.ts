@@ -2225,8 +2225,7 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
     await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, input.agent.id));
     const prepared = await prepareHeartbeatWorkspace(db, input);
     expect(prepared.resolvedWorkspace.remoteManagedWorkspace ?? false).toBe(false);
-    expect(prepared.resolvedWorkspace.warnings.join("
-")).not.toContain("remote-managed workspace");
+    expect(prepared.resolvedWorkspace.warnings.some(warning => warning.includes("remote-managed workspace"))).toBe(false);
     expect(prepared.executionWorkspace.cwd).toBe(emptied);
     await expect(gitWorkspaceCheck(input, prepared)).rejects.toMatchObject({
       message: expect.stringContaining("has no .git metadata"),
