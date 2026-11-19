@@ -378,8 +378,12 @@ const support = external ? { supported: true } : await getEmbeddedPostgresTestSu
     await settled(); expect(coordinator!.nextWakeAt()! > Date.now()).toBe(true);
   });
   it("does not replay an unresolved run left by another process", async () => {
-    const row = await due(); await pluginJobStore(db).createRun({ jobId: row.id, pluginId, trigger: "schedule" });
-    await start(); await quiet(); expect(rpc).not.toHaveBeenCalled();
+    const row = await due(); const left = await pluginJobStore(db).createRun({ jobId: row.id, pluginId, trigger: "schedule" });
+    // STUDIO-0069: the run is young on the scheduler's clock. Its job waits for its owner, and the scheduler keeps
+    // one deadline, the moment the run would be abandoned, instead of none.
+    await db.update(pluginJobRuns).set({ createdAt: new Date() }).where(eq(pluginJobRuns.id, left.id));
+    await start(); await settled(); expect(rpc).not.toHaveBeenCalled();
+    expect(coordinator!.nextWakeAt()! > Date.now()).toBe(true);
     const [run] = await runs(); await pluginJobStore(db).completeRun(run.id, { status: "cancelled" }); await completed();
   });
   it("fills released capacity from completion without a poll", async () => {
