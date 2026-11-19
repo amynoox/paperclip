@@ -877,6 +877,95 @@ describe("durable task Retry admission", () => {
       .toMatchObject({ status: "skipped", error: "task_retry_superseded" });
   });
 
+  // STUDIO-0070: production, 19 Nov 2026. A pause cut the assignee's runs (TR-1814, TR-1815: cancelled `agent_paused`,
+  // legacy), each leaving its hold, settled with replay blocked. After the resume another agent (the CTO) ran on the
+  // same tasks: the task's latest run was the CTO's succeeded run, and Retry answered `stale` for ever, even when
+  // given the run the server itself named.
+  async function seedCutByPauseThenReviewed() {
+    const input = { ...await seed(), actorSource: "local_implicit" };
+    const now = Date.now();
+    // The studio's roles run a conversation adapter (codex_local, claude_local), routed to a worker machine.
+    const [task] = await db.select().from(issues).where(eq(issues.id, input.issueId));
+    await db.update(agents).set({ adapterType: "codex_local" }).where(eq(agents.id, task.assigneeAgentId!));
+    const [cut] = await db.update(heartbeatRuns).set({
+      runtimeMode: "legacy", status: "cancelled", errorCode: "agent_paused", executionStage: "settled",
+      createdAt: new Date(now - 60_000), startedAt: new Date(now - 59_000), finishedAt: new Date(now - 30_000),
+      runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+      resultJson: { cancellation: { initiator: { type: "system" }, expected: true, reason: "Cancelled due to agent pause" },
+        pauseStop: { holds: ["manual"], companyPauseReason: null } },
+    }).where(eq(heartbeatRuns.id, input.observedRunId)).returning();
+    const [hold] = await db.insert(issueRecoveryActions).values({ companyId: input.companyId, sourceIssueId: input.issueId,
+      kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${cut.id}`,
+      status: "resolved", outcome: "blocked", nextAction: "Continue after recovery.",
+      evidence: { runId: cut.id, automaticRecovery: { policy: "preserve_without_replay_v1", runId: cut.id, replay: "blocked", actionOutcome: "unknown" } } }).returning();
+    const reviewerId = randomUUID();
+    await db.insert(agents).values({ id: reviewerId, companyId: input.companyId, name: "Reviewer", adapterType: "paperclip_runner", status: "idle" });
+    const [review] = await db.insert(heartbeatRuns).values({ companyId: input.companyId, agentId: reviewerId, issueId: input.issueId,
+      status: "succeeded", createdAt: new Date(now - 10_000), finishedAt: new Date(now - 5_000),
+      contextSnapshot: { issueId: input.issueId } }).returning();
+    return { input, cut, hold, review, reviewerId };
+  }
+
+  it("continues the assignee's cut run when another agent has run on the task since", async () => {
+    const { input, cut, review } = await seedCutByPauseThenReviewed();
+    // The task's presentation names the task's latest run: the other agent's.
+    const receipt = await requestTaskRetry({ ...input, observedRunId: review.id });
+    expect(receipt).toMatchObject({ accepted: true, stale: false, observedRunId: cut.id });
+    const heartbeat = heartbeatService(db);
+    const wake = async () => (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receipt.requestId!)))[0];
+    const queued = () => db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, input.companyId), eq(heartbeatRuns.status, "queued")));
+    // The Retry is not retired by the other agent's run. It waits where every Retry of a cut run waits: on the proof
+    // that the cut run's execution stopped. Nothing starts without it.
+    await heartbeat.resumeTaskRetry(input.companyId, receipt.requestId!);
+    expect(await wake()).toMatchObject({ status: "deferred_issue_execution", error: null });
+    expect((await wake()).payload?.executionWait).toMatchObject({ reason: "process_identity_missing" });
+    expect(await queued()).toHaveLength(0);
+    // The stop is recorded: the same Retry starts the assignee again, continuing the cut run.
+    await db.insert(heartbeatRunEvents).values({ companyId: input.companyId, agentId: cut.agentId, runId: cut.id, seq: 1,
+      eventType: "native.local_process_stopped", stream: "system", level: "info", message: "stopped" });
+    await heartbeat.resumeTaskRetry(input.companyId, receipt.requestId!);
+    const admitted = await wake();
+    expect(admitted, JSON.stringify(admitted.payload?.executionWait)).toMatchObject({ status: "coalesced" });
+    const [started] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, admitted.runId!));
+    expect(started).toMatchObject({ agentId: cut.agentId });
+    expect(started.contextSnapshot).toMatchObject({ previousRunId: cut.id,
+      explicitUserContinuation: { previousRunId: cut.id, taskRetryRequestId: receipt.requestId } });
+  });
+
+  it("accepts the assignee's own latest run as well, and still refuses a click that names neither run", async () => {
+    const { input, cut, review } = await seedCutByPauseThenReviewed();
+    expect(await requestTaskRetry({ ...input, observedRunId: randomUUID() }))
+      .toMatchObject({ accepted: false, stale: true, observedRunId: review.id });
+    expect(await requestTaskRetry({ ...input, observedRunId: null }))
+      .toMatchObject({ accepted: false, stale: true, observedRunId: review.id });
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, input.companyId))).toHaveLength(0);
+    expect(await requestTaskRetry({ ...input, observedRunId: cut.id }))
+      .toMatchObject({ accepted: true, stale: false, observedRunId: cut.id });
+  });
+
+  it("refuses an older run of the assignee once the assignee has run again, whatever other agents did", async () => {
+    const { input, cut, review } = await seedCutByPauseThenReviewed();
+    const [newer] = await db.insert(heartbeatRuns).values({ companyId: input.companyId, issueId: input.issueId,
+      agentId: cut.agentId, status: "failed", createdAt: new Date(Date.now() - 20_000), finishedAt: new Date(Date.now() - 15_000),
+      contextSnapshot: { issueId: input.issueId } }).returning();
+    // The assignee's work continued after the cut run: the cut run is not retried.
+    expect(await requestTaskRetry({ ...input, observedRunId: cut.id }))
+      .toMatchObject({ accepted: false, stale: true, observedRunId: review.id });
+    // The source is the assignee's latest run, not the cut one.
+    expect(await requestTaskRetry({ ...input, observedRunId: review.id, idempotencyKey: randomUUID() }))
+      .toMatchObject({ accepted: true, stale: false, observedRunId: newer.id });
+  });
+
+  it("never lets a task without a run of its assignee be retried through another agent's run", async () => {
+    const { input, review, reviewerId } = await seedCutByPauseThenReviewed();
+    const newcomer = randomUUID();
+    await db.insert(agents).values({ id: newcomer, companyId: input.companyId, name: "Newcomer", adapterType: "paperclip_runner", status: "idle" });
+    await db.update(issues).set({ assigneeAgentId: newcomer }).where(eq(issues.id, input.issueId));
+    expect(await requestTaskRetry({ ...input, observedRunId: review.id }))
+      .toMatchObject({ accepted: false, stale: true, observedRunId: review.id });
+    expect(reviewerId).not.toBe(newcomer);
+  });
+
   async function seedChatTask() {
     const input = await seed();
     const [issue] = await db.select().from(issues).where(eq(issues.id, input.issueId));
