@@ -1097,6 +1097,11 @@ export function reconcileReusedExecutionWorkspaceProjectWorkspaceId(
   return existingProjectWorkspaceId ?? resolvedProjectWorkspaceId ?? null;
 }
 
+/** STUDIO-0072: the warning a run carries when it starts in the placeholder of a remote-managed project workspace. */
+export function remoteManagedWorkspaceWarning(cwd: string) {
+  return `remote-managed workspace: launching from placeholder "${cwd}", no repository on this host`;
+}
+
 export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   adapterType: string;
   agentId: string;
@@ -1270,6 +1275,10 @@ export async function assertGitSensitiveAdapterWorkspaceValid(input: {
   if (
     workspaceExpectation &&
     !(input.resolvedWorkspace.localPathOnlyWorkspace === true && input.executionWorkspace.strategy === "project_primary" && !input.executionWorkspace.repoUrl && !input.executionWorkspace.branchName) &&
+    // STUDIO-0072: a remote-managed project workspace has no repository on this host by definition. Production,
+    // 19 Nov 2026: a task created in the interface was linked to such a workspace; its routed claude_local run failed
+    // at once on the empty managed directory this host resolves for it.
+    !(input.resolvedWorkspace.remoteManagedWorkspace === true && input.executionWorkspace.strategy === "project_primary" && !input.executionWorkspace.repoUrl && !input.executionWorkspace.branchName) &&
     effectiveCwd &&
     !(await hasGitMetadata(effectiveCwd))
   ) {
@@ -1356,6 +1365,11 @@ export type ResolvedWorkspaceForRun = {
   materializationFailures: WorkspaceMaterializationFailure[];
   /** True only for an explicitly configured local project path without a repository URL. */
   localPathOnlyWorkspace?: boolean;
+  /**
+   * STUDIO-0072: true only for a project workspace declared `remote_managed`, with neither a path nor a repository
+   * on this host. Its files live with a remote executor; `cwd` is this host's managed directory, a placeholder.
+   */
+  remoteManagedWorkspace?: boolean;
   /** Current configuration for drift reporting; never an alternative restore source. */
   freshnessSource?: { projectId: string | null; workspaceId: string | null; repoUrl: string | null; repoRef: string | null };
   /**
@@ -3608,6 +3622,8 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
           .then((stats) => stats.isDirectory())
           .catch(() => false);
         if (projectCwdExists) {
+          const remoteManagedWorkspace = workspace.sourceType === "remote_managed" &&
+            !readNonEmptyString(workspace.cwd) && !readNonEmptyString(workspace.repoUrl);
           return {
             cwd: projectCwd,
             source: "project_primary" as const,
@@ -3619,6 +3635,9 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
             warnings: [
               preferredWorkspaceWarning,
               managedWorkspaceWarning,
+              // STUDIO-0072: written to the run's log before the launch check (heartbeat.ts, runtimeWorkspaceWarnings),
+              // so a run that starts in this placeholder says so.
+              remoteManagedWorkspace ? remoteManagedWorkspaceWarning(projectCwd) : null,
             ].filter((value): value is string => Boolean(value)),
             baseCwdFallback: false,
             materializationFailures,
@@ -3626,6 +3645,7 @@ export function createHeartbeatWorkspaceResolver(db: Db) {
               (workspace.sourceType === "local_path" || workspace.sourceType === "non_git_path") &&
               Boolean(readNonEmptyString(workspace.cwd)) && workspace.cwd !== REPO_ONLY_CWD_SENTINEL &&
               !readNonEmptyString(workspace.repoUrl),
+            remoteManagedWorkspace,
           };
         }
         if (preferredWorkspace?.id === workspace.id) {

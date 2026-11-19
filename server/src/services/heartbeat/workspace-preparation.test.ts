@@ -20,7 +20,7 @@ import { executionWorkspaceService, toExecutionWorkspace } from "../execution-wo
 import { instanceSettingsService } from "../instance-settings.js";
 import { workspaceOperationService } from "../workspace-operations.js";
 import { nativeWorkspaceSyncInternals, prepareNativeWorkspaceSync } from "../native-runtime/native-workspace-sync.js";
-import { createHeartbeatWorkspaceResolver, prepareProjectRepositoryWorkspaces, resolveExecutionWorkspaceReuseRequestForIssue } from "./workspaces.js";
+import { assertGitSensitiveAdapterWorkspaceValid, remoteManagedWorkspaceWarning, createHeartbeatWorkspaceResolver, prepareProjectRepositoryWorkspaces, resolveExecutionWorkspaceReuseRequestForIssue } from "./workspaces.js";
 import { prepareHeartbeatWorkspace, type HeartbeatWorkspacePreparationInput } from "./workspace-preparation.js";
 import { buildNativeExecutionInput } from "../native-runtime/native-execution-input.js";
 import { nativeRuntimeContextFixture } from "../native-runtime/runtime-context.test-fixture.js";
@@ -2162,5 +2162,87 @@ describe.skipIf(!support.supported && !externalDatabaseUrl)("heartbeat workspace
     expect(result.persistedExecutionWorkspace!.name).toBe("Realized workspace");
     result.activeEnvironmentLease!.lease.metadata!.remoteCwd = "/rebound";
     expect(result.workspaceRestoreSource!.metadata?.remoteCwd).toBe("/original");
+  });
+
+  // STUDIO-0072: production, 19 Nov 2026. A task created in the interface (TR-2019) was linked to its project's
+  // primary workspace, which is `remote_managed`: no path and no repository on this host. Its routed claude_local run
+  // failed at once: "expected a git workspace for claude_local, but ".../_default" has no .git metadata."
+  type Prepared = Awaited<ReturnType<typeof prepareHeartbeatWorkspace>>;
+  /** The check the heartbeat runs before it launches the adapter, fed as heartbeat.ts feeds it. */
+  const gitWorkspaceCheck = (input: HeartbeatWorkspacePreparationInput, prepared: Prepared, adapterType = "claude_local") =>
+    assertGitSensitiveAdapterWorkspaceValid({
+      adapterType, agentId: input.agent.id,
+      issue: { id: input.task.issueRef!.id, identifier: input.task.issueRef!.identifier ?? null,
+        projectId: input.task.issueRef!.projectId ?? null, projectWorkspaceId: input.task.issueRef!.projectWorkspaceId ?? null },
+      resolvedWorkspace: prepared.resolvedWorkspace, executionWorkspace: prepared.executionWorkspace,
+      persistedExecutionWorkspace: prepared.persistedExecutionWorkspace, executionTarget: prepared.executionTarget,
+      environmentDriver: prepared.selectedEnvironment?.driver ?? "provider_api",
+      leaseMetadata: prepared.activeEnvironmentLease?.lease.metadata ?? {},
+    });
+  /** The interface's task: linked to the project's primary workspace, here made remote-managed. */
+  async function remoteManagedFixture() {
+    const f = await fixture();
+    await db.update(projectWorkspaces).set({ sourceType: "remote_managed", cwd: null, repoUrl: null, repoRef: null })
+      .where(eq(projectWorkspaces.id, f.issue.projectWorkspaceId!));
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, f.input.agent.id));
+    return f;
+  }
+
+  it("launches a git-sensitive adapter on a remote-managed project workspace, which has no repository on this host", async () => {
+    const { input, issue } = await remoteManagedFixture();
+    const prepared = await prepareHeartbeatWorkspace(db, input);
+    // The host resolves its own managed directory for the workspace: no repository there.
+    expect(prepared.resolvedWorkspace).toMatchObject({ source: "project_primary", workspaceId: issue.projectWorkspaceId,
+      remoteManagedWorkspace: true });
+    expect(prepared.executionWorkspace.cwd).toBe(resolveManagedProjectWorkspaceDir({ companyId: issue.companyId, projectId: issue.projectId! }));
+    await expect(access(join(prepared.executionWorkspace.cwd, ".git"))).rejects.toThrow();
+    // The run says where it starts: the heartbeat writes these warnings to the run's log before the launch check.
+    expect(prepared.resolvedWorkspace.warnings).toContain(remoteManagedWorkspaceWarning(prepared.executionWorkspace.cwd));
+    expect(prepared.persistedExecutionWorkspace).toMatchObject({ projectWorkspaceId: issue.projectWorkspaceId, strategyType: "project_primary" });
+    for (const adapterType of ["claude_local", "codex_local"]) {
+      await expect(gitWorkspaceCheck(input, prepared, adapterType)).resolves.toBeUndefined();
+    }
+  });
+
+  it("launches again on the second run, which reuses the execution workspace of the first", async () => {
+    const { input } = await remoteManagedFixture();
+    const first = await prepareHeartbeatWorkspace(db, input);
+    await expect(gitWorkspaceCheck(input, first)).resolves.toBeUndefined();
+    await reuse(input, first.persistedExecutionWorkspace!);
+    const second = await prepareHeartbeatWorkspace(db, input);
+    expect(second.persistedExecutionWorkspace).toMatchObject({ id: first.persistedExecutionWorkspace!.id });
+    expect(second.executionWorkspace.cwd).toBe(first.executionWorkspace.cwd);
+    await expect(gitWorkspaceCheck(input, second)).resolves.toBeUndefined();
+  });
+
+  it("still refuses a project workspace with a local path that holds no repository", async () => {
+    const { input, issue } = await fixture();
+    // A git project path whose repository is gone: the workspace is not remote-managed.
+    const emptied = join(home, `emptied-${issue.projectId}`);
+    await mkdir(emptied);
+    await db.update(projectWorkspaces).set({ cwd: emptied, sourceType: "git_repo", repoUrl: "https://example.com/studio/game.git" })
+      .where(eq(projectWorkspaces.id, issue.projectWorkspaceId!));
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, input.agent.id));
+    const prepared = await prepareHeartbeatWorkspace(db, input);
+    expect(prepared.resolvedWorkspace.remoteManagedWorkspace ?? false).toBe(false);
+    expect(prepared.resolvedWorkspace.warnings.some(warning => warning.includes("remote-managed workspace"))).toBe(false);
+    expect(prepared.executionWorkspace.cwd).toBe(emptied);
+    await expect(gitWorkspaceCheck(input, prepared)).rejects.toMatchObject({
+      message: expect.stringContaining("has no .git metadata"),
+    });
+  });
+
+  it("still refuses a workspace declared remote-managed that has a path on this host without a repository", async () => {
+    const { input, issue } = await fixture();
+    const emptied = join(home, `declared-remote-${issue.projectId}`);
+    await mkdir(emptied);
+    await db.update(projectWorkspaces).set({ cwd: emptied, sourceType: "remote_managed", repoUrl: null })
+      .where(eq(projectWorkspaces.id, issue.projectWorkspaceId!));
+    await db.update(agents).set({ adapterType: "claude_local" }).where(eq(agents.id, input.agent.id));
+    const prepared = await prepareHeartbeatWorkspace(db, input);
+    expect(prepared.resolvedWorkspace.remoteManagedWorkspace ?? false).toBe(false);
+    await expect(gitWorkspaceCheck(input, prepared)).rejects.toMatchObject({
+      message: expect.stringContaining("has no .git metadata"),
+    });
   });
 });
