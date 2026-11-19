@@ -33,6 +33,12 @@ export function executionHoldOf(blocker: ExecutionBlocker, activeRecoveryActionI
 }
 
 /**
+ * How many confirmations of a list run at once: half of the database pool's default size (10 connections), each
+ * confirmation making one query at a time, so that a list never takes the whole pool from the rest of the server.
+ */
+export const EXECUTION_HOLD_CONFIRMATIONS_AT_ONCE = 5;
+
+/**
  * The holds of a list of tasks. One grouped read finds the tasks that have a recovery action able to hold execution;
  * each of them is then confirmed by getExecutionBlocker, so the list never states a rule of its own.
  */
@@ -44,9 +50,22 @@ export async function listExecutionHolds(db: Db, companyId: string, issueIds: st
   const candidates = await db.selectDistinct({ issueId: issueRecoveryActions.sourceIssueId }).from(issueRecoveryActions)
     .where(and(eq(issueRecoveryActions.companyId, companyId), inArray(issueRecoveryActions.sourceIssueId, ids),
       executionBlockerPredicate()));
-  for (const { issueId } of candidates) {
-    const hold = executionHoldOf(await getExecutionBlocker(db, companyId, issueId), activeRecoveryActionId(issueId));
-    if (hold) holds.set(issueId, hold);
-  }
+  // After a general pause most tasks of a list are held: the confirmations run several at once. The first failure
+  // fails the whole read, because a partial map would say "nothing holds" for the tasks it did not confirm.
+  let next = 0;
+  let failed = false;
+  const confirmNext = async () => {
+    while (!failed && next < candidates.length) {
+      const { issueId } = candidates[next++]!;
+      try {
+        const hold = executionHoldOf(await getExecutionBlocker(db, companyId, issueId), activeRecoveryActionId(issueId));
+        if (hold) holds.set(issueId, hold);
+      } catch (error) {
+        failed = true;
+        throw error;
+      }
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(EXECUTION_HOLD_CONFIRMATIONS_AT_ONCE, candidates.length) }, confirmNext));
   return holds;
 }

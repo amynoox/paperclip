@@ -50,6 +50,7 @@ import { caseHandoffService } from "../services/case-handoffs.js";
 import { instanceSettingsService } from "../services/instance-settings.js";
 import { withNativeWorkspaceFinalizationOwnership } from "../services/native-runtime/native-workspace-finalization-ownership.js";
 import { noticeMetadataReferencesRecoveryAction } from "../services/recovery/successful-run-handoff.js";
+import { EXECUTION_HOLD_CONFIRMATIONS_AT_ONCE, listExecutionHolds } from "../services/execution-hold.js";
 
 const external = resolveExternalTestDatabaseUrl("PAPERCLIP_RECOVERY_ACTION_TEST_DATABASE_URL");
 const embeddedPostgresSupport = external ? { supported: true, reason: undefined } : await getEmbeddedPostgresTestSupport();
@@ -4283,5 +4284,99 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     // The detail does not use the grouped read.
     const detail = await request(app).get(`/api/issues/${sourceIssueId}`).expect(200);
     expect(detail.body.executionHold).toMatchObject({ recoveryActionId: hold.id, listedAsActiveAction: false });
+  });
+
+  /** `count` more tasks of the same company, each held like the first: a run cut by a pause, its hold settled. */
+  async function seedMoreHeldTasks(seeded: { companyId: string; coderId: string; prefix: string }, count: number) {
+    const holdByIssue = new Map<string, string>();
+    for (let index = 0; index < count; index += 1) {
+      const issueId = randomUUID();
+      const runId = randomUUID();
+      await db.insert(issues).values({ id: issueId, companyId: seeded.companyId, title: `Held task ${index}`, status: "todo",
+        priority: "medium", assigneeAgentId: seeded.coderId, issueNumber: 10 + index, identifier: `${seeded.prefix}-${10 + index}` });
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: seeded.companyId, agentId: seeded.coderId,
+        invocationSource: "manual", status: "cancelled", errorCode: "agent_paused", runtimeMode: "legacy", executionStage: "settled",
+        startedAt: new Date(Date.now() - 600_000), finishedAt: new Date(Date.now() - 300_000),
+        contextSnapshot: { issueId },
+        runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+        resultJson: { cancellation: { initiator: { type: "system" }, expected: true, reason: "Cancelled due to agent pause" },
+          pauseStop: { holds: ["manual"], companyPauseReason: null } } });
+      const [hold] = await db.insert(issueRecoveryActions).values({ companyId: seeded.companyId, sourceIssueId: issueId,
+        kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+        status: "resolved", outcome: "blocked", ownerType: "board", nextAction: "Reconcile the cut run before any continuation.",
+        evidence: { runId, automaticRecovery: { policy: "preserve_without_replay_v1", runId, replay: "blocked", actionOutcome: "unknown" } },
+      }).returning();
+      holdByIssue.set(issueId, hold!.id);
+    }
+    return holdByIssue;
+  }
+  /**
+   * The database seen through a wrapper that calls `onQuery` each time a query starts and counts the queries that
+   * are waiting for their answer at the same moment.
+   */
+  function observedDb(onQuery: (name: string) => void = () => {}) {
+    const seen = { inFlight: 0, most: 0 };
+    const wrap = (value: any): any => {
+      if (value === null || (typeof value !== "object" && typeof value !== "function")) return value;
+      return new Proxy(value, { get(target, property) {
+        const member = Reflect.get(target, property, target);
+        if (typeof member !== "function" || typeof property === "symbol" || property === "constructor") return member;
+        if (property === "then") return (resolve: (rows: unknown) => unknown, reject: (error: unknown) => unknown) => {
+          seen.inFlight += 1;
+          seen.most = Math.max(seen.most, seen.inFlight);
+          return (target as PromiseLike<unknown>).then(
+            rows => { seen.inFlight -= 1; return rows; },
+            error => { seen.inFlight -= 1; throw error; },
+          ).then(resolve, reject);
+        };
+        return (...args: unknown[]) => {
+          if (target === db) onQuery(property);
+          return wrap(member.apply(target, args));
+        };
+      } });
+    };
+    return { db: wrap(db) as typeof db, seen };
+  }
+
+  it("confirms the holds of a list several at once, never more than the bound, each task keeping its own hold", async () => {
+    const seeded = await seedSettledHoldOfCutRun();
+    const holdByIssue = new Map([[seeded.sourceIssueId, seeded.hold.id], ...await seedMoreHeldTasks(seeded, 11)]);
+    const issueIds = [...holdByIssue.keys(), seeded.freeIssueId];
+    const observed = observedDb();
+    const holds = await listExecutionHolds(observed.db, seeded.companyId, issueIds, () => null);
+    expect(observed.seen.most).toBeGreaterThan(1);
+    expect(observed.seen.most).toBeLessThanOrEqual(EXECUTION_HOLD_CONFIRMATIONS_AT_ONCE);
+    expect(observed.seen.inFlight).toBe(0);
+    expect(holds.size).toBe(12);
+    for (const [issueId, holdId] of holdByIssue) expect(holds.get(issueId)?.recoveryActionId, issueId).toBe(holdId);
+    // The same through the list route.
+    const rows = await listRows(createApp(), seeded.companyId, `?view=rows&ids=${issueIds.join(",")}`);
+    for (const [issueId, holdId] of holdByIssue) expect(rows.get(issueId)?.executionHold?.recoveryActionId, issueId).toBe(holdId);
+    expect(rows.get(seeded.freeIssueId)?.executionHold).toBeNull();
+  });
+
+  it("fails the whole read of the holds when one confirmation fails, and the list then carries no field", async () => {
+    const seeded = await seedSettledHoldOfCutRun();
+    const holdByIssue = new Map([[seeded.sourceIssueId, seeded.hold.id], ...await seedMoreHeldTasks(seeded, 11)]);
+    const issueIds = [...holdByIssue.keys(), seeded.freeIssueId];
+    // The grouped read answers; one query of the confirmations that follow it fails, while others are in flight.
+    let confirmationQueries: number | null = null;
+    const failing = observedDb(name => {
+      if (name === "selectDistinct") confirmationQueries = 0;
+      else if (name === "select" && confirmationQueries !== null && (confirmationQueries += 1) === 7) {
+        throw new Error("confirmation unavailable");
+      }
+    });
+    await expect(listExecutionHolds(failing.db, seeded.companyId, issueIds, () => null)).rejects.toThrow("confirmation unavailable");
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { (req as any).actor = { type: "board", source: "local_implicit" }; next(); });
+    app.use("/api", issueRoutes(failing.db, {} as any, {}));
+    app.use(errorHandler);
+    confirmationQueries = null;
+    const rows = await listRows(app, seeded.companyId, `?view=rows&ids=${issueIds.join(",")}`);
+    expect(rows.size).toBe(issueIds.length);
+    // No task says "nothing holds" (null) because its confirmation did not run.
+    for (const issueId of issueIds) expect(Object.hasOwn(rows.get(issueId)!, "executionHold"), issueId).toBe(false);
   });
 });
