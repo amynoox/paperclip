@@ -10,7 +10,6 @@ import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state
 import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
 import { isGovernancePauseStop } from "./governance-pause-stop.js";
-import { readProcessStartedAt } from "./hot-restart.js";
 import { sshClientStopProvesPause } from "./agent-execution-stop.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
@@ -84,23 +83,6 @@ export function isUserCommentContinuationReason(reason: string | null | undefine
 function processStopped(pid: number): boolean {
   try { process.kill(pid, 0); return false; }
   catch (error) { return (error as NodeJS.ErrnoException).code === "ESRCH"; }
-}
-
-/**
- * STUDIO-0074: a process alive under the number a cut run recorded is not that run's engine when it was born after
- * the run ended: the number was given to another program since (the host restarted and counts from the start
- * again, or the numbers wrapped). The birth time is read from the process table (Linux: /proc/<pid>/stat with the
- * boot time and the clock tick). When it cannot be read, or says nothing sure, the answer is no: the request waits,
- * as before. For a process group the same reading is made on its leader, whose number is the group's: a number
- * still in use as a group is never given to a new process, so a leader born after the run ended means the cut
- * run's group is empty.
- */
-async function bornAfterRunEnded(pid: number, run: { finishedAt: Date | null }): Promise<boolean> {
-  if (!run.finishedAt) return false;
-  const observed = await readProcessStartedAt(pid).catch(() => null);
-  const born = observed ? new Date(observed).getTime() : Number.NaN;
-  // One second of margin: the process table counts in clock ticks, the run's end in milliseconds.
-  return Number.isFinite(born) && born > run.finishedAt.getTime() + 1_000;
 }
 
 /** Validate the whole saved queue, preserving order and original authors.
@@ -543,8 +525,13 @@ export async function admitExplicitNativeContinuation(input: {
             !await nativeRunRefusedBeforeLaunch(db, run) &&
             !(run.runtimeMode === "native" &&
               await recordUnidentifiedLocalRunnerStop(db, run, { record: !input.dryRun }))) return blocked("process_identity_missing", "The previous run has no verified stop record. Paperclip cannot start this message yet.");
-        if (run.processPid && !processStopped(run.processPid) && !await bornAfterRunEnded(run.processPid, run)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
-        if (run.processGroupId && !processStopped(-run.processGroupId) && !await bornAfterRunEnded(run.processGroupId, run)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
+        // STUDIO-0074: a number still in use is not always the cut run's engine: it can have been given to another
+        // program since. The product's own proof decides (recordedLocalExecutionStopped: the identity the spawn
+        // recorded, and a live process or group leader born later than the recorded one). Nothing recorded, or a
+        // birth time that cannot be read, proves nothing: the request waits, as before.
+        const numberInUse = Boolean((run.processPid && !processStopped(run.processPid)) ||
+          (run.processGroupId && !processStopped(-run.processGroupId)));
+        if (numberInUse && !await recordedLocalExecutionStopped(db, run)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");
       }
     }
     // The runner keeps a closing or quarantined provider session in process

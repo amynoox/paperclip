@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
+import os from "node:os";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { activityLog, agents, agentWakeupRequests, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns,
   instanceUserRoles, issueComments, issueRecoveryActions, issueRelations, issueThreadInteractions, issues } from "@paperclipai/db";
@@ -10,6 +11,7 @@ import { projectCompanyHolds } from "../modules/agent-lifecycle/adapters/company
 import { createLifecycleStore } from "../modules/agent-lifecycle/adapters/postgres.js";
 import { configureAgentLifecycle, createAgentLifecycle, createAgentLifecycleEffects } from "./agent-lifecycle.js";
 import { createLifecycleDriver } from "./agent-lifecycle-driver.js";
+import { currentProcessSpaceHash } from "./controller-process-identity.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { heartbeatService } from "./heartbeat.js";
 import { persistHeartbeatRunProcessMetadata } from "./heartbeat/run-lifecycle.js";
@@ -309,27 +311,40 @@ describe("the runs a pause cut, when the role resumes", () => {
     const keptRequestsAreLookedAtAgain = (f: { companyId: string }) => heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
     const systemNotes = async (f: { issueId: string }) => (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
       .filter(comment => comment.authorType === "system" && comment.body.includes("has not started again yet"));
+    /**
+     * What the spawn of the cut run recorded (run-lifecycle.ts, persistHeartbeatRunProcessMetadata): the number, the
+     * group, and the birth time of the engine, on the run and in its identity event, in this process space.
+     */
+    async function spawnRecorded(f: { companyId: string; agentId: string; cut: { id: string } }, recorded: { pid: number; group: number | null; bornAt: Date }) {
+      await db.update(heartbeatRuns).set({ processPid: recorded.pid, processGroupId: recorded.group, processStartedAt: recorded.bornAt,
+        processHostHash: currentProcessSpaceHash() }).where(eq(heartbeatRuns.id, f.cut.id));
+      await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: f.cut.id, seq: 2,
+        eventType: "native.process_identity_recorded", stream: "system", level: "info", message: "identity",
+        payload: { targetKind: "local", hostname: os.hostname(), processPid: recorded.pid, processGroupId: recorded.group,
+          processStartedAt: recorded.bornAt.toISOString() } });
+    }
 
-    // The number a cut run recorded can be given to another program later (the host restarted, or the numbers
-    // wrapped). A program born after the cut run ended is not its engine: the stop is proven.
+    // The number a cut run recorded can be given to another program later (the numbers wrapped). The spawn recorded
+    // the engine's birth time with its number: a program alive under that number and born later is not that engine.
     it.each([["the process", false], ["the process and its group", true]] as const)(
-      "the recorded number now belongs to another program, born after the run ended (%s): the work starts", async (_what, group) => {
+      "the recorded number now belongs to another program, born later than the recorded engine (%s): the work starts", async (_what, group) => {
         const f = await fixture();
         const other = otherProgram(group);
         try {
-          await db.update(heartbeatRuns).set({ processPid: other.pid, ...(group ? { processGroupId: other.pid } : {}) })
-            .where(eq(heartbeatRuns.id, f.cut.id));
+          await spawnRecorded(f, { pid: other.pid, group: group ? other.pid : null, bornAt: new Date(Date.now() - 14 * HOUR) });
           await roleResumes(f);
           await expectContinued(f);
         } finally { await other.stop(); }
       });
 
-    it("the recorded number belongs to a program born before the run ended: the request is kept, and starts once that program is gone", async () => {
+    it("the recorded number belongs to the recorded engine, still alive: the request is kept, and starts once it is gone", async () => {
       const other = otherProgram();
       try {
-        // The cut run ended after that program was born: it may be the run's own engine, still alive.
-        const f = await fixture({ finishedMinutesAgo: 0 });
-        await db.update(heartbeatRuns).set({ processPid: other.pid, finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.cut.id));
+        const f = await fixture();
+        // The product's own writer, on a live program: it reads that program's birth time and records it.
+        await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.cut.id));
+        await persistHeartbeatRunProcessMetadata(db, f.cut.id, { pid: other.pid, processGroupId: null,
+          startedAt: new Date().toISOString(), targetKind: "local" });
         await roleResumes(f);
         await expectKept(f, "stop_not_proven", "process_running");
         await keptRequestsAreLookedAtAgain(f);
@@ -339,6 +354,33 @@ describe("the runs a pause cut, when the role resumes", () => {
         expect(await continuations(f)).toHaveLength(1);
         expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:stop_not_proven`, PAUSE_CUT_WORK_CONTINUED]);
       } finally { await other.stop().catch(() => undefined); }
+    });
+
+    // The pause cuts a run while its adapter is starting the engine: the engine is born just after the run's end
+    // and is recorded then. It is the run's engine all the same, and it is alive: nothing may start beside it.
+    it("an engine started just after its run was cut is alive and recorded: the request is kept", async () => {
+      const f = await fixture();
+      const engine = otherProgram();
+      try {
+        await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.cut.id));
+        await persistHeartbeatRunProcessMetadata(db, f.cut.id, { pid: engine.pid, processGroupId: null,
+          startedAt: new Date().toISOString(), targetKind: "local" });
+        const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.cut.id));
+        expect(run!.processStartedAt!.getTime()).toBeGreaterThan(run!.finishedAt!.getTime());
+        await roleResumes(f);
+        await expectKept(f, "stop_not_proven", "process_running");
+      } finally { await engine.stop(); }
+    });
+
+    // A number in use with nothing recorded about the engine that had it (an older row): nothing proves it changed hands.
+    it("a number in use and no recorded identity for it: the request is kept", async () => {
+      const f = await fixture();
+      const other = otherProgram();
+      try {
+        await db.update(heartbeatRuns).set({ processPid: other.pid }).where(eq(heartbeatRuns.id, f.cut.id));
+        await roleResumes(f);
+        await expectKept(f, "stop_not_proven", "process_running");
+      } finally { await other.stop(); }
     });
 
     // The leader of the recorded group is gone and a program it started still runs under the group's number. The
@@ -351,7 +393,8 @@ describe("the runs a pause cut, when the role resumes", () => {
       try {
         expect(groupRuns()).toBe(true);
         const f = await fixture();
-        await db.update(heartbeatRuns).set({ processGroupId: group }).where(eq(heartbeatRuns.id, f.cut.id));
+        // The engine led its group and is gone; its number and its birth time are on record.
+        await spawnRecorded(f, { pid: group, group, bornAt: new Date(Date.now() - 14 * HOUR) });
         await roleResumes(f);
         await expectKept(f, "stop_not_proven", "process_running");
         process.kill(-group, "SIGKILL");
