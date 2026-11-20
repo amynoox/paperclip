@@ -11,10 +11,11 @@
 // - the role itself is paused: a pause does not move the role's work to somebody else;
 // - the ticket still holds something on the server: a queued or running run, an execution or checkout lock on a
 //   run that has not ended, an environment lease not released (the lease of the run that caused the hand-over
-//   aside: its own end releases it);
+//   aside: its own end releases it). A caller may name runs that do not hold the ticket for its hand-over
+//   (`doesNotHold`, STUDIO-0078): the role's own runs still in the queue, the manager's own runs;
 // - the same run already caused a hand-over, or the ticket was already handed twice for the same cause since the
 //   role last ran on it for another reason (the bound against a to-and-fro between the role and its manager).
-import { and, desc, eq, inArray, isNull, ne, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, isNull, ne, notInArray, or, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import { activityLog, agents, environmentLeases, heartbeatRuns, issues } from "@paperclipai/db";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
@@ -52,6 +53,17 @@ export type ManagerHandoverInput = {
   /** The run that caused the hand-over, if any. One run causes one hand-over at most. */
   sourceRun: { id: string; status: string; agentId: string | null } | null;
   note: ManagerHandoverNote;
+  /**
+   * STUDIO-0078: live runs of the ticket that do not hold it for this hand-over. By default any run of the ticket
+   * queued or running holds it. A caller that hands a ticket because its role keeps failing says:
+   * - `queuedRunsOfTheRole`: a run of the role that has not started (the bounded retry of the run that just failed)
+   *   is not work in hand; once the ticket is the manager's, the queue cancels it as a run of a former assignee;
+   * - `runsOfTheManager`: the manager's own run on the ticket (woken by the worker router's card after each
+   *   failure) is the receiver at work, not somebody else's;
+   * - `leaseOfRunId`: the lease of a run that has ended and is being closed when the hand-over is asked (its own end
+   *   releases it, as for the run that caused the hand-over).
+   */
+  doesNotHold?: { queuedRunsOfTheRole?: boolean; runsOfTheManager?: boolean; leaseOfRunId?: string | null };
 };
 
 export type ManagerHandoverRefusal =
@@ -146,18 +158,25 @@ export async function handIssueToManager(
     if (!(await evaluateAgentInvokabilityFromDb(database, manager)).invokable) return { handed: false, reason: "manager_not_invokable" };
 
     // Nothing of the ticket is still held on the server.
-    const [liveRun] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
+    const holds = (run: { agentId: string; status: string }) =>
+      !(input.doesNotHold?.queuedRunsOfTheRole && run.agentId === input.fromAgentId && run.status === "queued")
+      && !(input.doesNotHold?.runsOfTheManager && run.agentId === manager.id);
+    const liveRuns = await tx.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status }).from(heartbeatRuns)
       .where(and(
         eq(heartbeatRuns.companyId, current.companyId),
         inArray(heartbeatRuns.status, [...LIVE_RUN_STATUSES]),
         sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${current.id}`,
-      )).limit(1);
-    if (liveRun) return { handed: false, reason: "still_held" };
+      ));
+    if (liveRuns.some(holds)) return { handed: false, reason: "still_held" };
+    const runsThatDoNotHold = [
+      ...liveRuns.filter((run) => !holds(run)).map((run) => run.id),
+      ...(input.doesNotHold?.leaseOfRunId ? [input.doesNotHold.leaseOfRunId] : []),
+    ];
     const lockRunIds = [current.executionRunId, current.checkoutRunId].filter((id): id is string => Boolean(id));
     if (lockRunIds.length > 0) {
-      const [liveLock] = await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns)
-        .where(and(inArray(heartbeatRuns.id, lockRunIds), inArray(heartbeatRuns.status, [...LIVE_RUN_STATUSES]))).limit(1);
-      if (liveLock) return { handed: false, reason: "still_held" };
+      const liveLocks = await tx.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status }).from(heartbeatRuns)
+        .where(and(inArray(heartbeatRuns.id, lockRunIds), inArray(heartbeatRuns.status, [...LIVE_RUN_STATUSES])));
+      if (liveLocks.some(holds)) return { handed: false, reason: "still_held" };
     }
     const [lease] = await tx.select({ id: environmentLeases.id }).from(environmentLeases)
       .where(and(
@@ -166,6 +185,8 @@ export async function handIssueToManager(
         eq(environmentLeases.status, "active"),
         isNull(environmentLeases.releasedAt),
         input.sourceRun ? sql`${environmentLeases.heartbeatRunId} is distinct from ${input.sourceRun.id}` : undefined,
+        runsThatDoNotHold.length > 0
+          ? or(isNull(environmentLeases.heartbeatRunId), notInArray(environmentLeases.heartbeatRunId, runsThatDoNotHold)) : undefined,
       )).limit(1);
     if (lease) return { handed: false, reason: "still_held" };
 

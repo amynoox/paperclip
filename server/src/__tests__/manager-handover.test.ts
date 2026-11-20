@@ -373,6 +373,52 @@ describePostgres("a ticket the worker router refuses goes to the role's direct m
     expect(await call(locked, locked.runIds[0]!)).toEqual({ handed: false, reason: "run_already_handed" });
   }, 180_000);
 
+  it("STUDIO-0078: a caller may say that the role's queued runs and the manager's own runs do not hold the ticket", async () => {
+    const note = routerRefusalHandoverNote(ENDED, null)!;
+    const call = (f: Fixture, doesNotHold?: { queuedRunsOfTheRole?: boolean; runsOfTheManager?: boolean; leaseOfRunId?: string }) =>
+      handIssueToManager(db, { enqueueWakeup: async () => null }, {
+        issue: { id: f.issueId, companyId: f.companyId }, fromAgentId: f.agentId, cause: "relaunch_loop", code: ENDED,
+        sourceRun: { id: f.runIds[0]!, status: "failed", agentId: f.agentId }, note, doesNotHold,
+      });
+    const run = async (f: Fixture, agentId: string, status: "queued" | "running" | "succeeded") => (await db.insert(heartbeatRuns).values({
+      companyId: f.companyId, agentId, invocationSource: "automation", triggerDetail: "system", status,
+      ...(status === "queued" ? {} : { startedAt: new Date() }), ...(status === "succeeded" ? { finishedAt: new Date() } : {}),
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId },
+    }).returning())[0]!;
+    const lease = (f: Fixture, heartbeatRunId: string) => db.insert(environmentLeases).values({
+      companyId: f.companyId, issueId: f.issueId, heartbeatRunId, status: "active", provider: "ssh",
+    });
+    const both = { queuedRunsOfTheRole: true, runsOfTheManager: true };
+    const held = { handed: false, reason: "still_held" };
+    // A run of the role that has started is work in hand; so is another agent's run, and another agent's lease.
+    const started = await seed("in_progress", [{ minutesAgo: 6, errorCode: ENDED }]);
+    await run(started, started.agentId, "running");
+    expect(await call(started, both)).toEqual(held);
+    const other = await seed("in_progress", [{ minutesAgo: 6, errorCode: ENDED }]);
+    await run(other, other.ceoId, "queued");
+    expect(await call(other, both)).toEqual(held);
+    const leased = await seed("in_progress", [{ minutesAgo: 6, errorCode: ENDED }]);
+    await run(leased, leased.managerId, "running");
+    const endedRun = await run(leased, leased.ceoId, "succeeded");
+    await lease(leased, endedRun.id);
+    expect(await call(leased, both)).toEqual(held);
+    for (const f of [started, other, leased]) expect(await handoversOf(f.issueId)).toHaveLength(0);
+    // The lease of a run that has ended and is being closed is released by that end: named, it does not hold.
+    expect(await call(leased, { ...both, leaseOfRunId: endedRun.id })).toMatchObject({ handed: true, managerAgentId: leased.managerId });
+    // The manager's run, running with its lease and the execution lock of the ticket, and the role's own retry in the queue.
+    const f = await seed("in_progress", [{ minutesAgo: 6, errorCode: ENDED }]);
+    const managerRun = await run(f, f.managerId, "running");
+    await lease(f, managerRun.id);
+    await db.update(issues).set({ executionRunId: managerRun.id }).where(eq(issues.id, f.issueId));
+    await run(f, f.agentId, "queued");
+    expect(await call(f)).toEqual(held);
+    expect(await call(f, { queuedRunsOfTheRole: true })).toEqual(held);
+    expect(await call(f, { runsOfTheManager: true })).toEqual(held);
+    expect(await handoversOf(f.issueId)).toHaveLength(0);
+    expect(await call(f, both)).toMatchObject({ handed: true, managerAgentId: f.managerId });
+    expect(await handoversOf(f.issueId)).toHaveLength(1);
+  }, 180_000);
+
   // The manager gives the ticket back to the role in the run it was woken for, and that run ends.
   async function giveBack(f: Fixture) {
     await db.update(issues).set({ assigneeAgentId: f.agentId, status: "todo", updatedAt: new Date() }).where(eq(issues.id, f.issueId));
