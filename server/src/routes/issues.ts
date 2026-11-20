@@ -11211,7 +11211,7 @@ export function issueRoutes(
                 sections: [{
                   title: "Settlement",
                   rows: [
-                    { type: "key_value", label: "Recovery action", value: result.recoveryAction.id },
+                    { type: "key_value", label: "Settled action", value: result.recoveryAction.id },
                     { type: "key_value", label: "Settled as", value: settlementCapacity },
                   ],
                 }],

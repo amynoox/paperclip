@@ -322,7 +322,9 @@ export async function wakeManagerOfBlockedIssue(
           rows: [
             agentLinkRow("Role", { id: role.id, name: role.name }),
             agentLinkRow("Manager", { id: manager.id, name: manager.name }),
-            keyValueRow("Recovery action", input.recoveryActionId),
+            // Not "Recovery action": that label is how the server finds the escalation notice of an action
+            // (noticeMetadataReferencesRecoveryAction), and this notice is not it.
+            keyValueRow("Board action", input.recoveryActionId),
             keyValueRow("Cause", input.cause),
           ],
         }],
