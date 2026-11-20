@@ -5801,6 +5801,39 @@ export function issueRoutes(
     return decision.allowed;
   }
 
+  // STUDIO-0083 (L12): in what capacity an agent settles a recovery action, read in the order the authority
+  // check below uses. null: the actor is not an agent the check would let through.
+  type RecoverySettlementCapacity = "assignee" | "recovery_owner" | "reporting_chain" | "ceo" | "direct_right";
+  async function recoverySettlementCapacity(
+    actorAgentId: string,
+    companyId: string,
+    assigneeAgentId: string | null,
+    ownerAgentId: string | null,
+  ): Promise<RecoverySettlementCapacity | null> {
+    if (assigneeAgentId === actorAgentId) return "assignee";
+    const over = async (targetAgentId: string): Promise<RecoverySettlementCapacity | null> => {
+      const decision = await access.decide({
+        actor: { type: "agent", agentId: actorAgentId, companyId },
+        action: "tasks:manage_active_checkouts",
+        resource: { type: "issue", companyId, assigneeAgentId: targetAgentId },
+      });
+      if (!decision.allowed) return null;
+      if (decision.reason === "allow_manager_chain") return "reporting_chain";
+      return decision.reason === "allow_legacy_agent_creator" ? "ceo" : "direct_right";
+    };
+    const overAssignee = assigneeAgentId ? await over(assigneeAgentId) : null;
+    if (overAssignee) return overAssignee;
+    if (ownerAgentId === actorAgentId) return "recovery_owner";
+    return ownerAgentId ? over(ownerAgentId) : null;
+  }
+  const RECOVERY_SETTLEMENT_CAPACITY_TEXT: Record<RecoverySettlementCapacity, string> = {
+    assignee: "as the assignee of the ticket",
+    recovery_owner: "as the owner of the action",
+    reporting_chain: "as a manager in its reporting chain",
+    ceo: "as CEO",
+    direct_right: "by its right over other agents' checked-out work (`tasks:manage_active_checkouts`)",
+  };
+
   async function assertAgentIssueMutationAllowed(
     req: Request,
     res: Response,
@@ -11124,6 +11157,14 @@ export function issueRoutes(
         });
       }
 
+      // STUDIO-0083 (L12): who settled what, for which role, in what capacity. In the activity for every agent;
+      // on the ticket too when the agent settles an action of a ticket that is not its own.
+      const settledForAgentId = existing.assigneeAgentId
+        ?? result.recoveryAction.previousOwnerAgentId ?? result.recoveryAction.returnOwnerAgentId ?? null;
+      const settlementCapacity = req.actor.type === "agent" && req.actor.agentId
+        ? await recoverySettlementCapacity(req.actor.agentId, existing.companyId, existing.assigneeAgentId,
+            result.recoveryAction.ownerAgentId ?? null).catch(() => null)
+        : null;
       await logActivity(db, {
         companyId: result.issue.companyId,
         actorType: actor.actorType,
@@ -11142,8 +11183,45 @@ export function issueRoutes(
           sourceIssueStatus: sourceIssueStatus ?? null,
           resolutionNote: result.recoveryAction.resolutionNote,
           ...(workspaceBaseRef ? { workspaceBaseRef } : {}),
+          ...(req.actor.type === "agent" && req.actor.agentId ? {
+            settledByAgentId: req.actor.agentId,
+            settledForAgentId,
+            settledAs: settlementCapacity,
+          } : {}),
         },
       });
+      if (req.actor.type === "agent" && req.actor.agentId && settlementCapacity && settlementCapacity !== "assignee") {
+        try {
+          const [settler, role] = await Promise.all([
+            agentsSvc.getById(req.actor.agentId),
+            settledForAgentId ? agentsSvc.getById(settledForAgentId) : null,
+          ]);
+          await svc.addComment(
+            result.issue.id,
+            `${settler?.name ?? "An agent"} settled the recovery action of this ticket`
+              + (role ? ` for ${role.name}` : "")
+              + `, ${RECOVERY_SETTLEMENT_CAPACITY_TEXT[settlementCapacity]}. `
+              + `Outcome: \`${result.recoveryAction.outcome ?? result.recoveryAction.status}\`; ticket status: \`${result.issue.status}\`.`,
+            {},
+            {
+              authorType: "system",
+              presentation: { kind: "system_notice", tone: "info", title: "Recovery action settled by another role", detailsDefaultOpen: false },
+              metadata: {
+                version: 1,
+                sections: [{
+                  title: "Settlement",
+                  rows: [
+                    { type: "key_value", label: "Recovery action", value: result.recoveryAction.id },
+                    { type: "key_value", label: "Settled as", value: settlementCapacity },
+                  ],
+                }],
+              },
+            },
+          );
+        } catch (error) {
+          logger.warn({ err: error, issueId: result.issue.id }, "could not write the settlement trace of a recovery action");
+        }
+      }
 
       if (result.chatRetry) {
         // The intent is committed with recovery resolution. A lost immediate
