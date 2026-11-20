@@ -5,6 +5,7 @@ import { conversationEventCondition, conversationEventColumns } from "./conversa
 import { deriveTaskKey } from "./run-preparation.js";
 import { retryIdempotentDatabaseOperation } from "../../database-retry.js";
 import { isConversation } from "../agent-conversations.js";
+import { cancelledRunKeepsSession } from "../cut-run-session.js";
 import fs from "node:fs/promises";
 import {
   and,
@@ -869,6 +870,10 @@ export function shouldResetTaskSessionForWake(
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
+  // STUDIO-0075: a continuation that would have gone on in the session of the run it continues.
+  const cutRunId = readNonEmptyString(contextSnapshot?.cutRunSessionNotKept);
+  if (contextSnapshot?.forceFreshSession === true && cutRunId)
+    return `a new conversation starts: the session of the cut run ${cutRunId} was not kept for this task (yet)`;
   if (contextSnapshot?.forceFreshSession === true)
     return "forceFreshSession was requested";
 
@@ -1695,9 +1700,15 @@ export function createHeartbeatRunState(db: Db) {
       const [issue] = await tx.select().from(issues).where(and(sql`${issues.id}::text = ${input.taskKey}`, eq(issues.companyId, input.companyId))).for("update");
       if (isConversation(issue)) {
         const [run] = input.lastRunId ? await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.lastRunId)) : [];
-        if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return null;
+        // STUDIO-0075: a conversation takes no session from a cancelled run, except a run a pause cut, and a run a
+        // person stopped when the owner's switch is on (cut-run-session.ts). The generation rule is unchanged.
+        if ((run?.status === "cancelled" && !cancelledRunKeepsSession(run))
+          || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return null;
       }
-    const existing = await tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId), eq(agentTaskSessions.adapterType, input.adapterType), eq(agentTaskSessions.taskKey, input.taskKey))).then((rows) => rows[0] ?? null);
+    // STUDIO-0075: a late write also locks the session row itself. Every writer of that row then waits or is seen,
+    // whether or not it takes the task's lock, and whether or not the key names a task.
+    const existingQuery = tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId), eq(agentTaskSessions.adapterType, input.adapterType), eq(agentTaskSessions.taskKey, input.taskKey)));
+    const existing = await (input.lateResultOfRun ? existingQuery.for("update") : existingQuery).then((rows) => rows[0] ?? null);
     if (existing?.lastRunId && input.lateResultOfRun && existing.lastRunId !== input.lateResultOfRun.id) {
       const [writer] = await tx.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
         .where(eq(heartbeatRuns.id, existing.lastRunId)).limit(1);
@@ -1792,7 +1803,7 @@ export function createHeartbeatRunState(db: Db) {
       if (opts?.taskKey && opts.lateResultOfRun) {
         const late = opts.lateResultOfRun;
         await tx.select({ id: issues.id }).from(issues).where(and(sql`${issues.id}::text = ${opts.taskKey}`, eq(issues.companyId, companyId))).for("update");
-        const written = await tx.select({ lastRunId: agentTaskSessions.lastRunId }).from(agentTaskSessions).where(and(...conditions));
+        const written = await tx.select({ lastRunId: agentTaskSessions.lastRunId }).from(agentTaskSessions).where(and(...conditions)).for("update");
         for (const row of written) {
           if (!row.lastRunId || row.lastRunId === late.id) continue;
           const [writer] = await tx.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)

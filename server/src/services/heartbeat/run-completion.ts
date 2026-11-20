@@ -34,6 +34,7 @@ import { isConversation, settleConversationTurn } from "../agent-conversations.j
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import { isWorkspaceGitScanError } from "../workspace-git-operation-scheduler.js";
 import { and, eq, sql } from "drizzle-orm";
+import { KEEP_SESSION_AFTER_PERSON_STOP, isPersonStop } from "../cut-run-session.js";
 import { agentTaskSessions, heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { HttpError } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
@@ -564,7 +565,12 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       // write (run-state.ts). `left`: the task's session stays as it was (a later run wrote it, the task is a
       // conversation that takes no session from a cancelled run, or there was nothing to forget).
       const lateResultOfRun = { id: run.id, createdAt: run.createdAt };
-      const session: "kept" | "cleared" | "left" = adapterResult.clearSession
+      // A run a person stopped leaves its session to the task only when the owner's switch says so
+      // (cut-run-session.ts). A pause, a lost link and a failure do not depend on it.
+      const [settled] = await db.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      const leftByPersonStop = Boolean(settled && isPersonStop(settled) && !KEEP_SESSION_AFTER_PERSON_STOP);
+      const session: "kept" | "cleared" | "left" = leftByPersonStop ? "left" : adapterResult.clearSession
         ? (await clearTaskSessions(agent.companyId, agent.id, { taskKey, adapterType: agent.adapterType, lateResultOfRun })) > 0
           ? "cleared" : "left"
         : (await upsertTaskSession({
@@ -574,7 +580,13 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           })) ? "kept" : "left";
       // The run says what its late result was and what became of its session: a session kept from a run whose stop
       // was not proven (router_provider_stop_unverified) must be readable on the run, not only in the task's session.
-      const lateResult = { errorCode: adapterResult.errorCode ?? null, errorMessage: runErrorMessage ?? null, session };
+      // Whether the session this result names is the one the task now holds: `left` with `false` is a real loss.
+      const lateSessionId = nextSessionState.displayId ?? nextSessionState.legacySessionId ?? null;
+      const [held] = await db.select({ sessionDisplayId: agentTaskSessions.sessionDisplayId }).from(agentTaskSessions).where(and(
+        eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agent.id),
+        eq(agentTaskSessions.adapterType, agent.adapterType), eq(agentTaskSessions.taskKey, taskKey))).limit(1);
+      const sameSessionAsTask = Boolean(namesSession && lateSessionId && held?.sessionDisplayId === lateSessionId);
+      const lateResult = { errorCode: adapterResult.errorCode ?? null, errorMessage: runErrorMessage ?? null, session, sameSessionAsTask };
       await db.update(heartbeatRuns).set({
         // Named on the run only when it is the session really kept for the task.
         ...(session === "kept" ? { sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId } : {}),

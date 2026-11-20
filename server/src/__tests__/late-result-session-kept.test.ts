@@ -17,6 +17,18 @@ const mockAdapterExecute = vi.hoisted(() =>
   })),
 );
 
+// STUDIO-0075: KEEP_SESSION_AFTER_PERSON_STOP is a constant. With PAPERCLIP_TEST_PERSON_STOP=off (set by
+// late-result-session-kept.person-stop-off.test.ts, which runs this file again) the module is replaced by the same
+// rules with the switch off; without it the real module is used, untouched.
+const PERSON_STOP_KEEPS = process.env.PAPERCLIP_TEST_PERSON_STOP !== "off";
+vi.mock("../services/cut-run-session.js", async () => {
+  const actual = await vi.importActual<typeof import("../services/cut-run-session.js")>("../services/cut-run-session.js");
+  if (process.env.PAPERCLIP_TEST_PERSON_STOP !== "off") return actual;
+  const { isGovernancePauseStop } = await vi.importActual<typeof import("../services/governance-pause-stop.js")>("../services/governance-pause-stop.js");
+  return { ...actual, KEEP_SESSION_AFTER_PERSON_STOP: false,
+    cancelledRunKeepsSession: (run: Parameters<typeof actual.cancelledRunKeepsSession>[0]) => isGovernancePauseStop(run) };
+});
+
 vi.mock("../adapters/index.ts", async () => {
   const actual = await vi.importActual<typeof import("../adapters/index.ts")>("../adapters/index.ts");
   return { ...actual, getServerAdapter: vi.fn(() => ({ supportsLocalAgentJwt: false, execute: mockAdapterExecute })) };
@@ -170,6 +182,22 @@ const support = await getEmbeddedPostgresTestSupport();
     await assignmentWake(f);
     return (await execution(f, 2)).run;
   }
+  /** A person stops the run from the Board: the cancellation names a user as its author. */
+  const personStops = (runId: string) => heartbeat.cancelRun(runId, "Cancelled by the board",
+    { resultJson: { cancelledByActorType: "user", cancelledByUserId: "responsible-user" } });
+  /** A wake no person asked for, of a kind that resumes the task's session. */
+  const automaticWake = (f: Fixture) => heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system",
+    reason: "issue_blockers_resolved", payload: { issueId: f.issueId }, requestedByActorType: "system", requestedByActorId: "test",
+    contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_blockers_resolved" } });
+  /** The task is a conversation of the role with a person, and the run belongs to its current session generation. */
+  async function asConversation(f: Fixture, runId: string) {
+    await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "responsible-user", conversationState: "active" })
+      .where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ contextSnapshot: sql`${heartbeatRuns.contextSnapshot} || '{"conversationSessionGeneration": 0}'::jsonb` })
+      .where(eq(heartbeatRuns.id, runId));
+  }
+  const notConversation = (f: Fixture) => db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null })
+    .where(eq(issues.id, f.issueId));
   /** What the next execution of the adapter for the task is given to resume, after `trigger`. */
   async function nextExecution(f: Fixture, trigger: () => Promise<unknown>) {
     const done = executions.get(f.companyId)!.length;
@@ -228,7 +256,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(stopped).toMatchObject({ status: "cancelled", sessionIdAfter: cut });
     expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: stopped.id });
     expect((await taskSession(f))?.sessionParamsJson).toMatchObject(paramsOf(cut));
-    // A run a person stopped is not a pause: the person's next request keeps the product's rule, a new conversation.
+    // A stop that is neither a pause nor a person's: the person's next request keeps the product's rule, a new conversation.
     await stopProven(f, stopped.id);
     const next = await nextExecution(f, () => personMessage(f));
     expect(next.run.contextSnapshot).toMatchObject({ previousRunId: stopped.id, forceFreshSession: true });
@@ -300,18 +328,89 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left" } });
   });
 
-  it("a conversation task takes no session from a cancelled run: the run names none, and says so", async () => {
+  it("a conversation task takes no session from a run cancelled by neither a pause nor a person: the run says the loss", async () => {
     const f = await seed();
     const stopped = await cutRun(f, async context => {
-      await heartbeat.cancelRun(context.runId, "Cancelled by the board");
-      await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "responsible-user", conversationState: "active" })
-        .where(eq(issues.id, f.issueId));
+      await heartbeat.cancelRun(context.runId, "Cancelled by another path");
+      await asConversation(f, context.runId);
       return routerFailure("router_cancelled", cut);
     });
     expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
     expect(stopped.sessionIdAfter).toBeNull();
-    expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left" }, events: [["info", "left"]] });
-    await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null }).where(eq(issues.id, f.issueId));
+    // `left`, and not the task's session: a real loss, readable on the run.
+    expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left", sameSessionAsTask: false }, events: [["info", "left"]] });
+    await notConversation(f);
+  });
+
+  it("a conversation task keeps the session of a run a pause cut, like any task, and the request after the pause resumes it", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async context => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      await asConversation(f, context.runId);
+      return routerFailure("router_cancelled", cut);
+    });
+    expect(cancelled).toMatchObject({ status: "cancelled", sessionIdAfter: cut });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: cancelled.id });
+    expect(await lateResultOf(cancelled.id)).toMatchObject({ record: { session: "kept", sameSessionAsTask: true } });
+    // The task is an ordinary task again for the request that follows (a conversation's own delivery is not this case).
+    await notConversation(f);
+    await stopProven(f, cancelled.id);
+    const next = await nextExecution(f, () => personMessage(f));
+    expect(next.run.contextSnapshot).not.toHaveProperty("forceFreshSession");
+    expect(next).toMatchObject({ sessionId: cut });
+  });
+
+  // The owner's decision, 20 Nov 2026: after a person stops a run in Paperclip and then writes, the role keeps its
+  // conversation. KEEP_SESSION_AFTER_PERSON_STOP is that decision; these cases hold for both of its values.
+  it(`a person stops the run, then writes: the session of the stopped run is ${PERSON_STOP_KEEPS ? "resumed" : "left aside, a new conversation"}`, async () => {
+    const f = await seed();
+    const stopped = await cutRun(f, async context => {
+      await personStops(context.runId);
+      return routerFailure("router_cancelled", cut);
+    });
+    expect(stopped.resultJson).toMatchObject({ cancellation: { initiator: { type: "user" } } });
+    await stopProven(f, stopped.id);
+    const next = await nextExecution(f, () => personMessage(f));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: stopped.id });
+    if (PERSON_STOP_KEEPS) {
+      expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "kept", sameSessionAsTask: true } });
+      expect(next.run.contextSnapshot).not.toHaveProperty("forceFreshSession");
+      expect({ sessionId: next.sessionId, sessionParams: next.sessionParams }).toMatchObject({ sessionId: cut, sessionParams: paramsOf(cut) });
+    } else {
+      // The product's rule: the stopped run's session is not the task's, and the person's request opens a new one.
+      expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left", sameSessionAsTask: false } });
+      expect(stopped.sessionIdAfter).toBeNull();
+      expect(next.run.contextSnapshot).toMatchObject({ forceFreshSession: true });
+      expect(next).toMatchObject({ sessionId: null });
+    }
+  });
+
+  it(`a person stops the run, then an automatic wake comes: the session ${PERSON_STOP_KEEPS ? "of the stopped run is resumed" : "from before the stopped run is resumed"}`, async () => {
+    const f = await seed();
+    const stopped = await cutRun(f, async context => {
+      await personStops(context.runId);
+      return routerFailure("router_cancelled", cut);
+    });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: PERSON_STOP_KEEPS ? cut : first });
+    await stopProven(f, stopped.id);
+    const next = await nextExecution(f, () => automaticWake(f));
+    expect(next).toMatchObject({ sessionId: PERSON_STOP_KEEPS ? cut : first });
+  });
+
+  it("a person stops the run and its result never brings a session: the person's request opens a new conversation, and its log says why", async () => {
+    const f = await seed();
+    const stopped = await cutRun(f, async context => {
+      await personStops(context.runId);
+      return routerFailure("router_cancelled", null);
+    });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
+    await stopProven(f, stopped.id);
+    const next = await nextExecution(f, () => personMessage(f));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: stopped.id, forceFreshSession: true });
+    expect(next).toMatchObject({ sessionId: null });
+    const log = (await heartbeat.readLog(next.run.id)).content;
+    if (PERSON_STOP_KEEPS) expect(log).toContain(`a new conversation starts: the session of the cut run ${stopped.id} was not kept for this task (yet)`);
+    else expect(log).toContain("forceFreshSession was requested");
   });
 
   it("a late session that cannot be written leaves an error event on the run, not only a line in the server's log", async () => {
@@ -367,6 +466,9 @@ const support = await getEmbeddedPostgresTestSupport();
     const next = await nextExecution(f, () => personMessage(f));
     expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id, forceFreshSession: true });
     expect(next).toMatchObject({ sessionId: null });
+    // One line in the continuation's log says that the conversation is new, and why.
+    expect((await heartbeat.readLog(next.run.id)).content)
+      .toContain(`a new conversation starts: the session of the cut run ${cancelled.id} was not kept for this task (yet)`);
   });
 
   it("after a pause over an ssh lease: the kept session is resumed on the proof the pause itself accepted", async () => {
