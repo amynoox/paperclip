@@ -13,7 +13,8 @@ import { readRunCancellation } from "./run-cancellation.js";
  * product's rule holds again: the session of such a run is left aside when its result comes late, and the person's
  * next request opens a new conversation. One line, one name: nothing else reads the decision.
  *
- * Any other cancellation (a lost controller lease, a reassignment, a shutdown) keeps the product's rule.
+ * Any other cancellation (a lost controller lease, a reassignment, a shutdown) keeps the product's rule on an
+ * ordinary task. On a conversation task it does not: see conversationCancelledRunKeepsSession below.
  */
 export const KEEP_SESSION_AFTER_PERSON_STOP = true;
 
@@ -30,4 +31,15 @@ export function isPersonStop(run: CancelledRun): boolean {
  */
 export function cancelledRunKeepsSession(run: CancelledRun): boolean {
   return isGovernancePauseStop(run) || (KEEP_SESSION_AFTER_PERSON_STOP && isPersonStop(run));
+}
+
+/**
+ * The same question for a CONVERSATION task (a task that is the conversation of a role with a person). The owner
+ * decided on 20 Nov 2026 that the conversation is kept when its run is cancelled: whatever cancelled the run (the
+ * system, recovery, a pause), its session stays the conversation's and the next request goes on in it. Only a run a
+ * person stopped follows the switch above. The product's own rule was that a conversation takes no session from a
+ * cancelled run.
+ */
+export function conversationCancelledRunKeepsSession(run: CancelledRun): boolean {
+  return run.status === "cancelled" && (KEEP_SESSION_AFTER_PERSON_STOP || !isPersonStop(run));
 }

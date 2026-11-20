@@ -328,17 +328,41 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left" } });
   });
 
-  it("a conversation task takes no session from a run cancelled by neither a pause nor a person: the run says the loss", async () => {
+  // The owner's rule (20 Nov 2026): the conversation with a role is kept when its run is cancelled, whatever cancelled
+  // it. The product's own rule was that a conversation takes no session from a cancelled run.
+  it("a conversation task keeps the session of a run the system cancelled, and the person's next request goes on in it", async () => {
     const f = await seed();
     const stopped = await cutRun(f, async context => {
+      // Neither a pause nor a person: the control plane cancels the run (recovery, a shutdown, another path).
       await heartbeat.cancelRun(context.runId, "Cancelled by another path");
       await asConversation(f, context.runId);
       return routerFailure("router_cancelled", cut);
     });
+    expect(stopped).toMatchObject({ status: "cancelled", sessionIdAfter: cut });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: stopped.id });
+    expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "kept", sameSessionAsTask: true }, events: [["info", "kept"]] });
+    // The task is still the conversation: the person writes, and the run that answers resumes that session.
+    await stopProven(f, stopped.id);
+    const next = await nextExecution(f, () => personMessage(f));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: stopped.id });
+    expect(next.run.contextSnapshot).not.toHaveProperty("forceFreshSession");
+    expect(next).toMatchObject({ sessionId: cut });
+    await notConversation(f);
+  });
+
+  it("a conversation task whose cut run belongs to an older generation of the conversation takes no session from it", async () => {
+    const f = await seed();
+    const stopped = await cutRun(f, async context => {
+      await heartbeat.cancelRun(context.runId, "Cancelled by another path");
+      await asConversation(f, context.runId);
+      // The person started the conversation afresh since: the run belongs to the generation before.
+      await db.update(issues).set({ conversationSessionGeneration: 1 }).where(eq(issues.id, f.issueId));
+      return routerFailure("router_cancelled", cut);
+    });
     expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
     expect(stopped.sessionIdAfter).toBeNull();
-    // `left`, and not the task's session: a real loss, readable on the run.
     expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left", sameSessionAsTask: false }, events: [["info", "left"]] });
+    await db.update(issues).set({ conversationSessionGeneration: 0 }).where(eq(issues.id, f.issueId));
     await notConversation(f);
   });
 

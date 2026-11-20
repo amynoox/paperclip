@@ -13,7 +13,7 @@ import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import { hasAutomaticInteractionDeliveryHold, INTERACTION_DELIVERY_DENIED, recheckQueuedRunInteractions, withInteractionDeliveryOrigin } from "../agent-interaction-delivery.js";
 import { adapterWaitPayload, readAdapterTaskWait, deferAdapterRun } from "../adapter-task-admission.js";
 import { deferredWorkIntentWait } from "../work-intent-outbox.js";
-import { cancelledRunKeepsSession } from "../cut-run-session.js";
+import { cancelledRunKeepsSession, conversationCancelledRunKeepsSession } from "../cut-run-session.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { createHeartbeatTimerPolicy } from "./timer-policy.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
@@ -5357,8 +5357,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             // Only the session really kept from that run: the task's session must have been written by it (its own
             // end, or its late result). If its result never came, or the server restarted before it, the task still
             // holds the session of an EARLIER run, which knows nothing of what the cut run did: a new conversation.
-            // The same holds for a run a person stopped, when the owner's switch is on (cut-run-session.ts).
-            const keepsSession = Boolean(continued && cancelledRunKeepsSession(continued));
+            // The same holds for a run a person stopped, when the owner's switch is on, and on a conversation task
+            // for any cancelled run (cut-run-session.ts).
+            const keepsSession = Boolean(continued && (cancelledRunKeepsSession(continued)
+              || (isConversation(issue) && conversationCancelledRunKeepsSession(continued))));
             const [kept] = keepsSession
               ? await tx.select({ lastRunId: agentTaskSessions.lastRunId }).from(agentTaskSessions).where(and(
                   eq(agentTaskSessions.companyId, issue.companyId), eq(agentTaskSessions.agentId, agentId),

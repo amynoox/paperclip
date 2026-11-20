@@ -5,7 +5,7 @@ import { conversationEventCondition, conversationEventColumns } from "./conversa
 import { deriveTaskKey } from "./run-preparation.js";
 import { retryIdempotentDatabaseOperation } from "../../database-retry.js";
 import { isConversation } from "../agent-conversations.js";
-import { cancelledRunKeepsSession } from "../cut-run-session.js";
+import { conversationCancelledRunKeepsSession } from "../cut-run-session.js";
 import fs from "node:fs/promises";
 import {
   and,
@@ -1700,9 +1700,10 @@ export function createHeartbeatRunState(db: Db) {
       const [issue] = await tx.select().from(issues).where(and(sql`${issues.id}::text = ${input.taskKey}`, eq(issues.companyId, input.companyId))).for("update");
       if (isConversation(issue)) {
         const [run] = input.lastRunId ? await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.lastRunId)) : [];
-        // STUDIO-0075: a conversation takes no session from a cancelled run, except a run a pause cut, and a run a
-        // person stopped when the owner's switch is on (cut-run-session.ts). The generation rule is unchanged.
-        if ((run?.status === "cancelled" && !cancelledRunKeepsSession(run))
+        // STUDIO-0075: a conversation keeps the session of a cancelled run (the owner's rule, cut-run-session.ts);
+        // only a run a person stopped is left aside, when the owner's switch is off. The product's own rule was that
+        // a conversation takes no session from a cancelled run. The generation rule is unchanged.
+        if ((run?.status === "cancelled" && !conversationCancelledRunKeepsSession(run))
           || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return null;
       }
     // STUDIO-0075: a late write also locks the session row itself. Every writer of that row then waits or is seen,
