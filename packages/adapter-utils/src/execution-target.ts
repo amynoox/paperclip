@@ -4939,6 +4939,16 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     }
   }
 
+  // STUDIO-0082: a bridge of an earlier run that is still up in this very folder (kept after an unproven provider
+  // stop) is stopped whole before this one starts: its server on the machine, and its worker in this process, which
+  // would otherwise poll the same `requests/` folder and handle this run's requests a second time.
+  const folderKey = paperclipBridgeFolderKey(target, queueDir);
+  const previousBridge = livePaperclipBridgesByFolder.get(folderKey);
+  if (previousBridge) {
+    await onLog("stdout", "[paperclip] Stopping the callback bridge an earlier run kept in this folder before starting a new one.\n");
+    await previousBridge.stop().catch(() => undefined);
+  }
+
   let server: Awaited<ReturnType<typeof startSandboxCallbackBridgeServer>> | null = null;
   let worker: Awaited<ReturnType<typeof startSandboxCallbackBridgeWorker>> | null = null;
   try {
@@ -4995,6 +5005,27 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
     await onLog("stdout", "[paperclip] Sandbox run log streaming enabled for this run.\n");
   }
 
+  if (server.stoppedStalePid > 0) {
+    await onLog("stdout", `[paperclip] Stopped the callback bridge an earlier run had left in this folder (process ${server.stoppedStalePid}).\n`);
+  }
+
+  // The stop runs once: the bridge of a later run in the same folder, the end of this run and a deferred stop may
+  // each ask for it.
+  let stopping: Promise<void> | null = null;
+  const liveBridge = {
+    stop: (): Promise<void> => (stopping ??= (async () => {
+      if (livePaperclipBridgesByFolder.get(folderKey) === liveBridge) livePaperclipBridgesByFolder.delete(folderKey);
+      await Promise.allSettled([
+        server?.stop(),
+      ]);
+      await Promise.allSettled([
+        worker?.stop(),
+        bridgeAsset.cleanup(),
+      ]);
+    })()),
+  };
+  livePaperclipBridgesByFolder.set(folderKey, liveBridge);
+
   return {
     env: {
       PAPERCLIP_API_URL: server.baseUrl,
@@ -5003,14 +5034,15 @@ export async function startAdapterExecutionTargetPaperclipBridge(input: {
       PAPERCLIP_BRIDGE_QUEUE_DIR: queueDir,
     },
     runLogTail,
-    stop: async () => {
-      await Promise.allSettled([
-        server?.stop(),
-      ]);
-      await Promise.allSettled([
-        worker?.stop(),
-        bridgeAsset.cleanup(),
-      ]);
-    },
+    stop: liveBridge.stop,
   };
+}
+
+// STUDIO-0082. The bridges of this server process that are still up on the queue path, by remote machine and bridge
+// folder. The runs of one worker-router reservation share their task folder, so a bridge kept after an unproven
+// provider stop and the bridge of the next run would otherwise be up in the same folder at once.
+const livePaperclipBridgesByFolder = new Map<string, { stop(): Promise<void> }>();
+
+function paperclipBridgeFolderKey(target: AdapterExecutionTarget, queueDir: string): string {
+  return JSON.stringify([adapterExecutionTargetSessionIdentity(target), queueDir]);
 }
