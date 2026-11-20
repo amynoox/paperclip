@@ -301,9 +301,11 @@ describe("the runs a pause cut, when the role resumes", () => {
 
     it("a task where a person's decision is pending", async () => {
       const f = await fixture();
-      await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
-        kind: "request_confirmation", continuationPolicy: "none", payload: {}, effectiveResolverPolicy: "human_only" } as never);
+      await decisionPending(f);
       await roleResumes(f);
+      await expectKept(f, "waiting_for_person", "decision_pending");
+      // The ready hook called again for the same ready state does not take its own kept request for a person's.
+      await createLifecycleDriver(db, {} as never).onReady!(await state(f.agentId) as never);
       await expectKept(f, "waiting_for_person", "decision_pending");
     });
 
@@ -343,10 +345,11 @@ describe("the runs a pause cut, when the role resumes", () => {
       await decisionPending(f);
       await roleResumes(f);
       await expectKept(f, "waiting_for_person", "decision_pending");
+      // A person cancels the kept request while a new pause is starting: cancelled since that pause began, but not by it.
+      await pausedAgain(f);
       const [kept] = await retries(f);
       await db.update(agentWakeupRequests).set({ status: "cancelled", error: "Cancelled by the board", finishedAt: new Date() })
         .where(eq(agentWakeupRequests.id, kept!.id));
-      await pausedAgain(f);
       await roleResumes(f);
       expect(await retries(f)).toHaveLength(1);
       expect(await continuations(f)).toHaveLength(0);
@@ -516,6 +519,7 @@ describe("the runs a pause cut, when the role resumes", () => {
       await companyIs(lifting, "paused");
       await createAgentLifecycle(db).resumeAgent(lifting.agentId, "user", PERSON);
       expect(await state(lifting.agentId)).toMatchObject({ lifecycleHolds: ["company_paused"], lifecycleOperation: { resumeRequestedBy: PERSON } });
+      await db.update(companies).set({ status: "active" }).where(eq(companies.id, lifting.companyId));
       await createAgentLifecycle(db).resumeAgent(lifting.agentId, "company_paused");
       await work.process(lifting.agentId);
       expect((await state(lifting.agentId)).lifecycleState).toBe("ready");
