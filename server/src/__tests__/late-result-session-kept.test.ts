@@ -2,13 +2,14 @@ import { randomUUID } from "node:crypto";
 import { and, asc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agentTaskSessions, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns,
-  issueComments, issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  agentTaskSessions, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases,
+  heartbeatRunEvents, heartbeatRuns, issueComments, issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { runningProcesses, type AdapterExecutionContext, type AdapterExecutionResult } from "../adapters/index.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { environmentService } from "../services/environments.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async (_context: AdapterExecutionContext): Promise<AdapterExecutionResult> => ({
@@ -123,6 +124,19 @@ const support = await getEmbeddedPostgresTestSupport();
       payload: { issueId: f.issueId, commentId }, contextSnapshot: { issueId: f.issueId, wakeCommentId: commentId } }).catch(() => undefined);
   }
   /**
+   * What production holds about a cut run and the stand-in adapter does not write: its process is recorded and gone,
+   * its lease is released. A person's request to continue needs that proof (explicit-native-continuation.ts).
+   */
+  async function stopProven(f: Fixture, runId: string) {
+    await db.update(heartbeatRuns).set({ processPid: 2_000_000_000 }).where(eq(heartbeatRuns.id, runId));
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId, seq: 100_000,
+      eventType: "native.process_identity_recorded", stream: "system", level: "info", message: "identity" });
+    const environment = await environmentService(db).ensureLocalEnvironment(f.companyId);
+    await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId: environment.id, heartbeatRunId: runId,
+      issueId: f.issueId, provider: "local", status: "expired", leasePolicy: "ephemeral", releasedAt: new Date(),
+      metadata: { agentId: f.agentId, driver: "local" } });
+  }
+  /**
    * A first run that ends well in session `first`, then the run whose engine opened session `cut` and that ends as
    * `cutTurn` says. Returns that second run.
    */
@@ -162,7 +176,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(retry).toMatchObject({ sessionId: cut, sessionParams: paramsOf(cut) });
   });
 
-  it("a pause that cancels the run: the session of its late result is kept for the task", async () => {
+  it("a pause that cancels the run: the session of its late result is kept, and the person's request after it resumes that session", async () => {
     const f = await seed();
     const cancelled = await cutRun(f, async () => {
       // The pause route stops the role's runs; the router's result comes after.
@@ -175,18 +189,22 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(kept!.sessionParamsJson).toMatchObject(paramsOf(cut));
     // The configuration fingerprint a finished run gets is on it.
     expect(Object.keys(kept!.sessionParamsJson ?? {}).some(key => key.startsWith("__paperclip"))).toBe(true);
+    // The role is resumed and a person asks to go on: the run that continues the cut run is given that session.
+    await stopProven(f, cancelled.id);
+    const next = await nextExecution(f, () => personMessage(f));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id });
+    expect(next).toMatchObject({ sessionId: cut, sessionParams: paramsOf(cut) });
   });
 
-  it("a run another path settled first: the session of its late result is kept, and the next run resumes it", async () => {
+  it("a run another path settled first: the session of its late result is kept", async () => {
     const f = await seed();
     const stopped = await cutRun(f, async context => {
       await heartbeat.cancelRun(context.runId, "Cancelled by the board");
       return routerFailure("router_interactive_transport_lost", cut);
     });
     expect(stopped).toMatchObject({ status: "cancelled", sessionIdAfter: cut });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: stopped.id });
     expect((await taskSession(f))?.sessionParamsJson).toMatchObject(paramsOf(cut));
-    const next = await nextExecution(f, () => personMessage(f));
-    expect(next).toMatchObject({ sessionId: cut, sessionParams: paramsOf(cut) });
   });
 
   it("a late result does not replace the session a later run of the role already wrote", async () => {
@@ -209,8 +227,11 @@ const support = await getEmbeddedPostgresTestSupport();
       await heartbeat.cancelRun(context.runId, "Cancelled by the board");
       return routerFailure("router_cancelled", null);
     });
-    expect(stopped.status).toBe("cancelled");
-    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
+    expect(stopped).toMatchObject({ status: "cancelled", sessionIdAfter: null });
+    const kept = await taskSession(f);
+    expect(kept).toMatchObject({ sessionDisplayId: first });
+    // Nothing was written for the late run: the row is still the first run's.
+    expect(kept!.lastRunId).not.toBe(stopped.id);
   });
 
   it("clearSession in a failure forgets the session, also when the result comes late", async () => {
