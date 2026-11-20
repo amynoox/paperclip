@@ -536,9 +536,13 @@ describePostgres("heartbeat run state database wiring", () => {
     } else {
       await db.update(heartbeatRuns).set({ status: "cancelled" }).where(eq(heartbeatRuns.id, run.id));
     }
-    expect(await state.upsertTaskSession({ ...input, sessionDisplayId: "stale" })).toBeNull();
+    // STUDIO-0075: the owner's rule keeps the session of a cancelled conversation run (cut-run-session.ts), where the
+    // product fenced that write. A superseded generation is fenced as before, and so is a clear by either run.
+    const rewritten = await state.upsertTaskSession({ ...input, sessionDisplayId: "later" });
+    if (scenario === "cancelled") expect(rewritten?.sessionDisplayId).toBe("later");
+    else expect(rewritten).toBeNull();
     expect(await state.clearTaskSessions(companyId, agent.id, { taskKey: issue.id, expectedRunId: run.id })).toBe(0);
     const [retained] = await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.id, saved!.id));
-    expect(retained.sessionDisplayId).toBe("retained");
+    expect(retained.sessionDisplayId).toBe(scenario === "cancelled" ? "later" : "retained");
   });
 });
