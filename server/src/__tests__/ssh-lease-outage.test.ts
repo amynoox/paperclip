@@ -14,6 +14,7 @@ import {
   environments,
   heartbeatRunEvents,
   heartbeatRuns,
+  issueComments,
   issueRecoveryActions,
   issueThreadInteractions,
   issues,
@@ -22,6 +23,9 @@ import {
 } from "@paperclipai/db";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
+import { isTransientWorkspacePreparationCode } from "../services/heartbeat/retries.js";
+import { legacyExecutionNeedsReconciliation } from "../services/legacy-execution-recovery.js";
+import { classifyContinuationFailure } from "../services/recovery/service.js";
 import { instanceSettingsService } from "../services/instance-settings.ts";
 import { readSshLeaseOutageStart, sshLeaseOutageRetry } from "../services/heartbeat/ssh-lease-outage-retry.js";
 import {
@@ -286,6 +290,50 @@ describeEmbeddedPostgres("ssh lease outage on the real run path (TR-2093)", () =
     const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, last.id));
     expect(events.some((event) => String(event.message).includes("Bounded retry exhausted after 2 scheduled attempts"))).toBe(true);
   }, 180_000);
+
+  // The run keeps the code of STUDIO-0052 instead of a new one. Seven places of the server already know that
+  // code; a new code forgotten in one of them would put a Board hold back in the middle of a cut. This case
+  // walks an ssh outage through each of them.
+  it("an ssh outage passes each of the seven places that know the code environment_provider_unavailable", async () => {
+    const f = await seed();
+    probe.failure = killedByLocalTimeout;
+    const first = await start(f);
+    // 1. failRunSetup gives the run the code of the transient provider failure (run-completion.ts).
+    expect(first).toMatchObject({ status: "failed", errorCode: "environment_provider_unavailable" });
+    expect(first.resultJson).toMatchObject({ executionRecovery: { kind: "bootstrap", providerWorkStarted: false } });
+    // 2. isTransientWorkspacePreparationCode (retries.ts): the failure is retried at all, and the retry gate reads it.
+    expect(isTransientWorkspacePreparationCode(first.errorCode)).toBe(true);
+    expect((await scheduledOf(f))[0]).toMatchObject({ retryOfRunId: first.id, scheduledRetryReason: SSH_LEASE_OUTAGE_RETRY_REASON });
+    // 3 and 4. The retry of an answered question's continuation: for an ssh outage the lane owns it
+    // (run-completion.ts, interactionOwnsRetry), so the interaction lane's own list (retries.ts,
+    // isRetryableInteractionContinuationInfrastructureFailure) is not on this path any more. The case
+    // "the continuation of an answered question" below proves it; other providers keep that list.
+    // 5. legacyExecutionNeedsReconciliation (legacy-execution-recovery.ts): no Board hold for a failure
+    // before any provider work.
+    expect(legacyExecutionNeedsReconciliation(first)).toBe(false);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    expect((await issueOf(f)).status).toBe("in_progress");
+    expect(await actionsOf(f)).toHaveLength(0);
+
+    // Past the bound the lane stops; what follows is the path the code has today.
+    await promote(f);
+    await age(f, 12 * 60 + 1);
+    const last = await promote(f);
+    expect(await scheduledOf(f)).toHaveLength(0);
+    // 6. NON_RETRYABLE_CONTINUATION_ERROR_CODES (recovery/service.ts): the sweep does not start its own
+    // generic continuation on top of the spent lane.
+    expect(classifyContinuationFailure(last)).toMatchObject({ kind: "non_retryable", errorCode: "environment_provider_unavailable" });
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await runsOf(f)).map((run) => run.status)).toEqual(["failed", "failed", "failed"]);
+    expect((await issueOf(f)).status).toBe("blocked");
+    expect((await actionsOf(f))[0]).toMatchObject({ kind: "stranded_assigned_issue", status: "active" });
+    // 7. WORKSPACE_SCAN_NOTICES (recovery/stranded-notice.ts): the notice of that code, not a generic one.
+    const notices = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).filter((row) => row.authorType === "system");
+    expect(notices.some((row) => row.body.includes("Retry the task once the provider is available"))).toBe(true);
+    expect(JSON.stringify(notices.map((row) => row.presentation))).toContain("Environment provider was temporarily unavailable");
+  }, 240_000);
 
   it("one minute before 12 h the lane still retries", async () => {
     const f = await seed();
