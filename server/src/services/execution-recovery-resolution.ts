@@ -15,6 +15,7 @@ import { appendHeartbeatRunEvent } from "./heartbeat-run-events.js";
 import { logger } from "../middleware/logger.js";
 import { and, eq, exists, inArray, isNull, not, or, sql } from "drizzle-orm";
 import { notifyExternalConversationSettlement } from "./external-conversation-settlement-notifications.js";
+import { recordTaskSessionRemoved } from "./task-session-removal.js";
 import {
   agents,
   agentTaskSessions,
@@ -321,6 +322,9 @@ export async function markExecutionReconciliation(
         const [goal] = await tx.select({ id: agentTaskSessions.id }).from(agentTaskSessions)
           .where(and(scope, sql`${agentTaskSessions.goalStatus} is not null`, sql`${agentTaskSessions.goalStatus} <> 'complete'`)).limit(1);
         if (goal) await notifyExternalConversationSettlement(tx, { companyId: action.companyId });
+        // STUDIO-0075: the removal leaves its mark, so that the cut run's late result does not put the session back.
+        await recordTaskSessionRemoved(tx, { companyId: action.companyId, agentId: cutRun.agentId,
+          taskKeys: task.identifier ? [task.id, task.identifier] : [task.id], reason: "cut_run_session_dropped" });
         await tx.delete(agentTaskSessions).where(scope);
       }
     }
