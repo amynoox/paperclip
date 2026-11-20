@@ -772,7 +772,9 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${cutRunId}`,
       nextAction: "Reconcile the cut run.", evidence: { runId: cutRunId },
     }).returning();
-    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+    // STUDIO-0076: a pause no longer blocks a task of the role, so the block of TR-1168 can no longer come from a
+    // paused assignee. The receipt is kept for the block of an assignee that cannot be invoked for another reason.
+    await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, coderId));
     const enqueueWakeup = vi.fn(async () => null);
     const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
     expect(result).toMatchObject({ escalated: 1, issueIds: [observed.id] });
@@ -796,16 +798,17 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       status: "active", ownerType: "board", returnOwnerAgentId: other.coderId, previousOwnerAgentId: other.coderId,
       cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${failedRunId}`,
       nextAction: "Reconcile the run.", evidence: { runId: failedRunId } });
-    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, other.coderId));
+    await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, other.coderId));
     await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
     const [otherAction] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, otherIssue.id));
     expect(otherAction!.evidence).not.toHaveProperty("legacyCancellationBlock");
   });
 
-  it("escalates an unchanged paused-assignee snapshot and publishes its committed notice", async () => {
+  // STUDIO-0076: a paused assignee is no longer escalated; the snapshot is now that of an assignee pending approval.
+  it("escalates an unchanged snapshot of an assignee that cannot be invoked and publishes its committed notice", async () => {
     const { companyId, coderId, sourceIssue } = await seedCompany();
     const observed = (await issueService(db).update(sourceIssue.id, { status: "todo" }))!;
-    await db.update(agents).set({ status: "paused" }).where(eq(agents.id, coderId));
+    await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, coderId));
     const enqueueWakeup = vi.fn(async () => null);
     const result = await recoveryService(db, { enqueueWakeup }).reconcileStrandedAssignedIssues();
     expect(result).toMatchObject({ escalated: 1, issueIds: [observed.id] });

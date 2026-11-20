@@ -82,11 +82,24 @@ describePostgres("new task for a manually paused assignee", () => {
     expect(finished.status).toBe("done");
   }, 180_000);
 
-  it("still escalates a new task whose assignee is paused by something other than a person", async () => {
+  // STUDIO-0076: upstream escalated a new task whose assignee is paused by something other than a person. A pause
+  // now blocks no task of the role, whatever the hold: the task waits, and starts once the pause lifts.
+  it("keeps a new task waiting too when its assignee is paused by something other than a person, and starts it on resume", async () => {
     const f = await seed(["budget"]);
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
     const [saved] = await db.select().from(issues).where(eq(issues.id, f.issueId));
-    expect(saved.status).not.toBe("todo");
+    expect(saved.status).toBe("todo");
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId))).toHaveLength(0);
     expect(await runs(f)).toHaveLength(0);
+
+    await db.update(agents).set({ status: "idle", lifecycleState: "ready", lifecycleHolds: [], pauseReason: null, pausedAt: null })
+      .where(eq(agents.id, f.agentId));
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    const ids = new Set((await runs(f)).map(run => run.id));
+    expect(dispatched.filter(id => ids.has(id))).toHaveLength(1);
+    const [finished] = await db.select().from(issues).where(eq(issues.id, f.issueId));
+    expect(finished.status).toBe("done");
   }, 180_000);
 });

@@ -234,6 +234,9 @@ const ADAPTER_DECLARED_WAIT_MEANINGS: Readonly<Record<string, string>> = Object.
   router_ticket_blocked: "the ticket is blocked; its dependency wake starts it again once unblocked",
 });
 
+// STUDIO-0076: reason of the start given, when a pause lifts, to a task that waits on a declared wait.
+export const DECLARED_WAIT_PAUSE_LIFTED_WAKE_REASON = "issue_declared_wait_pause_lifted";
+
 export function adapterDeclaredWaitNoteBody(code: string): string {
   const meaning = ADAPTER_DECLARED_WAIT_MEANINGS[code] ?? "the worker router declared a wait";
   const hours = adapterDeclaredWaitMaxMs(code) / (60 * 60_000);
