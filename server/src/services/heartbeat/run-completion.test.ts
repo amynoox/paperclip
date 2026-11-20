@@ -694,7 +694,9 @@ describe.skipIf(!support.supported && !process.env.PAPERCLIP_TEST_DATABASE_URL)(
       return write(...args);
     });
     await f.completion.completeRun(f.input);
-    expect(await read(f.run.id)).toMatchObject({ status: "cancelled", resultJson: { winner: "Stop" }, sessionIdAfter: null });
+    // STUDIO-0075: the winner's terminal status and result stay as they are; the run only names the session its late
+    // result returned, which is kept for the task so that the next run resumes it.
+    expect(await read(f.run.id)).toMatchObject({ status: "cancelled", resultJson: { winner: "Stop" }, sessionIdAfter: "provider-session" });
     expect(f.deps.setWakeupStatus).not.toHaveBeenCalled();
     expect(f.deps.updateRuntimeState).not.toHaveBeenCalled();
     expect(f.deps.releaseIssueExecutionAndPromote).not.toHaveBeenCalled();
