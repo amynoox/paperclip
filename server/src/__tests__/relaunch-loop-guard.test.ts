@@ -25,6 +25,7 @@ import {
   RELAUNCH_LOOP_FRESH_SESSION_ACTIVITY_ACTION,
   RELAUNCH_LOOP_GUARD_CONTEXT_KEY,
   RELAUNCH_LOOP_SHORT_RUN_MS,
+  RELAUNCH_LOOP_TIMEOUT_ERROR_CODES,
   ROUTER_PRE_RESERVATION_REFUSAL_CODES,
   applyRelaunchLoopGuard,
   classifyRelaunchLoopRun,
@@ -110,6 +111,22 @@ describe("relaunch loop guard: the decision", () => {
     expect(decide([sample(1), sample(2), productive, sample(5)]).action).toBe("fresh_session");
   });
 
+  it.each([
+    ["the run's own status", { status: "timed_out", errorCode: "timeout" }],
+    ["the status alone", { status: "timed_out", errorCode: null }],
+    ["the adapter's code on a failed run", { status: "failed", errorCode: "timeout" }],
+    ["the worker router's code", { status: "failed", errorCode: "router_interactive_timeout" }],
+  ] as Array<[string, Partial<RelaunchLoopRunSample>]>)("counts a run that ended on a timeout whatever it lasted (%s)", (_name, patch) => {
+    const twentyMinutes = (minutesAgo: number) => sample(minutesAgo, { ...patch, finishedAt: new Date(at(minutesAgo).getTime() + 20 * 60_000) });
+    expect(classifyRelaunchLoopRun(twentyMinutes(30), false)).toBe("empty_failure");
+    expect(decide([twentyMinutes(30), twentyMinutes(60), twentyMinutes(90)]).action).toBe("fresh_session");
+    // Its other conditions hold: something left behind, or another session, still ends the series.
+    const productive = twentyMinutes(60);
+    expect(decide([twentyMinutes(30), productive, twentyMinutes(90), twentyMinutes(120)], [productive.id]).action).toBe("none");
+    expect(decide([twentyMinutes(30), sample(60, { ...patch, sessionIdBefore: "s2" }), twentyMinutes(90), twentyMinutes(120)]).action).toBe("none");
+    expect(RELAUNCH_LOOP_TIMEOUT_ERROR_CODES).toEqual(["timeout", "router_interactive_timeout"]);
+  });
+
   it("a timed-out run under five minutes counts like a failure", () => {
     expect(decide([sample(1, { status: "timed_out", errorCode: "timeout" }), sample(3), sample(5)]).action).toBe("fresh_session");
   });
@@ -125,7 +142,7 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
   let home: string;
 
   type Step =
-    | { kind: "fail"; code: string; session?: string; clearSession?: boolean; comment?: boolean; document?: boolean; productionActivity?: boolean }
+    | { kind: "fail"; code: string; session?: string; clearSession?: boolean; comment?: boolean; document?: boolean; productionActivity?: boolean; timedOut?: boolean }
     | { kind: "ok"; session: string };
   // What each engine launch was asked to resume, in order, per issue.
   type Launch = { runId: string; agentId: string; resumed: string | null; resumedParams: Record<string, unknown> | null };
@@ -170,6 +187,11 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
             companyId: input.agent.companyId, actorType: "agent", actorId: input.agent.id, agentId: input.agent.id, runId: input.runId,
             action: "issue.document_upserted", entityType: "issue", entityId: issueId, details: { key: "notes" },
           });
+        }
+        // A run that reaches its timeout: the adapter returns the session its engine announced (STUDIO-0080).
+        if (step.timedOut) {
+          return { exitCode: null, signal: "SIGTERM", timedOut: true, errorCode: "timeout", errorMessage: "Timed out after 1200s",
+            ...(step.session ? { sessionId: step.session, sessionDisplayId: step.session, sessionParams: { sessionId: step.session } } : {}) };
         }
         return {
           exitCode: 1, signal: null, timedOut: false, errorCode: step.code, errorMessage: `engine failed (${step.code})`,
@@ -249,7 +271,7 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
     expect(run).not.toBeNull();
     await heartbeat.drainActiveRunExecutions();
     await expect.poll(async () => (await devRuns(f)).find((row) => row.id === run!.id)?.status, { timeout: 30_000 })
-      .toMatch(/^(failed|succeeded)$/);
+      .toMatch(/^(failed|succeeded|timed_out)$/);
     expect(devLaunches(f).length).toBe(before + 1);
     const finished = (await devRuns(f)).find((row) => row.id === run!.id)!;
     // As production recorded it: the retry scheduled after a failure was cancelled before it started,
@@ -336,6 +358,51 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
     await turn(f, fail(ACK_UNCERTAIN));
     expect(resumedOf(f)[5]).toBe("s2");
     expect(await guardNotes(f)).toHaveLength(1);
+  }, 180_000);
+
+  // The lived case behind STUDIO-0080's review: a session too large to reopen. Every run that resumes it
+  // reaches its timeout, so each lasts as long as the timeout itself and none is "short".
+  it("three runs in a row that reach their timeout on the same session, twenty minutes each: the fourth starts fresh, with the note", async () => {
+    const f = await seed();
+    await openSession(f);
+    const timedOut = [
+      await turn(f, fail("timeout", { timedOut: true, session: "s1" })),
+      await turn(f, fail("timeout", { timedOut: true, session: "s1" })),
+      await turn(f, fail("timeout", { timedOut: true, session: "s1" })),
+    ];
+    expect(timedOut.map((run) => `${run.status}:${run.errorCode}:${run.sessionIdBefore}:${run.sessionIdAfter}`))
+      .toEqual(["timed_out:timeout:s1:s1", "timed_out:timeout:s1:s1", "timed_out:timeout:s1:s1"]);
+    // Twenty minutes each, for every run of the role, so their order holds.
+    await db.update(heartbeatRuns).set({ startedAt: sql`${heartbeatRuns.finishedAt} - interval '20 minutes'` })
+      .where(and(eq(heartbeatRuns.agentId, f.devId), sql`${heartbeatRuns.startedAt} is not null`));
+    expect(await guardNotes(f)).toHaveLength(0);
+
+    const fresh = await turn(f, { kind: "ok", session: "s2" });
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", null]);
+    expect(fresh.contextSnapshot).toMatchObject({ forceFreshSession: true,
+      [RELAUNCH_LOOP_GUARD_CONTEXT_KEY]: { action: "fresh_session", droppedSessionId: "s1", failedRunIds: timedOut.map((run) => run.id) } });
+    const notes = await guardNotes(f);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.body).toBe(
+      "The last 3 runs of Dev Unity on this issue failed one after the other while resuming the same engine session, "
+      + "each on a timeout and without leaving anything behind (`timeout`). "
+      + "That session is dropped: the next run starts on a fresh session.",
+    );
+  }, 180_000);
+
+  it("a twenty-minute failure that is not a timeout still ends the series, among two timeouts", async () => {
+    const f = await seed();
+    await openSession(f);
+    await turn(f, fail("timeout", { timedOut: true, session: "s1" }));
+    const long = await turn(f, fail(ACK_UNCERTAIN, { session: "s1" }));
+    await turn(f, fail("timeout", { timedOut: true, session: "s1" }));
+    await db.update(heartbeatRuns).set({ startedAt: sql`${heartbeatRuns.finishedAt} - interval '20 minutes'` })
+      .where(and(eq(heartbeatRuns.agentId, f.devId), sql`${heartbeatRuns.startedAt} is not null`));
+    expect(long.status).toBe("failed");
+    await turn(f, fail(ACK_UNCERTAIN));
+    // The run after the long failure is the only one that counts: no series.
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", "s1"]);
+    expect(await guardNotes(f)).toHaveLength(0);
   }, 180_000);
 
   it("two failures on the session are not a series: the third run still resumes it", async () => {

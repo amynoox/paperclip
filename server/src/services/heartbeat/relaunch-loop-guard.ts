@@ -14,6 +14,10 @@
 //   issue that failed, resumed the same engine session, lasted under
 //   RELAUNCH_LOOP_SHORT_RUN_MS and left nothing behind, whatever their error
 //   code;
+// - a run that ended on a timeout is counted whatever it lasted: a session
+//   too large to reopen makes every run that resumes it reach its timeout,
+//   and each of those runs lasts as long as the timeout itself (STUDIO-0080
+//   returns the session of a timed-out run, so such a session is resumed);
 // - declared waits, refusals the worker router returns before any reservation,
 //   cancellations, and runs that failed in setup before their adapter was
 //   admitted (a lease that could not be acquired) are neither counted nor do
@@ -43,8 +47,19 @@ import { keyValueRow, runLinkRow, systemNoticePresentation } from "../recovery/n
 /** Consecutive empty failures on one session before the session is dropped. */
 export const RELAUNCH_LOOP_FAILURE_THRESHOLD = 3;
 
-/** A failure counts only when the run lasted less than this. */
+/** A failure counts only when the run lasted less than this, unless it ended on a timeout. */
 export const RELAUNCH_LOOP_SHORT_RUN_MS = 5 * 60_000;
+
+// A run that ended on a timeout: the run's own status, or the code under which
+// the adapter or the worker router reports that its engine ran out of time.
+export const RELAUNCH_LOOP_TIMEOUT_ERROR_CODES: readonly string[] = Object.freeze([
+  "timeout",
+  "router_interactive_timeout",
+]);
+
+export function isRelaunchLoopTimeout(run: Pick<RelaunchLoopRunSample, "status" | "errorCode">): boolean {
+  return run.status === "timed_out" || Boolean(run.errorCode && RELAUNCH_LOOP_TIMEOUT_ERROR_CODES.includes(run.errorCode));
+}
 
 /** How many started runs of the agent on the issue are read, newest first. */
 export const RELAUNCH_LOOP_RUN_SAMPLE_LIMIT = 40;
@@ -106,7 +121,8 @@ export function classifyRelaunchLoopRun(
   if (run.errorCode && ROUTER_PRE_RESERVATION_REFUSAL_CODES.includes(run.errorCode)) return "skipped";
   if (run.engineNeverStarted) return "skipped";
   if (!run.finishedAt) return "other";
-  if (run.finishedAt.getTime() - run.startedAt.getTime() >= RELAUNCH_LOOP_SHORT_RUN_MS) return "other";
+  if (!isRelaunchLoopTimeout(run)
+      && run.finishedAt.getTime() - run.startedAt.getTime() >= RELAUNCH_LOOP_SHORT_RUN_MS) return "other";
   if (producedSomething) return "other";
   return "empty_failure";
 }
@@ -146,15 +162,21 @@ export function evaluateRelaunchLoop(input: {
 
 export function relaunchLoopFreshSessionNoteBody(input: {
   agentName: string;
-  failedRuns: readonly Pick<RelaunchLoopRunSample, "errorCode">[];
+  failedRuns: readonly Pick<RelaunchLoopRunSample, "errorCode" | "status">[];
 }): string {
   const codes = [...new Set(input.failedRuns.map((run) => run.errorCode ?? "no code"))]
     .map((code) => `\`${code}\``)
     .join(", ");
   const minutes = RELAUNCH_LOOP_SHORT_RUN_MS / 60_000;
+  const timeouts = input.failedRuns.filter(isRelaunchLoopTimeout).length;
+  const how = timeouts === 0
+    ? `each in under ${minutes} minutes`
+    : timeouts === input.failedRuns.length
+      ? "each on a timeout"
+      : `each on a timeout or in under ${minutes} minutes`;
   return (
     `The last ${input.failedRuns.length} runs of ${input.agentName} on this issue failed one after the other ` +
-    `while resuming the same engine session, each in under ${minutes} minutes and without leaving anything behind (${codes}). ` +
+    `while resuming the same engine session, ${how} and without leaving anything behind (${codes}). ` +
     "That session is dropped: the next run starts on a fresh session."
   );
 }
