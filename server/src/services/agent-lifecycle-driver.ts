@@ -3,6 +3,7 @@ import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./heartbeat/recovery.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { replayWakesMissedDuringPause } from "./pause-missed-wakes.js";
 import { continueRunsCutByPause, pauseLiftedOf } from "./pause-resume-continuation.js";
+import { logger } from "../middleware/logger.js";
 import { agents, companies, environments, heartbeatRuns, plugins, pluginCompanySettings, type Db } from "@paperclipai/db";
 import { instanceSettingsService } from "./instance-settings.js";
 import { pluginHasAgentEnvironments, pluginServesAgentEnvironment } from "./plugin-environment-driver.js";
@@ -18,20 +19,34 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
   const heartbeat = heartbeatService(db, { pluginWorkerManager: manager });
   return {
     async onReady(agent) {
-      await db.transaction(tx => promoteDeferredWorkIntents(tx, { companyId: agent.companyId, trigger: "pause_lifted" }));
-      await heartbeat.resumeQueuedRunsForAgent(agent.companyId, agent.id);
+      // studio.25 assembly: each step in its own try. Nothing calls onReady again for this ready state (the lifecycle
+      // worker calls it once and ignores its error), so an error of one step must not skip the next ones.
+      const failed = (step: string, error: unknown) => logger.error(
+        { err: error, companyId: agent.companyId, agentId: agent.id, step }, "agent ready: a step failed, the next steps still run");
+      try {
+        await db.transaction(tx => promoteDeferredWorkIntents(tx, { companyId: agent.companyId, trigger: "pause_lifted" }));
+      } catch (error) { failed("promote_deferred_work_intents", error); }
+      try {
+        await heartbeat.resumeQueuedRunsForAgent(agent.companyId, agent.id);
+      } catch (error) { failed("resume_queued_runs", error); }
       // STUDIO-0028: wakes refused during the pause (not only people's
       // comments) reach the agent once, per task it still owns.
-      await replayWakesMissedDuringPause(db, { companyId: agent.companyId, agentId: agent.id,
-        wakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts) });
+      try {
+        await replayWakesMissedDuringPause(db, { companyId: agent.companyId, agentId: agent.id,
+          wakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts) });
+      } catch (error) { failed("replay_wakes_missed_during_pause", error); }
       // STUDIO-0076: a task that waits on a declared wait starts once; its owner's wake can be lost to the pause.
-      await heartbeat.wakeDeclaredWaitsAfterPause({ companyId: agent.companyId, agentId: agent.id });
+      try {
+        await heartbeat.wakeDeclaredWaitsAfterPause({ companyId: agent.companyId, agentId: agent.id });
+      } catch (error) { failed("wake_declared_waits_after_pause", error); }
       // STUDIO-0074: when this ready state follows a pause, the runs that pause cut continue by themselves, through
       // the Retry of the person who asked to resume. Last, so that a person's message kept during the pause is
       // already back in the queue. A ready state that follows no pause (first setup) does nothing here.
-      const lifted = pauseLiftedOf(agent.lifecycleOperation);
-      if (lifted) await continueRunsCutByPause(db, { companyId: agent.companyId, agentId: agent.id, ...lifted,
-        resumeTaskRetry: (companyId, requestId) => heartbeat.resumeTaskRetry(companyId, requestId) });
+      try {
+        const lifted = pauseLiftedOf(agent.lifecycleOperation);
+        if (lifted) await continueRunsCutByPause(db, { companyId: agent.companyId, agentId: agent.id, ...lifted,
+          resumeTaskRetry: (companyId, requestId) => heartbeat.resumeTaskRetry(companyId, requestId) });
+      } catch (error) { failed("continue_runs_cut_by_pause", error); }
     },
     async requiredPluginIds(agent) {
       const selected = agent.lifecycleRequiredPluginIds;
