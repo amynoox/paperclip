@@ -5,6 +5,7 @@ import { activityLog, agents, agentWakeupRequests, companies, createDb, environm
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { projectCompanyHolds } from "../modules/agent-lifecycle/adapters/company-policy.js";
+import { createLifecycleStore } from "../modules/agent-lifecycle/adapters/postgres.js";
 import { configureAgentLifecycle, createAgentLifecycle, createAgentLifecycleEffects } from "./agent-lifecycle.js";
 import { createLifecycleDriver } from "./agent-lifecycle-driver.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
@@ -330,6 +331,25 @@ describe("the runs a pause cut, when the role resumes", () => {
       // Nobody asked for this resume: the person of the earlier pause is not reused.
       await expectRefused(later, "resumed_without_a_person");
       expect(pauseLiftedOf((await state(f.agentId)).lifecycleOperation)).toMatchObject({ requestedBy: null });
+    });
+
+    it("a company pause that lands while the role is resuming: the new pause forgets who asked before it", async () => {
+      const f = await fixture();
+      // The person's resume is committed, and the company is paused before the role is ready.
+      await createLifecycleStore(db, createAgentLifecycleEffects()).change(f.agentId, "resume", { reason: "user", requestedBy: PERSON });
+      expect(await state(f.agentId)).toMatchObject({ lifecycleState: "resuming", lifecycleOperation: { resumeRequestedBy: PERSON } });
+      await idle(f);
+      await db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.companyId));
+      await projectCompanyHolds(db, createAgentLifecycleEffects(), f.companyId);
+      await work.process(f.agentId);
+      expect(await state(f.agentId)).toMatchObject({ lifecycleState: "paused", lifecycleHolds: ["company_paused"] });
+      await db.update(agents).set({ pausedAt: new Date(Date.now() - 14 * HOUR) }).where(eq(agents.id, f.agentId));
+      await busy(f);
+      await db.update(companies).set({ status: "active" }).where(eq(companies.id, f.companyId));
+      await projectCompanyHolds(db, createAgentLifecycleEffects(), f.companyId);
+      await work.process(f.agentId);
+      expect((await state(f.agentId)).lifecycleState).toBe("ready");
+      await expectRefused(f, "resumed_without_a_person");
     });
 
     it("a resume made with a key whose person may not change the task: the product's own check keeps the request", async () => {
