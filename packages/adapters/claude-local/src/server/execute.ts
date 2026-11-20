@@ -1131,6 +1131,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         : undefined;
 
     if (proc.timedOut) {
+      // STUDIO-0080: the guard of the analysed path below (shouldDropSessionForPoison). A run can reach its
+      // timeout after Claude wrote its final `result`; when that result reports a poisoned previous message id,
+      // every later resume of the session fails the same way, so the session is dropped and cleared, never
+      // returned. The path without a final result has nothing of the kind to read: Claude reports the poison
+      // in its `result` only, and the run's raw output is not searched for it (the agent's own tool output
+      // lands there). The next resume reports it, and the fallback further down starts that run fresh.
+      const poisonedAtTimeout = parsed ? isClaudePoisonedPreviousMessageIdError(parsed) : false;
+      const sessionAtTimeout = poisonedAtTimeout ? null : announcedSession;
       return {
         exitCode: proc.exitCode,
         signal: proc.signal,
@@ -1147,8 +1155,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
-        ...(announcedSession ?? {}),
-        clearSession: Boolean(opts.clearSessionOnMissingSession && !announcedSession),
+        ...(sessionAtTimeout ?? {}),
+        clearSession: poisonedAtTimeout || Boolean(opts.clearSessionOnMissingSession && !sessionAtTimeout),
       };
     }
 

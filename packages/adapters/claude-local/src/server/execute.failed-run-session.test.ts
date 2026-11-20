@@ -256,6 +256,47 @@ describe("claude_local: the session of a run that failed", () => {
     expect(result.clearSession).toBe(true);
   });
 
+  // The message Claude reports when the last entry of a session's transcript is poisoned: every later resume
+  // of that session fails the same way.
+  const POISON = "API Error: 400 diagnostics.previous_message_id: must be the `id` from a prior /v1/messages response (starts with `msg_`)";
+  const poisonedResult = (sessionId: string) => JSON.stringify({ type: "result", session_id: sessionId, is_error: true,
+    subtype: "error_during_execution", result: POISON });
+
+  it("a run that reaches its timeout after Claude reported a poisoned session returns no session and clears it", async () => {
+    engineAnswers({ exitCode: null, signal: "SIGTERM", timedOut: true, stdout: [init(NEW), poisonedResult(NEW)].join("\n") });
+    const { result } = await run({ timeoutSec: 30 });
+    expect(result).toMatchObject({ timedOut: true, errorCode: "timeout" });
+    expect(result.sessionId).toBeUndefined();
+    expect(result.sessionParams).toBeUndefined();
+    expect(result.sessionDisplayId).toBeUndefined();
+    expect(result.clearSession).toBe(true);
+  });
+
+  it("a run that reaches its timeout after another error of Claude still returns the announced session", async () => {
+    const otherError = JSON.stringify({ type: "result", session_id: NEW, is_error: true, subtype: "error_during_execution", result: "API Error: 529 overloaded" });
+    engineAnswers({ exitCode: null, signal: "SIGTERM", timedOut: true, stdout: [init(NEW), otherError].join("\n") });
+    const { result } = await run({ timeoutSec: 30 });
+    expect(result.timedOut).toBe(true);
+    expect(result.sessionId).toBe(NEW);
+    expect(result.clearSession).toBe(false);
+  });
+
+  it("the agent's own output quoting the poison message does not drop the session of a cut run", async () => {
+    // No final result: Claude reported nothing. The phrase is in what the agent printed (a log it was reading).
+    engineAnswers({ exitCode: null, signal: "SIGTERM", stdout: [init(NEW), assistant(NEW, `Found in the log: ${POISON}`)].join("\n") });
+    const { result } = await run();
+    expect(result.sessionId).toBe(NEW);
+    expect(result.clearSession).toBe(false);
+  });
+
+  it("a session poisoned in a run that was cut is refused at its next resume, and that run starts fresh", async () => {
+    engineAnswers({ exitCode: 1, stdout: poisonedResult(KEPT) }, succeeded(FRESH));
+    const { result } = await run({ runtime: { sessionId: KEPT, sessionParams: { sessionId: KEPT } } });
+    expect(launches().map(resumedIn)).toEqual([KEPT, null]);
+    expect(result.exitCode).toBe(0);
+    expect(result.sessionId).toBe(FRESH);
+  });
+
   it("a successful run is unchanged: its session and its parameters", async () => {
     engineAnswers(succeeded(NEW));
     const { result, workspaceDir } = await run();
