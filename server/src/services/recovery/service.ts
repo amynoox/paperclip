@@ -1205,6 +1205,23 @@ export function recoveryService(
   // the latest consecutive series of this agent's waiting runs on the issue,
   // and the Board's latest return of the issue (a `restored` recovery-action
   // resolution, or a user's status change to `todo`). Null without such runs.
+  /**
+   * The deadline of an adapter-declared wait that is still within its bound: the assignee's latest started run on
+   * the issue ended in such a wait, and the bound, counted from the first run of the series, has not passed. Null
+   * otherwise. One reading for the sweep's two uses (an invokable assignee, and a paused one: STUDIO-0076).
+   */
+  async function liveAdapterDeclaredWaitDeadline(
+    issue: { companyId: string; id: string },
+    agentId: string,
+    run: { status: string; errorCode: string | null } | null | undefined,
+    now: Date,
+  ): Promise<number | null> {
+    if (!isAdapterDeclaredWaitRun(run)) return null;
+    const waitStart = await readAdapterDeclaredWaitBoundStart(issue.companyId, issue.id, agentId, run!.errorCode);
+    const waitDeadline = waitStart ? waitStart.getTime() + adapterDeclaredWaitMaxMs(run!.errorCode) : null;
+    return waitDeadline !== null && now.getTime() < waitDeadline ? waitDeadline : null;
+  }
+
   async function readAdapterDeclaredWaitBoundStart(
     companyId: string,
     issueId: string,
@@ -5002,6 +5019,26 @@ export function recoveryService(
         result.skipped += 1;
         continue;
       }
+      // STUDIO-0076: production, 20 Nov 2026 (TR-2030, TR-2031). The assignee's last run waited for a worker machine
+      // (router_waiting_for_resources); the role was paused for an update, and this sweep moved both tasks to
+      // `blocked` two seconds later ("the original assignee is not invokable"). After the resume nothing started
+      // them again: the router never serves a blocked task. A pause does not end a declared wait: while the wait
+      // is within its bound, neither block nor requeue, and leave the series' note, as for an invokable assignee
+      // (the gate further down). Any pause (manual, company, budget); an agent in error or terminated is not
+      // paused and keeps today's path. Past the bound the normal path applies, the block below included.
+      if (agent?.status === "paused" && agent.companyId === issue.companyId
+        && (issue.status !== "in_review" || participantAgentId)) {
+        const pausedOwnRun = latestRun?.agentId === agentId && latestRun.startedAt
+          ? latestRun
+          : await getLatestStartedIssueRunForAgent(issue.companyId, issue.id, agentId);
+        const pausedWaitDeadline = await liveAdapterDeclaredWaitDeadline(issue, agentId, pausedOwnRun, new Date());
+        if (pausedWaitDeadline !== null) {
+          await ensureRouterNote(issue, pausedOwnRun!, agentId, "wait");
+          opts?.onDeferredDeadline?.(pausedWaitDeadline);
+          result.skipped += 1;
+          continue;
+        }
+      }
       // STUDIO-0051: a task waiting on a person's question keeps its status while its assignee is not invokable
       // (an agent in error, for example): the answer wakes the assignee once it is back, and that wake only starts
       // on a task in progress, so escalating to blocked here would lose it.
@@ -5299,20 +5336,9 @@ export function recoveryService(
       // past the bound, the normal path.
       // An `in_review` issue with no pending review participant is left to
       // the review path's own skip, as before (no signal there, by design).
-      if (
-        isAdapterDeclaredWaitRun(ownLatestRun) &&
-        (issue.status !== "in_review" || participantAgentId)
-      ) {
-        const waitStart = await readAdapterDeclaredWaitBoundStart(
-          issue.companyId,
-          issue.id,
-          agentId,
-          ownLatestRun!.errorCode,
-        );
-        const waitDeadline = waitStart
-          ? waitStart.getTime() + adapterDeclaredWaitMaxMs(ownLatestRun!.errorCode)
-          : null;
-        if (waitDeadline !== null && recoveryNow.getTime() < waitDeadline) {
+      if (issue.status !== "in_review" || participantAgentId) {
+        const waitDeadline = await liveAdapterDeclaredWaitDeadline(issue, agentId, ownLatestRun, recoveryNow);
+        if (waitDeadline !== null) {
           await ensureRouterNote(issue, ownLatestRun!, agentId, "wait");
           opts?.onDeferredDeadline?.(waitDeadline);
           result.skipped += 1;
