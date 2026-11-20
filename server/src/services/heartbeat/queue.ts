@@ -5353,7 +5353,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             const [continued] = await tx.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
               .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
                 eq(heartbeatRuns.id, explicitContinuation.previousRunId)));
-            if (!continued || !isGovernancePauseStop(continued)) enrichedContextSnapshot.forceFreshSession = true;
+            // Only the session really kept from that run: the task's session must have been written by it (its own
+            // end, or its late result). If its result never came, or the server restarted before it, the task still
+            // holds the session of an EARLIER run, which knows nothing of what the cut run did: a new conversation.
+            const [kept] = continued && isGovernancePauseStop(continued)
+              ? await tx.select({ lastRunId: agentTaskSessions.lastRunId }).from(agentTaskSessions).where(and(
+                  eq(agentTaskSessions.companyId, issue.companyId), eq(agentTaskSessions.agentId, agentId),
+                  eq(agentTaskSessions.adapterType, agent.adapterType), eq(agentTaskSessions.taskKey, issue.id))).limit(1)
+              : [];
+            if (kept?.lastRunId !== explicitContinuation.previousRunId) enrichedContextSnapshot.forceFreshSession = true;
             enrichedContextSnapshot.previousRunId = explicitContinuation.previousRunId;
             enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
           }

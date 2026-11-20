@@ -560,26 +560,33 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       if (nativeTaskSessionPublicationHandled(run.runnerProfileJson, {
         runId: run.id, companyId: run.companyId, agentId: agent.id, taskKey, adapterType: agent.adapterType,
       })) return;
-      const [current] = await db.select({ lastRunId: agentTaskSessions.lastRunId }).from(agentTaskSessions).where(and(
-        eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agent.id),
-        eq(agentTaskSessions.adapterType, agent.adapterType), eq(agentTaskSessions.taskKey, taskKey))).limit(1);
-      if (current?.lastRunId && current.lastRunId !== run.id) {
-        const [writer] = await db.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
-          .where(eq(heartbeatRuns.id, current.lastRunId)).limit(1);
-        // A later run of the agent on the task already wrote its session: this older result must not replace it.
-        if (writer && writer.createdAt.getTime() > run.createdAt.getTime()) return;
-      }
-      if (adapterResult.clearSession) {
-        await clearTaskSessions(agent.companyId, agent.id, { taskKey, adapterType: agent.adapterType });
-        return;
-      }
-      await upsertTaskSession({
-        companyId: agent.companyId, agentId: agent.id, adapterType: agent.adapterType, taskKey,
-        sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(nextSessionState.params, configuredModel, sessionConfigMetadata),
-        sessionDisplayId: nextSessionState.displayId, lastRunId: run.id, lastError: runErrorMessage,
+      // Not over the session of a run created at the same time or later: checked under the task's lock, with the
+      // write (run-state.ts). `left`: the task's session stays as it was (a later run wrote it, the task is a
+      // conversation that takes no session from a cancelled run, or there was nothing to forget).
+      const lateResultOfRun = { id: run.id, createdAt: run.createdAt };
+      const session: "kept" | "cleared" | "left" = adapterResult.clearSession
+        ? (await clearTaskSessions(agent.companyId, agent.id, { taskKey, adapterType: agent.adapterType, lateResultOfRun })) > 0
+          ? "cleared" : "left"
+        : (await upsertTaskSession({
+            companyId: agent.companyId, agentId: agent.id, adapterType: agent.adapterType, taskKey,
+            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(nextSessionState.params, configuredModel, sessionConfigMetadata),
+            sessionDisplayId: nextSessionState.displayId, lastRunId: run.id, lastError: runErrorMessage, lateResultOfRun,
+          })) ? "kept" : "left";
+      // The run says what its late result was and what became of its session: a session kept from a run whose stop
+      // was not proven (router_provider_stop_unverified) must be readable on the run, not only in the task's session.
+      const lateResult = { errorCode: adapterResult.errorCode ?? null, errorMessage: runErrorMessage ?? null, session };
+      await db.update(heartbeatRuns).set({
+        // Named on the run only when it is the session really kept for the task.
+        ...(session === "kept" ? { sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId } : {}),
+        resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ lateResult })}::jsonb`,
+      }).where(eq(heartbeatRuns.id, run.id));
+      await appendRunEvent(run, {
+        eventType: "run.late_result", stream: "system", level: "info",
+        message: session === "kept" ? "The result came after the run was settled; its session is kept for the task."
+          : session === "cleared" ? "The result came after the run was settled and asked to forget the session; the task's session is cleared."
+          : "The result came after the run was settled; the task's session is left as it was.",
+        payload: lateResult,
       });
-      await db.update(heartbeatRuns).set({ sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId })
-        .where(eq(heartbeatRuns.id, run.id));
     }
 
     let logSummary: {
@@ -780,8 +787,14 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           "skipping late run finalization because the run already left running state",
         );
         // STUDIO-0075: the run is settled, but the session its result names is still the one to resume.
-        await persistLateSessionState().catch((err) => {
+        await persistLateSessionState().catch(async (err) => {
           logger.error({ err, runId: run.id }, "the session of a late run result could not be kept for its task");
+          // Not only a line in the server's log: the run itself says its late session was not kept.
+          await appendRunEvent(run, {
+            eventType: "run.late_result", stream: "system", level: "error",
+            message: "The result came after the run was settled; its session could not be kept for the task.",
+            payload: { errorCode: adapterResult.errorCode ?? null, session: "failed", error: err instanceof Error ? err.message : String(err) },
+          }).catch(() => {});
         });
         return;
       }

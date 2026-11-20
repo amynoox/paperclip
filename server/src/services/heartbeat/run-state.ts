@@ -1684,6 +1684,12 @@ export function createHeartbeatRunState(db: Db) {
     sessionDisplayId: string | null;
     lastRunId: string | null;
     lastError: string | null;
+    /**
+     * STUDIO-0075: the write of a result that arrived after its run was settled. It is refused (null) when the
+     * task's session was last written by another run created at the same time as this one, or later. Read under the
+     * task's lock, which every session write takes: a later run cannot write between this check and this write.
+     */
+    lateResultOfRun?: { id: string; createdAt: Date };
   }) {
     return db.transaction(async (tx) => {
       const [issue] = await tx.select().from(issues).where(and(sql`${issues.id}::text = ${input.taskKey}`, eq(issues.companyId, input.companyId))).for("update");
@@ -1692,6 +1698,11 @@ export function createHeartbeatRunState(db: Db) {
         if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return null;
       }
     const existing = await tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId), eq(agentTaskSessions.adapterType, input.adapterType), eq(agentTaskSessions.taskKey, input.taskKey))).then((rows) => rows[0] ?? null);
+    if (existing?.lastRunId && input.lateResultOfRun && existing.lastRunId !== input.lateResultOfRun.id) {
+      const [writer] = await tx.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, existing.lastRunId)).limit(1);
+      if (writer && writer.createdAt.getTime() >= input.lateResultOfRun.createdAt.getTime()) return null;
+    }
     if (existing) {
       return tx
         .update(agentTaskSessions)
@@ -1732,6 +1743,8 @@ export function createHeartbeatRunState(db: Db) {
       adapterType?: string | null;
       expectedRunId?: string;
       includeIssueAliases?: boolean;
+      /** STUDIO-0075: a late result's request to forget the session; same rule as `upsertTaskSession`. */
+      lateResultOfRun?: { id: string; createdAt: Date };
     },
   ) {
     const conditions = [
@@ -1774,6 +1787,17 @@ export function createHeartbeatRunState(db: Db) {
         if (isConversation(issue)) {
           const [run] = await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, opts.expectedRunId));
           if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return 0;
+        }
+      }
+      if (opts?.taskKey && opts.lateResultOfRun) {
+        const late = opts.lateResultOfRun;
+        await tx.select({ id: issues.id }).from(issues).where(and(sql`${issues.id}::text = ${opts.taskKey}`, eq(issues.companyId, companyId))).for("update");
+        const written = await tx.select({ lastRunId: agentTaskSessions.lastRunId }).from(agentTaskSessions).where(and(...conditions));
+        for (const row of written) {
+          if (!row.lastRunId || row.lastRunId === late.id) continue;
+          const [writer] = await tx.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, row.lastRunId)).limit(1);
+          if (writer && writer.createdAt.getTime() >= late.createdAt.getTime()) return 0;
         }
       }
       const goals = await tx.select({ id: agentTaskSessions.id }).from(agentTaskSessions)

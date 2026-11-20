@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentTaskSessions, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases,
@@ -127,14 +127,33 @@ const support = await getEmbeddedPostgresTestSupport();
    * What production holds about a cut run and the stand-in adapter does not write: its process is recorded and gone,
    * its lease is released. A person's request to continue needs that proof (explicit-native-continuation.ts).
    */
-  async function stopProven(f: Fixture, runId: string) {
-    await db.update(heartbeatRuns).set({ processPid: 2_000_000_000 }).where(eq(heartbeatRuns.id, runId));
+  async function stopProven(f: Fixture, runId: string, lease: "local" | "ssh" = "local") {
+    // Over ssh the proof is the pause's own (STUDIO-0073): the run ended more than ten minutes ago.
+    const ended = new Date(Date.now() - (lease === "ssh" ? 11 * 60_000 : 0));
+    await db.update(heartbeatRuns).set({ processPid: 2_000_000_000, ...(lease === "ssh" ? { finishedAt: ended } : {}) })
+      .where(eq(heartbeatRuns.id, runId));
     await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId, seq: 100_000,
       eventType: "native.process_identity_recorded", stream: "system", level: "info", message: "identity" });
     const environment = await environmentService(db).ensureLocalEnvironment(f.companyId);
     await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId: environment.id, heartbeatRunId: runId,
-      issueId: f.issueId, provider: "local", status: "expired", leasePolicy: "ephemeral", releasedAt: new Date(),
-      metadata: { agentId: f.agentId, driver: "local" } });
+      issueId: f.issueId, provider: lease, status: "expired", leasePolicy: "ephemeral", releasedAt: ended,
+      ...(lease === "ssh" ? { providerLeaseId: `ssh://worker@mac-03:22${FOLDER}/${runId}`, cleanupStatus: "success" } : {}),
+      metadata: { agentId: f.agentId, driver: lease } });
+  }
+  /** What the run says of its late result: the record in its result, and its event. */
+  async function lateResultOf(runId: string) {
+    const events = await db.select().from(heartbeatRunEvents).where(and(eq(heartbeatRunEvents.runId, runId),
+      eq(heartbeatRunEvents.eventType, "run.late_result")));
+    return { record: (await reread(runId)).resultJson?.lateResult, events: events.map(event => [event.level, event.payload?.session]) };
+  }
+  /** A later run of the role on the task, created `afterMs` after the given run, and optionally the session it wrote. */
+  async function laterRun(f: Fixture, of: string, afterMs: number, wrote: string | null, status = "succeeded") {
+    const [later] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status,
+      contextSnapshot: { issueId: f.issueId }, createdAt: new Date((await reread(of)).createdAt.getTime() + afterMs),
+      ...(status === "succeeded" ? { finishedAt: new Date() } : {}) }).returning();
+    if (wrote) await db.update(agentTaskSessions).set({ sessionParamsJson: paramsOf(wrote), sessionDisplayId: wrote, lastRunId: later!.id })
+      .where(and(eq(agentTaskSessions.agentId, f.agentId), eq(agentTaskSessions.taskKey, f.issueId)));
+    return later!;
   }
   /**
    * A first run that ends well in session `first`, then the run whose engine opened session `cut` and that ends as
@@ -184,6 +203,8 @@ const support = await getEmbeddedPostgresTestSupport();
       return routerFailure("router_cancelled", cut);
     });
     expect(cancelled).toMatchObject({ status: "cancelled", sessionIdAfter: cut });
+    expect(await lateResultOf(cancelled.id)).toEqual({ record: { errorCode: "router_cancelled", errorMessage: "router cancelled", session: "kept" },
+      events: [["info", "kept"]] });
     const kept = await taskSession(f);
     expect(kept).toMatchObject({ sessionDisplayId: cut, lastRunId: cancelled.id });
     expect(kept!.sessionParamsJson).toMatchObject(paramsOf(cut));
@@ -213,18 +234,94 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(next).toMatchObject({ sessionId: null });
   });
 
-  it("a late result does not replace the session a later run of the role already wrote", async () => {
+  // The order of two runs of the role on the task is the order of their creation. A late result is written only when
+  // no run created at the same time or later has written the task's session, and that is read under the task's lock.
+  it("a late result does not replace the session a later run of the role already wrote, nor one created at the same time", async () => {
+    for (const afterMs of [60_000, 0]) {
+      const f = await seed();
+      const stopped = await cutRun(f, async context => {
+        await heartbeat.cancelRun(context.runId, "Cancelled by the board");
+        // Meanwhile a later run of the role on the task has ended and written its own session.
+        await laterRun(f, context.runId, afterMs, other);
+        return routerFailure("router_cancelled", cut);
+      });
+      expect(await taskSession(f)).toMatchObject({ sessionDisplayId: other });
+      // The run does not name a session that is not the task's, and says its result was left aside.
+      expect(stopped.sessionIdAfter).toBeNull();
+      expect(await lateResultOf(stopped.id)).toMatchObject({ record: { errorCode: "router_cancelled", session: "left" }, events: [["info", "left"]] });
+    }
+  });
+
+  it("a later run still running, which has written nothing yet: the late result is kept until that run writes its own", async () => {
     const f = await seed();
-    await cutRun(f, async context => {
+    const stopped = await cutRun(f, async context => {
       await heartbeat.cancelRun(context.runId, "Cancelled by the board");
-      // Meanwhile a later run of the role on the task has ended and written its own session.
-      const [later] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "succeeded",
-        contextSnapshot: { issueId: f.issueId }, createdAt: new Date(Date.now() + 60_000), finishedAt: new Date() }).returning();
-      await db.update(agentTaskSessions).set({ sessionParamsJson: paramsOf(other), sessionDisplayId: other, lastRunId: later!.id })
-        .where(and(eq(agentTaskSessions.agentId, f.agentId), eq(agentTaskSessions.taskKey, f.issueId)));
+      await laterRun(f, context.runId, 60_000, null, "running");
       return routerFailure("router_cancelled", cut);
     });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: stopped.id });
+    await db.delete(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "running")));
+  });
+
+  it("a later run that writes while the late result waits for the task's lock is not overwritten", async () => {
+    const f = await seed();
+    let committed!: Promise<unknown>;
+    const stopped = await cutRun(f, async context => {
+      await heartbeat.cancelRun(context.runId, "Cancelled by the board");
+      // A later run holds the task's lock, as every session write does, and writes its session before it lets go.
+      let locked!: () => void;
+      const hasLock = new Promise<void>(resolve => { locked = resolve; });
+      committed = db.transaction(async tx => {
+        await tx.execute(sql`select id from issues where id = ${f.issueId} for update`);
+        locked();
+        await new Promise(resolve => setTimeout(resolve, 1_500));
+        const [later] = await tx.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+          contextSnapshot: { issueId: f.issueId }, createdAt: new Date(Date.now() + 60_000), finishedAt: new Date() }).returning();
+        await tx.update(agentTaskSessions).set({ sessionParamsJson: paramsOf(other), sessionDisplayId: other, lastRunId: later!.id })
+          .where(and(eq(agentTaskSessions.agentId, f.agentId), eq(agentTaskSessions.taskKey, f.issueId)));
+      });
+      await hasLock;
+      return routerFailure("router_cancelled", cut);
+    });
+    await committed;
     expect(await taskSession(f)).toMatchObject({ sessionDisplayId: other });
+    expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left" } });
+  });
+
+  it("a late clearSession does not forget the session a later run of the role wrote", async () => {
+    const f = await seed();
+    const stopped = await cutRun(f, async context => {
+      await heartbeat.cancelRun(context.runId, "Cancelled by the board");
+      await laterRun(f, context.runId, 60_000, other);
+      return routerFailure("router_cancelled", null, { clearSession: true });
+    });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: other });
+    expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left" } });
+  });
+
+  it("a conversation task takes no session from a cancelled run: the run names none, and says so", async () => {
+    const f = await seed();
+    const stopped = await cutRun(f, async context => {
+      await heartbeat.cancelRun(context.runId, "Cancelled by the board");
+      await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "responsible-user" }).where(eq(issues.id, f.issueId));
+      return routerFailure("router_cancelled", cut);
+    });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
+    expect(stopped.sessionIdAfter).toBeNull();
+    expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left" }, events: [["info", "left"]] });
+    await db.update(issues).set({ conversationAgentId: null, conversationUserId: null }).where(eq(issues.id, f.issueId));
+  });
+
+  it("a late session that cannot be written leaves an error event on the run, not only a line in the server's log", async () => {
+    const f = await seed();
+    const stopped = await cutRun(f, async context => {
+      await heartbeat.cancelRun(context.runId, "Cancelled by the board");
+      // PostgreSQL refuses this character in a JSON value: the write of the session fails.
+      return routerFailure("router_cancelled", cut, { sessionParams: { ...paramsOf(cut), cwd: `${FOLDER}/\u0000` } });
+    });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
+    expect(stopped.sessionIdAfter).toBeNull();
+    expect((await lateResultOf(stopped.id)).events).toEqual([["error", "failed"]]);
   });
 
   it("a late result that names no session leaves the task's session as it was", async () => {
@@ -246,11 +343,58 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await taskSession(f)).toBeNull();
 
     const late = await seed();
-    await cutRun(late, async context => {
+    const stopped = await cutRun(late, async context => {
       await heartbeat.cancelRun(context.runId, "Cancelled by the board");
       return routerFailure("router_cancelled", null, { clearSession: true });
     });
     expect(await taskSession(late)).toBeNull();
+    expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "cleared" }, events: [["info", "cleared"]] });
+  });
+
+  // The request after a pause continues in the session of the cut run only when that session is really the task's.
+  it("after a pause, when the cut run's result brought no session (it never came, or the server restarted first): a new conversation", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", null);
+    });
+    // The task still holds the session of the run BEFORE the cut run, which knows nothing of what the cut run did.
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
+    expect((await taskSession(f))!.lastRunId).not.toBe(cancelled.id);
+    await stopProven(f, cancelled.id);
+    const next = await nextExecution(f, () => personMessage(f));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id, forceFreshSession: true });
+    expect(next).toMatchObject({ sessionId: null });
+  });
+
+  it("after a pause over an ssh lease: the kept session is resumed on the proof the pause itself accepted", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_provider_stop_unverified", cut);
+    });
+    expect(await lateResultOf(cancelled.id)).toMatchObject({ record: { errorCode: "router_provider_stop_unverified", session: "kept" } });
+    await stopProven(f, cancelled.id, "ssh");
+    const next = await nextExecution(f, () => personMessage(f));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id });
+    expect(next.run.contextSnapshot).not.toHaveProperty("forceFreshSession");
+    expect({ sessionId: next.sessionId, sessionParams: next.sessionParams }).toMatchObject({ sessionId: cut, sessionParams: paramsOf(cut) });
+  });
+
+  it("after a budget pause too: the kept session is resumed", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", cut);
+    });
+    // The stop a budget issues carries its own reason; it is a pause stop like the others (governance-pause-stop.ts).
+    await db.update(heartbeatRuns).set({ resultJson: sql`jsonb_set(${heartbeatRuns.resultJson}, '{cancellation,reason}', '"Cancelled due to budget pause"')` })
+      .where(eq(heartbeatRuns.id, cancelled.id));
+    await stopProven(f, cancelled.id);
+    const next = await nextExecution(f, () => personMessage(f));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id });
+    expect(next.run.contextSnapshot).not.toHaveProperty("forceFreshSession");
+    expect(next).toMatchObject({ sessionId: cut });
   });
 
   it("another configuration: the kept session is not handed to the next run, and the run's log says so", async () => {
