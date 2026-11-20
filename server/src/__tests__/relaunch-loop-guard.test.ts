@@ -55,7 +55,8 @@ const WAIT = "router_waiting_for_resources";
 const ENGINE_LINE = "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n";
 const ROUTER_LINE = "[paperclip-router] waiting for a cost estimate (still waiting)\n";
 const HOST_LINE = "[paperclip] Restoring workspace changes from the remote target.\n";
-const CODEX_ANNOUNCEMENT = "{\"type\":\"thread.started\",\"thread_id\":\"019a-session\"}\n";
+const NARRATION = "Let me run the build again and read what it prints.";
+const CODEX_ANNOUNCEMENT ="{\"type\":\"thread.started\",\"thread_id\":\"019a-session\"}\n";
 
 const at = (minutesAgo: number) => new Date(Date.UTC(2026, 10, 20, 6, 45) - minutesAgo * 60_000);
 function sample(minutesAgo: number, patch: Partial<RelaunchLoopRunSample> = {}): RelaunchLoopRunSample {
@@ -233,7 +234,7 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
   type Step =
     | { kind: "fail"; code: string; session?: string; clearSession?: boolean; comment?: boolean; document?: boolean; productionActivity?: boolean; timedOut?: boolean;
         /** What the engine did before its timeout, as the server records it. */
-        engine?: "output_tokens" | "summary" | "output" | "router_lines" | "host_lines" | "router_around_output" | "announcement_after_a_wait" }
+        engine?: "output_tokens" | "summary" | "narration" | "output" | "router_lines" | "host_lines" | "router_around_output" | "announcement_after_a_wait" }
     | { kind: "ok"; session: string };
   // What each engine launch was asked to resume, in order, per issue.
   type Launch = { runId: string; agentId: string; resumed: string | null; resumedParams: Record<string, unknown> | null };
@@ -294,6 +295,7 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
           return { exitCode: null, signal: "SIGTERM", timedOut: true, errorCode: "timeout", errorMessage: "Timed out after 1200s",
             ...(step.engine === "output_tokens" ? { usage: { inputTokens: 1200, outputTokens: 5400 }, usageBasis: "per_run" as const } : {}),
             ...(step.engine === "summary" ? { summary: "Built the player and ran the smoke scene." } : {}),
+            ...(step.engine === "narration" ? { summary: NARRATION } : {}),
             ...(step.session ? { sessionId: step.session, sessionDisplayId: step.session, sessionParams: { sessionId: step.session } } : {}) };
         }
         return {
@@ -498,6 +500,9 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
   it.each([
     ["the model's output tokens", "output_tokens"],
     ["a summary returned by the adapter", "summary"],
+    // The last message of an engine cut in the middle of its work: the server posts no comment for it, so the
+    // summary kept on the run is the only sign.
+    ["a last message that is narration and is posted nowhere", "narration"],
     ["output still written after its first five minutes", "output"],
   ] as const)("three timeouts during which the engine worked (%s) and nothing on the issue: no guard, the session is kept", async (_name, engine) => {
     const f = await seed();
@@ -510,6 +515,11 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
     expect(worked.map((run) => `${run.status}:${run.sessionIdBefore}`)).toEqual(["timed_out:s1", "timed_out:s1", "timed_out:s1"]);
     if (engine === "output_tokens") expect(worked[2]!.usageJson).toMatchObject({ outputTokens: 5400 });
     if (engine === "summary") expect(worked[2]!.resultJson).toMatchObject({ summary: "Built the player and ran the smoke scene." });
+    if (engine === "narration") {
+      expect(worked[2]!.resultJson).toMatchObject({ summary: NARRATION });
+      const posted = await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId));
+      expect(posted.filter((row) => row.authorAgentId === f.devId)).toHaveLength(0);
+    }
     if (engine === "output") expect(worked[2]!.lastOutputAt).not.toBeNull();
     // Twenty minutes each; the output of each run was written near its end.
     await db.update(heartbeatRuns).set({ startedAt: sql`${heartbeatRuns.finishedAt} - interval '20 minutes'` })
