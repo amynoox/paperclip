@@ -157,7 +157,7 @@ describe("the runs a pause cut, when the role resumes", () => {
     it("a task where a person's decision is pending", async () => {
       const f = await fixture();
       await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
-        kind: "request_confirmation", continuationPolicy: "none", payload: {}, effectiveResolverPolicy: "human_only" });
+        kind: "request_confirmation", continuationPolicy: "none", payload: {}, effectiveResolverPolicy: "human_only" } as never);
       await roleResumes(f);
       await expectRefused(f, "waiting_for_person", { wait: "decision_pending", saved: true });
     });
