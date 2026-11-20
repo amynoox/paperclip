@@ -248,6 +248,29 @@ describe("the runs a pause cut, when the role resumes", () => {
       expect((await traces(f))[2]!.details).toMatchObject({ replacesRetryRequestId: keptRequest!.id });
     });
 
+    it("a kept request overtaken by a person's message: one run continues the cut run, not two", async () => {
+      const f = await fixture({ lease: "ssh", finishedMinutesAgo: 5 });
+      await roleResumes(f);
+      await expectKept(f, "stop_not_proven", "remote_cleanup");
+      const proven = new Date(Date.now() - 13 * HOUR);
+      await db.update(heartbeatRuns).set({ finishedAt: proven }).where(eq(heartbeatRuns.id, f.cut.id));
+      await db.update(environmentLeases).set({ releasedAt: proven }).where(eq(environmentLeases.heartbeatRunId, f.cut.id));
+      // Before any pass dispatches the kept request, a person writes on the task.
+      const commentId = randomUUID();
+      await db.insert(issueComments).values({ id: commentId, companyId: f.companyId, issueId: f.issueId, authorType: "user",
+        authorUserId: "board", body: "Go on." });
+      await heartbeatService(db).wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason: "issue_commented",
+        requestedByActorType: "user", requestedByActorId: "board",
+        payload: { issueId: f.issueId, commentId }, contextSnapshot: { issueId: f.issueId, wakeCommentId: commentId } });
+      await heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
+      await heartbeatService(db).resumeQueuedRuns();
+      const onTask = (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+        .filter(run => run.contextSnapshot?.issueId === f.issueId && run.id !== f.cut.id);
+      expect(onTask.map(run => run.status), JSON.stringify((await wakes(f)).map(wake => ({ reason: wake.reason, status: wake.status,
+        error: wake.error, wait: wake.payload?.executionWait })))).toEqual(["queued"]);
+      expect(await continuations(f)).toHaveLength(1);
+    });
+
     it("a task where a person's decision is pending", async () => {
       const f = await fixture();
       await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
