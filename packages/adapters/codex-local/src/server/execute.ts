@@ -1548,6 +1548,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           costUsd: null,
           pricingContext: attempt.pricingContext,
           errorMessage: `Timed out after ${timeoutSec}s`,
+          // What the engine last said before the timeout, as the monitor's result above and a success return it.
+          // Codex reports its tokens at the end of a turn only, so on a timeout this text is the one sign the
+          // host gets that the engine was at work (STUDIO-0078 reads it); it stays empty when Codex said nothing.
+          summary: attempt.parsed.summary,
           ...(announcedSessionId
             ? { sessionId: announcedSessionId, sessionParams: sessionParamsFor(announcedSessionId), sessionDisplayId: announcedSessionId }
             : {}),

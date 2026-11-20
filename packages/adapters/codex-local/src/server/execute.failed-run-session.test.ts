@@ -175,6 +175,29 @@ describe("codex_local: the session of a run that failed", () => {
     }
   });
 
+  // Codex reports its tokens at the end of a turn only. On a timeout, what it last said is the one sign the host
+  // has that it was at work: a role that says what it starts, then compiles in silence until its timeout.
+  const said = (text: string) => JSON.stringify({ type: "item.completed", item: { type: "agent_message", text } });
+  const commandStarted = JSON.stringify({ type: "item.started", item: { type: "command_execution", command: "unity -batchmode -buildTarget StandaloneWindows64" } });
+
+  it("a run that reaches its timeout after Codex said something returns what it last said", async () => {
+    engineAnswers({ exitCode: null, signal: "SIGTERM", timedOut: true,
+      stdout: [started(NEW), said("Reading the build settings."), said("Starting the player build; this takes a while."), commandStarted].join("\n") });
+    const { result } = await run({ timeoutSec: 30 });
+    expect(result.timedOut).toBe(true);
+    expect(result.summary).toBe("Starting the player build; this takes a while.");
+    expect(result.sessionId).toBe(NEW);
+  });
+
+  it("a run that reaches its timeout before Codex said anything returns an empty summary", async () => {
+    // The session announced, then silence: the shape of a session that no longer answers.
+    engineAnswers(timedOutAfterStart(NEW));
+    const { result } = await run({ timeoutSec: 30 });
+    expect(result.timedOut).toBe(true);
+    expect(result.summary).toBe("");
+    expect(result.sessionId).toBe(NEW);
+  });
+
   it("the output-inactivity monitor is unchanged: it stops the engine and returns no session, on purpose", async () => {
     // Codex announces its session, then stays silent longer than the monitor allows.
     engineAnswers({ exitCode: null, signal: "SIGTERM", stdout: `${started(NEW)}\n`, hangMs: 400 });
