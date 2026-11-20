@@ -377,7 +377,8 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(false);
     await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, newer));
     expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(true);
-    await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.id, (await askedAgain(f))[0]!.wake.id));
+    // No request waits any more (the one that was filed is taken away, so that a new one could be filed).
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, (await askedAgain(f))[0]!.wake.id));
     // The same run, had its adapter been invoked: nothing is filed.
     await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: failed.id, seq: 200_000,
       eventType: "adapter.invoke", stream: "system", level: "info", message: "adapter invocation" });
@@ -390,6 +391,10 @@ const support = await getEmbeddedPostgresTestSupport();
     // Had it failed on a code that is not a transient preparation failure: nothing is filed.
     await db.update(heartbeatRuns).set({ errorCode: "setup_failed" }).where(eq(heartbeatRuns.id, failed.id));
     expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(false);
+    expect(await askedAgain(f)).toHaveLength(0);
+    // And as it really is, with no request waiting: the request is filed.
+    await db.update(heartbeatRuns).set({ errorCode: "environment_provider_unavailable" }).where(eq(heartbeatRuns.id, failed.id));
+    expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(true);
     expect(await askedAgain(f)).toHaveLength(1);
   });
 
