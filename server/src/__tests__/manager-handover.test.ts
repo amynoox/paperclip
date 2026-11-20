@@ -425,6 +425,25 @@ describePostgres("a ticket the worker router refuses goes to the role's direct m
     expect(await blockNotices(f.issueId)).toHaveLength(1);
   }, 240_000);
 
+  // The sweep itself must not read again the refusal that caused the hand-over: given back in progress, the role's
+  // latest run on the ticket is still that refused run.
+  it("given back in progress, the sweep neither hands the ticket again nor blocks it on the refusal already handed", async () => {
+    const f = await seed("in_progress", [{ minutesAgo: 30, errorCode: CLOSED }]);
+    refusals.delete(f.issueId);
+    await sweep(f);
+    await expectHanded(f, CLOSED, "in_progress");
+    await db.update(issues).set({ assigneeAgentId: f.agentId, status: "in_progress", updatedAt: new Date() }).where(eq(issues.id, f.issueId));
+    await endHeldRuns();
+    holdRuns = true;
+    await sweep(f);
+    await sweep(f);
+    expect(await actionsOf(f.issueId)).toHaveLength(0);
+    expect(await blockNotices(f.issueId)).toHaveLength(0);
+    expect(await handoversOf(f.issueId)).toHaveLength(1);
+    expect(await issueOf(f.issueId)).toMatchObject({ assigneeAgentId: f.agentId });
+    expect((await issueOf(f.issueId)).status).not.toBe("blocked");
+  }, 180_000);
+
   // What follows when the manager does nothing with the ticket it received: the product's own path for a ticket in
   // review that nobody reviews. One more wake of the manager, then a block with a Board action.
   it("the manager decides nothing: it is woken once more by the review path, then the ticket is blocked for the Board", async () => {
