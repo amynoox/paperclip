@@ -344,16 +344,15 @@ function shellQuote(value: string) {
 //   shell started when that is another: a version-manager shim that runs `node` as its child (upstream
 //   paperclipai/paperclip#18724, which stops the bridge by the number of `ready.json` for that reason);
 // - a launch first stops the bridge a previous run left in the folder, by the numbers that run recorded;
-// - neither ends a process that the system shows to be something else (a number reused after a restart).
+// - neither ends a process that the system shows to be something else (a number reused after a restart), and a stop
+//   leaves a number of its own that the folder's files now give to another bridge.
 
 /**
- * Shell function `bridge_end <number>`: ends the process when its command line shows it to be a bridge, and returns
- * 0 when it ended one.
- * - `strict`, in a launch, for a number another run recorded: only a process whose command line holds the entrypoint
- *   of THIS folder's bridge. A process that cannot be read is left.
- * - `own`, in a stop, for a number of the bridge's own launch: a process whose command line holds the bridge's
- *   entrypoint file name (the folder is known already), and also a live process whose command line cannot be read,
- *   as before this patch.
+ * Shell function `bridge_end <number>`: ends the process when its command line holds the entrypoint of THIS folder's
+ * bridge (a path under the bridge's own folder, so no other folder's bridge has it), and returns 0 when it ended one.
+ * - `strict`, in a launch, for a number another run recorded: a process whose command line cannot be read is left.
+ * - `own`, in a stop, for a number of the bridge's own launch: a live process whose command line cannot be read is
+ *   ended too, as before this patch.
  * The whole command line is asked for (`-ww`): a `ps` that cuts it to a width would hide the path of a bridge's
  * entrypoint, which is long. The studio's worker Macs give the whole line without it (read on 20 Nov 2026); the flag
  * is kept for a `ps` that would cut.
@@ -369,7 +368,7 @@ function bridgeEndShellFunction(entrypoint: string, mode: "strict" | "own"): str
     `  if [ -z "$bridge_args" ]; then`,
     mode === "strict" ? "    return 1" : `    kill -0 ${number} 2>/dev/null || return 1`,
     "  else",
-    `    case "$bridge_args" in *${shellQuote(mode === "strict" ? entrypoint : SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT)}*) ;; *) return 1 ;; esac`,
+    `    case "$bridge_args" in *${shellQuote(entrypoint)}*) ;; *) return 1 ;; esac`,
     "  fi",
     `  kill ${number} 2>/dev/null || true`,
     "  i=0",
@@ -1983,12 +1982,24 @@ export async function startSandboxCallbackBridgeServer(input: {
             // End the processes of this launch, and no other. Whatever `server.pid` holds by now belongs to whoever
             // wrote it last: the bridge of a later run of the same folder, at work.
             ...bridgeEndShellFunction(remoteEntrypoint, "own"),
-            `bridge_end ${numberOrNothing(bridgePid)} || true`,
-            `bridge_end ${numberOrNothing(launchPid)} || true`,
-            // The two files are removed only while they are still this bridge's.
+            // What the folder says now. `ready.json` is this bridge's only while it still reads what this bridge
+            // wrote; otherwise the two files belong to whoever wrote them last.
             `recorded="$(cat ${shellQuote(directories.pidFile)} 2>/dev/null || true)"`,
-            `if [ -n "$recorded" ] && { [ "$recorded" = ${numberOrNothing(launchPid)} ] || [ "$recorded" = ${numberOrNothing(bridgePid)} ]; }; then rm -f ${shellQuote(directories.pidFile)}; fi`,
-            `if [ "$(cat ${shellQuote(directories.readyFile)} 2>/dev/null || true)" = ${shellQuote(ownReadyText)} ]; then rm -f ${shellQuote(directories.readyFile)}; fi`,
+            `ready_now="$(cat ${shellQuote(directories.readyFile)} 2>/dev/null || true)"`,
+            `ready_number="$(printf '%s' "$ready_now" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' | head -n 1)"`,
+            "mine=0",
+            `if [ "$ready_now" = ${shellQuote(ownReadyText)} ]; then mine=1; fi`,
+            // A number of this launch that the folder's files now give to another bridge is that bridge's: the
+            // system reused it (a restart of the machine) for the bridge of the run at work. It is left.
+            "end_own() {",
+            `  if [ "$mine" = 0 ] && [ -n "$1" ] && { [ "$1" = "$recorded" ] || [ "$1" = "$ready_number" ]; }; then return 0; fi`,
+            `  bridge_end "$1" || true`,
+            "}",
+            `end_own ${numberOrNothing(bridgePid)}`,
+            `end_own ${numberOrNothing(launchPid)}`,
+            // The two files are removed only while they are still this bridge's.
+            `if [ "$mine" = 1 ] && [ -n "$recorded" ] && { [ "$recorded" = ${numberOrNothing(launchPid)} ] || [ "$recorded" = ${numberOrNothing(bridgePid)} ]; }; then rm -f ${shellQuote(directories.pidFile)}; fi`,
+            `if [ "$mine" = 1 ]; then rm -f ${shellQuote(directories.readyFile)}; fi`,
           ].join("\n"),
         ),
         cwd: input.remoteCwd,

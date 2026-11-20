@@ -44,9 +44,9 @@ describe("sandbox callback bridge: each bridge is known by the process its own l
   type ExecInput = { command: string; args?: string[]; cwd?: string; env?: Record<string, string>; stdin?: string; timeoutMs?: number };
   /**
    * Executes each command on this machine. `rewriteLaunchReport` stands in for a launch whose report differs,
-   * `rewriteReady` for a bridge whose `ready.json` reads otherwise, `pathFirst` for a machine whose programs differ.
+   * `pathFirst` (read at each command) for a machine whose programs differ.
    */
-  function createExecRunner(rewriteLaunchReport?: (stdout: string) => string, more: { rewriteReady?: (stdout: string) => string; pathFirst?: string } = {}) {
+  function createExecRunner(rewriteLaunchReport?: (stdout: string) => string, more: { pathFirst?: string } = {}) {
     return {
       execute: async (input: ExecInput): Promise<RunProcessResult> => {
         const startedAt = new Date().toISOString();
@@ -62,10 +62,8 @@ describe("sandbox callback bridge: each bridge is known by the process its own l
         try {
           const result = await execFile(command, args, { cwd: input.cwd, env, maxBuffer: 32 * 1024 * 1024, timeout: input.timeoutMs });
           const isLaunchReport = /^\{"pid":\d+,"stoppedStalePid":\d+\}\s*$/.test(result.stdout);
-          const isReady = /^\{"pid":\d+,"host":/.test(result.stdout);
           return { exitCode: 0, signal: null, timedOut: false, stderr: result.stderr, pid: null, startedAt,
-            stdout: isLaunchReport && rewriteLaunchReport ? rewriteLaunchReport(result.stdout)
-              : isReady && more.rewriteReady ? more.rewriteReady(result.stdout) : result.stdout };
+            stdout: isLaunchReport && rewriteLaunchReport ? rewriteLaunchReport(result.stdout) : result.stdout };
         } catch (error) {
           const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: string | number | null; signal?: NodeJS.Signals | null; killed?: boolean };
           return { exitCode: typeof err.code === "number" ? err.code : null, signal: err.signal ?? null, timedOut: Boolean(err.killed && input.timeoutMs),
@@ -283,16 +281,64 @@ describe("sandbox callback bridge: each bridge is known by the process its own l
     expect(alive(b.launchPid)).toBe(false);
   }, 60_000);
 
-  it("a bridge whose ready.json gives no number is ended by the process the shell started", async () => {
+  it("a wrapper that outlives the bridge it ran is ended too: the process the shell started is one of the bridge's numbers", async () => {
     const folder = await taskFolder();
-    const bridge = await folder.launch(createExecRunner(undefined, { rewriteReady: (stdout) => stdout.replace(/"pid":\d+,/, "") }));
-    expect(bridge.pid).toBe(0);
-    expect(bridge.launchPid).toBeGreaterThan(0);
-    expect(alive(bridge.launchPid)).toBe(true);
+    // A wrapper that does not end with its child.
+    const wrapper = path.join(path.dirname(folder.shim), "node-wrapper");
+    await writeFile(wrapper, `#!/bin/sh\n${JSON.stringify(process.execPath)} "$@"\nsleep 20\n`, { mode: 0o755 });
+    const bridge = await folder.launch(createExecRunner(), wrapper);
+    expect(bridge.launchPid).not.toBe(bridge.pid);
     await bridge.stop();
+    expect(alive(bridge.pid)).toBe(false);
     expect(alive(bridge.launchPid)).toBe(false);
-    expect(await reachable(bridge.baseUrl)).toBe(false);
     expect(await pidFileOf(folder.directories)).toBeNull();
+  }, 60_000);
+
+  // After a restart of the machine the numbers start again from low values: a number an old bridge had may then
+  // belong to another bridge. A trial cannot choose a process's number, so the old bridge's handle is made with a
+  // launch whose report is rewritten to the number in question.
+  it("the folder's bridge now runs under a number the old bridge had: the old bridge's late stop ends nothing, and the bridge at work still answers", async () => {
+    const folder = await taskFolder();
+    // The bridge of the run at work, relaunched in the folder after the restart.
+    const atWork = await folder.launch();
+    const atWorkReady = await readFile(folder.directories.readyFile, "utf8");
+    // The old bridge's handle. Its launch must leave the bridge at work alone: it is given a `ps` that answers nothing.
+    const bin = path.join(path.dirname(folder.shim), "no-ps");
+    await mkdir(bin, { recursive: true });
+    await writeFile(path.join(bin, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const machine: { pathFirst?: string } = { pathFirst: bin };
+    const old = await folder.launch(createExecRunner((stdout) => stdout.replace(/"pid":\d+/, `"pid":${atWork.pid}`), machine));
+    machine.pathFirst = undefined;
+    expect(old.launchPid).toBe(atWork.pid);
+    expect(alive(atWork.pid)).toBe(true);
+    // The folder's two files are those of the bridge at work, as after its launch.
+    await writeFile(folder.directories.pidFile, `${atWork.pid}\n`, "utf8");
+    await writeFile(folder.directories.readyFile, atWorkReady, "utf8");
+
+    await keptBridgeTimerFires(old);
+
+    expect(alive(atWork.pid)).toBe(true);
+    expect(await reachable(atWork.baseUrl)).toBe(true);
+    expect(await pidFileOf(folder.directories)).toBe(String(atWork.pid));
+    expect(await readyPidOf(folder.directories)).toBe(atWork.pid);
+    await atWork.stop();
+    expect(alive(atWork.pid)).toBe(false);
+  }, 60_000);
+
+  it("a number the old bridge had now belongs to the bridge of another folder: the old bridge's stop does not touch it", async () => {
+    const folder = await taskFolder();
+    const other = await taskFolder();
+    const elsewhere = await other.launch();
+    const old = await folder.launch(createExecRunner((stdout) => stdout.replace(/"pid":\d+/, `"pid":${elsewhere.pid}`)));
+    expect(old.launchPid).toBe(elsewhere.pid);
+    await old.stop();
+    // Its own bridge is ended; the other folder's bridge, a bridge too, is not this folder's.
+    expect(alive(old.pid)).toBe(false);
+    expect(alive(elsewhere.pid)).toBe(true);
+    expect(await reachable(elsewhere.baseUrl)).toBe(true);
+    expect(await pidFileOf(other.directories)).toBe(String(elsewhere.pid));
+    expect(await readyPidOf(other.directories)).toBe(elsewhere.pid);
+    await elsewhere.stop();
   }, 60_000);
 
   it("a previous bridge whose ready.json is gone is still stopped at the next launch, by the number in server.pid", async () => {
