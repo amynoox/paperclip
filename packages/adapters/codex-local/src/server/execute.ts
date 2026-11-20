@@ -1493,6 +1493,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       });
       if (attempt.monitor?.fired) {
         const errorMessage = formatOutputInactivityMonitorErrorMessage(attempt.monitor.elapsedMsSinceLastEvent);
+        // STUDIO-0080 (the owner, 20 Nov 2026): a role under Codex keeps its conversation when its run is stopped
+        // after thirty minutes without output. The session Codex announced is returned with the failure, as on a
+        // timeout. If that session is the one that no longer answers, the relaunch guard (STUDIO-0078) settles it
+        // at the next runs.
+        const monitoredSessionId = attempt.parsed.sessionId;
         return {
           exitCode: null,
           signal: attempt.monitor.terminationSignal ?? attempt.proc.signal,
@@ -1504,9 +1509,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           errorFamily: null,
           usage: attempt.parsed.usageReported ? attempt.parsed.usage : undefined,
           usageBasis: attempt.parsed.usageBasis,
-          sessionId: null,
-          sessionParams: null,
-          sessionDisplayId: null,
+          sessionId: monitoredSessionId,
+          sessionParams: monitoredSessionId ? sessionParamsFor(monitoredSessionId) : null,
+          sessionDisplayId: monitoredSessionId,
           provider: "openai",
           biller,
           model,
@@ -1524,14 +1529,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             },
           },
           summary: attempt.parsed.summary,
-          clearSession: clearSessionOnMissingSession,
+          clearSession: clearSessionOnMissingSession && !monitoredSessionId,
         };
       }
       if (attempt.proc.timedOut) {
         // STUDIO-0080: a run that reached its timeout returned no session, so the conversation Codex had opened
         // (`thread.started`) was lost and the next run started from nothing. It is returned with the failure,
-        // as it already is when the engine is killed or its link is lost. The output-inactivity monitor above
-        // keeps returning no session, on purpose.
+        // as it already is when the engine is killed or its link is lost, and as the output-inactivity monitor
+        // above returns it.
         const announcedSessionId = attempt.parsed.sessionId;
         return {
           exitCode: attempt.proc.exitCode,

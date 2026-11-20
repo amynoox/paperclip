@@ -198,21 +198,81 @@ describe("codex_local: the session of a run that failed", () => {
     expect(result.sessionId).toBe(NEW);
   });
 
-  it("the output-inactivity monitor is unchanged: it stops the engine and returns no session, on purpose", async () => {
+  // The owner, 20 Nov 2026: a role under Codex keeps its conversation when its run is stopped after thirty
+  // minutes without output. The monitor returned no session, on purpose; it returns the announced one now.
+  const silentAfterStart = (threadId: string): Engine => ({ exitCode: null, signal: "SIGTERM", stdout: `${started(threadId)}\n`, hangMs: 400 });
+
+  it("the output-inactivity monitor stops the engine and returns the session Codex announced, with its parameters", async () => {
     // Codex announces its session, then stays silent longer than the monitor allows.
-    engineAnswers({ exitCode: null, signal: "SIGTERM", stdout: `${started(NEW)}\n`, hangMs: 400 });
+    engineAnswers(silentAfterStart(NEW));
+    const { result, workspaceDir } = await run({ outputInactivityTimeoutMs: 100 });
+    expect(result.errorCode).toBe("codex_output_inactivity_monitor");
+    expect(result.timedOut).toBe(false);
+    expect(result.sessionId).toBe(NEW);
+    expect(result.sessionDisplayId).toBe(NEW);
+    expect(result.sessionParams).toEqual({ sessionId: NEW, cwd: workspaceDir, workspaceId: "workspace-1",
+      repoUrl: "https://github.com/paperclipai/paperclip.git", repoRef: "main" });
+    expect(result.clearSession).toBe(false);
+  });
+
+  it("the session the monitor returned is the one the next run resumes", async () => {
+    engineAnswers(silentAfterStart(NEW), succeeded(NEW));
+    const stopped = (await run({ outputInactivityTimeoutMs: 100 })).result;
+    expect(stopped.errorCode).toBe("codex_output_inactivity_monitor");
+    const next = (await run({ runtime: { sessionId: stopped.sessionId!, sessionParams: stopped.sessionParams ?? {} } })).result;
+    // Two launches: the one the monitor stopped, opened on nothing, then the resume of its session.
+    expect(launches().map(resumedIn)).toEqual([null, NEW]);
+    expect(next.exitCode).toBe(0);
+    expect(next.sessionId).toBe(NEW);
+  });
+
+  it("the monitor stops an engine that announced nothing: no session, and nothing cleared", async () => {
+    engineAnswers({ exitCode: null, signal: "SIGTERM", stdout: "", hangMs: 400 });
     const { result } = await run({ outputInactivityTimeoutMs: 100 });
     expect(result.errorCode).toBe("codex_output_inactivity_monitor");
     expect(result.sessionId).toBeNull();
     expect(result.sessionParams).toBeNull();
     expect(result.sessionDisplayId).toBeNull();
+    expect(result.clearSession).toBe(false);
+    // A resumed run that announced nothing: no session is made up from the kept one.
+    vi.clearAllMocks();
+    engineAnswers({ exitCode: null, signal: "SIGTERM", stdout: "", hangMs: 400 });
+    const resumed = (await run({ outputInactivityTimeoutMs: 100, runtime: { sessionId: KEPT, sessionParams: { sessionId: KEPT } } })).result;
+    expect(resumedIn(launches()[0]!)).toBe(KEPT);
+    expect(resumed.sessionId).toBeNull();
+    expect(resumed.clearSession).toBe(false);
   });
 
-  it("the monitor wins over the timeout when both ended the run: still no session", async () => {
+  it("a resumed run the monitor stops keeps its session", async () => {
+    engineAnswers(silentAfterStart(KEPT));
+    const { result } = await run({ outputInactivityTimeoutMs: 100, runtime: { sessionId: KEPT, sessionParams: { sessionId: KEPT } } });
+    expect(resumedIn(launches()[0]!)).toBe(KEPT);
+    expect(result.errorCode).toBe("codex_output_inactivity_monitor");
+    expect(result.sessionId).toBe(KEPT);
+    expect(result.clearSession).toBe(false);
+  });
+
+  it("the fresh retry after a refused resume is stopped by the monitor: its own session replaces the refused one, or the refused one is cleared", async () => {
+    engineAnswers(rejected(KEPT), silentAfterStart(FRESH));
+    const announced = (await run({ outputInactivityTimeoutMs: 100, runtime: { sessionId: KEPT, sessionParams: { sessionId: KEPT } } })).result;
+    expect(launches().map(resumedIn)).toEqual([KEPT, null]);
+    expect(announced.errorCode).toBe("codex_output_inactivity_monitor");
+    expect(announced.sessionId).toBe(FRESH);
+    expect(announced.clearSession).toBe(false);
+    // Stopped before any announcement: the refused session is cleared, as before.
+    vi.clearAllMocks();
+    engineAnswers(rejected(KEPT), { exitCode: null, signal: "SIGTERM", stdout: "", hangMs: 400 });
+    const silent = (await run({ outputInactivityTimeoutMs: 100, runtime: { sessionId: KEPT, sessionParams: { sessionId: KEPT } } })).result;
+    expect(silent.sessionId).toBeNull();
+    expect(silent.clearSession).toBe(true);
+  });
+
+  it("the monitor wins over the timeout when both ended the run: the session is returned under the monitor's code", async () => {
     engineAnswers({ exitCode: null, signal: "SIGTERM", timedOut: true, stdout: `${started(NEW)}\n`, hangMs: 400 });
     const { result } = await run({ outputInactivityTimeoutMs: 100, timeoutSec: 30 });
     expect(result.errorCode).toBe("codex_output_inactivity_monitor");
-    expect(result.sessionId).toBeNull();
+    expect(result.timedOut).toBe(false);
+    expect(result.sessionId).toBe(NEW);
   });
 
   it("a resumed run that reaches its timeout after the announcement keeps the session", async () => {
