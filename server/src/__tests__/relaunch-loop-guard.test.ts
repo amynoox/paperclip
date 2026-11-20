@@ -1179,6 +1179,41 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
     expect(await boardActions(f)).toEqual([expect.objectContaining({ ownerType: "board", status: "active" })]);
   }, 300_000);
 
+  // One answer of the CTO, as in production: its comment wakes the assignee of the ticket, whoever that is by then.
+  // While the role is the assignee, that is one more run of the role, which fails as scripted.
+  async function ctoAnswers(f: Fixture, session: string): Promise<"role ran" | "role not woken"> {
+    if ((await issueRow(f)).assigneeAgentId !== f.devId) {
+      await db.insert(issueComments).values({
+        companyId: f.companyId, issueId: f.issueId, authorType: "agent", authorAgentId: f.ctoId, body: "Try again, the build is ready.",
+      });
+      return "role not woken";
+    }
+    await turn(f, fail(ACK_UNCERTAIN, { session }));
+    return "role ran";
+  }
+
+  // The question asked after TR-2069: twenty-six `router_interactive_ack_uncertain` in a row in production. With the
+  // guard, twenty-six answers of the CTO start the role five times in all.
+  it("TR-2069 at length: twenty-six answers of the CTO start the role five times, then the issue is the CTO's and nothing loops", async () => {
+    const f = await seed();
+    await openSession(f);
+    const outcomes: string[] = [];
+    // The session each run returns: s1 while it is resumed, s2 from the fresh run on.
+    for (let answer = 1; answer <= 26; answer += 1) outcomes.push(await ctoAnswers(f, devLaunches(f).length < 4 ? "s1" : "s2"));
+    expect(outcomes.slice(0, 4)).toEqual(["role ran", "role ran", "role ran", "role ran"]);
+    expect(outcomes.slice(4)).toEqual(Array.from({ length: 22 }, () => "role not woken"));
+    // The engine was launched five times: once to open the session, three times on it, once fresh.
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", null]);
+    expect((await devRuns(f)).filter((run) => run.startedAt && run.errorCode === ACK_UNCERTAIN)).toHaveLength(4);
+    expect(await guardNotes(f)).toHaveLength(1);
+    expect(await handovers(f)).toHaveLength(1);
+    expect(await boardActions(f)).toHaveLength(0);
+    expect(await issueRow(f)).toMatchObject({ status: "in_review", assigneeAgentId: f.ctoId });
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    expect(devLaunches(f)).toHaveLength(5);
+  }, 600_000);
+
   it("the server stopped before the hand-over: asked later, the issue is handed once, under the fresh run", async () => {
     const f = await seed();
     await openSession(f);
