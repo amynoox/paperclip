@@ -42,11 +42,23 @@
 //   the router refuses again at no cost.
 // - router_ticket_blocked: the ticket is blocked; its dependency wake starts
 //   it again once unblocked. It stays a bounded wait (list below).
+// STUDIO-0083: four more refusals the router returns before any reservation and names permanent (asking again
+// cannot pass until the ticket or its coordination ticket is corrected): the `worker-router` block cannot be read
+// (router_request_block_invalid), it names a system the router does not know (router_request_system_unknown), the
+// attempt of the session was already used (router_attempt_already_used), this ticket already completed its part
+// (router_ticket_already_completed). Until studio.24 they were retried as ordinary failures and then blocked.
+// STUDIO-0083 also changes what follows a refusal on a ticket at work (`todo`, `in_progress`) whose role has a
+// direct manager: the ticket is handed to that manager, with a notice, and no Board action is created
+// (manager-handover.ts, called where the block is applied). Without a manager, and in review, nothing changes.
 export const ROUTER_REFUSAL_ERROR_CODES: readonly string[] = Object.freeze([
   "router_group_participant_ended",
   "router_group_participant_closed",
   "router_group_participant_mismatch",
   "router_group_participant_reserved",
+  "router_request_block_invalid",
+  "router_request_system_unknown",
+  "router_attempt_already_used",
+  "router_ticket_already_completed",
 ]);
 
 export type RouterRefusalOutcome = "block" | "note";
@@ -62,6 +74,10 @@ export function routerRefusalOutcome(
   switch (code) {
     case "router_group_participant_reserved":
     case "router_group_participant_mismatch":
+    case "router_request_block_invalid":
+    case "router_request_system_unknown":
+    case "router_attempt_already_used":
+    case "router_ticket_already_completed":
       return "block";
     case "router_group_participant_closed":
     case "router_group_participant_ended":
@@ -94,7 +110,91 @@ const ROUTER_REFUSAL_TEXTS: Readonly<Record<string, RouterRefusalText>> = Object
     meaning: "this participant has finished its part of the group",
     gesture: "If this participant's part is finished, move the issue to review or done; otherwise reassign it, or correct the participant in the `worker-router` block of the description.",
   },
+  router_request_block_invalid: {
+    title: "Worker router: the request block is invalid",
+    meaning: "the `worker-router` block of this ticket's description cannot be read",
+    gesture: "Correct the `worker-router` block of the description, then move this issue back to `todo`.",
+  },
+  router_request_system_unknown: {
+    title: "Worker router: unknown system",
+    meaning: "the `worker-router` block of this ticket's description names a system the router does not know",
+    gesture: "Correct the `worker-router` block of the description, then move this issue back to `todo`.",
+  },
+  router_attempt_already_used: {
+    title: "Worker router: this attempt was already used",
+    meaning: "the attempt of the coordinated session this ticket names was already used",
+    gesture: "Declare a new attempt of the session in the coordination ticket, or open a new ticket for the follow-up.",
+  },
+  router_ticket_already_completed: {
+    title: "Worker router: this ticket already completed its part",
+    meaning: "this ticket already completed its part of the coordinated session",
+    gesture: "Declare a new attempt of the session in the coordination ticket, or open a new ticket for the follow-up.",
+  },
 });
+
+// STUDIO-0083: what the manager reads when a refused ticket at work is handed to it. `{manager}` is filled by the
+// hand-over; `message` is the refused run's own error text, already redacted by the caller.
+const ROUTER_REFUSAL_HANDOVER: Readonly<Record<string, { reason: string | null; ask: string; nextAction: string }>> = Object.freeze({
+  router_group_participant_ended: {
+    reason: "this participant finished its part of the coordinated session and returned its machine. This role gets no other run of its own on this ticket while the other participants are at work; afterwards only the whole group can be reserved again, if none of its tickets was closed",
+    ask: "close it; or, to make it work again, end the failed attempt and declare a new attempt of the session in the coordination ticket",
+    nextAction: "Close this ticket, or end the failed attempt and declare a new attempt of the session in the coordination ticket.",
+  },
+  router_group_participant_closed: {
+    reason: "another participant of this ticket's group is done or cancelled, so the group cannot be reserved again as it is",
+    ask: "close it; or, to make the session work again, declare a new attempt in the coordination ticket with participant tickets that are all open",
+    nextAction: "Close this ticket, or declare a new attempt in the coordination ticket with participant tickets that are all open.",
+  },
+  router_group_participant_reserved: {
+    reason: null,
+    ask: "in the participants list of the coordination ticket, replace that ticket by a new sub-ticket of the coordination ticket, assigned to the same role and never run; the new ticket must not run before the list names it. The list uses internal ticket ids",
+    nextAction: "Replace the reserved participant by a new sub-ticket of the coordination ticket in its participants list.",
+  },
+  router_group_participant_mismatch: {
+    reason: null,
+    ask: "correct the participants list of the coordination ticket so that every participant is a sub-ticket of it and names this group. The list uses internal ticket ids",
+    nextAction: "Correct the participants list of the coordination ticket.",
+  },
+  router_request_block_invalid: {
+    reason: null,
+    ask: "correct the `worker-router` block of the description",
+    nextAction: "Correct the `worker-router` block of the description.",
+  },
+  router_request_system_unknown: {
+    reason: null,
+    ask: "correct the `worker-router` block of the description",
+    nextAction: "Correct the `worker-router` block of the description.",
+  },
+  router_attempt_already_used: {
+    reason: null,
+    ask: "declare a new attempt of the session in the coordination ticket, or open a new ticket for the follow-up",
+    nextAction: "Declare a new attempt of the session in the coordination ticket, or open a new ticket for the follow-up.",
+  },
+  router_ticket_already_completed: {
+    reason: null,
+    ask: "declare a new attempt of the session in the coordination ticket, or open a new ticket for the follow-up",
+    nextAction: "Declare a new attempt of the session in the coordination ticket, or open a new ticket for the follow-up.",
+  },
+});
+
+export function routerRefusalHandoverNote(
+  code: string,
+  message: string | null | undefined,
+): { title: string; body: string; nextAction: string } | null {
+  const handover = ROUTER_REFUSAL_HANDOVER[code];
+  if (!handover) return null;
+  const text = routerRefusalText(code);
+  const said = message?.trim().replace(/[.\s]+$/, "");
+  const reason = handover.reason ?? (said || text.meaning);
+  return {
+    title: text.title,
+    body:
+      `The worker router refused this run before reserving any machine (\`${code}\`): ${reason}. `
+      + (handover.reason ? "" : "Asking again cannot pass. ")
+      + `Handed to {manager} for review: ${handover.ask}.`,
+    nextAction: handover.nextAction,
+  };
+}
 
 export function routerRefusalText(code: string): RouterRefusalText {
   return ROUTER_REFUSAL_TEXTS[code] ?? { title: "Worker router refusal", meaning: "the worker router refused the run", gesture: null };

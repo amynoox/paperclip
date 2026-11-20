@@ -163,7 +163,9 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   const actionsOf = (issueId: string) => db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
 
   it("declares the router's waits (machine, stop, blocked ticket) and its four group refusals, none retried", () => {
-    expect(ROUTER_REFUSAL_ERROR_CODES).toEqual([ENDED, CLOSED, MISMATCH, RESERVED]);
+    // STUDIO-0083: four more refusals the router names permanent.
+    expect(ROUTER_REFUSAL_ERROR_CODES).toEqual([ENDED, CLOSED, MISMATCH, RESERVED,
+      "router_request_block_invalid", "router_request_system_unknown", "router_attempt_already_used", "router_ticket_already_completed"]);
     // Only the dependency wait joins the bounded waits; the group refusals are never a wait.
     expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT, STOP, UNSETTLED, READMISSION, TICKET_BLOCKED]);
     expect(adapterDeclaredWaitMaxMs(TICKET_BLOCKED)).toBe(12 * 60 * 60_000);

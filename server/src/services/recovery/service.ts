@@ -28,10 +28,12 @@ import {
   isAdapterDeclaredWaitErrorCode,
   adapterDeclaredWaitNoteBody,
   DECLARED_WAIT_PAUSE_LIFTED_WAKE_REASON,
+  routerRefusalHandoverNote,
   routerRefusalNoteBody,
   routerRefusalOutcome,
   routerRefusalText,
 } from "./adapter-declared-wait.js";
+import { handIssueToManager, readLatestManagerHandoverAt, wakeManagerOfBlockedIssue } from "./manager-handover.js";
 import { isAiAuthenticationBlocked } from "../ai-auth-failure.js";
 import { RESTRICTED_WORKSPACE_SOURCE_REASON } from "../workspace-source-restriction.js";
 import { hasCommittedNativePlanWait } from "../native-runtime/native-plan-wait.js";
@@ -1335,7 +1337,10 @@ export function recoveryService(
       ))
       .orderBy(desc(activityLog.createdAt))
       .limit(1);
-    const dates = [restored?.at ?? null, returned?.at ?? null].filter((at): at is Date => at instanceof Date);
+    // STUDIO-0083: a ticket handed to the role's manager and given back is in the same case: the refusal that
+    // caused the hand-over is older than it and is not read again.
+    const handedAt = await readLatestManagerHandoverAt(db, { companyId, issueId });
+    const dates = [restored?.at ?? null, returned?.at ?? null, handedAt].filter((at): at is Date => at instanceof Date);
     return dates.length ? dates.reduce((latest, at) => (at > latest ? at : latest)) : null;
   }
 
@@ -4372,8 +4377,16 @@ export function recoveryService(
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    // STUDIO-0083: a run the worker router refused on a ticket at work goes to the role's direct manager, with a
+    // notice and without a Board action. Both callers of the refusal path pass here (the release of the refused run
+    // and the sweep) and say so by their notice; any other escalation of a ticket whose latest run happens to be a
+    // refusal (an assignee that is no longer invokable, for one) keeps the block below.
+    const handed = await handRouterRefusalToManager(input);
+    if (handed === "skip") return null;
+    if (handed) return handed;
     const publications: ActivityPublication[] = [];
     const postCommitActions: IssuePostCommitAction[] = [];
+    const boardAction: { created?: { id: string; cause: string } } = {};
     const updated = await db.transaction(async (tx) => {
       // Recovery observes candidates before asynchronous policy checks. Serialize
       // its effects with operator decisions; a stale observation grants no new
@@ -4408,13 +4421,54 @@ export function recoveryService(
       )).limit(1).then((rows) => rows[0] ?? null);
       if (pendingHandoff) return null;
 
-      return applyStrandedAssignedIssueEscalation(input, tx, publications, postCommitActions);
+      return applyStrandedAssignedIssueEscalation(input, tx, publications, postCommitActions, boardAction);
     });
     if (updated) {
       for (const publication of publications) publishActivity(publication);
       await executeIssuePostCommitActions(db, postCommitActions);
+      // STUDIO-0083 (L16): a block with an action only the Board can settle woke nobody. The direct manager of the
+      // role is woken once per action. A failure here never undoes the block.
+      if (boardAction.created) {
+        await wakeManagerOfBlockedIssue(db, { enqueueWakeup: deps.enqueueWakeup }, {
+          issue: input.issue,
+          recoveryActionId: boardAction.created.id,
+          cause: boardAction.created.cause,
+          sourceRun: input.latestRun,
+        }).catch((error: unknown) => {
+          logger.warn({ err: error, issueId: input.issue.id, recoveryActionId: boardAction.created?.id },
+            "could not wake the manager of a role whose issue was blocked for the Board");
+        });
+      }
     }
     return updated;
+  }
+
+  // The refused run's role is the assignee, the ticket is at work and this is the plain stranded path (no other
+  // recovery cause). "skip": the same run already caused a hand-over (the manager gave the ticket back and the
+  // role has not run since): neither handed again nor blocked. null: today's path.
+  async function handRouterRefusalToManager(
+    input: Parameters<typeof escalateStrandedAssignedIssue>[0],
+  ): Promise<typeof issues.$inferSelect | "skip" | null> {
+    const run = input.latestRun;
+    if (input.recoveryCause || !run || run.status !== "failed" || !run.errorCode) return null;
+    // Only when the refusal path asks: the "skip" below protects a ticket the manager has just given back, and must
+    // never swallow the block another path asked for.
+    if (input.notice?.routerRefusalCode !== run.errorCode) return null;
+    if (routerRefusalOutcome(run.errorCode, input.issue.status) !== "block") return null;
+    if (!input.issue.assigneeAgentId || run.agentId !== input.issue.assigneeAgentId) return null;
+    if (isStrandedIssueRecoveryIssue(input.issue)) return null;
+    const note = routerRefusalHandoverNote(run.errorCode, run.error ? redactSensitiveText(run.error) : null);
+    if (!note) return null;
+    const result = await handIssueToManager(db, { enqueueWakeup: deps.enqueueWakeup }, {
+      issue: input.issue,
+      fromAgentId: input.issue.assigneeAgentId,
+      cause: "router_refusal",
+      code: run.errorCode,
+      sourceRun: { id: run.id, status: run.status, agentId: run.agentId },
+      note,
+    });
+    if (result.handed) return result.issue;
+    return result.reason === "run_already_handed" ? "skip" : null;
   }
 
   async function applyStrandedAssignedIssueEscalation(
@@ -4422,6 +4476,7 @@ export function recoveryService(
     tx: DbTransaction,
     publications: ActivityPublication[],
     postCommitActions: IssuePostCommitAction[],
+    boardAction?: { created?: { id: string; cause: string } },
   ) {
     // Bind implicit settings and policy reads to the held connection as well.
     const transactionIssuesSvc = issueService(tx as unknown as Db);
@@ -4468,6 +4523,9 @@ export function recoveryService(
     }, tx, publications, postCommitActions);
     if (!updated) return null;
     if (isProviderQuotaWait) return updated;
+    if (boardAction && recoveryAction.ownerType === "board" && recoveryAction.attemptCount === 1) {
+      boardAction.created = { id: recoveryAction.id, cause: recoveryCause };
+    }
     await recordStrandedLegacyCancellationBlock(tx, recoveryAction, input.issue, input.previousStatus);
     const sourceAssigneePreserved =
       updated.assigneeAgentId === input.issue.assigneeAgentId &&
