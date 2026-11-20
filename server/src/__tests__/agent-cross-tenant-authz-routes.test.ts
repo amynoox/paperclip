@@ -191,6 +191,8 @@ vi.mock("../routes/authz.js", async () => {
       agentId: null,
       runId: req.actor.runId ?? null,
       agentApiKeyId: null,
+      // As the real getActorInfo returns it (STUDIO-0074 reads it for the resume's activity entry).
+      actorSource: req.actor.source ?? "session",
     };
   }
 
