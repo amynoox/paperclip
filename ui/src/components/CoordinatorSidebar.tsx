@@ -1,10 +1,11 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Inbox, Boxes, ChevronRight, CircleCheck, FolderOpen, History, LayoutDashboard, MessageCircle, MoreHorizontal, Network, Pin, PinOff, Plus, Repeat, Search, Settings, SquarePen, Unplug, type LucideIcon } from "lucide-react";
+import { Inbox, Boxes, ChevronRight, CircleCheck, FolderOpen, History, LayoutDashboard, MessageCircle, MoreHorizontal, Network, Pin, PinOff, Plus, Puzzle, Repeat, Search, Settings, SquarePen, Unplug, type LucideIcon } from "lucide-react";
 import type { Agent, Project } from "@paperclipai/shared";
 import { useCoordinatorAttentionCount } from "@/hooks/useCoordinatorAttentionCount";
 import { issuesApi } from "@/api/issues";
 import { instanceSettingsApi } from "@/api/instanceSettings";
+import { pluginsApi, type PluginUiContribution } from "@/api/plugins";
 import { useAgentChatNavigation } from "@/hooks/useAgentChatNavigation";
 import { useRecentTasks } from "@/hooks/useRecentTasks";
 import { usePinnedNavigation } from "@/hooks/usePinnedNavigation";
@@ -40,6 +41,34 @@ const moreDestinations = [
   { label: "Audit", to: "/activity", icon: History },
   { label: "Settings", to: "/settings", icon: Settings },
 ] as const;
+
+type MoreDestination = { label: string; to: string; icon: LucideIcon };
+// The three pages above "More": a plugin page of the same path would never be reached.
+const primaryDestinations = [{ to: "/chats" }, { to: "/issues" }, { to: "/decisions" }] as const;
+
+/**
+ * STUDIO-0081: the pages plugins add to the workspace, as destinations of the "More" menu.
+ * One entry per plugin that declares both a page with a route (`type: "page"`, `routePath`) and an entry
+ * for the left menu (`type: "sidebar"`): the label is that entry's name, the link is the page's route. The
+ * contributions list holds ready plugins only, so the entry appears and disappears with the plugin. A path
+ * that a built-in page or another plugin already uses is skipped. The plugin's own code is not loaded here:
+ * only its declaration is read.
+ */
+export function buildPluginMoreDestinations(contributions: readonly PluginUiContribution[] | undefined, taken: readonly { to: string }[]): MoreDestination[] {
+  const used = new Set([...primaryDestinations, ...taken].map(item => item.to));
+  const first = <T extends { order?: number }>(slots: T[]) => [...slots].sort((a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER))[0];
+  const entries: MoreDestination[] = [];
+  for (const contribution of contributions ?? []) {
+    const page = first(contribution.slots.filter(slot => slot.type === "page" && slot.routePath));
+    const menu = first(contribution.slots.filter(slot => slot.type === "sidebar"));
+    if (!page || !menu) continue;
+    const to = `/${page.routePath}`;
+    if (used.has(to)) continue;
+    used.add(to);
+    entries.push({ label: menu.displayName, to, icon: Puzzle });
+  }
+  return entries.sort((a, b) => a.label.localeCompare(b.label));
+}
 
 export function buildPinnedNavigationItems(pins: readonly string[], agents: readonly Agent[], destinations: readonly { to: string; label: string; icon: LucideIcon }[]): PinnedNavigationItem[] {
   const keys = new Set(pins);
@@ -110,9 +139,17 @@ export function CoordinatorSidebar({ children }: { children?: ReactNode }) {
     queryKey: queryKeys.instance.experimentalSettings,
     queryFn: () => instanceSettingsApi.getExperimental(),
   });
-  const destinations = useMemo(() => experimental?.enableCases
+  const builtInDestinations = useMemo(() => experimental?.enableCases
     ? [...moreDestinations, { label: "Cases", to: "/cases", icon: Boxes }]
     : moreDestinations, [experimental?.enableCases]);
+  // STUDIO-0081: the same list every plugin outlet reads (ready plugins only). While it loads, or when the
+  // server does not answer, there is no plugin entry; a pin kept for one is simply not shown until it is back.
+  const { data: pluginContributions } = useQuery({
+    queryKey: queryKeys.plugins.uiContributions,
+    queryFn: () => pluginsApi.listUiContributions(),
+  });
+  const pluginDestinations = useMemo(() => buildPluginMoreDestinations(pluginContributions, builtInDestinations), [pluginContributions, builtInDestinations]);
+  const destinations = useMemo(() => [...builtInDestinations, ...pluginDestinations], [builtInDestinations, pluginDestinations]);
   const [moreOpen, setMoreOpen] = useState(false);
   const moreContentRef = useRef<HTMLDivElement>(null);
   const orderedPins = useMemo(() => buildPinnedNavigationItems(pinnedNavigation.pins, agents.data ?? [], destinations), [pinnedNavigation.pins, agents.data, destinations]);
@@ -172,7 +209,7 @@ export function CoordinatorSidebar({ children }: { children?: ReactNode }) {
               const pinned = pinnedNavigation.pins.includes(to);
               const PinIcon = pinned ? PinOff : Pin;
               return <div key={to}>
-                {index === 6 || index === 10 ? <div role="separator" className="my-1 border-t border-border" /> : null}
+                {index === 6 || index === 10 || (pluginDestinations.length > 0 && index === builtInDestinations.length) ? <div role="separator" className="my-1 border-t border-border" /> : null}
                 <div className="group/coordinator-more relative flex items-center rounded-sm transition-colors hover:bg-accent">
                   <Link to={to} onClick={() => { setMoreOpen(false); if (isMobile) setSidebarOpen(false); }} className="flex min-w-0 flex-1 items-center gap-2 rounded-sm px-2 py-1.5 pr-10 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
                     <Icon className="size-4 shrink-0 text-muted-foreground" />{label}

@@ -4,14 +4,17 @@ import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { Agent, AttentionFeed, AttentionItem } from "@paperclipai/shared";
-import { buildPinnedNavigationItems, CoordinatorSidebar } from "./CoordinatorSidebar";
+import { buildPinnedNavigationItems, buildPluginMoreDestinations, CoordinatorSidebar } from "./CoordinatorSidebar";
+import type { PluginUiContribution } from "@/api/plugins";
 import { TooltipProvider } from "./ui/tooltip";
 import { coordinatorAttentionQueryKey, coordinatorAttentionSummaryQueryKey } from "@/lib/coordinator-attention";
 import { queryKeys } from "@/lib/queryKeys";
 
 (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 const fixture = vi.hoisted(() => ({ attention: vi.fn(), summary: vi.fn(), openNewIssue: vi.fn(), pathname: "/COO/issues", collapsed: false, userId: "reviewer", chats: [] as Array<{ isUnreadForMe: boolean }>,
-  recentTasks: [] as Array<Record<string, unknown>>, projects: [] as Array<Record<string, unknown>>, projectTasks: vi.fn(), enableCases: false, agents: [] as Agent[] }));
+  recentTasks: [] as Array<Record<string, unknown>>, projects: [] as Array<Record<string, unknown>>, projectTasks: vi.fn(), enableCases: false, agents: [] as Agent[],
+  // What GET /plugins/ui-contributions answers: the declarations of the plugins that are ready, or a failure.
+  contributions: [] as unknown[], contributionsFail: false }));
 vi.mock("@/hooks/useAgentChatNavigation", () => ({ useAgentChatNavigation: () => ({
   companyId: "company", userId: fixture.userId, agents: { data: fixture.agents }, chats: { data: fixture.chats }, session: { isSuccess: true },
 }) }));
@@ -22,6 +25,10 @@ vi.mock("@/context/SidebarContext", () => ({ useSidebar: () => ({ collapsed: fix
 vi.mock("@/api/attention", () => ({ attentionApi: { list: fixture.attention, summary: fixture.summary } }));
 vi.mock("@/api/instanceSettings", () => ({ instanceSettingsApi: { getExperimental: async () => ({ enableCases: fixture.enableCases }) } }));
 vi.mock("@/api/projects", () => ({ projectsApi: { list: async () => fixture.projects } }));
+vi.mock("@/api/plugins", () => ({ pluginsApi: { listUiContributions: async () => {
+  if (fixture.contributionsFail) throw new Error("server unreachable");
+  return fixture.contributions;
+} } }));
 vi.mock("./SidebarCompanyMenu", () => ({ SidebarCompanyMenu: () => null }));
 vi.mock("@/lib/router", () => ({
   useLocation: () => ({ pathname: fixture.pathname, search: "" }),
@@ -47,6 +54,7 @@ let root: Root, container: HTMLDivElement, client: QueryClient;
 beforeEach(() => {
   vi.clearAllMocks(); localStorage.clear(); fixture.collapsed = false; fixture.userId = "reviewer"; fixture.pathname = "/COO/issues";
   fixture.chats = []; fixture.recentTasks = []; fixture.projects = []; fixture.enableCases = false; fixture.agents = [];
+  fixture.contributions = []; fixture.contributionsFail = false;
   fixture.summary.mockResolvedValue(summary([pending("question"), pending("review")]));
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -183,6 +191,136 @@ describe("Coordinator pinned pages", () => {
       window.dispatchEvent(new StorageEvent("storage", { key }));
     });
     expect(pinnedPage("/agents/all")?.textContent).toBe("Agents");
+  });
+});
+
+// STUDIO-0081. The owner, 20 Nov 2026: the pages offered behind "More" can be pinned, and "Machines" must be one of
+// them. "Machines" is a page of the worker router plugin, declared exactly as below in its manifest (0.30.21 and
+// later); the left menu of the coordinator view mounted no plugin entry at all.
+describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
+  const slot = (patch: Record<string, unknown>) => ({ id: "slot", displayName: "Slot", exportName: "Slot", ...patch });
+  const contribution = (pluginKey: string, slots: Array<Record<string, unknown>>) =>
+    ({ pluginId: `id-${pluginKey}`, pluginKey, displayName: pluginKey, version: "1.0.0", uiEntryFile: "index.js", slots, launchers: [] }) as unknown as PluginUiContribution;
+  const router = contribution("paperclip-worker-router", [
+    slot({ type: "page", id: "machines", displayName: "Machines", exportName: "MachinesPage", routePath: "machines" }),
+    slot({ type: "sidebar", id: "machines-menu", displayName: "Machines", exportName: "MachinesMenu" }),
+  ]);
+  const navigation = () => container.querySelector('nav[aria-label="Workspace navigation"]')!;
+  const pinnedPage = (to: string) => navigation().querySelector(`a[href="${to}"]`);
+  const moreLinks = () => [...document.querySelectorAll<HTMLAnchorElement>('[aria-label="More workspace pages"][data-slot="popover-content"] a')].map(link => link.getAttribute("href"));
+  async function click(label: string) {
+    const button = document.querySelector<HTMLButtonElement>(`button[aria-label="${label}"]`);
+    expect(button, label).not.toBeNull();
+    await act(async () => button!.click());
+    await flush();
+  }
+  const KEY = "paperclip.coordinator.pinned-nav.v1:reviewer";
+
+  it("a ready plugin with a page and a menu entry adds one destination, named as its menu entry, to its route", async () => {
+    fixture.contributions = [router];
+    await renderSidebar();
+    // Not in the navigation itself: only behind "More".
+    expect(pinnedPage("/machines")).toBeNull();
+    await click("More workspace pages");
+    const link = document.querySelector<HTMLAnchorElement>('[data-slot="popover-content"] a[href="/machines"]');
+    expect(link?.textContent).toBe("Machines");
+    // After every built-in page, behind a separator of its own.
+    expect(moreLinks()).toEqual(["/search", "/dashboard", "/projects", "/routines", "/artifacts", "/agents/all", "/skills", "/apps", "/activity", "/settings", "/machines"]);
+    expect(link!.closest("div")!.parentElement!.querySelector('[role="separator"]')).not.toBeNull();
+    expect(document.querySelector('button[aria-label="Pin Machines"]')).not.toBeNull();
+  });
+
+  it.each([
+    ["no plugin is installed", []],
+    ["the plugin is not ready (the server lists ready plugins only)", []],
+    ["the plugin has a page but no menu entry", [contribution("page-only", [slot({ type: "page", routePath: "machines", displayName: "Machines" })])]],
+    ["the plugin has a menu entry but no page", [contribution("menu-only", [slot({ type: "sidebar", displayName: "Machines" })])]],
+    ["the plugin's page has no route", [contribution("no-route", [slot({ type: "page", displayName: "Machines" }), slot({ type: "sidebar", displayName: "Machines" })])]],
+  ] as Array<[string, PluginUiContribution[]]>)("adds nothing when %s", async (_name, contributions) => {
+    fixture.contributions = contributions;
+    await renderSidebar();
+    await click("More workspace pages");
+    expect(moreLinks()).toEqual(["/search", "/dashboard", "/projects", "/routines", "/artifacts", "/agents/all", "/skills", "/apps", "/activity", "/settings"]);
+    expect(document.querySelector('button[aria-label="Pin Machines"]')).toBeNull();
+  });
+
+  it("pins the plugin page by its path, shows it in Pinned, and reads the pin back", async () => {
+    fixture.contributions = [router];
+    await renderSidebar();
+    await click("More workspace pages");
+    await click("Pin Machines");
+    expect(JSON.parse(localStorage.getItem(KEY)!)).toEqual(["/machines"]);
+    expect(pinnedPage("/machines")?.textContent).toBe("Machines");
+    // A new page load reads the pin from the browser.
+    await act(async () => root.unmount());
+    root = createRoot(container);
+    await renderSidebar();
+    expect(pinnedPage("/machines")?.textContent).toBe("Machines");
+    await click("More workspace pages");
+    await click("Unpin Machines");
+    expect(JSON.parse(localStorage.getItem(KEY)!)).toEqual([]);
+    expect(pinnedPage("/machines")).toBeNull();
+  });
+
+  it("a pin kept while the plugin is away breaks nothing, is kept, and comes back with the plugin", async () => {
+    localStorage.setItem(KEY, JSON.stringify(["/projects", "/machines", "/dashboard"]));
+    await renderSidebar();
+    // The plugin is absent: its pin is not shown, the others are, in their order.
+    expect([...container.querySelectorAll<HTMLAnchorElement>(".design-sidebar-pins a")].map(link => link.getAttribute("href"))).toEqual(["/projects", "/dashboard"]);
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    // Pinning another page meanwhile does not drop the kept pin.
+    await click("More workspace pages");
+    await click("Pin Routines");
+    expect(JSON.parse(localStorage.getItem(KEY)!)).toEqual(["/projects", "/machines", "/dashboard", "/routines"]);
+    // The plugin is ready again: the pin is back at its place.
+    fixture.contributions = [router];
+    await act(async () => { await client.invalidateQueries({ queryKey: queryKeys.plugins.uiContributions }); });
+    await flush();
+    expect([...container.querySelectorAll<HTMLAnchorElement>(".design-sidebar-pins a")].map(link => link.textContent)).toEqual(["Projects", "Machines", "Dashboard", "Routines"]);
+  });
+
+  it("shows no plugin entry and no error when the server does not answer, and keeps the built-in pages", async () => {
+    fixture.contributionsFail = true;
+    localStorage.setItem(KEY, JSON.stringify(["/machines", "/projects"]));
+    await renderSidebar();
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    expect(pinnedPage("/projects")?.textContent).toBe("Projects");
+    expect(pinnedPage("/machines")).toBeNull();
+    await click("More workspace pages");
+    expect(moreLinks()).toHaveLength(10);
+  });
+
+  it("a plugin with two menu entries and two pages gives one destination: the first of each by order", () => {
+    const two = contribution("two", [
+      slot({ type: "sidebar", id: "b", displayName: "Second entry", order: 20 }),
+      slot({ type: "sidebar", id: "a", displayName: "Fleet", order: 10 }),
+      slot({ type: "page", id: "p2", displayName: "Other page", routePath: "fleet-other", order: 2 }),
+      slot({ type: "page", id: "p1", displayName: "Fleet page", routePath: "fleet", order: 1 }),
+    ]);
+    expect(buildPluginMoreDestinations([two], []).map(item => [item.label, item.to])).toEqual([["Fleet", "/fleet"]]);
+  });
+
+  it("gives one destination per plugin, sorted by name, and never a path a built-in page or another plugin uses", () => {
+    const page = (routePath: string, label: string) => [slot({ type: "page", routePath }), slot({ type: "sidebar", displayName: label })];
+    const destinations = buildPluginMoreDestinations([
+      contribution("z", page("zebra", "Zebra")),
+      router,
+      contribution("shadow-more", page("projects", "Fake projects")),
+      contribution("shadow-primary", page("issues", "Fake tasks")),
+      contribution("duplicate", page("machines", "Machines again")),
+    ], [{ to: "/projects" }]);
+    expect(destinations.map(item => [item.label, item.to])).toEqual([["Machines", "/machines"], ["Zebra", "/zebra"]]);
+    expect(buildPluginMoreDestinations(undefined, [])).toEqual([]);
+  });
+
+  it("other kinds of slots are not destinations: only a page with a menu entry", () => {
+    const other = contribution("other", [
+      slot({ type: "routeSidebar", routePath: "machines", displayName: "Route menu" }),
+      slot({ type: "companySettingsPage", routePath: "machines", displayName: "Settings page" }),
+      slot({ type: "sidebarPanel", displayName: "Panel" }),
+      slot({ type: "dashboardWidget", displayName: "Widget" }),
+    ]);
+    expect(buildPluginMoreDestinations([other], [])).toEqual([]);
   });
 });
 afterEach(async () => { await act(async () => root.unmount()); client.clear(); container.remove(); });
