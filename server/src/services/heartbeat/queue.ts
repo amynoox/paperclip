@@ -13,6 +13,7 @@ import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import { hasAutomaticInteractionDeliveryHold, INTERACTION_DELIVERY_DENIED, recheckQueuedRunInteractions, withInteractionDeliveryOrigin } from "../agent-interaction-delivery.js";
 import { adapterWaitPayload, readAdapterTaskWait, deferAdapterRun } from "../adapter-task-admission.js";
 import { deferredWorkIntentWait } from "../work-intent-outbox.js";
+import { isGovernancePauseStop } from "../governance-pause-stop.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { createHeartbeatTimerPolicy } from "./timer-policy.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
@@ -5344,7 +5345,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           if (!explicitContinuation && (executionBlocker || (continuationBlocked && !verifiedConversationReset)) && !ownsReconstructionContinuation)
             return deferBlockedExecution(continuationHold());
           if (explicitContinuation) {
-            enrichedContextSnapshot.forceFreshSession = true;
+            // STUDIO-0075: a person's request on an interrupted run opens a new conversation, because what the run
+            // was doing when it broke is unknown. A run a pause cut is different: it was stopped on purpose, its stop
+            // is proven (the gate above), and its engine session is kept for the task. The request then continues in
+            // that session: the role goes on where it was, instead of starting again from a summary. The adapter still
+            // refuses to resume on another machine or in another folder, and the server on another configuration.
+            const [continued] = await tx.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+              .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
+                eq(heartbeatRuns.id, explicitContinuation.previousRunId)));
+            if (!continued || !isGovernancePauseStop(continued)) enrichedContextSnapshot.forceFreshSession = true;
             enrichedContextSnapshot.previousRunId = explicitContinuation.previousRunId;
             enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
           }
