@@ -1,5 +1,6 @@
 import { readWakeChatConversationId } from "../../run-dispatch/index.js";
 import { isAdapterDeclaredWaitErrorCode, routerRefusalOutcome } from "../../../services/recovery/adapter-declared-wait.js";
+import { readPauseCutWorkAskedAgain } from "../../../services/pause-cut-asked-again.js";
 import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun } from "../domain/context.js";
 import {
   decideQueuedCommentAction,
@@ -187,6 +188,14 @@ async function runReleaseDrain(
     }
 
     if (locked.handoffAssigneeAgentId && candidate.agentId !== locked.handoffAssigneeAgentId) {
+      preservedWakeIds.push(candidate.id);
+      continue;
+    }
+
+    // STUDIO-0074 (L15): a Retry filed again after the run that continued work a pause cut could not start waits for
+    // its time (pause-resume-continuation.ts). Promoting it here would start it at once, as an ordinary wake and
+    // without the Retry's own checks: it is left to the Retry's dispatch.
+    if (readPauseCutWorkAskedAgain(candidate.payload)) {
       preservedWakeIds.push(candidate.id);
       continue;
     }

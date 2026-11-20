@@ -117,6 +117,7 @@ import {
 import { visibleIssueCondition } from "../issue-visibility.js";
 import { forbidden, notFound } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
+import { keepPauseCutWorkAfterFailedStart } from "../pause-resume-continuation.js";
 import { proveRunProcessGone } from "../run-process-owner.js";
 import { LEGACY_HOST_FALLBACK_EVENT } from "../native-runtime/native-restart-recovery.js";
 import { redactSensitiveText } from "../../redaction.js";
@@ -4288,6 +4289,14 @@ export function recoveryService(
     recoveryCause?: StrandedRecoveryCause;
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
+    // STUDIO-0074 (L15): the run that continues work a pause cut failed before its engine was called (the lease of
+    // its machine was not obtained). The task is not blocked: the same person's request is filed again and waits.
+    if (input.latestRun && await keepPauseCutWorkAfterFailedStart(db, { companyId: input.issue.companyId,
+      issueId: input.issue.id, runId: input.latestRun.id }).catch((error) => {
+      logger.error({ err: error, issueId: input.issue.id, runId: input.latestRun?.id },
+        "could not ask again for a continuation that failed to start; the task is blocked as before");
+      return false;
+    })) return null;
     const publications: ActivityPublication[] = [];
     const postCommitActions: IssuePostCommitAction[] = [];
     const updated = await db.transaction(async (tx) => {
