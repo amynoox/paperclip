@@ -122,11 +122,15 @@ describe("the runs a pause cut, when the role resumes", () => {
     expect((await state(f.agentId)).lifecycleState).toBe("paused");
     await busy(f);
   }
-  /** The company's status changes and its policy is projected on the role. */
+  /**
+   * The company's status changes and its policy is projected on the role. A company pause or archive restarts the
+   * role's pause, which sets its start to now: the cases keep the start fourteen hours ago, before the cut run.
+   */
   async function companyIs(f: { companyId: string; agentId: string }, status: "paused" | "active" | "archived") {
     await db.update(companies).set({ status }).where(eq(companies.id, f.companyId));
     await projectCompanyHolds(db, createAgentLifecycleEffects(), f.companyId);
     await work.process(f.agentId);
+    if (status !== "active") await db.update(agents).set({ pausedAt: new Date(Date.now() - 14 * HOUR) }).where(eq(agents.id, f.agentId));
   }
   type Task = { companyId: string; agentId: string; issueId: string; cut: { id: string } };
   const traces = (f: Task) => db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId),
@@ -506,6 +510,16 @@ describe("the runs a pause cut, when the role resumes", () => {
       await companyIs(byPolicy, "active");
       expect((await state(byPolicy.agentId)).lifecycleState).toBe("ready");
       await expectRefused(byPolicy, "resumed_without_a_person");
+
+      // A resume that names nobody and itself lifts the last hold does not inherit the person on record.
+      const lifting = await fixture();
+      await companyIs(lifting, "paused");
+      await createAgentLifecycle(db).resumeAgent(lifting.agentId, "user", PERSON);
+      expect(await state(lifting.agentId)).toMatchObject({ lifecycleHolds: ["company_paused"], lifecycleOperation: { resumeRequestedBy: PERSON } });
+      await createAgentLifecycle(db).resumeAgent(lifting.agentId, "company_paused");
+      await work.process(lifting.agentId);
+      expect((await state(lifting.agentId)).lifecycleState).toBe("ready");
+      await expectRefused(lifting, "resumed_without_a_person");
     });
 
     it("a resume made with a key whose person may not change the task: the product's own check keeps the request", async () => {
