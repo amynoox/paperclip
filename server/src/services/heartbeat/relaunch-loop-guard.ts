@@ -17,7 +17,10 @@
 // - a run that ended on a timeout is counted whatever it lasted: a session
 //   too large to reopen makes every run that resumes it reach its timeout,
 //   and each of those runs lasts as long as the timeout itself (STUDIO-0080
-//   returns the session of a timed-out run, so such a session is resumed);
+//   returns the session of a timed-out run, so such a session is resumed).
+//   Such a run counts only when the engine itself did nothing: a role that
+//   compiles, plays or migrates through its whole timeout and comments only
+//   at the end left nothing on the issue either, and must keep its session;
 // - declared waits, refusals the worker router returns before any reservation,
 //   cancellations, and runs that failed in setup before their adapter was
 //   admitted (a lease that could not be acquired) are neither counted nor do
@@ -92,6 +95,13 @@ export interface RelaunchLoopRunSample {
   /** The engine session the run resumed; null when it started a fresh one. */
   sessionIdBefore: string | null;
   /**
+   * The server holds a sign that the engine worked during the run: output
+   * tokens of the model, a summary returned by the adapter, or output still
+   * being written after the run's first RELAUNCH_LOOP_SHORT_RUN_MS. Read only
+   * for a run that ended on a timeout after that long.
+   */
+  engineWorked: boolean;
+  /**
    * The run failed in setup, before its adapter was admitted: a legacy run
    * still at stage `preparing` (the controller writes `dispatching` in the
    * lease renewal that admits the adapter). The adapter's own
@@ -121,8 +131,10 @@ export function classifyRelaunchLoopRun(
   if (run.errorCode && ROUTER_PRE_RESERVATION_REFUSAL_CODES.includes(run.errorCode)) return "skipped";
   if (run.engineNeverStarted) return "skipped";
   if (!run.finishedAt) return "other";
-  if (!isRelaunchLoopTimeout(run)
-      && run.finishedAt.getTime() - run.startedAt.getTime() >= RELAUNCH_LOOP_SHORT_RUN_MS) return "other";
+  if (run.finishedAt.getTime() - run.startedAt.getTime() >= RELAUNCH_LOOP_SHORT_RUN_MS) {
+    // A long run counts only when it ended on a timeout and its engine did nothing meanwhile.
+    if (!isRelaunchLoopTimeout(run) || run.engineWorked) return "other";
+  }
   if (producedSomething) return "other";
   return "empty_failure";
 }
@@ -181,6 +193,20 @@ export function relaunchLoopFreshSessionNoteBody(input: {
   );
 }
 
+// What the server records of an engine's own work during a run, whatever the adapter:
+// - the model's output tokens (usage_json, written from the adapter's result; Claude reports them as its stream
+//   goes, so a run cut by its timeout has them);
+// - the summary the adapter returned (result_json.summary: text the engine wrote);
+// - the time of the last output chunk of the run log (last_output_at): an engine still writing after its first
+//   RELAUNCH_LOOP_SHORT_RUN_MS was at work, one that fell silent before that only waited for its timeout.
+const outputTokensOf = (key: string) =>
+  sql`(jsonb_typeof(${heartbeatRuns.usageJson} -> ${key}) = 'number' and (${heartbeatRuns.usageJson} ->> ${key})::numeric > 0)`;
+const ENGINE_WORKED_SQL = sql<boolean>`coalesce(
+  ${outputTokensOf("outputTokens")} or ${outputTokensOf("rawOutputTokens")}
+  or nullif(btrim(${heartbeatRuns.resultJson} ->> 'summary'), '') is not null
+  or ${heartbeatRuns.lastOutputAt} >= ${heartbeatRuns.startedAt} + make_interval(secs => ${RELAUNCH_LOOP_SHORT_RUN_MS / 1000}),
+  false)`;
+
 async function readStartedRuns(
   db: Db,
   input: { companyId: string; agentId: string; issueId: string; exceptRunId: string },
@@ -194,6 +220,7 @@ async function readStartedRuns(
       finishedAt: heartbeatRuns.finishedAt,
       sessionIdBefore: heartbeatRuns.sessionIdBefore,
       engineNeverStarted: sql<boolean>`coalesce(${heartbeatRuns.runtimeMode} = 'legacy' and ${heartbeatRuns.executionStage} = 'preparing', false)`,
+      engineWorked: ENGINE_WORKED_SQL,
     })
     .from(heartbeatRuns)
     .where(and(
@@ -205,7 +232,7 @@ async function readStartedRuns(
     ))
     .orderBy(desc(heartbeatRuns.startedAt), desc(heartbeatRuns.id))
     .limit(RELAUNCH_LOOP_RUN_SAMPLE_LIMIT);
-  return rows.map((row) => ({ ...row, engineNeverStarted: row.engineNeverStarted === true }));
+  return rows.map((row) => ({ ...row, engineNeverStarted: row.engineNeverStarted === true, engineWorked: row.engineWorked === true }));
 }
 
 // "Left something behind": the product's own list of issue-visible progress

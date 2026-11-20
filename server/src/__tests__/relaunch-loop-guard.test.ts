@@ -48,7 +48,7 @@ const at = (minutesAgo: number) => new Date(Date.UTC(2026, 10, 20, 6, 45) - minu
 function sample(minutesAgo: number, patch: Partial<RelaunchLoopRunSample> = {}): RelaunchLoopRunSample {
   return {
     id: randomUUID(), status: "failed", errorCode: ACK_UNCERTAIN, startedAt: at(minutesAgo),
-    finishedAt: new Date(at(minutesAgo).getTime() + 60_000), sessionIdBefore: "s1", engineNeverStarted: false, ...patch,
+    finishedAt: new Date(at(minutesAgo).getTime() + 60_000), sessionIdBefore: "s1", engineNeverStarted: false, engineWorked: false, ...patch,
   };
 }
 const decide = (runs: RelaunchLoopRunSample[], produced: string[] = []) =>
@@ -125,6 +125,16 @@ describe("relaunch loop guard: the decision", () => {
     expect(decide([twentyMinutes(30), productive, twentyMinutes(90), twentyMinutes(120)], [productive.id]).action).toBe("none");
     expect(decide([twentyMinutes(30), sample(60, { ...patch, sessionIdBefore: "s2" }), twentyMinutes(90), twentyMinutes(120)]).action).toBe("none");
     expect(RELAUNCH_LOOP_TIMEOUT_ERROR_CODES).toEqual(["timeout", "router_interactive_timeout"]);
+    // A timeout during which the engine worked is a long run like another: it ends the series.
+    const worked = sample(60, { ...patch, engineWorked: true, finishedAt: new Date(at(60).getTime() + 20 * 60_000) });
+    expect(classifyRelaunchLoopRun(worked, false)).toBe("other");
+    expect(decide([twentyMinutes(30), worked, twentyMinutes(90), twentyMinutes(120)]).action).toBe("none");
+  });
+
+  it("the engine's own work is read only for a long run that ended on a timeout", () => {
+    // A short failure counts whatever the engine wrote before it failed.
+    expect(classifyRelaunchLoopRun(sample(3, { engineWorked: true }), false)).toBe("empty_failure");
+    expect(classifyRelaunchLoopRun(sample(3, { status: "timed_out", errorCode: "timeout", engineWorked: true }), false)).toBe("empty_failure");
   });
 
   it("a timed-out run under five minutes counts like a failure", () => {
@@ -142,7 +152,9 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
   let home: string;
 
   type Step =
-    | { kind: "fail"; code: string; session?: string; clearSession?: boolean; comment?: boolean; document?: boolean; productionActivity?: boolean; timedOut?: boolean }
+    | { kind: "fail"; code: string; session?: string; clearSession?: boolean; comment?: boolean; document?: boolean; productionActivity?: boolean; timedOut?: boolean;
+        /** What the engine did before its timeout, as the server records it. */
+        engine?: "output_tokens" | "summary" | "output" }
     | { kind: "ok"; session: string };
   // What each engine launch was asked to resume, in order, per issue.
   type Launch = { runId: string; agentId: string; resumed: string | null; resumedParams: Record<string, unknown> | null };
@@ -190,7 +202,10 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
         }
         // A run that reaches its timeout: the adapter returns the session its engine announced (STUDIO-0080).
         if (step.timedOut) {
+          if (step.engine === "output") await input.onLog("stdout", "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n");
           return { exitCode: null, signal: "SIGTERM", timedOut: true, errorCode: "timeout", errorMessage: "Timed out after 1200s",
+            ...(step.engine === "output_tokens" ? { usage: { inputTokens: 1200, outputTokens: 5400 }, usageBasis: "per_run" as const } : {}),
+            ...(step.engine === "summary" ? { summary: "Built the player and ran the smoke scene." } : {}),
             ...(step.session ? { sessionId: step.session, sessionDisplayId: step.session, sessionParams: { sessionId: step.session } } : {}) };
         }
         return {
@@ -388,6 +403,46 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
       + "each on a timeout and without leaving anything behind (`timeout`). "
       + "That session is dropped: the next run starts on a fresh session.",
     );
+  }, 180_000);
+
+  // The other side of the same rule: a role that works through its whole timeout and writes nothing on the issue
+  // (it compiles, plays, migrates, pushes to Git, and comments only at the end) must keep its session.
+  it.each([
+    ["the model's output tokens", "output_tokens"],
+    ["a summary returned by the adapter", "summary"],
+    ["output still written after its first five minutes", "output"],
+  ] as const)("three timeouts during which the engine worked (%s) and nothing on the issue: no guard, the session is kept", async (_name, engine) => {
+    const f = await seed();
+    await openSession(f);
+    const worked = [
+      await turn(f, fail("timeout", { timedOut: true, session: "s1", engine })),
+      await turn(f, fail("timeout", { timedOut: true, session: "s1", engine })),
+      await turn(f, fail("timeout", { timedOut: true, session: "s1", engine })),
+    ];
+    expect(worked.map((run) => `${run.status}:${run.sessionIdBefore}`)).toEqual(["timed_out:s1", "timed_out:s1", "timed_out:s1"]);
+    if (engine === "output_tokens") expect(worked[2]!.usageJson).toMatchObject({ outputTokens: 5400 });
+    if (engine === "summary") expect(worked[2]!.resultJson).toMatchObject({ summary: "Built the player and ran the smoke scene." });
+    if (engine === "output") expect(worked[2]!.lastOutputAt).not.toBeNull();
+    // Twenty minutes each; the output of each run was written near its end.
+    await db.update(heartbeatRuns).set({ startedAt: sql`${heartbeatRuns.finishedAt} - interval '20 minutes'` })
+      .where(and(eq(heartbeatRuns.agentId, f.devId), sql`${heartbeatRuns.startedAt} is not null`));
+    await turn(f, fail(ACK_UNCERTAIN));
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", "s1"]);
+    expect(await guardNotes(f)).toHaveLength(0);
+  }, 180_000);
+
+  it("an engine that wrote only in its first minute and then nothing until its timeout did nothing: the guard acts", async () => {
+    const f = await seed();
+    await openSession(f);
+    for (let index = 0; index < 3; index += 1) await turn(f, fail("timeout", { timedOut: true, session: "s1", engine: "output" }));
+    // Twenty minutes each, and the only output came one minute after the start (the session's announcement).
+    await db.update(heartbeatRuns).set({ startedAt: sql`${heartbeatRuns.finishedAt} - interval '20 minutes'` })
+      .where(and(eq(heartbeatRuns.agentId, f.devId), sql`${heartbeatRuns.startedAt} is not null`));
+    await db.update(heartbeatRuns).set({ lastOutputAt: sql`${heartbeatRuns.startedAt} + interval '1 minute'` })
+      .where(and(eq(heartbeatRuns.agentId, f.devId), sql`${heartbeatRuns.lastOutputAt} is not null`));
+    await turn(f, { kind: "ok", session: "s2" });
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", null]);
+    expect(await guardNotes(f)).toHaveLength(1);
   }, 180_000);
 
   it("a twenty-minute failure that is not a timeout still ends the series, among two timeouts", async () => {
