@@ -5049,6 +5049,8 @@ export function recoveryService(
         agent && agent.companyId === issue.companyId
           ? await isAgentInvokable(agent)
           : false;
+      // STUDIO-0076: paused, whatever the hold. A pause never blocks a task of the role (see below).
+      const agentPaused = agent?.status === "paused" && agent.companyId === issue.companyId;
       if (
         agent?.status === "paused" &&
         agent.companyId === issue.companyId &&
@@ -5080,15 +5082,16 @@ export function recoveryService(
         result.skipped += 1;
         continue;
       }
-      // STUDIO-0076: production, 20 Nov 2026 (TR-2030, TR-2031). The assignee's last run waited for a worker machine
-      // (router_waiting_for_resources); the role was paused for an update, and this sweep moved both tasks to
-      // `blocked` two seconds later ("the original assignee is not invokable"). After the resume nothing started
-      // them again: the router never serves a blocked task. A pause does not end a declared wait: while the wait
-      // is within its bound, neither block nor requeue, and leave the series' note, as for an invokable assignee
-      // (the gate further down). Any pause (manual, company, budget); a terminated agent or one pending approval
-      // is not paused and keeps today's path. Past the bound the normal path applies, the block below included.
-      // In review nothing changes: the block below serves work statuses only, and the gate already holds the wait.
-      if (agent?.status === "paused" && agent.companyId === issue.companyId && issue.status !== "in_review") {
+      // STUDIO-0076: a pause is a decision (a person's, the company's, a budget's), not a lost assignee. While the
+      // assignee has status `paused`, whatever the hold, none of its tasks at work is blocked as "the original
+      // assignee is not invokable", whatever its last run: the task keeps its status, and the normal path takes it
+      // again once the pause lifts. Production, 20 Nov 2026: TR-2030, TR-2031 (last run router_waiting_for_resources)
+      // and TR-2072, TR-2073 were blocked within seconds of a pause for an install; 18 Nov: TR-1802, TR-1826 (last
+      // run cancelled by the lifecycle's own stop). After the resume nothing started them again: the router never
+      // serves a blocked task. A declared wait still within its bound also gets the note of its series, as for an
+      // invokable assignee (the gate further down). A terminated agent or one pending approval is not paused and
+      // keeps today's block.
+      if (agentPaused && issue.status !== "in_review") {
         const pausedOwnRun = latestRun?.agentId === agentId && latestRun.startedAt
           ? latestRun
           : await getLatestStartedIssueRunForAgent(issue.companyId, issue.id, agentId);
@@ -5096,9 +5099,9 @@ export function recoveryService(
         if (pausedWaitDeadline !== null) {
           await ensureRouterNote(issue, pausedOwnRun!, agentId, "wait");
           opts?.onDeferredDeadline?.(pausedWaitDeadline);
-          result.skipped += 1;
-          continue;
         }
+        result.skipped += 1;
+        continue;
       }
       // STUDIO-0051: a task waiting on a person's question keeps its status while its assignee is not invokable
       // (an agent in error, for example): the answer wakes the assignee once it is back, and that wake only starts
@@ -5646,7 +5649,7 @@ export function recoveryService(
           !participantLatestRun ||
           !isTerminalIssueRun(participantLatestRun)
         ) {
-          if (!agentInvokable) {
+          if (!agentInvokable && !agentPaused) {
             const updated = await escalateStrandedAssignedIssue({
               issue,
               previousStatus: "in_review",
@@ -5722,6 +5725,11 @@ export function recoveryService(
           continue;
         }
 
+        // STUDIO-0076: a paused review participant is left until its pause lifts.
+        if (agentPaused) {
+          result.skipped += 1;
+          continue;
+        }
         if (!agentInvokable) {
           const updated = await escalateStrandedAssignedIssue({
             issue,

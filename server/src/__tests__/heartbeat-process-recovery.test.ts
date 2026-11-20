@@ -8476,9 +8476,11 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       retryReason: "issue_continuation_needed",
       runErrorCode: "issue_continuation_waiting_on_review",
     });
+    // STUDIO-0076: a paused owner is no longer "non-invokable" for this purpose (a pause blocks no task); an owner
+    // pending approval still is.
     await db
       .update(agents)
-      .set({ status: "paused" })
+      .set({ status: "pending_approval" })
       .where(eq(agents.id, agentId));
 
     const result = await heartbeatService(db).reconcileStrandedAssignedIssues();
