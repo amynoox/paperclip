@@ -1,8 +1,9 @@
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
-import { activityLog, agentWakeupRequests, budgetResumeClaims, heartbeatRunEvents, heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { activityLog, agents, agentWakeupRequests, budgetResumeClaims, heartbeatRunEvents, heartbeatRuns, issues, type Db } from "@paperclipai/db";
 import { HttpError } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity, publishActivity, type ActivityPublication, type LogActivityInput } from "./activity-log.js";
+import { evaluateAgentInvokabilityFromDb } from "./agent-invokability.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { PAUSE_CUT_WORK_ASKED_AGAIN, readPauseCutWorkAskedAgain, type PauseCutWorkAskedAgain } from "./pause-cut-asked-again.js";
 import { AGENT_LIFECYCLE_STOP_REASON, AGENT_PAUSE_STOP_REASON, BUDGET_PAUSE_STOP_REASON, isGovernancePauseStop } from "./governance-pause-stop.js";
@@ -317,6 +318,15 @@ export async function pauseCutWorkRequestMayStart(db: Db, input: {
 export const PAUSE_CUT_WORK_START_FAILED_MAX_MS = 12 * 60 * 60_000;
 /** The wait before each new request of a series, counted from the failure it answers; the last one repeats. */
 export const PAUSE_CUT_WORK_START_FAILED_DELAYS_MS: readonly number[] = [30_000, 60_000, 120_000, 240_000, 300_000];
+/** While a series lasts, the task says so again after each of these periods. */
+export const PAUSE_CUT_WORK_START_FAILED_NOTE_EVERY_MS = 60 * 60_000;
+/**
+ * The preparation failures this path asks again for, a closed list: the machine or its link did not answer
+ * (ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE, the lease is not obtained on transient evidence;
+ * REMOTE_WORKSPACE_PREPARATION_TIMEOUT_CODE). Any other code leaves at once, to the block of today: a removed
+ * extension (plugin_worker_unavailable), a refused key (setup_failed) would never pass.
+ */
+export const PAUSE_CUT_WORK_START_FAILED_CODES: readonly string[] = ["environment_provider_unavailable", "remote_workspace_prepare_timeout"];
 const AGAIN = "again";
 const OPEN_FOR_WORK_STATUSES = ["todo", "in_progress", "in_review"];
 
@@ -348,11 +358,16 @@ export async function keepPauseCutWorkAfterFailedStart(db: Db, input: {
   const [run] = await db.select({ id: heartbeatRuns.id, agentId: heartbeatRuns.agentId, status: heartbeatRuns.status,
     errorCode: heartbeatRuns.errorCode, finishedAt: heartbeatRuns.finishedAt, processPid: heartbeatRuns.processPid,
     processGroupId: heartbeatRuns.processGroupId, contextSnapshot: heartbeatRuns.contextSnapshot,
+    resultJson: heartbeatRuns.resultJson,
   }).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, input.runId)));
   // Only a start that failed: a transient preparation failure, with no engine called.
   if (!run || run.status !== "failed" || !run.finishedAt || run.processPid || run.processGroupId) return false;
   const { isTransientWorkspacePreparationCode } = await import("./heartbeat/retries.js");
-  if (!isTransientWorkspacePreparationCode(run.errorCode)) return false;
+  if (!run.errorCode || !PAUSE_CUT_WORK_START_FAILED_CODES.includes(run.errorCode)
+    || !isTransientWorkspacePreparationCode(run.errorCode)) return false;
+  // When the failure carries the provider's own verdict, it must say that asking again can pass.
+  const verdict = record(record(run.resultJson).providerFailure).retryability;
+  if (verdict !== undefined && verdict !== "transient") return false;
   const [engineCalled] = await db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
     eq(heartbeatRunEvents.companyId, companyId), eq(heartbeatRunEvents.runId, run.id),
     inArray(heartbeatRunEvents.eventType, ["adapter.invoke", "native.process_start_requested", "native.process_identity_recorded"]),
@@ -381,13 +396,6 @@ export async function keepPauseCutWorkAfterFailedStart(db: Db, input: {
   )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
   if (latest?.id !== run.id) return false;
 
-  // A request of a person already waits on the task (the one filed for this failure, or a person's own): held.
-  const [waiting] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
-    eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, run.agentId),
-    inArray(agentWakeupRequests.status, LIVE_WAKE_STATUSES), eq(agentWakeupRequests.requestedByActorType, "user"),
-    sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`)).limit(1);
-  if (waiting) return true;
-
   const key = request.idempotencyKey.slice(PAUSE_RESUME_RETRY_KEY_PREFIX.length).split(":");
   const earlier = readPauseCutWorkAskedAgain(request.payload);
   const readyOperationId = key[1] ?? "none";
@@ -397,11 +405,28 @@ export async function keepPauseCutWorkAfterFailedStart(db: Db, input: {
     actorId: PAUSE_RESUME_ACTOR_ID, agentId: run.agentId, action, entityType: "issue", entityId: issueId,
     details: { interruptedRunId: run.id, readyOperationId, resumedByUserId: actorId, actorSource, cutRunId,
       errorCode: run.errorCode, ...details } });
+  // The bound comes first: past twelve hours nothing holds the task, whatever waits on it.
   if (now.getTime() - seriesStartedAt >= PAUSE_CUT_WORK_START_FAILED_MAX_MS) {
     await recordOnce(db, write, entry(PAUSE_CUT_WORK_NOT_CONTINUED, { reason: "start_failed_for_twelve_hours",
       seriesStartedAt: new Date(seriesStartedAt).toISOString() }));
     return false;
   }
+  // A role that cannot be started now (paused, terminated, waiting for approval, a broken reporting chain) would
+  // keep its request waiting with no run and no new failure, and the task held for nothing: block as before.
+  const [assignee] = await db.select().from(agents).where(and(eq(agents.companyId, companyId), eq(agents.id, run.agentId)));
+  if (!(await evaluateAgentInvokabilityFromDb(db, assignee)).invokable) return false;
+  const series = { companyId, issueId, agentId: run.agentId, cutRunId, seriesStartedAt, errorCode: run.errorCode, now, write };
+
+  // A request of a person already waits on the task (the one filed for this failure, or a person's own): held.
+  const [waiting] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, run.agentId),
+    inArray(agentWakeupRequests.status, LIVE_WAKE_STATUSES), eq(agentWakeupRequests.requestedByActorType, "user"),
+    sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`)).limit(1);
+  if (waiting) {
+    await noteStartFailedSeries(db, series);
+    return true;
+  }
+
   const attempt = (earlier?.attempt ?? 0) + 1;
   const delays = PAUSE_CUT_WORK_START_FAILED_DELAYS_MS;
   const notBefore = run.finishedAt.getTime() + delays[Math.min(attempt, delays.length) - 1]!;
@@ -422,7 +447,13 @@ export async function keepPauseCutWorkAfterFailedStart(db: Db, input: {
         payload: sql`jsonb_set(${agentWakeupRequests.payload}, ${sql.raw(`'{${PAUSE_CUT_WORK_ASKED_AGAIN}}'`)}, ${JSON.stringify(mark)}::jsonb)`,
       }).where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, receipt.requestId),
         eq(agentWakeupRequests.status, "deferred_issue_execution")));
-      await write(tx as unknown as Db, entry(PAUSE_CUT_WORK_REQUEST_FILED, { reason: "start_failed", attempt,
+      // The Retry's admission holds the task's row until this commits: a second caller that files the same request
+      // (the release and the sweep, at the same moment) finds the entry here and writes none.
+      const [recorded] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
+        eq(activityLog.companyId, companyId), eq(activityLog.entityType, "issue"), eq(activityLog.entityId, issueId),
+        eq(activityLog.action, PAUSE_CUT_WORK_REQUEST_FILED),
+        sql`${activityLog.details}->>'retryRequestId' = ${receipt.requestId}`)).limit(1);
+      if (!recorded) await write(tx as unknown as Db, entry(PAUSE_CUT_WORK_REQUEST_FILED, { reason: "start_failed", attempt,
         retryRequestId: receipt.requestId, startsNotBefore: new Date(notBefore).toISOString() }), publications);
       return receipt.requestId;
     });
@@ -430,6 +461,8 @@ export async function keepPauseCutWorkAfterFailedStart(db: Db, input: {
     // The person may no longer change the task, or the Retry path names another refusal: say it, and block as before.
     if (!(error instanceof HttpError) || error.status < 400 || error.status >= 500) throw error;
     const code = (error.details as { code?: unknown } | undefined)?.code;
+    // The Retry path is busy for a moment (its own word: retryable): the task stays held, the next look files.
+    if (code === "task_retry_busy") return true;
     await recordOnce(db, write, entry(PAUSE_CUT_WORK_NOT_CONTINUED, { reason: typeof code === "string" ? code : `retry_refused_${error.status}` }));
     return false;
   }
@@ -439,13 +472,44 @@ export async function keepPauseCutWorkAfterFailedStart(db: Db, input: {
   const [filed] = await db.select({ status: agentWakeupRequests.status }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.id, filedId)));
   if (!filed || !LIVE_WAKE_STATUSES.includes(filed.status)) return false;
-  if (attempt === 1) {
-    await (await import("./issues.js")).issueService(db).addComment(issueId,
-      `The run that continued the work a pause cut on this task could not start (\`${run.errorCode}\`): its machine or its environment did not answer. Nothing was lost and no engine was started. Paperclip asks again by itself, with growing waits, for up to 12 hours; the task is not blocked meanwhile.`,
-      {}, { authorType: "system" }).catch(error =>
-      logger.error({ err: error, companyId, issueId, runId: run.id }, "a continuation that could not start is asked for again, but its note on the task could not be written"));
-  }
+  await noteStartFailedSeries(db, series);
   return true;
+}
+
+/**
+ * What the task says while a series of failed starts lasts: one system comment when it begins, then one per hour.
+ * The entry that counts them is written under the task's row lock, so two callers at the same moment write one.
+ */
+async function noteStartFailedSeries(db: Db, input: {
+  companyId: string; issueId: string; agentId: string; cutRunId: string; seriesStartedAt: number;
+  errorCode: string | null; now: Date; write: Record_;
+}) {
+  const hour = Math.max(0, Math.floor((input.now.getTime() - input.seriesStartedAt) / PAUSE_CUT_WORK_START_FAILED_NOTE_EVERY_MS));
+  const startedAt = new Date(input.seriesStartedAt).toISOString();
+  const first = await db.transaction(async tx => {
+    await tx.select({ id: issues.id }).from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("update");
+    const [noted] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
+      eq(activityLog.companyId, input.companyId), eq(activityLog.entityType, "issue"), eq(activityLog.entityId, input.issueId),
+      eq(activityLog.action, PAUSE_CUT_WORK_KEPT), sql`${activityLog.details}->>'reason' = 'start_failed_still_asking'`,
+      sql`${activityLog.details}->>'cutRunId' = ${input.cutRunId}`, sql`${activityLog.details}->>'seriesStartedAt' = ${startedAt}`,
+      sql`${activityLog.details}->>'hour' = ${String(hour)}`)).limit(1);
+    if (noted) return false;
+    await input.write(tx as unknown as Db, { companyId: input.companyId, actorType: "system", actorId: PAUSE_RESUME_ACTOR_ID,
+      agentId: input.agentId, action: PAUSE_CUT_WORK_KEPT, entityType: "issue", entityId: input.issueId,
+      details: { interruptedRunId: input.cutRunId, cutRunId: input.cutRunId, reason: "start_failed_still_asking",
+        seriesStartedAt: startedAt, hour, errorCode: input.errorCode } });
+    return true;
+  }).catch(error => {
+    logger.error({ err: error, companyId: input.companyId, issueId: input.issueId }, "the record of a series of failed starts could not be written");
+    return false;
+  });
+  if (!first) return;
+  const until = new Date(input.seriesStartedAt + PAUSE_CUT_WORK_START_FAILED_MAX_MS).toISOString();
+  const body = hour === 0
+    ? `The run that continued the work a pause cut on this task could not start (\`${input.errorCode}\`): its machine or its environment did not answer. Nothing was lost and no engine was started. Paperclip asks again by itself, with growing waits, for up to 12 hours; the task is not blocked meanwhile.`
+    : `The work a pause cut on this task still cannot start, ${hour} hour${hour === 1 ? "" : "s"} after its first failed start (\`${input.errorCode}\`). Paperclip keeps asking by itself until ${until}, then the task is blocked. If the machine was removed or will not come back, do not wait: block or reassign the task.`;
+  await (await import("./issues.js")).issueService(db).addComment(input.issueId, body, {}, { authorType: "system" }).catch(error =>
+    logger.error({ err: error, companyId: input.companyId, issueId: input.issueId }, "a continuation that could not start is asked for again, but its note on the task could not be written"));
 }
 
 /** The mark of a request asked again after a failed start; null for any other request. */

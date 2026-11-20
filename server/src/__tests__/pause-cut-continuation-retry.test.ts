@@ -16,9 +16,12 @@ import { runningProcesses, type AdapterExecutionContext, type AdapterExecutionRe
 import { heartbeatService } from "../services/heartbeat.ts";
 import { environmentService } from "../services/environments.js";
 import {
-  keepPauseCutWorkAfterFailedStart, PAUSE_CUT_WORK_CONTINUED, PAUSE_CUT_WORK_NOT_CONTINUED, PAUSE_CUT_WORK_REQUEST_FILED,
-  PAUSE_CUT_WORK_START_FAILED_DELAYS_MS, PAUSE_CUT_WORK_START_FAILED_MAX_MS, PAUSE_RESUME_RETRY_KEY_PREFIX,
+  keepPauseCutWorkAfterFailedStart, PAUSE_CUT_WORK_CONTINUED, PAUSE_CUT_WORK_KEPT, PAUSE_CUT_WORK_NOT_CONTINUED, PAUSE_CUT_WORK_REQUEST_FILED,
+  PAUSE_CUT_WORK_START_FAILED_CODES, PAUSE_CUT_WORK_START_FAILED_DELAYS_MS, PAUSE_CUT_WORK_START_FAILED_MAX_MS,
+  PAUSE_CUT_WORK_START_FAILED_NOTE_EVERY_MS, PAUSE_RESUME_RETRY_KEY_PREFIX,
 } from "../services/pause-resume-continuation.js";
+import { conflict, forbidden } from "../errors.js";
+import { isTransientWorkspacePreparationCode } from "../services/heartbeat/retries.js";
 import { readPauseCutWorkAskedAgain, type PauseCutWorkAskedAgain } from "../services/pause-cut-asked-again.js";
 import { requestTaskRetry } from "../services/task-retry.js";
 
@@ -127,6 +130,9 @@ const support = await getEmbeddedPostgresTestSupport();
     eq(activityLog.entityId, f.issueId), eq(activityLog.action, action))).orderBy(asc(activityLog.createdAt))).map(entry => entry.details ?? {});
   const notes = async (f: Fixture) => (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
     .filter(comment => comment.authorType === "system" && comment.body.includes("could not start"));
+  /** The notes a series writes after its first hour. */
+  const hourlyNotes = async (f: Fixture) => (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+    .filter(comment => comment.authorType === "system" && comment.body.includes("still cannot start"));
   /** The requests asked again after a failed start, oldest first, with their mark and the failed run their key names. */
   async function askedAgain(f: Fixture) {
     const wakes = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId))
@@ -335,6 +341,92 @@ const support = await getEmbeddedPostgresTestSupport();
   it("the waits grow: thirty seconds, one, two, four minutes, then five minutes each time", () => {
     expect(PAUSE_CUT_WORK_START_FAILED_DELAYS_MS).toEqual([30_000, 60_000, 120_000, 240_000, 300_000]);
     expect(PAUSE_CUT_WORK_START_FAILED_MAX_MS).toBe(12 * 60 * 60_000);
+    expect(PAUSE_CUT_WORK_START_FAILED_NOTE_EVERY_MS).toBe(60 * 60_000);
+    // The closed list of codes is inside what the product itself retries as a transient preparation failure.
+    expect(PAUSE_CUT_WORK_START_FAILED_CODES).toEqual(["environment_provider_unavailable", "remote_workspace_prepare_timeout"]);
+    for (const code of PAUSE_CUT_WORK_START_FAILED_CODES) expect(isTransientWorkspacePreparationCode(code)).toBe(true);
+  });
+
+  it("past twelve hours a request that still waits holds nothing: the bound is read first", async () => {
+    const f = await seed();
+    const { failed } = await continuationThatCannotStart(f);
+    const held = { companyId: f.companyId, issueId: f.issueId, runId: failed.id };
+    expect((await askedAgain(f))[0]!.wake.status).toBe("deferred_issue_execution");
+    const start = failed.finishedAt!.getTime();
+    expect(await keepPauseCutWorkAfterFailedStart(db, { ...held, now: new Date(start + PAUSE_CUT_WORK_START_FAILED_MAX_MS - 60_000) })).toBe(true);
+    expect(await keepPauseCutWorkAfterFailedStart(db, { ...held, now: new Date(start + PAUSE_CUT_WORK_START_FAILED_MAX_MS) })).toBe(false);
+    expect((await entries(f, PAUSE_CUT_WORK_NOT_CONTINUED)).at(-1)).toMatchObject({ interruptedRunId: failed.id, reason: "start_failed_for_twelve_hours" });
+  });
+
+  it.each(["paused", "terminated", "pending_approval"] as const)(
+    "a role that cannot be started now (%s) is not held, even with a request waiting: blocked as before", async status => {
+      const f = await seed();
+      const { failed } = await continuationThatCannotStart(f);
+      const held = { companyId: f.companyId, issueId: f.issueId, runId: failed.id };
+      expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(true);
+      await db.update(agents).set({ status }).where(eq(agents.id, f.agentId));
+      expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(false);
+      // A role in error can still be started: it is held.
+      await db.update(agents).set({ status: "error" }).where(eq(agents.id, f.agentId));
+      expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(true);
+      await db.update(agents).set({ status: "active" }).where(eq(agents.id, f.agentId));
+    });
+
+  it("while the series lasts the task says so again every hour, once per hour", async () => {
+    const f = await seed();
+    const { failed } = await continuationThatCannotStart(f);
+    const held = { companyId: f.companyId, issueId: f.issueId, runId: failed.id };
+    const at = (minutes: number) => new Date(failed.finishedAt!.getTime() + minutes * 60_000);
+    expect(await notes(f)).toHaveLength(1);
+    // Within the first hour: nothing more, however often the task is looked at.
+    for (const minutes of [5, 30, 59]) expect(await keepPauseCutWorkAfterFailedStart(db, { ...held, now: at(minutes) })).toBe(true);
+    expect(await hourlyNotes(f)).toHaveLength(0);
+    // After one hour: one note, once.
+    for (const minutes of [61, 75, 119]) expect(await keepPauseCutWorkAfterFailedStart(db, { ...held, now: at(minutes) })).toBe(true);
+    let hourly = await hourlyNotes(f);
+    expect(hourly).toHaveLength(1);
+    expect(hourly[0]!.body).toContain("1 hour after its first failed start");
+    expect(hourly[0]!.body).toContain("environment_provider_unavailable");
+    expect(hourly[0]!.body).toContain(new Date(failed.finishedAt!.getTime() + PAUSE_CUT_WORK_START_FAILED_MAX_MS).toISOString());
+    // After three hours: one more.
+    for (const minutes of [181, 190]) expect(await keepPauseCutWorkAfterFailedStart(db, { ...held, now: at(minutes) })).toBe(true);
+    hourly = await hourlyNotes(f);
+    expect(hourly).toHaveLength(2);
+    expect(hourly.some(note => note.body.includes("3 hours after its first failed start"))).toBe(true);
+    expect(await notes(f)).toHaveLength(1);
+    expect((await entries(f, PAUSE_CUT_WORK_KEPT)).filter(entry => entry.reason === "start_failed_still_asking").map(entry => entry.hour)).toEqual([0, 1, 3]);
+  });
+
+  it("two looks at the same moment file one request, one entry and one note", async () => {
+    const f = await seed();
+    const { failed } = await continuationThatCannotStart(f);
+    const held = { companyId: f.companyId, issueId: f.issueId, runId: failed.id };
+    // Back to the moment of the failure: nothing is filed, nothing is written yet.
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, (await askedAgain(f))[0]!.wake.id));
+    await db.delete(activityLog).where(and(eq(activityLog.companyId, f.companyId), eq(activityLog.entityId, f.issueId)));
+    await db.delete(issueComments).where(eq(issueComments.issueId, f.issueId));
+    // The release of the task and the sweep, together.
+    expect(await Promise.all([1, 2, 3].map(() => keepPauseCutWorkAfterFailedStart(db, held)))).toEqual([true, true, true]);
+    expect(await askedAgain(f)).toHaveLength(1);
+    expect((await entries(f, PAUSE_CUT_WORK_REQUEST_FILED)).filter(entry => entry.reason === "start_failed")).toHaveLength(1);
+    expect(await notes(f)).toHaveLength(1);
+  });
+
+  it("a Retry path that is busy for a moment does not block the task; another refusal does, and says why", async () => {
+    const f = await seed();
+    const { failed } = await continuationThatCannotStart(f);
+    const held = { companyId: f.companyId, issueId: f.issueId, runId: failed.id };
+    await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, (await askedAgain(f))[0]!.wake.id));
+    const busy = async () => { throw conflict("Retry is busy because chat authorization is in progress. Try again.", { code: "task_retry_busy", retryable: true }); };
+    expect(await keepPauseCutWorkAfterFailedStart(db, { ...held, requestRetry: busy as never })).toBe(true);
+    expect(await askedAgain(f)).toHaveLength(0);
+    expect(await entries(f, PAUSE_CUT_WORK_NOT_CONTINUED)).toHaveLength(0);
+    // The next look files the request.
+    const refused = async () => { throw forbidden("Missing permission: tasks:assign", { code: "missing_permission" }); };
+    expect(await keepPauseCutWorkAfterFailedStart(db, { ...held, requestRetry: refused as never })).toBe(false);
+    expect((await entries(f, PAUSE_CUT_WORK_NOT_CONTINUED)).at(-1)).toMatchObject({ interruptedRunId: failed.id, reason: "missing_permission" });
+    expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(true);
+    expect(await askedAgain(f)).toHaveLength(1);
   });
 
   it("twelve hours after the first failure nothing is filed any more: the task is blocked as before, and says why", async () => {
@@ -391,6 +483,16 @@ const support = await getEmbeddedPostgresTestSupport();
     // Had it failed on a code that is not a transient preparation failure: nothing is filed.
     await db.update(heartbeatRuns).set({ errorCode: "setup_failed" }).where(eq(heartbeatRuns.id, failed.id));
     expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(false);
+    // Or on a preparation code the product retries but that is not about the machine's link (a removed extension
+    // never comes back): it leaves at once.
+    await db.update(heartbeatRuns).set({ errorCode: "plugin_worker_unavailable" }).where(eq(heartbeatRuns.id, failed.id));
+    expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(false);
+    // Or with the provider's own verdict that asking again cannot pass.
+    await db.update(heartbeatRuns).set({ errorCode: "environment_provider_unavailable",
+      resultJson: { ...failed.resultJson, providerFailure: { ...(failed.resultJson?.providerFailure as object), retryability: "requires_action" } } })
+      .where(eq(heartbeatRuns.id, failed.id));
+    expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(false);
+    await db.update(heartbeatRuns).set({ resultJson: failed.resultJson }).where(eq(heartbeatRuns.id, failed.id));
     expect(await askedAgain(f)).toHaveLength(0);
     // And as it really is, with no request waiting: the request is filed.
     await db.update(heartbeatRuns).set({ errorCode: "environment_provider_unavailable" }).where(eq(heartbeatRuns.id, failed.id));
