@@ -32,6 +32,9 @@ vi.mock("@/api/plugins", () => ({ pluginsApi: { listUiContributions: async () =>
 vi.mock("./SidebarCompanyMenu", () => ({ SidebarCompanyMenu: () => null }));
 vi.mock("@/lib/router", () => ({
   useLocation: () => ({ pathname: fixture.pathname, search: "" }),
+  // The company on screen. This stand-in Link adds no prefix: a plugin entry carries its own (see the
+  // company test file, which mounts the real router).
+  useActiveCompanyPrefix: () => "COO",
   Link: ({ to, children, ...props }: { to: string; children: ReactNode }) => <a href={to} {...props}>{children}</a>,
   NavLink: ({ to, children, className, state: _state, end: _end, ...props }: {
     to: string; children: ReactNode; className?: string | ((state: { isActive: boolean }) => string); state?: unknown; end?: boolean;
@@ -221,12 +224,12 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
     fixture.contributions = [router];
     await renderSidebar();
     // Not in the navigation itself: only behind "More".
-    expect(pinnedPage("/machines")).toBeNull();
+    expect(pinnedPage("/COO/machines")).toBeNull();
     await click("More workspace pages");
-    const link = document.querySelector<HTMLAnchorElement>('[data-slot="popover-content"] a[href="/machines"]');
+    const link = document.querySelector<HTMLAnchorElement>('[data-slot="popover-content"] a[href="/COO/machines"]');
     expect(link?.textContent).toBe("Machines");
     // After every built-in page, behind a separator of its own.
-    expect(moreLinks()).toEqual(["/search", "/dashboard", "/projects", "/routines", "/artifacts", "/agents/all", "/skills", "/apps", "/activity", "/settings", "/machines"]);
+    expect(moreLinks()).toEqual(["/search", "/dashboard", "/projects", "/routines", "/artifacts", "/agents/all", "/skills", "/apps", "/activity", "/settings", "/COO/machines"]);
     expect(link!.closest("div")!.parentElement!.querySelector('[role="separator"]')).not.toBeNull();
     expect(document.querySelector('button[aria-label="Pin Machines"]')).not.toBeNull();
   });
@@ -236,11 +239,11 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
     fixture.contributions = [router];
     await renderSidebar();
     await click("More workspace pages");
-    expect(moreLinks().slice(-3)).toEqual(["/settings", "/cases", "/machines"]);
+    expect(moreLinks().slice(-3)).toEqual(["/settings", "/cases", "/COO/machines"]);
     const content = document.querySelector('[aria-label="More workspace pages"][data-slot="popover-content"]')!;
     // Before Agents, before Cases, before the plugin pages.
     expect(content.querySelectorAll('[role="separator"]')).toHaveLength(3);
-    const machinesRow = content.querySelector('a[href="/machines"]')!.closest("div")!.parentElement!;
+    const machinesRow = content.querySelector('a[href="/COO/machines"]')!.closest("div")!.parentElement!;
     expect(machinesRow.querySelector('[role="separator"]')).not.toBeNull();
   });
 
@@ -264,16 +267,16 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
     await click("More workspace pages");
     await click("Pin Machines");
     expect(JSON.parse(localStorage.getItem(KEY)!)).toEqual(["/machines"]);
-    expect(pinnedPage("/machines")?.textContent).toBe("Machines");
+    expect(pinnedPage("/COO/machines")?.textContent).toBe("Machines");
     // A new page load reads the pin from the browser.
     await act(async () => root.unmount());
     root = createRoot(container);
     await renderSidebar();
-    expect(pinnedPage("/machines")?.textContent).toBe("Machines");
+    expect(pinnedPage("/COO/machines")?.textContent).toBe("Machines");
     await click("More workspace pages");
     await click("Unpin Machines");
     expect(JSON.parse(localStorage.getItem(KEY)!)).toEqual([]);
-    expect(pinnedPage("/machines")).toBeNull();
+    expect(pinnedPage("/COO/machines")).toBeNull();
   });
 
   it("a pin kept while the plugin is away breaks nothing, is kept, and comes back with the plugin", async () => {
@@ -299,7 +302,7 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
     await renderSidebar();
     expect(container.querySelector('[role="alert"]')).toBeNull();
     expect(pinnedPage("/projects")?.textContent).toBe("Projects");
-    expect(pinnedPage("/machines")).toBeNull();
+    expect(pinnedPage("/COO/machines")).toBeNull();
     await click("More workspace pages");
     expect(moreLinks()).toHaveLength(10);
   });
@@ -367,8 +370,8 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
     expect(container.querySelector('a[href="/chats"]')).not.toBeNull();
     await click("More workspace pages");
     // The nameless entry is named after its plugin; the one without slots gives nothing.
-    expect(moreLinks().slice(-2)).toEqual(["/machines", "/nameless"]);
-    expect(document.querySelector('[data-slot="popover-content"] a[href="/nameless"]')?.textContent).toBe("nameless");
+    expect(moreLinks().slice(-2)).toEqual(["/COO/machines", "/COO/nameless"]);
+    expect(document.querySelector('[data-slot="popover-content"] a[href="/COO/nameless"]')?.textContent).toBe("nameless");
   });
 
   it("a route declared with leading slashes gives one clean path, compared with the taken ones after that", () => {
@@ -381,6 +384,18 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
       contribution("only-slashes", page("//", "Nothing")),
       contribution("blank", page("  ", "Blank")),
     ], [{ to: "/projects" }]).map(item => [item.label, item.to])).toEqual([["Fleet", "/fleet"], ["Machines", "/machines"]]);
+  });
+
+  it("carries its link with the company prefix, and keeps a key that holds no company", () => {
+    const [machines] = buildPluginMoreDestinations([router], [], "ban");
+    expect(machines).toMatchObject({ label: "Machines", to: "/machines", href: "/BAN/machines" });
+    for (const none of [undefined, null, "", "  "]) expect(buildPluginMoreDestinations([router], [], none)[0]).not.toHaveProperty("href");
+    // A route declared with a slash gives the same link.
+    expect(buildPluginMoreDestinations([contribution("slash", [slot({ type: "page", routePath: "/fleet" }), slot({ type: "sidebar", displayName: "Fleet" })])], [], "BAN")[0])
+      .toMatchObject({ to: "/fleet", href: "/BAN/fleet" });
+    // The pinned row: the same key, the prefixed link. A built-in destination has no link of its own.
+    expect(buildPinnedNavigationItems(["/projects", "/machines"], [], [machines!, { to: "/projects", label: "Projects", icon: machines!.icon }])
+      .map(item => [item.key, item.to])).toEqual([["/projects", "/projects"], ["/machines", "/BAN/machines"]]);
   });
 
   it("other kinds of slots are not destinations: only a page with a menu entry", () => {

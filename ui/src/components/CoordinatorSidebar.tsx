@@ -12,7 +12,8 @@ import { usePinnedNavigation } from "@/hooks/usePinnedNavigation";
 import { useDialogActions } from "@/context/DialogContext";
 import { useSidebar } from "@/context/SidebarContext";
 import { queryKeys } from "@/lib/queryKeys";
-import { Link, useLocation } from "@/lib/router";
+import { normalizeCompanyPrefix } from "@/lib/company-routes";
+import { Link, useActiveCompanyPrefix, useLocation } from "@/lib/router";
 import { agentRouteRef, cn, projectRouteRef, SIDEBAR_RAIL_HIDDEN_LABEL } from "@/lib/utils";
 import { SidebarCompanyMenu } from "./SidebarCompanyMenu";
 import { SidebarNavItem } from "./SidebarNavItem";
@@ -42,7 +43,8 @@ const moreDestinations = [
   { label: "Settings", to: "/settings", icon: Settings },
 ] as const;
 
-type MoreDestination = { label: string; to: string; icon: LucideIcon };
+/** `to` is the destination's key (and its pin). `href`, when set, is the link to render in its place. */
+type MoreDestination = { label: string; to: string; icon: LucideIcon; href?: string };
 // The three pages above "More": a plugin page of the same path would never be reached.
 const primaryDestinations = [{ to: "/chats" }, { to: "/issues" }, { to: "/decisions" }] as const;
 
@@ -56,12 +58,18 @@ const primaryDestinations = [{ to: "/chats" }, { to: "/issues" }, { to: "/decisi
  * a route is one segment without a slash); this function still never throws on a declaration that lacks them,
  * because an error here would take the whole left menu down: such an entry is named after the page or the
  * plugin, or skipped.
+ *
+ * The link. A plugin page is served at `/<company prefix>/<routePath>`, and the router's own prefixing only
+ * knows the host's roots: it would take `/machines` for a company named MACHINES. So the entry carries its
+ * link already prefixed (`href`), as the host does for Cases links, while its key stays `/<routePath>`: a pin
+ * holds no company and is rendered with the prefix of the company on screen.
  */
-export function buildPluginMoreDestinations(contributions: readonly PluginUiContribution[] | undefined, taken: readonly { to: string }[]): MoreDestination[] {
+export function buildPluginMoreDestinations(contributions: readonly PluginUiContribution[] | undefined, taken: readonly { to: string }[], companyPrefix?: string | null): MoreDestination[] {
   const used = new Set([...primaryDestinations, ...taken].map(item => item.to));
   const first = <T extends { order?: number }>(slots: T[]) => [...slots].sort((a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER))[0];
   const text = (value: unknown) => (typeof value === "string" ? value.trim() : "");
   const routeOf = (slot: { routePath?: unknown }) => text(slot.routePath).replace(/^\/+/, "");
+  const prefix = text(companyPrefix) ? normalizeCompanyPrefix(text(companyPrefix)) : "";
   const entries: MoreDestination[] = [];
   for (const contribution of Array.isArray(contributions) ? contributions : []) {
     const slots: PluginUiContribution["slots"] = Array.isArray(contribution?.slots) ? contribution.slots.filter(Boolean) : [];
@@ -73,14 +81,14 @@ export function buildPluginMoreDestinations(contributions: readonly PluginUiCont
     const to = `/${routeOf(page)}`;
     if (used.has(to)) continue;
     used.add(to);
-    entries.push({ label, to, icon: Puzzle });
+    entries.push({ label, to, icon: Puzzle, ...(prefix ? { href: `/${prefix}${to}` } : {}) });
   }
   return entries.sort((a, b) => a.label.localeCompare(b.label));
 }
 
-export function buildPinnedNavigationItems(pins: readonly string[], agents: readonly Agent[], destinations: readonly { to: string; label: string; icon: LucideIcon }[]): PinnedNavigationItem[] {
+export function buildPinnedNavigationItems(pins: readonly string[], agents: readonly Agent[], destinations: readonly { to: string; label: string; icon: LucideIcon; href?: string }[]): PinnedNavigationItem[] {
   const keys = new Set(pins);
-  const items = new Map<string, PinnedNavigationItem>(destinations.map(item => [item.to, { key: item.to, to: item.to, label: item.label, icon: <item.icon className="size-4" /> }]));
+  const items = new Map<string, PinnedNavigationItem>(destinations.map(item => [item.to, { key: item.to, to: item.href ?? item.to, label: item.label, icon: <item.icon className="size-4" /> }]));
   for (const agent of agents) {
     const key = agentChatPinKey(agent.companyId, agent.id);
     if (keys.has(key)) items.set(key, { key, to: `/chats/${encodeURIComponent(agentRouteRef(agent))}`, label: agent.name, icon: <AgentAvatar agent={agent} size={20} /> });
@@ -156,8 +164,9 @@ export function CoordinatorSidebar({ children }: { children?: ReactNode }) {
     queryKey: queryKeys.plugins.uiContributions,
     queryFn: () => pluginsApi.listUiContributions(),
   });
-  const pluginDestinations = useMemo(() => buildPluginMoreDestinations(pluginContributions, builtInDestinations), [pluginContributions, builtInDestinations]);
-  const destinations = useMemo(() => [...builtInDestinations, ...pluginDestinations], [builtInDestinations, pluginDestinations]);
+  const companyPrefix = useActiveCompanyPrefix();
+  const pluginDestinations = useMemo(() => buildPluginMoreDestinations(pluginContributions, builtInDestinations, companyPrefix), [pluginContributions, builtInDestinations, companyPrefix]);
+  const destinations = useMemo<MoreDestination[]>(() => [...builtInDestinations, ...pluginDestinations], [builtInDestinations, pluginDestinations]);
   const [moreOpen, setMoreOpen] = useState(false);
   const moreContentRef = useRef<HTMLDivElement>(null);
   const orderedPins = useMemo(() => buildPinnedNavigationItems(pinnedNavigation.pins, agents.data ?? [], destinations), [pinnedNavigation.pins, agents.data, destinations]);
@@ -213,13 +222,13 @@ export function CoordinatorSidebar({ children }: { children?: ReactNode }) {
         <Flyout open={moreOpen} onOpenChange={setMoreOpen}>
           <FlyoutTrigger asChild><button type="button" aria-label="More workspace pages" className="design-sidebar-item flex w-auto items-center gap-2.5 rounded-lg py-1.5 text-left transition-colors focus-visible:ring-2 focus-visible:ring-ring"><MoreHorizontal className="size-4 shrink-0" /><span className={rail ? SIDEBAR_RAIL_HIDDEN_LABEL : undefined}>More</span></button></FlyoutTrigger>
           <FlyoutContent ref={moreContentRef} tabIndex={-1} onOpenAutoFocus={(event) => { event.preventDefault(); moreContentRef.current?.focus(); }} side={isMobile ? "bottom" : "right"} align="start" className="w-56 p-1" aria-label="More workspace pages">
-            {destinations.map(({ label, to, icon: Icon }, index) => {
+            {destinations.map(({ label, to, icon: Icon, href }, index) => {
               const pinned = pinnedNavigation.pins.includes(to);
               const PinIcon = pinned ? PinOff : Pin;
               return <div key={to}>
                 {index === 6 || index === 10 || (pluginDestinations.length > 0 && index === builtInDestinations.length) ? <div role="separator" className="my-1 border-t border-border" /> : null}
                 <div className="group/coordinator-more relative flex items-center rounded-sm transition-colors hover:bg-accent">
-                  <Link to={to} onClick={() => { setMoreOpen(false); if (isMobile) setSidebarOpen(false); }} className="flex min-w-0 flex-1 items-center gap-2 rounded-sm px-2 py-1.5 pr-10 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
+                  <Link to={href ?? to} onClick={() => { setMoreOpen(false); if (isMobile) setSidebarOpen(false); }} className="flex min-w-0 flex-1 items-center gap-2 rounded-sm px-2 py-1.5 pr-10 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring">
                     <Icon className="size-4 shrink-0 text-muted-foreground" />{label}
                   </Link>
                   <button type="button" aria-label={`${pinned ? "Unpin" : "Pin"} ${label}`} aria-pressed={pinned} title={`${pinned ? "Unpin" : "Pin"} ${label}`} disabled={!pinnedNavigation.canPin} onClick={() => pinnedNavigation.toggle(to)} className={cn("absolute right-0.5 top-1/2 flex size-8 -translate-y-1/2 items-center justify-center rounded-sm opacity-0 transition-opacity outline-none group-hover/coordinator-more:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100 hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring", pinned ? "text-foreground" : "text-muted-foreground")}>
