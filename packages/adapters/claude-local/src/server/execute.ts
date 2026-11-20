@@ -1082,6 +1082,42 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     opts: { fallbackSessionId: string | null; clearSessionOnMissingSession?: boolean },
   ): AdapterExecutionResult => {
     const { proc, parsedStream, parsed, sessionBaseline } = attempt;
+    // STUDIO-0080: the parameters kept with a session of this run, the same whether the run succeeded or was
+    // cut after Claude announced its session.
+    const sessionParamsFor = (id: string): Record<string, unknown> => ({
+      sessionId: id,
+      cwd,
+      promptBundleKey: promptBundle.bundleKey,
+      mcpServerIdentity: runtimeMcpIdentity,
+      ...(executionTargetIsRemote
+        ? {
+            remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
+          }
+        : {}),
+      ...(workspaceId ? { workspaceId } : {}),
+      ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+      ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+      ...(() => {
+        // Persist the cumulative ledger so the next resumed run reports only
+        // its own share; a run without a final result keeps the old baseline.
+        const totals = parsedStream.sessionTotals?.sessionId === id
+          ? parsedStream.sessionTotals
+          : sessionBaseline?.sessionId === id ? sessionBaseline : null;
+        return totals ? { claudeSessionTotals: totals } : {};
+      })(),
+    });
+    // STUDIO-0080: a run that ends without Claude's final `result` (the engine killed by a pause or by a lost
+    // link, or the run's own timeout) returned no session, so the conversation Claude had opened was lost and
+    // the next run started from nothing. The session Claude announced in this attempt (`system`/`init`) is
+    // returned with the failure. A session Claude cannot reopen afterwards is handled where it always was:
+    // the resume is refused as unknown and this adapter retries on a fresh session, clearing the kept one.
+    const announcedSession = parsedStream.sessionId
+      ? {
+          sessionId: parsedStream.sessionId,
+          sessionParams: sessionParamsFor(parsedStream.sessionId),
+          sessionDisplayId: parsedStream.sessionId,
+        }
+      : null;
     const loginMeta = detectClaudeLoginRequired({
       parsed,
       stdout: proc.stdout,
@@ -1111,7 +1147,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         errorMessage: `Timed out after ${timeoutSec}s`,
         errorCode: "timeout",
         errorMeta,
-        clearSession: Boolean(opts.clearSessionOnMissingSession),
+        ...(announcedSession ?? {}),
+        clearSession: Boolean(opts.clearSessionOnMissingSession && !announcedSession),
       };
     }
 
@@ -1198,7 +1235,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             : {}),
           ...(proc.terminalResultCleanup ? { unmanagedBackgroundTask: proc.terminalResultCleanup } : {}),
         },
-        clearSession: Boolean(opts.clearSessionOnMissingSession),
+        ...(announcedSession ?? {}),
+        clearSession: Boolean(opts.clearSessionOnMissingSession && !announcedSession),
       };
     }
 
@@ -1245,30 +1283,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     // calls clearTaskSessions on the next heartbeat. See RED-978 / RED-976.
     const shouldDropSessionForPoison = poisonedPreviousMessageId;
     const resolvedSessionId = shouldDropSessionForPoison ? null : rawResolvedSessionId;
-    const resolvedSessionParams = resolvedSessionId
-      ? ({
-        sessionId: resolvedSessionId,
-        cwd,
-        promptBundleKey: promptBundle.bundleKey,
-        mcpServerIdentity: runtimeMcpIdentity,
-        ...(executionTargetIsRemote
-          ? {
-              remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget),
-            }
-          : {}),
-        ...(workspaceId ? { workspaceId } : {}),
-        ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
-        ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
-        ...(() => {
-          // Persist the cumulative ledger so the next resumed run reports only
-          // its own share; a run without a final result keeps the old baseline.
-          const totals = parsedStream.sessionTotals?.sessionId === resolvedSessionId
-            ? parsedStream.sessionTotals
-            : sessionBaseline?.sessionId === resolvedSessionId ? sessionBaseline : null;
-          return totals ? { claudeSessionTotals: totals } : {};
-        })(),
-      } as Record<string, unknown>)
-      : null;
+    const resolvedSessionParams = resolvedSessionId ? sessionParamsFor(resolvedSessionId) : null;
     const errorMessage = failed
       ? describeClaudeFailure(parsed) ?? `Claude exited with code ${proc.exitCode ?? -1}`
       : null;
