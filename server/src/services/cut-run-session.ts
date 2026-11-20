@@ -13,8 +13,13 @@ import { readRunCancellation } from "./run-cancellation.js";
  * product's rule holds again: the session of such a run is left aside when its result comes late, and the person's
  * next request opens a new conversation. One line, one name: nothing else reads the decision.
  *
- * Any other cancellation (a lost controller lease, a reassignment, a shutdown) keeps the product's rule on an
- * ordinary task. On a conversation task it does not: see conversationCancelledRunKeepsSession below.
+ * These two functions decide one thing only: whether a person's REQUEST that continues a cancelled run goes on in
+ * that run's session (heartbeat/queue.ts), and, on a conversation task, whether the session writer takes the session
+ * (heartbeat/run-state.ts). They do not filter the late result itself: on an ordinary task the session a late
+ * result names is kept for the task whatever cancelled the run (a reassignment, a lost controller lease, a
+ * shutdown, a run the sweep declared lost), and an ordinary wake resumes it, as it resumes any task session. What
+ * stays the product's rule for those cancellations is the person's explicit request, which opens a new conversation.
+ * A session removed on purpose is never put back by a late result (task-session-removal.ts).
  */
 export const KEEP_SESSION_AFTER_PERSON_STOP = true;
 

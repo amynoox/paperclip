@@ -3,13 +3,16 @@ import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   agentTaskSessions, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases,
-  heartbeatRunEvents, heartbeatRuns, issueComments, issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { runningProcesses, type AdapterExecutionContext, type AdapterExecutionResult } from "../adapters/index.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { environmentService } from "../services/environments.js";
+import { markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
+import { createHeartbeatRunState } from "../services/heartbeat/run-state.js";
+import { TASK_SESSION_REMOVED } from "../services/task-session-removal.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
   vi.fn(async (_context: AdapterExecutionContext): Promise<AdapterExecutionResult> => ({
@@ -326,6 +329,103 @@ const support = await getEmbeddedPostgresTestSupport();
     });
     expect(await taskSession(f)).toMatchObject({ sessionDisplayId: other });
     expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left" } });
+  });
+
+  // A session removed on purpose always wins over a late result: the result of a run created before the removal
+  // never puts the session back. The removal leaves a mark the late write reads (task-session-removal.ts).
+  type Removal = (f: Fixture, cutRunId: string) => Promise<unknown>;
+  const REMOVALS: Array<[string, Removal]> = [
+    ["a person resets the role's session for the task", f => heartbeat.resetRuntimeSession(f.agentId, { taskKey: f.issueId })],
+    // The guard against relaunch loops (the series of TR-2069) gives the session up by this same call.
+    ["the guard against relaunch loops gives the session up", f => createHeartbeatRunState(db).clearTaskSessions(f.companyId, f.agentId,
+      { taskKey: f.issueId, adapterType })],
+    // STUDIO-0048: recovery drops the session the cut run left mid-turn, by the real settlement.
+    ["recovery drops the session the cut run left mid-turn", async (f, cutRunId) => {
+      // The hold of the cut run: the one the server wrote when it cancelled the run, or one written here.
+      const held = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
+        eq(issueRecoveryActions.sourceIssueId, f.issueId), sql`${issueRecoveryActions.evidence}->>'runId' = ${cutRunId}`));
+      const action = held[0] ?? (await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+        kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${cutRunId}`,
+        status: "active", ownerType: "board", nextAction: "Review the cut run.", evidence: { runId: cutRunId } }).returning())[0]!;
+      await markExecutionReconciliation(db, action, { runId: cutRunId } as never, "responsible-user", undefined, { dependencyBlockedOnly: true });
+    }],
+  ];
+  it.each(REMOVALS)("%s, then the cut run's late result arrives: the session is not put back", async (_what, remove) => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async context => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
+      await remove(f, context.runId);
+      expect(await taskSession(f)).toBeNull();
+      return routerFailure("router_cancelled", cut);
+    });
+    expect(cancelled).toMatchObject({ status: "cancelled" });
+    expect(await taskSession(f)).toBeNull();
+    expect(cancelled.sessionIdAfter).toBeNull();
+    expect(await lateResultOf(cancelled.id)).toMatchObject({ record: { session: "left", sameSessionAsTask: false }, events: [["info", "left"]] });
+  });
+
+  it("a session removed BEFORE the cut run was created does not hold that run's late result: it is kept", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async context => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      await heartbeat.resetRuntimeSession(f.agentId, { taskKey: f.issueId });
+      // That removal is older than the run: its mark is moved to one second before the run was created.
+      await db.execute(sql`update activity_log set created_at = (select created_at from heartbeat_runs where id = ${context.runId}) - interval '1 second'
+        where company_id = ${f.companyId} and action = ${TASK_SESSION_REMOVED}`);
+      return routerFailure("router_cancelled", cut);
+    });
+    expect(cancelled).toMatchObject({ status: "cancelled", sessionIdAfter: cut });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: cancelled.id });
+    expect(await lateResultOf(cancelled.id)).toMatchObject({ record: { session: "kept", sameSessionAsTask: true } });
+  });
+
+  it("a session removed for ANOTHER task of the role does not hold this task's late result", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      // The role's session for another task is reset while this run is cut.
+      await heartbeat.resetRuntimeSession(f.agentId, { taskKey: randomUUID() });
+      return routerFailure("router_cancelled", cut);
+    });
+    expect(cancelled).toMatchObject({ status: "cancelled", sessionIdAfter: cut });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: cancelled.id });
+  });
+
+  // Sessions are kept per role (agent_task_sessions is keyed by the agent): what the former role holds is never what
+  // the new assignee resumes. While the cut run of the former role still holds the task, the product starts no run of
+  // the new role at all (its request is kept: "the previous execution has not finished or its owner changed").
+  it("a task handed to another role: the session kept for the former role never serves the new one", async () => {
+    const f = await seed();
+    // The conversation of the former role, kept when the system cancelled its run.
+    const stopped = await cutRun(f, async context => {
+      await heartbeat.cancelRun(context.runId, "Cancelled by another path");
+      await asConversation(f, context.runId);
+      return routerFailure("router_cancelled", cut);
+    });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: stopped.id });
+    await notConversation(f);
+    const newRole = randomUUID();
+    await db.insert(agents).values({ id: newRole, companyId: f.companyId, name: "Other role", role: "engineer", status: "active",
+      adapterType, adapterConfig: {}, runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {} });
+    await db.update(issues).set({ assigneeAgentId: newRole }).where(eq(issues.id, f.issueId));
+    const [former] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+    const [assignee] = await db.select().from(agents).where(eq(agents.id, newRole));
+    const sessions = createHeartbeatRunState(db);
+    // What a wake of each role would resume on this task (the product's own reader).
+    expect(await sessions.resolveSessionBeforeForWakeup(former!, f.issueId)).toBe(cut);
+    expect(await sessions.resolveSessionBeforeForWakeup(assignee!, f.issueId)).toBeNull();
+    expect(await db.select().from(agentTaskSessions).where(eq(agentTaskSessions.agentId, newRole))).toHaveLength(0);
+    // A run of the new role on another task of the same company: no session of the former role either.
+    const otherTask = randomUUID();
+    await db.insert(issues).values({ id: otherTask, companyId: f.companyId, title: "Another task", status: "todo", priority: "medium", assigneeAgentId: newRole });
+    const next = await nextExecution(f, () => heartbeat.wakeup(newRole, { source: "assignment", triggerDetail: "system",
+      reason: "issue_assigned", payload: { issueId: otherTask, mutation: "update" },
+      requestedByActorType: "user", requestedByActorId: "responsible-user",
+      contextSnapshot: { issueId: otherTask, taskId: otherTask, source: "issue.update" } }));
+    expect(next.run.agentId).toBe(newRole);
+    expect(next).toMatchObject({ sessionId: null });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut });
   });
 
   // The owner's rule (20 Nov 2026): the conversation with a role is kept when its run is cancelled, whatever cancelled

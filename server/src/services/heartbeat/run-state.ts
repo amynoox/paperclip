@@ -6,6 +6,7 @@ import { deriveTaskKey } from "./run-preparation.js";
 import { retryIdempotentDatabaseOperation } from "../../database-retry.js";
 import { isConversation } from "../agent-conversations.js";
 import { conversationCancelledRunKeepsSession } from "../cut-run-session.js";
+import { recordTaskSessionRemoved, taskSessionRemovedAfterRun } from "../task-session-removal.js";
 import fs from "node:fs/promises";
 import {
   and,
@@ -1706,6 +1707,11 @@ export function createHeartbeatRunState(db: Db) {
         if ((run?.status === "cancelled" && !conversationCancelledRunKeepsSession(run))
           || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return null;
       }
+    // STUDIO-0075: a session removed on purpose after this run was created never comes back with its late result
+    // (a person's reset, the session of a cut run dropped by recovery, a guard that gave the session up). The
+    // removal left its mark under this same task lock (task-session-removal.ts).
+    if (input.lateResultOfRun && await taskSessionRemovedAfterRun(tx, { companyId: input.companyId, agentId: input.agentId,
+      taskKey: input.taskKey, adapterType: input.adapterType, runId: input.lateResultOfRun.id })) return null;
     // STUDIO-0075: a late write also locks the session row itself. Every writer of that row then waits or is seen,
     // whether or not it takes the task's lock, and whether or not the key names a task.
     const existingQuery = tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId), eq(agentTaskSessions.adapterType, input.adapterType), eq(agentTaskSessions.taskKey, input.taskKey)));
@@ -1815,7 +1821,19 @@ export function createHeartbeatRunState(db: Db) {
       const goals = await tx.select({ id: agentTaskSessions.id }).from(agentTaskSessions)
         .where(and(...conditions, sql`${agentTaskSessions.goalStatus} is not null`, sql`${agentTaskSessions.goalStatus} <> 'complete'`)).limit(1);
       if (goals.length) await notifyExternalConversationSettlement(tx, { companyId });
-      return tx.delete(agentTaskSessions).where(and(...conditions)).returning().then((rows) => rows.length);
+      if (opts?.lateResultOfRun) return tx.delete(agentTaskSessions).where(and(...conditions)).returning().then((rows) => rows.length);
+      // STUDIO-0075: a removal made on purpose leaves its mark, so that the late result of a run created before it
+      // does not put the session back. The task's row is locked first, as every session write does: a late write
+      // either sees the mark or is deleted with the rest.
+      const aliases = opts?.taskKey ? await tx.select({ id: issues.id, identifier: issues.identifier }).from(issues)
+        .where(and(eq(issues.companyId, companyId), or(sql`${issues.id}::text = ${opts.taskKey}`,
+          opts.includeIssueAliases ? eq(issues.identifier, opts.taskKey.toUpperCase()) : sql`false`))).for("update") : [];
+      const removed = await tx.delete(agentTaskSessions).where(and(...conditions)).returning();
+      const taskKeys = opts?.taskKey ? [...new Set([opts.taskKey, ...removed.map(row => row.taskKey),
+        ...aliases.flatMap(issue => opts.includeIssueAliases ? [issue.id, ...(issue.identifier ? [issue.identifier] : [])] : [issue.id])])] : null;
+      await recordTaskSessionRemoved(tx, { companyId, agentId, taskKeys, adapterType: opts?.adapterType ?? null,
+        reason: opts?.expectedRunId ? "cleared_by_run" : "cleared" });
+      return removed.length;
     });
   }
 
