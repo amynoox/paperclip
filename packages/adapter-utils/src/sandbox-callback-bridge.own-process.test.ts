@@ -330,7 +330,8 @@ describe("sandbox callback bridge: each bridge is known by the process its own l
 
   it("on a machine whose `ps` cuts a command line at 79 columns unless asked for all of it, the bridges are still recognised", async () => {
     const folder = await taskFolder();
-    // A BSD `ps` with no terminal attached, as on a Mac reached over ssh: 79 columns, unless `-ww` is given.
+    // A `ps` that cuts a command line to 79 columns unless `-ww` is given. The studio's worker Macs do not cut
+    // (read on 20 Nov 2026); this stands for a machine that would.
     const bin = path.join(path.dirname(folder.shim), "bsd-ps");
     await mkdir(bin, { recursive: true });
     await writeFile(path.join(bin, "ps"), [

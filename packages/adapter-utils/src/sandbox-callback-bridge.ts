@@ -354,8 +354,9 @@ function shellQuote(value: string) {
  * - `own`, in a stop, for a number of the bridge's own launch: a process whose command line holds the bridge's
  *   entrypoint file name (the folder is known already), and also a live process whose command line cannot be read,
  *   as before this patch.
- * The whole command line is asked for (`-ww`): without a terminal a BSD `ps` cuts it at 79 columns, which is shorter
- * than the path of a bridge's entrypoint.
+ * The whole command line is asked for (`-ww`): a `ps` that cuts it to a width would hide the path of a bridge's
+ * entrypoint, which is long. The studio's worker Macs give the whole line without it (read on 20 Nov 2026); the flag
+ * is kept for a `ps` that would cut.
  */
 function bridgeEndShellFunction(entrypoint: string, mode: "strict" | "own"): string[] {
   // A stop keeps the name `pid` for the number it ends, as it had; a launch has its own `pid`, the new bridge's.
