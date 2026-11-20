@@ -31,6 +31,7 @@ import {
   evaluateRelaunchLoop,
   type RelaunchLoopRunSample,
 } from "../services/heartbeat/relaunch-loop-guard.js";
+import { ISSUE_PROGRESS_ACTIVITY_ACTIONS } from "../services/issue-rewake-throttle.js";
 import { issueService } from "../services/issues.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 
@@ -124,7 +125,7 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
   let home: string;
 
   type Step =
-    | { kind: "fail"; code: string; session?: string; clearSession?: boolean; comment?: boolean; document?: boolean }
+    | { kind: "fail"; code: string; session?: string; clearSession?: boolean; comment?: boolean; document?: boolean; productionActivity?: boolean }
     | { kind: "ok"; session: string };
   // What each engine launch was asked to resume, in order, per issue.
   type Launch = { runId: string; agentId: string; resumed: string | null; resumedParams: Record<string, unknown> | null };
@@ -154,6 +155,16 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
           };
         }
         if (step.comment) await issueService(db).addComment(issueId, "Partial result before the failure.", { agentId: input.agent.id, runId: input.runId });
+        // The four entries production recorded under each failed run of TR-2069: none is the role's work.
+        if (step.productionActivity) {
+          for (const [action, actorType] of [["environment.lease_acquired", "agent"], ["environment.lease_released", "agent"],
+            ["tool_gateway.discovery", "agent"], ["cost.reported", "system"]] as const) {
+            await logActivity(db, {
+              companyId: input.agent.companyId, actorType, actorId: actorType === "agent" ? input.agent.id : "cost", agentId: input.agent.id,
+              runId: input.runId, action, entityType: "issue", entityId: issueId, details: {},
+            });
+          }
+        }
         if (step.document) {
           await logActivity(db, {
             companyId: input.agent.companyId, actorType: "agent", actorId: input.agent.id, agentId: input.agent.id, runId: input.runId,
@@ -262,14 +273,37 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
   it("TR-2069: a failure, the CTO's answer, a failure, an answer, a failure; the fourth run starts on a fresh session, with one note", async () => {
     const f = await seed();
     await openSession(f);
+    // The router returns the session in its failure, and production recorded four activity entries per run.
+    const routerFailure = (code: string) => fail(code, { session: "s1", productionActivity: true });
     const failed = [
-      await turn(f, fail(OUTPUT_LIMIT)),
-      await turn(f, fail(ACK_UNCERTAIN)),
-      await turn(f, fail(ACK_UNCERTAIN)),
+      await turn(f, routerFailure(OUTPUT_LIMIT)),
+      await turn(f, routerFailure(ACK_UNCERTAIN)),
+      await turn(f, routerFailure(ACK_UNCERTAIN)),
     ];
     expect(failed.map((run) => `${run.status}:${run.errorCode}:${run.sessionIdBefore}`)).toEqual([
       `failed:${OUTPUT_LIMIT}:s1`, `failed:${ACK_UNCERTAIN}:s1`, `failed:${ACK_UNCERTAIN}:s1`,
     ]);
+    // The exact shape production recorded for the ten failures (20 Nov 2026, c6c6a3e0 and the others): a legacy
+    // run left at stage `dispatching`, no `executionRecovery`, the same session before and after, woken by a
+    // comment, not a retry; and between two of them a retry cancelled before it started, with no stage.
+    for (const run of failed) {
+      expect(run).toMatchObject({ runtimeMode: "legacy", executionStage: "dispatching", sessionIdAfter: "s1", retryOfRunId: null, scheduledRetryReason: null });
+      expect(run.resultJson).not.toHaveProperty("executionRecovery");
+      expect(run.contextSnapshot).toMatchObject({ wakeReason: "issue_commented" });
+    }
+    const cancelledRetries = (await devRuns(f)).filter((run) => run.status === "cancelled");
+    expect(cancelledRetries).toHaveLength(4);
+    for (const run of cancelledRetries) {
+      expect(run).toMatchObject({ runtimeMode: "legacy", executionStage: null, startedAt: null, errorCode: "issue_waiting_for_response", scheduledRetryReason: "transient_failure" });
+    }
+    // Production: 79 to 104 seconds each. Ninety seconds here, for every run of the role, so their order holds.
+    await db.update(heartbeatRuns).set({ startedAt: sql`${heartbeatRuns.finishedAt} - interval '90 seconds'` })
+      .where(and(eq(heartbeatRuns.agentId, f.devId), sql`${heartbeatRuns.startedAt} is not null`));
+    for (const action of ["environment.lease_acquired", "environment.lease_released", "tool_gateway.discovery", "cost.reported"]) {
+      expect(ISSUE_PROGRESS_ACTIVITY_ACTIONS).not.toContain(action);
+    }
+    expect(await db.select().from(activityLog).where(and(eq(activityLog.runId, failed[2]!.id), eq(activityLog.entityId, f.issueId))))
+      .toHaveLength(4);
     expect(await guardNotes(f)).toHaveLength(0);
 
     const fresh = await turn(f, { kind: "ok", session: "s2" });
