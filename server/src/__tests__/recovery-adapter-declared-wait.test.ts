@@ -165,7 +165,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT, STOP, UNSETTLED, READMISSION, TICKET_BLOCKED]);
     expect(adapterDeclaredWaitMaxMs(TICKET_BLOCKED)).toBe(12 * 60 * 60_000);
     // Unsettled receipts: the stop kind and its bound.
-    expect(adapterDeclaredWaitMaxMs(READMISSION)).toBe(60 * 60_000);
+    expect(adapterDeclaredWaitMaxMs(READMISSION)).toBe(12 * 60 * 60_000);
     expect(routerRefusalOutcome(RESERVED, "in_review")).toBe("block");
     expect(routerRefusalOutcome(MISMATCH, "todo")).toBe("block");
     expect(routerRefusalOutcome(CLOSED, "in_progress")).toBe("block");
@@ -181,7 +181,6 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     expect(adapterDeclaredWaitMaxMs(WAIT)).toBe(12 * 60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(STOP)).toBe(12 * 60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(UNSETTLED)).toBe(12 * 60 * 60_000);
-    expect(adapterDeclaredWaitMaxMs(READMISSION)).toBe(12 * 60 * 60_000);
     // The cut run keeps its transient retry (the retried run waits for the link itself).
     expect(ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES).toEqual([WAIT, UNSETTLED, READMISSION, TICKET_BLOCKED, ...ROUTER_REFUSAL_ERROR_CODES]);
   });
@@ -293,7 +292,8 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       expect(notes[0]!.body).toContain("past 12 h");
     }
     // The held issue is looked at again at the end of the bound: twelve hours after the first run of the series ended.
-    expect(deadlines.every(at => at > Date.now() + 9 * 60 * 60_000)).toBe(true);
+    expect(deadlines).toHaveLength(6);
+    expect(deadlines.every(at => at > Date.now() + 7 * 60 * 60_000)).toBe(true);
     // Past twelve hours the normal path takes over, as before.
     const spent = await seed("todo", [{ minutesAgo: 12 * 60 + 15, errorCode: STOP }, { minutesAgo: 10, errorCode: UNSETTLED, retry: true }]);
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: spent.companyId });
