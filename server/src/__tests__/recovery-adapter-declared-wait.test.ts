@@ -165,7 +165,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT, STOP, UNSETTLED, READMISSION, TICKET_BLOCKED]);
     expect(adapterDeclaredWaitMaxMs(TICKET_BLOCKED)).toBe(12 * 60 * 60_000);
     // Unsettled receipts: the stop kind and its bound.
-    expect(adapterDeclaredWaitMaxMs(READMISSION)).toBe(60 * 60_000);
+    expect(adapterDeclaredWaitMaxMs(READMISSION)).toBe(12 * 60 * 60_000);
     expect(routerRefusalOutcome(RESERVED, "in_review")).toBe("block");
     expect(routerRefusalOutcome(MISMATCH, "todo")).toBe("block");
     expect(routerRefusalOutcome(CLOSED, "in_progress")).toBe("block");
@@ -176,10 +176,11 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     expect(routerRefusalOutcome(TICKET_BLOCKED, "todo")).toBeNull();
     expect(routerRefusalOutcome("process_lost", "todo")).toBeNull();
     expect(ADAPTER_DECLARED_WAIT_MAX_MS).toBe(12 * 60 * 60_000);
-    expect(ADAPTER_DECLARED_STOP_WAIT_MAX_MS).toBe(60 * 60_000);
+    // STUDIO-0077: the stop series gets the bound of a machine wait (it was 1 h).
+    expect(ADAPTER_DECLARED_STOP_WAIT_MAX_MS).toBe(12 * 60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(WAIT)).toBe(12 * 60 * 60_000);
-    expect(adapterDeclaredWaitMaxMs(STOP)).toBe(60 * 60_000);
-    expect(adapterDeclaredWaitMaxMs(UNSETTLED)).toBe(60 * 60_000);
+    expect(adapterDeclaredWaitMaxMs(STOP)).toBe(12 * 60 * 60_000);
+    expect(adapterDeclaredWaitMaxMs(UNSETTLED)).toBe(12 * 60 * 60_000);
     // The cut run keeps its transient retry (the retried run waits for the link itself).
     expect(ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES).toEqual([WAIT, UNSETTLED, READMISSION, TICKET_BLOCKED, ...ROUTER_REFUSAL_ERROR_CODES]);
   });
@@ -248,9 +249,9 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
 
   // The router sends no wake when its proof fails (machine silent, engine
   // alive, no trace from an older launcher): it opens its own incident ticket
-  // at 10 minutes, and past 1 h normal escalation takes over.
-  it("applies normal escalation once an unproven stop has outlasted 1 h, and keeps 12 h when the latest run waits for a machine", async () => {
-    const spent = await seed("todo", [{ minutesAgo: 72, errorCode: STOP }, { minutesAgo: 10, errorCode: UNSETTLED, retry: true }]);
+  // at 10 minutes, and past the bound (12 h since STUDIO-0077) normal escalation takes over.
+  it("applies normal escalation once an unproven stop has outlasted its bound, and keeps 12 h when the latest run waits for a machine", async () => {
+    const spent = await seed("todo", [{ minutesAgo: ADAPTER_DECLARED_STOP_WAIT_MAX_MS / 60_000 + 12, errorCode: STOP }, { minutesAgo: 10, errorCode: UNSETTLED, retry: true }]);
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: spent.companyId });
     expect((await issueOf(spent.issueId)).status).toBe("blocked");
     expect((await actionsOf(spent.issueId))[0]).toMatchObject({ kind: "stranded_assigned_issue", status: "active" });
@@ -260,6 +261,43 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     await heartbeat.reconcileStrandedAssignedIssues({ companyId: machine.companyId });
     expect((await issueOf(machine.issueId)).status).toBe("todo");
     expect(await actionsOf(machine.issueId)).toHaveLength(0);
+    await heartbeat.drainActiveRunExecutions();
+  }, 180_000);
+
+  // STUDIO-0077: production, 19 Nov 2026. A cut of the link lasted more than an hour. Past the 1 h bound recovery
+  // requeued; each requeued run waited ten minutes for the proof and failed router_previous_dispatch_unsettled, eleven
+  // times in a row, 630 s each; the issue was then blocked. A cut must not block an issue: the stop series is held
+  // 12 h, like a machine wait.
+  it("holds an unproven stop beyond one hour: neither requeued nor blocked while the cut lasts, for each code of the stop series", async () => {
+    // The cut run, then eleven runs that each waited for its proof: more than two hours in all.
+    const elevenUnsettled = Array.from({ length: 11 }, (_, index) => ({ minutesAgo: 122 - 11 * index, durationMinutes: 10.5, errorCode: UNSETTLED, retry: true }));
+    const production = await seed("in_progress", [{ minutesAgo: 130, errorCode: STOP }, ...elevenUnsettled]);
+    const stopOnly = await seed("todo", [{ minutesAgo: 185, errorCode: STOP }]);
+    const readmission = await seed("todo", [{ minutesAgo: 240, errorCode: READMISSION }, { minutesAgo: 20, errorCode: READMISSION, retry: true }]);
+    const deadlines: number[] = [];
+    for (let sweep = 0; sweep < 2; sweep += 1) {
+      for (const f of [production, stopOnly, readmission]) {
+        const result = await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId, onDeferredDeadline: at => deadlines.push(at) });
+        expect(result.dispatchRequeued + result.continuationRequeued + result.escalated).toBe(0);
+      }
+    }
+    await heartbeat.drainActiveRunExecutions();
+    for (const [f, status] of [[production, "in_progress"], [stopOnly, "todo"], [readmission, "todo"]] as const) {
+      expect((await issueOf(f.issueId)).status).toBe(status);
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+      // One note for the whole series, which names the bound.
+      const notes = await waitNotes(f.issueId);
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toContain("past 12 h");
+    }
+    // The held issue is looked at again at the end of the bound: twelve hours after the first run of the series ended.
+    expect(deadlines).toHaveLength(6);
+    expect(deadlines.every(at => at > Date.now() + 7 * 60 * 60_000)).toBe(true);
+    // Past twelve hours the normal path takes over, as before.
+    const spent = await seed("todo", [{ minutesAgo: 12 * 60 + 15, errorCode: STOP }, { minutesAgo: 10, errorCode: UNSETTLED, retry: true }]);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: spent.companyId });
+    expect((await issueOf(spent.issueId)).status).toBe("blocked");
     await heartbeat.drainActiveRunExecutions();
   }, 180_000);
 
@@ -627,7 +665,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
 
   it("counts each kind of wait in its own series: a wait after another kind gets its own bound", async () => {
     const bound = ADAPTER_DECLARED_WAIT_MAX_MS / 60_000;
-    // A machine wait older than 12 h, then an unproven stop 5 min ago: the 1 h stop bound counts from the stop.
+    // A machine wait older than 12 h, then an unproven stop 5 min ago: the stop bound counts from the stop.
     const stop = await seed("todo", [{ minutesAgo: bound + 30, errorCode: WAIT }, { minutesAgo: 5, durationMinutes: 1, errorCode: STOP, retry: true }]);
     // A machine wait older than 12 h, then a blocked ticket 5 min ago: the dependency wait counts from itself.
     const ticket = await seed("todo", [{ minutesAgo: bound + 30, errorCode: WAIT }, { minutesAgo: 5, durationMinutes: 1, errorCode: TICKET_BLOCKED, retry: true }]);
