@@ -112,11 +112,25 @@ export const RUN_LOG_HOST_LINE_PREFIXES: readonly string[] = Object.freeze([
   "[paperclip] ",
 ]);
 
-/** True when a run log chunk holds at least one line the host did not write. */
+// The line by which an engine announces its session (Codex: `thread.started`; Claude: `system`/`init`). It says a
+// session was opened, not that the engine did anything. The worker router writes Codex's when the session opens,
+// which can be ten minutes into a run that waited before its launch: counted as output, it would make an engine
+// that then stayed silent until its timeout look like one at work.
+function isSessionAnnouncementLine(text: string): boolean {
+  if (!text.startsWith("{")) return false;
+  try {
+    const event = JSON.parse(text) as { type?: unknown; subtype?: unknown } | null;
+    return event?.type === "thread.started" || (event?.type === "system" && event?.subtype === "init");
+  } catch {
+    return false;
+  }
+}
+
+/** True when a run log chunk holds at least one line of the engine's work: not the host's, not a session announcement. */
 export function isEngineOutputChunk(chunk: string): boolean {
   return chunk.split(/\r?\n/).some((line) => {
-    const text = line.trimStart();
-    return text.length > 0 && !RUN_LOG_HOST_LINE_PREFIXES.some((prefix) => text.startsWith(prefix));
+    const text = line.trim();
+    return text.length > 0 && !RUN_LOG_HOST_LINE_PREFIXES.some((prefix) => line.trimStart().startsWith(prefix)) && !isSessionAnnouncementLine(text);
   });
 }
 

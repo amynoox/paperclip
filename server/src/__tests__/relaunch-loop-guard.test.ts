@@ -55,6 +55,7 @@ const WAIT = "router_waiting_for_resources";
 const ENGINE_LINE = "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n";
 const ROUTER_LINE = "[paperclip-router] waiting for a cost estimate (still waiting)\n";
 const HOST_LINE = "[paperclip] Restoring workspace changes from the remote target.\n";
+const CODEX_ANNOUNCEMENT = "{\"type\":\"thread.started\",\"thread_id\":\"019a-session\"}\n";
 
 const at = (minutesAgo: number) => new Date(Date.UTC(2026, 10, 20, 6, 45) - minutesAgo * 60_000);
 function sample(minutesAgo: number, patch: Partial<RelaunchLoopRunSample> = {}): RelaunchLoopRunSample {
@@ -143,6 +144,17 @@ describe("relaunch loop guard: the decision", () => {
     // Another bracketed word is not the host's prefix.
     expect(isEngineOutputChunk("[paperclip-routerX] something\n")).toBe(true);
     expect(isEngineOutputChunk("[paperclip-router]\n")).toBe(true);
+    // The line by which an engine announces its session is not work: Codex's, written by the router when the
+    // session opens (possibly minutes into a run that waited before its launch), and Claude's.
+    expect(isEngineOutputChunk(CODEX_ANNOUNCEMENT)).toBe(false);
+    expect(isEngineOutputChunk("{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"c1\"}\n")).toBe(false);
+    expect(isEngineOutputChunk(`${ROUTER_LINE}  ${CODEX_ANNOUNCEMENT}`)).toBe(false);
+    expect(isEngineOutputChunk(`${CODEX_ANNOUNCEMENT}${ENGINE_LINE}`)).toBe(true);
+    // Any other event of the engine is work, as is a line that only looks like the announcement.
+    expect(isEngineOutputChunk("{\"type\":\"system\",\"subtype\":\"status\"}\n")).toBe(true);
+    expect(isEngineOutputChunk("{\"type\":\"turn.started\"}\n")).toBe(true);
+    expect(isEngineOutputChunk("{\"type\":\"thread.started\"\n")).toBe(true);
+    expect(isEngineOutputChunk("thread.started\n")).toBe(true);
   });
 
   it("reads the time of the last engine output of a log page, past the host's later lines", () => {
@@ -221,7 +233,7 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
   type Step =
     | { kind: "fail"; code: string; session?: string; clearSession?: boolean; comment?: boolean; document?: boolean; productionActivity?: boolean; timedOut?: boolean;
         /** What the engine did before its timeout, as the server records it. */
-        engine?: "output_tokens" | "summary" | "output" | "router_lines" | "host_lines" | "router_around_output" }
+        engine?: "output_tokens" | "summary" | "output" | "router_lines" | "host_lines" | "router_around_output" | "announcement_after_a_wait" }
     | { kind: "ok"; session: string };
   // What each engine launch was asked to resume, in order, per issue.
   type Launch = { runId: string; agentId: string; resumed: string | null; resumedParams: Record<string, unknown> | null };
@@ -273,6 +285,7 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
           step.engine === "output" ? [["stdout", ENGINE_LINE]]
             : step.engine === "router_lines" ? [["stdout", ROUTER_LINE], ["stdout", ROUTER_LINE], ["stderr", ROUTER_LINE]]
             : step.engine === "host_lines" ? [["stdout", HOST_LINE], ["stderr", HOST_LINE]]
+            : step.engine === "announcement_after_a_wait" ? [["stdout", ROUTER_LINE], ["stdout", ROUTER_LINE], ["stdout", CODEX_ANNOUNCEMENT], ["stdout", ROUTER_LINE]]
             : step.engine === "router_around_output" ? [["stdout", ROUTER_LINE], ["stdout", ENGINE_LINE], ["stdout", ROUTER_LINE], ["stderr", HOST_LINE]]
             : [];
         for (const [stream, line] of logged) await input.onLog(stream, line);
@@ -530,6 +543,7 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
   it.each([
     ["the worker router's lines", "router_lines"],
     ["Paperclip's own lines", "host_lines"],
+    ["the router's lines and, after its wait, the announcement of the session", "announcement_after_a_wait"],
   ] as const)("three timeouts of twenty minutes during which only the host wrote into the log (%s): the guard acts", async (_name, engine) => {
     const f = await seed();
     await openSession(f);
