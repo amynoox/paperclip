@@ -24,6 +24,7 @@ import { registerServerAdapter, unregisterServerAdapter } from "../adapters/inde
 import { heartbeatService } from "../services/heartbeat.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
+import { logger } from "../middleware/logger.js";
 import {
   ADAPTER_DECLARED_STOP_WAIT_MAX_MS,
   ADAPTER_DECLARED_WAIT_ERROR_CODES,
@@ -1149,6 +1150,42 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       }
     }, 240_000);
 
+    // One role, three tasks, a long pause (the bench saw a task blocked during a long pause, 20 Nov at 07:25:58).
+    it("blocks none of the three tasks of one role during a long pause (last run succeeded, failed, cut), and takes the failed one again at its end", async () => {
+      const f = await seed("in_progress", [{ minutesAgo: 200, errorCode: "adapter_failed" }]);
+      /** Another task of the same role, with its last run. */
+      async function alsoHas(issueNumber: number, run: PriorRun, resultJson: Record<string, unknown> | null) {
+        const issueId = randomUUID();
+        const at = new Date(Date.now() - run.minutesAgo * 60_000);
+        const [row] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "assignment",
+          triggerDetail: "system", status: run.status ?? "failed", errorCode: run.errorCode, createdAt: at, startedAt: at,
+          updatedAt: new Date(at.getTime() + 7 * 60_000), finishedAt: new Date(at.getTime() + 7 * 60_000),
+          resultJson: resultJson ?? {}, contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" } }).returning();
+        await db.insert(issues).values({ id: issueId, companyId: f.companyId, title: "Another task of the role", status: "in_progress",
+          assigneeAgentId: f.agentId, issueNumber, checkoutRunId: row!.id, startedAt: new Date() });
+        return { ...f, issueId, runIds: [row!.id] };
+      }
+      const succeeded = await alsoHas(2, { minutesAgo: 190, errorCode: null, status: "succeeded" }, null);
+      const cut = await alsoHas(3, { minutesAgo: 185, errorCode: "cancelled", status: "cancelled" }, lifecycleStop(true));
+      await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: new Date(Date.now() - 3 * 60 * 60_000),
+        lifecycleState: "paused", lifecycleHolds: ["manual"] }).where(eq(agents.id, f.agentId));
+      for (let sweep = 0; sweep < 4; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      for (const task of [f, succeeded, cut]) {
+        expect((await issueOf(task.issueId)).status).toBe("in_progress");
+        expect(await actionsOf(task.issueId)).toHaveLength(0);
+        expect(await commentsOf(task.issueId)).toHaveLength(0);
+      }
+      expect((await runsOf(f)).length).toBe(3);
+      // The pause lifts: the task whose last run failed is taken again by the normal path; none carries the notice
+      // of an assignee that cannot be invoked.
+      await resume(f);
+      await sweepTwice(f);
+      await expectTakenAgain(f);
+      for (const task of [f, succeeded, cut])
+        expect((await commentsOf(task.issueId)).some(row => row.body.includes("the original assignee is not invokable"))).toBe(false);
+    }, 240_000);
+
     it("leaves a paused review participant in review, with or without a run of its own", async () => {
       for (const prior of [[], [{ minutesAgo: 10, errorCode: "process_lost" }]] as PriorRun[][]) {
         const f = await seed("in_review", prior, { review: true });
@@ -1296,8 +1333,13 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       await pause(f, "company_paused");
       await companyIs(f, true);
       // The role is ready again while its company is still paused: the start is refused, and the resume does not fail.
+      const warned = vi.spyOn(logger, "warn");
       await resume(f);
       await heartbeat.drainActiveRunExecutions();
+      // The server's log says which task was not started, and on which waiting run.
+      expect(warned.mock.calls.some(([fields, message]) => (fields as Record<string, unknown>)?.issueId === f.issueId
+        && (fields as Record<string, unknown>)?.declaredWaitRunId === f.runIds.at(-1)
+        && String(message).includes("was not started when its assignee's pause lifted"))).toBe(true);
       expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
       expect((await issueOf(f.issueId)).status).toBe("todo");
       await companyIs(f, false);
@@ -1310,6 +1352,9 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       await pause(again);
       await readyStep(again);
       await heartbeat.drainActiveRunExecutions();
+      expect(warned.mock.calls.some(([fields, message]) => (fields as Record<string, unknown>)?.issueId === again.issueId
+        && (fields as Record<string, unknown>)?.err instanceof Error && String(message).includes("the wake was refused"))).toBe(true);
+      warned.mockRestore();
       expect((await runsOf(again)).map(run => run.id).sort()).toEqual([...again.runIds].sort());
       expect((await issueOf(again.issueId)).status).toBe("todo");
       await resume(again);
