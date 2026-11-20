@@ -595,8 +595,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         payload: exhaustion,
         retryExhaustion: exhaustion,
       });
-      if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON || ((retryReason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON
-          || retryReason === SSH_LEASE_OUTAGE_RETRY_REASON)
+      if (retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON || (retryReason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON
           && isResolvedInteractionContinuationWakeContext(run.contextSnapshot))) {
         await escalatePlanApprovalResumeFailureNeedsAttention({
           run,

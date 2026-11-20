@@ -5,6 +5,7 @@ import path from "node:path";
 import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
+  agentWakeupRequests,
   agents,
   authUsers,
   companies,
@@ -48,7 +49,8 @@ vi.mock("@paperclipai/adapter-utils/ssh", async (importOriginal) => {
     ...actual,
     ensureSshWorkspaceReady: async (config: { remoteWorkspacePath: string }) => {
       probe.calls += 1;
-      if (probe.failure) throw actual.withSshLeaseProbeFailureCause(probe.failure());
+      // On a tree without the probe's own classifier (the witness), the one every ssh command has.
+      if (probe.failure) throw (actual.withSshLeaseProbeFailureCause ?? actual.withSshConnectFailureCause)(probe.failure());
       return { remoteCwd: config.remoteWorkspacePath };
     },
   };
@@ -304,6 +306,11 @@ describeEmbeddedPostgres("ssh lease outage on the real run path (TR-2093)", () =
     await db.update(heartbeatRuns).set({ status: "cancelled", errorCode: "issue_waiting_for_response", finishedAt: new Date() })
       .where(and(eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.status, "scheduled_retry")));
     await db.update(issues).set({ executionRunId: null, executionLockedAt: null, executionAgentNameKey: null }).where(eq(issues.id, f.issueId));
+    // A run that had started and was cancelled (a pause) sits in the middle: it says nothing about the link.
+    const cancelledAt = new Date();
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "automation", triggerDetail: "system",
+      status: "cancelled", errorCode: "agent_paused", createdAt: cancelledAt, startedAt: cancelledAt, finishedAt: cancelledAt,
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId } });
     await age(f, 12 * 60 + 5);
     // A comment wakes the role: a new run, not a retry of the first one. It fails on the lease too.
     const woken = await start(f, "issue_commented");
@@ -384,6 +391,8 @@ describeEmbeddedPostgres("ssh lease outage on the real run path (TR-2093)", () =
     expect(retry!.contextSnapshot).toMatchObject({ mutation: "interaction", interactionId, interactionStatus: "accepted",
       retryReason: SSH_LEASE_OUTAGE_RETRY_REASON });
     expect(isResolvedInteractionContinuationWakeContext(retry!.contextSnapshot)).toBe(true);
+    const [retryWake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, retry!.wakeupRequestId!));
+    expect(retryWake!.payload).toMatchObject({ mutation: "interaction", interactionId, interactionStatus: "accepted", retryReason: SSH_LEASE_OUTAGE_RETRY_REASON });
     // A third and a fourth failure: still the lane, past the interaction lane's two attempts.
     await promote(f);
     await promote(f);
@@ -392,6 +401,21 @@ describeEmbeddedPostgres("ssh lease outage on the real run path (TR-2093)", () =
     expect((await scheduledOf(f))[0]).toMatchObject({ scheduledRetryReason: SSH_LEASE_OUTAGE_RETRY_REASON, scheduledRetryAttempt: 4 });
     expect((await issueOf(f)).status).toBe("in_progress");
     expect(await actionsOf(f)).toHaveLength(0);
+  }, 180_000);
+
+  it("an old outage of the role on another issue does not shorten this one", async () => {
+    const f = await seed();
+    const [other] = await db.insert(issues).values({ companyId: f.companyId, title: "Another infra task", status: "in_progress",
+      assigneeAgentId: f.agentId, issueNumber: 2 }).returning();
+    const longAgo = new Date(Date.now() - 13 * 60 * MINUTE);
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "automation", triggerDetail: "system",
+      status: "failed", errorCode: "environment_provider_unavailable", createdAt: longAgo, startedAt: longAgo, finishedAt: longAgo,
+      resultJson: { providerFailure: { provider: "ssh" }, executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      contextSnapshot: { issueId: other!.id, taskId: other!.id } });
+    probe.failure = killedByLocalTimeout;
+    const first = await start(f);
+    expect((await readSshLeaseOutageStart(db, first)).getTime()).toBe(first.finishedAt!.getTime());
+    expect((await scheduledOf(f))[0]).toMatchObject({ retryOfRunId: first.id, scheduledRetryReason: SSH_LEASE_OUTAGE_RETRY_REASON });
   }, 180_000);
 
   it("a run that got its lease ends the outage: the next one has its own 12 h", async () => {

@@ -97,6 +97,7 @@ describe("sshLeaseProbeFailureCode", () => {
     ["the host key changed", { code: 255, killed: false, stderr: "Host key verification failed.\n" }],
     ["the host is unknown", { code: 255, killed: false, stderr: "ssh: Could not resolve hostname pk-infra: Name or service not known\n" }],
     ["the launcher lost the command", { killed: false, launcherLost: true }],
+    ["the child reported an exit code", { code: 143 }],
   ] as Array<[string, Record<string, unknown>]>)("keeps no code when %s", (_name, patch) => {
     expect(sshLeaseProbeFailureCode(killedByTimeout(patch))).toBeNull();
     expect((withSshLeaseProbeFailureCause(killedByTimeout(patch)) as Error).cause).toBeUndefined();

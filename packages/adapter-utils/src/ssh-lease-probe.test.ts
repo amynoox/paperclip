@@ -14,7 +14,7 @@ vi.mock("node:child_process", async (importOriginal) => {
   };
 });
 
-import { ensureSshWorkspaceReady } from "./ssh.js";
+import { ensureSshWorkspaceReady, runSshCommand } from "./ssh.js";
 
 const config = {
   host: "fixture.invalid", username: "fixture", port: 22, remoteWorkspacePath: "/srv/paperclip-infra/execution",
@@ -49,6 +49,14 @@ describe("ensureSshWorkspaceReady", () => {
 
   it("a probe that printed its folder and then hung keeps no cause: the machine answered", async () => {
     const { error } = await probe("printf '/srv/paperclip-infra/execution\\n'; sleep 5", 300);
+    expect(error).toMatchObject({ killed: true });
+    expect(error!.cause).toBeUndefined();
+  });
+
+  it("any other ssh command killed by its timeout keeps no cause: only the probe is safe to run again", async () => {
+    fake.script = "sleep 5";
+    fake.timeoutMs = 300;
+    const error = await runSshCommand(config, "long-running-command").then(() => null, (failure) => failure as Error & { killed?: boolean });
     expect(error).toMatchObject({ killed: true });
     expect(error!.cause).toBeUndefined();
   });
