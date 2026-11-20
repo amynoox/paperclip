@@ -193,7 +193,8 @@ const support = await getEmbeddedPostgresTestSupport();
     await stopProven(f, cancelled.id);
     const next = await nextExecution(f, () => personMessage(f));
     expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id });
-    expect(next).toMatchObject({ sessionId: cut, sessionParams: paramsOf(cut) });
+    expect(next.run.contextSnapshot).not.toHaveProperty("forceFreshSession");
+    expect({ sessionId: next.sessionId, sessionParams: next.sessionParams }).toMatchObject({ sessionId: cut, sessionParams: paramsOf(cut) });
   });
 
   it("a run another path settled first: the session of its late result is kept", async () => {
@@ -205,6 +206,11 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(stopped).toMatchObject({ status: "cancelled", sessionIdAfter: cut });
     expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: stopped.id });
     expect((await taskSession(f))?.sessionParamsJson).toMatchObject(paramsOf(cut));
+    // A run a person stopped is not a pause: the person's next request keeps the product's rule, a new conversation.
+    await stopProven(f, stopped.id);
+    const next = await nextExecution(f, () => personMessage(f));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: stopped.id, forceFreshSession: true });
+    expect(next).toMatchObject({ sessionId: null });
   });
 
   it("a late result does not replace the session a later run of the role already wrote", async () => {
