@@ -385,7 +385,10 @@ const support = await getEmbeddedPostgresTestSupport();
     }
   });
 
-  it(`a person stops the run, then an automatic wake comes: the session ${PERSON_STOP_KEEPS ? "of the stopped run is resumed" : "from before the stopped run is resumed"}`, async () => {
+  // After a person's stop the product holds the task until a person asks (the hold of the stopped run): an automatic
+  // wake starts nothing, so no automatic run can take the stopped run's session, whatever the switch says. The
+  // session question only arises for the person's own request (the case above).
+  it("a person stops the run, then an automatic wake comes: nothing starts until a person asks", async () => {
     const f = await seed();
     const stopped = await cutRun(f, async context => {
       await personStops(context.runId);
@@ -393,8 +396,17 @@ const support = await getEmbeddedPostgresTestSupport();
     });
     expect(await taskSession(f)).toMatchObject({ sessionDisplayId: PERSON_STOP_KEEPS ? cut : first });
     await stopProven(f, stopped.id);
-    const next = await nextExecution(f, () => automaticWake(f));
-    expect(next).toMatchObject({ sessionId: PERSON_STOP_KEEPS ? cut : first });
+    const before = executions.get(f.companyId)!.length;
+    await automaticWake(f).catch(() => undefined);
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(executions.get(f.companyId)!.length).toBe(before);
+    const refused = (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId)))
+      .filter(wake => wake.payload?.issueId === f.issueId && wake.status === "skipped");
+    expect(refused.map(wake => wake.reason)).toContain("execution_reconciliation_required");
+    // The person then writes: the run that starts is the continuation of the stopped run.
+    const next = await nextExecution(f, () => personMessage(f));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: stopped.id });
+    expect(next).toMatchObject({ sessionId: PERSON_STOP_KEEPS ? cut : null });
   });
 
   it("a person stops the run and its result never brings a session: the person's request opens a new conversation, and its log says why", async () => {
