@@ -184,6 +184,37 @@ export function summarizeHeartbeatRunResultJson(
 const NARRATION_OPENERS =
   /^(let me\b|i['’]ll\b|i['’]m going\b|i need to\b|i can see\b|now i['’]ll\b|next,? i['’]ll\b|looking at\b|fetching\b|checking\b|first,)/i;
 
+// STUDIO-0080. An adapter's summary is posted as a comment of the agent whatever the run's outcome, and a run
+// that did not succeed returns one too: what the engine last said before it was cut (a timeout, a lost link, a
+// kill). Posted bare, in the agent's name, that half-way message reads like a finished report. It stays posted,
+// since it often says why the run stopped or what it did, and is told for what it is: a first line of the server
+// gives the run's status. The status is read from the stop reason the server itself writes into the result at
+// completion (heartbeat-stop-metadata.ts); `completed`, an absent or an unknown reason add no line.
+const UNFINISHED_RUN_STATUS_BY_STOP_REASON: Readonly<Record<string, UnfinishedRunStatus>> = Object.freeze({
+  timeout: "timed_out",
+  adapter_failed: "failed",
+  process_lost: "failed",
+  max_turns_exhausted: "failed",
+  cancelled: "cancelled",
+  paused: "cancelled",
+  budget_paused: "cancelled",
+  interrupted: "interrupted",
+});
+
+export type UnfinishedRunStatus = "timed_out" | "failed" | "cancelled" | "interrupted";
+
+export const UNFINISHED_RUN_STATUS_LINE_REASON_CODE = "unfinished_run_status_line";
+
+export function readUnfinishedRunStatus(resultJson: Record<string, unknown> | null | undefined): UnfinishedRunStatus | null {
+  const stopReason = resultJson?.stopReason;
+  if (typeof stopReason !== "string" || !Object.hasOwn(UNFINISHED_RUN_STATUS_BY_STOP_REASON, stopReason)) return null;
+  return UNFINISHED_RUN_STATUS_BY_STOP_REASON[stopReason]!;
+}
+
+export function unfinishedRunStatusLine(status: UnfinishedRunStatus): string {
+  return `This run ended \`${status}\` before it finished. Its last message:`;
+}
+
 export const LEGACY_WITHHELD_RUN_COMMENT =
   "Run completed. Agent did not post a summary comment this run (transcript withheld — see run log).";
 
@@ -614,11 +645,17 @@ export function resolveHeartbeatRunResponse(input: {
       readCommentText(resultJson.result) ??
       readCommentText(resultJson.message);
     if (legacyText && !NARRATION_OPENERS.test(legacyText.trimStart())) {
+      // STUDIO-0080: the summary of a run that did not succeed is posted under a line that says so.
+      // Not on a response bound to an external chat: that text is what a person outside reads in their own chat
+      // tool, and it is left as it was.
+      const unfinished = input.preferFinalResponseOverExistingComment === true ? null : readUnfinishedRunStatus(resultJson);
       return {
-        text: legacyText,
+        text: unfinished ? `${unfinishedRunStatusLine(unfinished)}\n\n${legacyText}` : legacyText,
         decision: decision("adapter_final_response", {
           commentAction: "create",
-          reasonCodes: ["legacy_adapter_summary_compatibility"],
+          reasonCodes: unfinished
+            ? ["legacy_adapter_summary_compatibility", UNFINISHED_RUN_STATUS_LINE_REASON_CODE]
+            : ["legacy_adapter_summary_compatibility"],
         }),
       } satisfies ResolvedHeartbeatRunResponse;
     }
