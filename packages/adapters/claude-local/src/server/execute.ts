@@ -856,6 +856,33 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     hasMatchingSessionCwd &&
     hasMatchingExecutionTarget;
   const sessionId = canResumeSession ? runtimeSessionId : null;
+  // STUDIO-0075: tell the host the session as soon as Claude announces it (`system`/`init`), with the parameters a
+  // successful run returns below. When the launch throws (a lost link to the worker machine) nothing is returned at
+  // the end; the host already holds the session and the retry resumes it. Only an id Claude can resume (a UUID).
+  let announcedSessionId: string | null = null;
+  const announceSession = async (id: string | null, baseline: ClaudeSessionTotals | null) => {
+    if (!id || id === announcedSessionId || !ctx.onSessionAnnounced) return;
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) return;
+    announcedSessionId = id;
+    try {
+      await ctx.onSessionAnnounced({ sessionId: id, sessionDisplayId: id, sessionParams: {
+        sessionId: id,
+        cwd,
+        promptBundleKey: promptBundle.bundleKey,
+        mcpServerIdentity: runtimeMcpIdentity,
+        ...(executionTargetIsRemote ? { remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget) } : {}),
+        ...(workspaceId ? { workspaceId } : {}),
+        ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+        ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+        // A run without a final result keeps the old ledger baseline of the session it resumed.
+        ...(baseline?.sessionId === id ? { claudeSessionTotals: baseline } : {}),
+      } });
+    } catch (error) {
+      await Promise.resolve(onLog("stderr",
+        `[paperclip] The session "${id}" announced by Claude could not be recorded before the end of the run: ${error instanceof Error ? error.message : String(error)}\n`,
+      )).catch(() => undefined);
+    }
+  };
   // Totals the resumed session had reported when its previous run ended; the
   // CLI's result ledger is cumulative over a resumed session.
   const resumedSessionTotals = readClaudeSessionTotals(runtimeSessionParams.claudeSessionTotals, sessionId);
@@ -1031,8 +1058,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     const sessionBaseline = resumeSessionId ? resumedSessionTotals : null;
     const consumeAccounting = createClaudeStreamParser({ sessionBaseline });
+    let streamSessionId: string | null = null;
     const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
       const parsed = consumeAccounting(stdout);
+      streamSessionId = parsed.sessionId ?? streamSessionId;
       return { usage: parsed.usage ?? undefined, usageBasis: "per_run", costUsd: parsed.costUsd,
         provider: "anthropic", biller: isBedrockAuth(effectiveEnv) ? "aws_bedrock" : "anthropic",
         billingType, model: Object.keys(parseObject(parsed.resultJson?.modelUsage)).length > 1 ? "mixed" : parsed.model || model,
@@ -1048,7 +1077,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       graceSec,
       onSpawn,
       onRuntimeProgress: ctx.onRuntimeProgress,
-      onLog: accountingLog,
+      onLog: async (stream, chunk) => {
+        await accountingLog(stream, chunk);
+        if (stream === "stdout") await announceSession(streamSessionId, sessionBaseline);
+      },
       runLogTail: paperclipBridge?.runLogTail,
       settleRunDisposition: paperclipBridge?.settleRunDisposition,
       terminalResultCleanup: {

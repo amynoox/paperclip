@@ -115,6 +115,8 @@ interface RunCompletionSession {
   taskKey: string | null;
   configuredModel: string | null;
   sessionConfigMetadata: EffectiveRunSessionConfigMetadata;
+  /** STUDIO-0075: the session the adapter announced during this run, already kept for the task (heartbeat.ts). */
+  announcedSession?: { current: { params: Record<string, unknown>; displayId: string | null } | null };
 }
 
 interface RunCompletionInput {
@@ -457,7 +459,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       outcome = "failed";
     }
 
-    const nextSessionState = resolveNextSessionState({
+    let nextSessionState = resolveNextSessionState({
       adapterType: agent.adapterType,
       codec: sessionCodec,
       adapterResult,
@@ -466,6 +468,23 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       previousDisplayId: runtimeForAdapter.sessionDisplayId,
       previousLegacySessionId: runtimeForAdapter.sessionId,
     });
+    // STUDIO-0075: a run that did not succeed keeps the session its engine announced while it ran. A result that
+    // names no session would otherwise write the PREVIOUS session back over it. A result that names another
+    // session than the announced one does not win either: the announcement comes from the engine's own stream; the
+    // run's log says so. `clearSession` and a result that explicitly names no session still clear, as before.
+    const announcedSession = session.announcedSession?.current ?? null;
+    if (announcedSession && outcome !== "succeeded" && !adapterResult.clearSession) {
+      const resultNamesSession = adapterResult.sessionParams !== undefined || adapterResult.sessionId !== undefined
+        || adapterResult.sessionDisplayId !== undefined;
+      const resultSessionId = nextSessionState.displayId ?? nextSessionState.legacySessionId;
+      if (!resultNamesSession || (resultSessionId !== null && resultSessionId !== announcedSession.displayId)) {
+        if (resultNamesSession) {
+          await onLog("stdout", `[paperclip] The run's result names session "${resultSessionId}" but its engine announced "${announcedSession.displayId}" during the run; keeping the announced session.\n`);
+        }
+        nextSessionState = { params: announcedSession.params, displayId: announcedSession.displayId,
+          legacySessionId: announcedSession.displayId };
+      }
+    }
     const rawUsage = normalizeUsageTotals(adapterResult.usage);
     const sessionUsageResolution = await resolveNormalizedUsageForSession({
       agentId: agent.id,
@@ -739,6 +758,11 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           },
           "skipping late run finalization because the run already left running state",
         );
+        // STUDIO-0075: the session announced during the run is already kept for the task. A late result that asks
+        // to forget the session (the engine refused to resume it) is still obeyed, for this run's own record only.
+        if (taskKey && adapterResult.clearSession) {
+          await clearTaskSessions(agent.companyId, agent.id, { taskKey, adapterType: agent.adapterType, expectedRunId: run.id });
+        }
         return;
       }
     }
@@ -1340,9 +1364,13 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
         },
       );
 
+      // STUDIO-0075: the session the adapter announced during this run, when there is one, is the task's session
+      // after a thrown error too; the previous session is written back only when nothing was announced.
+      const announcedSession = session.announcedSession?.current ?? null;
       if (
         taskKey &&
         (goalCheckpointSession.current ||
+          announcedSession ||
           previousSessionParams ||
           previousSessionDisplayId ||
           taskSession)
@@ -1354,6 +1382,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           taskKey,
           sessionParamsJson:
             goalCheckpointSession.current?.params ??
+            announcedSession?.params ??
             attachPaperclipSessionMetadataToSessionParams(
               previousSessionParams,
               configuredModel,
@@ -1361,6 +1390,7 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             ),
           sessionDisplayId:
             goalCheckpointSession.current?.displayId ??
+            announcedSession?.displayId ??
             previousSessionDisplayId,
           lastRunId: failedRun.id,
           lastError: message,

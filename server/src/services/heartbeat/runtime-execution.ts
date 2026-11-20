@@ -162,6 +162,9 @@ export interface HeartbeatRuntimeExecutionInput {
     configuredModel: string | null;
     sessionConfigMetadata: EffectiveRunSessionConfigMetadata;
     goalCheckpointSession: { current: { params: Record<string, unknown>; displayId: string } | null };
+    /** STUDIO-0075: receives the session a legacy adapter announces while its run is still going. */
+    onSessionAnnounced?: (session: { sessionId: string; sessionDisplayId: string | null;
+      sessionParams: Record<string, unknown> }) => Promise<void>;
   };
   instructions: {
     // Instruction callbacks can replace the copy and receipt while a provider is running.
@@ -250,7 +253,7 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
   const { persistedExecutionWorkspace, executionWorkspace, executionTarget, workspaceOperationRecorder, nativeWorkspaceSync, workspaceRestoreSource, remoteExecution } = input.workspace;
   const remoteWorkspaceAuthority = readRemoteWorkspaceAuthority(persistedExecutionWorkspace?.metadata);
   const { runtimeConfig, resolvedConfig, resolvedInstanceSettings, configuredTaskEnvironment, adapterEnv, agentIdentity, observability, managedAiRuntime, runtimeEnv, useHostGitHub, githubSelection } = input.config;
-  const { runtimeSessionParamsForAdapter, configuredModel, sessionConfigMetadata, goalCheckpointSession } = input.session;
+  const { runtimeSessionParamsForAdapter, configuredModel, sessionConfigMetadata, goalCheckpointSession, onSessionAnnounced } = input.session;
   const { nativeInstructionWorkingCopy, collectStoppedInstructions, nativeInstructionReservation, releaseInstructionCopy } = input.instructions;
   const { providerTraceCapture, nativeRunnerPreparationSpans, attestedQuestionResponseAtMs, attemptStartedAtMs, environmentAcquireStartedAtMs, environmentRealizeEndedAtMs } = input.trace;
   const { executionControl, executionPhaseContext, dispatchResolvedInteractionContinuationWithAtomicGate } = input.control;
@@ -899,6 +902,8 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
               runtimeMcp,
               runtimeTools,
               onLog,
+              // STUDIO-0075: the adapter says which session its engine opened as soon as the engine announces it.
+              ...(onSessionAnnounced ? { onSessionAnnounced } : {}),
               onMeta: onAdapterMeta,
               onEvent: onAdapterEvent,
               onUsage: usageRecorder ? async receipt => { await usageRecorder.capture(receipt); } : undefined,

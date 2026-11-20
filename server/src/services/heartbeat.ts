@@ -249,6 +249,7 @@ export {
   shouldResetTaskSessionForModelChange,
   stripConfiguredModelFromSessionParams,
   stripPaperclipSessionMetadataFromSessionParams,
+  attachPaperclipSessionMetadataToSessionParams,
   resolveTaskSessionConfigFreshness,
 } from "./heartbeat/workspaces.js";
 import { boundHeartbeatRunEventPayloadForStorage } from "./heartbeat/run-log.js";
@@ -3274,6 +3275,33 @@ export function heartbeatService(
           displayId: string;
         } | null;
       } = { current: null };
+      // STUDIO-0075: the session a legacy adapter announces while its run is still going (onSessionAnnounced) is
+      // kept for the task at once, with the configuration fingerprint a finished run gets, and named on the run. A
+      // run cut afterwards (a lost link, a pause, a server restart) is then resumed in that session: before, its
+      // failure wrote the PREVIOUS session back and the session it had opened was lost (production, 20 Nov 2026,
+      // two routed runs ended router_provider_stop_unverified; their retries opened new conversations).
+      const announcedSession: {
+        current: { params: Record<string, unknown>; displayId: string | null } | null;
+      } = { current: null };
+      const onSessionAnnounced = async (announced: { sessionId: string; sessionDisplayId: string | null;
+        sessionParams: Record<string, unknown> }) => {
+        const sessionId = readNonEmptyString(announced?.sessionId);
+        if (!taskKey || !sessionId) return;
+        // The same reading as a finished run's result. An adapter whose sessions need a canonical id (Hermes) keeps
+        // nothing from an unfinished run: this returns no parameters for it.
+        const next = resolveNextSessionState({ adapterType: agent.adapterType, codec: sessionCodec, outcome: "failed",
+          adapterResult: { exitCode: null, signal: null, timedOut: false, sessionId,
+            sessionParams: { ...parseObject(announced.sessionParams), sessionId },
+            sessionDisplayId: readNonEmptyString(announced.sessionDisplayId) ?? sessionId },
+          previousParams: null, previousDisplayId: null, previousLegacySessionId: null });
+        const params = attachPaperclipSessionMetadataToSessionParams(next.params, configuredModel, sessionConfigMetadata);
+        if (!params) return;
+        await upsertTaskSession({ companyId: agent.companyId, agentId: agent.id, adapterType: agent.adapterType, taskKey,
+          sessionParamsJson: params, sessionDisplayId: next.displayId, lastRunId: run.id, lastError: null });
+        await db.update(heartbeatRuns).set({ sessionIdAfter: next.displayId ?? next.legacySessionId })
+          .where(eq(heartbeatRuns.id, run.id));
+        announcedSession.current = { params, displayId: next.displayId ?? next.legacySessionId };
+      };
       try {
         const startedAt = run.startedAt ?? new Date();
         const runningWithSession = await timePreparation("execution_start", () => db
@@ -3569,6 +3597,7 @@ export function heartbeatService(
             configuredModel,
             sessionConfigMetadata,
             goalCheckpointSession,
+            onSessionAnnounced,
           },
           instructions: {
             nativeInstructionWorkingCopy: preparedInstructions.nativeInstructionWorkingCopy,
@@ -3685,7 +3714,7 @@ export function heartbeatService(
         await measureRunPhase("completion.run", () => runCompletion.completeRun({
           run, agent, issueId, issueRef, signal: executionControl.controller.signal,
           output: runOutput,
-          session: { runtimeForAdapter, previousSessionParams, taskKey, configuredModel, sessionConfigMetadata },
+          session: { runtimeForAdapter, previousSessionParams, taskKey, configuredModel, sessionConfigMetadata, announcedSession },
           readFailureReportSecrets,
           adapterResult, sessionCodec, taskSessionForRun, sessionCompaction,
           configFreshnessResultMetadata, runLedgerScope, currentUserRedactionOptions,
@@ -3831,7 +3860,7 @@ export function heartbeatService(
         await runCompletion.failRun({
           run, agent, issueId, issueRef, signal: executionControl.controller.signal,
           output: runOutput,
-          session: { runtimeForAdapter, previousSessionParams, taskKey, configuredModel, sessionConfigMetadata },
+          session: { runtimeForAdapter, previousSessionParams, taskKey, configuredModel, sessionConfigMetadata, announcedSession },
           readFailureReportSecrets,
           runId, err, identityRedactor, requiredWorkspaceRestoreEvidence, legacyAdapterEntered,
           goalCheckpointSession, previousSessionDisplayId, taskSession,

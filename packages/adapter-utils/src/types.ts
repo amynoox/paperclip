@@ -313,6 +313,18 @@ export interface AdapterExecutionContext {
   runtimeTools?: AdapterRuntimeToolAccess;
   onLog: (stream: "stdout" | "stderr", chunk: string) => Promise<void>;
   onMeta?: (meta: AdapterInvocationMeta) => Promise<void>;
+  /**
+   * STUDIO-0075: called by an adapter as soon as its engine announces the session of this run, while the run is
+   * still going. `sessionParams` are the ones a successful run would return (session, working directory, remote
+   * execution identity). The host keeps them for the task at once, so a run that is cut afterwards (a lost link,
+   * a pause, a host restart) is resumed in that session instead of a new one. Optional: an adapter that never
+   * calls it, and a host that does not provide it, behave as before.
+   */
+  onSessionAnnounced?: (session: {
+    sessionId: string;
+    sessionDisplayId: string | null;
+    sessionParams: Record<string, unknown>;
+  }) => Promise<void>;
   onEvent?: (event: AdapterRuntimeEvent) => Promise<void>;
   onUsage?: (receipt: AdapterUsageCheckpoint) => Promise<void>;
   onRuntimeProgress?: RuntimeStatusSink;

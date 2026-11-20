@@ -1139,6 +1139,28 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       runtimeSessionId.length > 0 &&
       (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(effectiveExecutionCwd)) &&
       adapterExecutionTargetSessionMatches(runtimeRemoteExecution, runtimeExecutionTarget);
+    // STUDIO-0075: tell the host the session as soon as Codex announces it (`thread.started`), with the parameters a
+    // successful run returns below. When the launch throws (a lost link to the worker machine) nothing is returned
+    // at the end; the host already holds the session and the retry resumes it.
+    let announcedSessionId: string | null = null;
+    const announceSession = async (id: string | null) => {
+      if (!id || id === announcedSessionId || !ctx.onSessionAnnounced) return;
+      announcedSessionId = id;
+      try {
+        await ctx.onSessionAnnounced({ sessionId: id, sessionDisplayId: id, sessionParams: {
+          sessionId: id,
+          cwd: effectiveExecutionCwd,
+          ...(executionTargetIsRemote ? { remoteExecution: adapterExecutionTargetSessionIdentity(runtimeExecutionTarget) } : {}),
+          ...(workspaceId ? { workspaceId } : {}),
+          ...(workspaceRepoUrl ? { repoUrl: workspaceRepoUrl } : {}),
+          ...(workspaceRepoRef ? { repoRef: workspaceRepoRef } : {}),
+        } });
+      } catch (error) {
+        await Promise.resolve(onLog("stderr",
+          `[paperclip] The session "${id}" announced by Codex could not be recorded before the end of the run: ${error instanceof Error ? error.message : String(error)}\n`,
+        )).catch(() => undefined);
+      }
+    };
     const codexTransientFallbackMode = readCodexTransientFallbackMode(context);
     const forceSaferInvocation = fallbackModeUsesSaferInvocation(codexTransientFallbackMode);
     const forceFreshSession = fallbackModeUsesFreshSession(codexTransientFallbackMode);
@@ -1394,8 +1416,10 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
 
       const consumeAccounting = createCodexJsonlParser();
+      let streamSessionId: string | null = null;
       const accountingLog = createUsageCheckpointLog(onLog, ctx.onUsage, stdout => {
         const parsed = consumeAccounting(stdout);
+        streamSessionId = parsed.sessionId ?? streamSessionId;
         return { usage: parsed.usageReported ? parsed.usage : undefined, costStatus: parsed.usageComplete ? undefined : "unpriced", usageBasis: "per_run", provider: "openai", biller, billingType, model, pricingContext, costUsd: null, complete: parsed.usageComplete };
       });
       try {
@@ -1413,6 +1437,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
             monitor?.noteOutputChunk(stream, chunk);
             if (stream === "stdout") {
               await accountingLog(stream, chunk);
+              await announceSession(streamSessionId);
               return;
             }
             const cleaned = stripCodexRolloutNoise(chunk);
