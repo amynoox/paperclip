@@ -1036,11 +1036,25 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       }
     }, 240_000);
 
-    it("blocks as today when the assignee is in error, not paused", async () => {
-      const f = await seed("todo", WAITED);
-      await db.update(agents).set({ status: "error" }).where(eq(agents.id, f.agentId));
+    it("holds for a paused review participant too: the task stays in review", async () => {
+      const f = await seed("in_review", WAITED, { review: true });
+      await pause(f);
       await sweepTwice(f);
-      await expectBlockedAsToday(f);
+      await expectKept(f, "in_review");
+    }, 240_000);
+
+    it("covers a pause only: an assignee that cannot be invoked for another reason is blocked as today", async () => {
+      for (const status of ["terminated", "pending_approval"] as const) {
+        const f = await seed("todo", WAITED);
+        await db.update(agents).set({ status }).where(eq(agents.id, f.agentId));
+        await sweepTwice(f);
+        await expectBlockedAsToday(f);
+      }
+      // An assignee in `error` can still be invoked: its wait is kept by the rule for an invokable assignee, as today.
+      const inError = await seed("todo", WAITED);
+      await db.update(agents).set({ status: "error" }).where(eq(agents.id, inError.agentId));
+      await sweepTwice(inError);
+      await expectKept(inError, "todo");
     }, 240_000);
 
     it("changes nothing for a task with no way forward: another failure, or a status the sweep does not serve", async () => {
