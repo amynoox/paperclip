@@ -466,6 +466,22 @@ describeEmbeddedPostgres("ssh lease outage on the real run path (TR-2093)", () =
     expect((await scheduledOf(f))[0]).toMatchObject({ retryOfRunId: first.id, scheduledRetryReason: SSH_LEASE_OUTAGE_RETRY_REASON });
   }, 180_000);
 
+  it("an old failure of another provider under the same code is not part of the ssh outage", async () => {
+    const f = await seed();
+    // Thirteen hours ago the same task failed on a sandbox provider (HTTP 502): the same code, another lane.
+    const longAgo = new Date(Date.now() - 13 * 60 * MINUTE);
+    await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "automation", triggerDetail: "system",
+      status: "failed", errorCode: "environment_provider_unavailable", createdAt: longAgo, startedAt: longAgo, finishedAt: longAgo,
+      resultJson: { providerFailure: { provider: "daytona", httpStatus: 502 }, executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId } });
+    probe.failure = killedByLocalTimeout;
+    const first = await start(f, "issue_commented");
+    expect(first).toMatchObject({ status: "failed", errorCode: "environment_provider_unavailable" });
+    // The ssh outage began with this run, not thirteen hours ago: the lane retries.
+    expect((await readSshLeaseOutageStart(db, first)).getTime()).toBe(first.finishedAt!.getTime());
+    expect((await scheduledOf(f))[0]).toMatchObject({ retryOfRunId: first.id, scheduledRetryReason: SSH_LEASE_OUTAGE_RETRY_REASON, scheduledRetryAttempt: 1 });
+  }, 180_000);
+
   it("a run that got its lease ends the outage: the next one has its own 12 h", async () => {
     const f = await seed();
     probe.failure = killedByLocalTimeout;
