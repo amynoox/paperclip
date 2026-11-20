@@ -191,7 +191,7 @@ vi.mock("../routes/authz.js", async () => {
       agentId: null,
       runId: req.actor.runId ?? null,
       agentApiKeyId: null,
-      // As the real getActorInfo returns it (STUDIO-0074 reads it for the resume's activity entry).
+      // As the real getActorInfo returns it (STUDIO-0074: the resume command carries it).
       actorSource: req.actor.source ?? "session",
     };
   }
@@ -472,7 +472,8 @@ describe("agent cross-tenant route authorization", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(mockAgentService.resume).toHaveBeenCalledWith(agentId);
+    // STUDIO-0074: the resume command carries the person who asks and how that person was signed in.
+    expect(mockAgentService.resume).toHaveBeenCalledWith(agentId, "user", { userId: "board-user", source: "local_implicit" });
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       companyId,
       actorType: "user",
@@ -483,8 +484,6 @@ describe("agent cross-tenant route authorization", () => {
       action: "agent.resumed",
       entityType: "agent",
       entityId: agentId,
-      // STUDIO-0074: how the person who resumed was signed in.
-      details: { actorSource: "local_implicit" },
     }));
   });
 
@@ -500,9 +499,7 @@ describe("agent cross-tenant route authorization", () => {
     expect(res.body.resumeDeferred).toEqual({ reason: "pause_in_progress", remainingHolds: [],
       message: "The pause is still stopping this agent's runs: the agent resumes by itself when the pause completes." });
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      action: "agent.resumed", entityId: agentId,
-      // STUDIO-0074: the entry also keeps how the person who resumed was signed in.
-      details: { actorSource: "local_implicit", deferredUntilPauseCompletes: true, remainingHolds: [] },
+      action: "agent.resumed", entityId: agentId, details: { deferredUntilPauseCompletes: true, remainingHolds: [] },
     }));
 
     mockAgentService.resume.mockResolvedValue({ ...pausingAgent, lifecycleHolds: ["budget"] });
@@ -545,7 +542,8 @@ describe("agent cross-tenant route authorization", () => {
       resource: { type: "agent", companyId, agentId },
       scope: { requiresChangeGrant: true },
     }));
-    expect(mockAgentService.resume).toHaveBeenCalledWith(agentId);
+    // STUDIO-0074: an agent's resume names no person.
+    expect(mockAgentService.resume).toHaveBeenCalledWith(agentId, "user", undefined);
   });
 
   it.each([

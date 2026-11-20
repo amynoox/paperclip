@@ -11,7 +11,20 @@ export function assertRootDatabase(db: Db) {
 }
 
 type LifecycleRow = typeof agents.$inferSelect;
-type ChangeOptions = { version?: number; owner?: string; reason?: string };
+/** STUDIO-0074: the person who asks to resume an agent: the user and how that user was signed in. */
+export type ResumeRequester = { userId: string; source: string };
+/**
+ * STUDIO-0074: what the lifecycle operation keeps about a pause's resume.
+ * - `resumeRequestedBy`: the person who asked to resume during this pause, saved by the resume command in its own
+ *   transaction. A new pause forgets it.
+ * - `pauseLifted`: set on the operation that made the agent ready after a pause: when that pause started, and who
+ *   asked to resume. The continuation of the runs the pause cut reads it (pause-resume-continuation.ts).
+ */
+export type PauseResumeOperation = AgentLifecycleOperation & {
+  resumeRequestedBy?: ResumeRequester;
+  pauseLifted?: { pausedAt: string | null; requestedBy?: ResumeRequester };
+};
+type ChangeOptions = { version?: number; owner?: string; reason?: string; requestedBy?: ResumeRequester };
 
 // Prepared drafts wait for the wizard; they have no background verification obligation.
 export const pendingLifecycleWork = and(
@@ -134,9 +147,17 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   if (command === "complete" && next === "paused" && !holds.length) next = "resuming";
   if (["complete", "reconcile"].includes(command) && next === "paused" && holds.length === 1 && holds[0] === "setup"
     && await effects.setupRequiresPreparation(tx, agent.companyId, agent.defaultEnvironmentId, agent)) next = "preparing";
+  // STUDIO-0074: a person's resume that does not change the state yet (the pause is still stopping runs, or another
+  // hold remains) still says who asked, on the operation of the pause in progress.
+  const resumeRequestedBy = command === "resume" && options.requestedBy ? options.requestedBy
+    : (agent.lifecycleOperation as PauseResumeOperation | null)?.resumeRequestedBy;
   if (next === agent.lifecycleState) {
-    if (JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) || agent.pauseReason !== (holds[0] ?? null)) {
-      const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null }).where(eq(agents.id, agent.id)).returning();
+    const requester = command === "resume" && options.requestedBy && agent.lifecycleOperation
+      && ["pausing", "paused"].includes(agent.lifecycleState) ? options.requestedBy : null;
+    if (requester || JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) || agent.pauseReason !== (holds[0] ?? null)) {
+      const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null,
+        ...(requester ? { lifecycleOperation: sql`${agents.lifecycleOperation} || ${JSON.stringify({ resumeRequestedBy: requester })}::jsonb` } : {}),
+      }).where(eq(agents.id, agent.id)).returning();
       return updated;
     }
     return agent;
@@ -149,6 +170,12 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
       : agent.lifecycleOperation?.resumeState,
   };
   if (next === "ready") operation.resumeState = "ready";
+  // STUDIO-0074: the requester follows the pause until the agent is ready; a new pause starts without one.
+  if (resumeRequestedBy && next !== "pausing" && next !== "ready") (operation as PauseResumeOperation).resumeRequestedBy = resumeRequestedBy;
+  if (next === "ready" && agent.lifecycleState === "resuming") {
+    (operation as PauseResumeOperation).pauseLifted = { pausedAt: agent.pausedAt ? agent.pausedAt.toISOString() : null,
+      ...(resumeRequestedBy ? { requestedBy: resumeRequestedBy } : {}) };
+  }
   if (next === "pausing") {
     const [company] = await tx.select({ pauseReason: companies.pauseReason }).from(companies)
       .where(eq(companies.id, agent.companyId));

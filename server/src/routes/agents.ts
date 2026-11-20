@@ -5925,13 +5925,16 @@ export function agentRoutes(
       });
       return;
     }
-    const agent = await svcLifecycle.resumeAgent(id);
+    const actor = getActorInfo(req);
+    // STUDIO-0074: a person's resume says who asks, in the resume command itself. The runs this pause cut continue
+    // in that person's name once the agent is ready (pause-resume-continuation.ts). An agent's resume names nobody.
+    const agent = await svcLifecycle.resumeAgent(id, "user",
+      actor.actorType === "user" ? { userId: actor.actorId, source: actor.actorSource } : undefined);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
 
-    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: actor.actorType,
@@ -5942,11 +5945,7 @@ export function agentRoutes(
       action: "agent.resumed",
       entityType: "agent",
       entityId: agent.id,
-      // STUDIO-0074: how the person who resumed was signed in. The continuation of the runs the pause cut is filed
-      // in that person's name, with this source (pause-resume-continuation.ts).
-      ...(actor.actorType === "user" || agent.lifecycleState === "pausing" ? { details: {
-        ...(actor.actorType === "user" ? { actorSource: actor.actorSource } : {}),
-        ...(agent.lifecycleState === "pausing" ? { deferredUntilPauseCompletes: true, remainingHolds: agent.lifecycleHolds } : {}) } } : {}),
+      ...(agent.lifecycleState === "pausing" ? { details: { deferredUntilPauseCompletes: true, remainingHolds: agent.lifecycleHolds } } : {}),
     });
 
     // STUDIO-0061: a resume while the pause is still stopping the agent's runs lifts the holds it may lift, and the

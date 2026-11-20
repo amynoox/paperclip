@@ -4,117 +4,150 @@ import { activityLog, agents, agentWakeupRequests, companies, createDb, environm
   issueComments, issueRecoveryActions, issueRelations, issueThreadInteractions, issues } from "@paperclipai/db";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
-import { logActivity } from "./activity-log.js";
+import { projectCompanyHolds } from "../modules/agent-lifecycle/adapters/company-policy.js";
+import { configureAgentLifecycle, createAgentLifecycle, createAgentLifecycleEffects } from "./agent-lifecycle.js";
 import { createLifecycleDriver } from "./agent-lifecycle-driver.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { heartbeatService } from "./heartbeat.js";
 import { environmentService } from "./environments.js";
-import { PAUSE_CUT_WORK_CONTINUED, PAUSE_CUT_WORK_NOT_CONTINUED } from "./pause-resume-continuation.js";
+import { PAUSE_CUT_WORK_CONTINUED, PAUSE_CUT_WORK_KEPT, PAUSE_CUT_WORK_NOT_CONTINUED, PAUSE_CUT_WORK_REQUEST_FILED,
+  continueRunsCutByPause, pauseLiftedOf } from "./pause-resume-continuation.js";
 
 // STUDIO-0074: production, 18-20 Nov 2026. A manual pause cut the runs of a role (run 5f24df87: legacy, cancelled
 // `agent_paused`, pauseStop manual, a recorded process that is gone, one local lease released). Each cut run left its
 // hold, and after the resume a person had to ask again on every task. The owner decided that the resume of a role
-// continues the runs its pause cut. The cases replay that run as it was read in the database, then call the ready hook
-// of the lifecycle driver: the function the lifecycle worker calls when the role has resumed.
+// continues the runs its pause cut.
+// Each case pauses the role through the real lifecycle (command, store, worker, driver), writes the cut run as
+// production recorded it, then resumes the role through the same lifecycle: the worker makes the role ready and calls
+// the driver's ready hook. No case writes an `agent.resumed` activity entry: the person comes from the resume command.
 describe("the runs a pause cut, when the role resumes", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
+  let work: ReturnType<typeof configureAgentLifecycle>;
   beforeAll(async () => {
     temporary = await startEmbeddedPostgresTestDatabase("pause-resume-continuation-");
     db = createDb(temporary.connectionString);
+    work = configureAgentLifecycle(db, createLifecycleDriver(db, {} as never));
   });
-  afterAll(async () => { await temporary?.cleanup(); });
+  afterAll(async () => { await work?.stop(); await temporary?.cleanup(); });
 
   const GONE_PID = 2_000_000_000;
-  type Options = {
+  const HOUR = 3600_000;
+  const PERSON = { userId: "board", source: "local_implicit" };
+  const TRACES = [PAUSE_CUT_WORK_CONTINUED, PAUSE_CUT_WORK_KEPT, PAUSE_CUT_WORK_NOT_CONTINUED, PAUSE_CUT_WORK_REQUEST_FILED];
+  type CutOptions = {
     lease?: "local" | "ssh";
     finishedMinutesAgo?: number;
-    taskStatus?: string;
-    /** Who the `agent.resumed` entry names; `none` writes no entry. */
-    resumedBy?: "user" | "agent" | "none";
+    /** A run the pause cut before it started: no process, no lease, no hold. */
+    neverStarted?: boolean;
+    holds?: string[];
     /** Replaces the pause's cancellation record. */
     resultJson?: Record<string, unknown>;
     errorCode?: string;
   };
-  const manualPauseStop = (at: Date, holds: string[] = ["manual"]) => ({
+  const pauseStop = (at: Date, holds: string[] = ["manual"]) => ({
     cancellation: { reason: "Cancelled due to agent pause", source: "control_plane", expected: true,
       initiator: { type: "system" }, recordedAt: at.toISOString() },
     pauseStop: { holds, companyPauseReason: null }, stopReason: "paused",
     effectiveTimeoutSec: 0, timeoutConfigured: false, timeoutFired: false, timeoutSource: null });
-  const resumeEntry = (f: { companyId: string; agentId: string }, by: "user" | "agent" = "user") => logActivity(db, {
-    companyId: f.companyId, action: "agent.resumed", entityType: "agent", entityId: f.agentId,
-    ...(by === "user" ? { actorType: "user" as const, actorId: "board", details: { actorSource: "local_implicit" } }
-      : { actorType: "agent" as const, actorId: f.agentId, agentId: f.agentId }) });
-  async function fixture(options: Options = {}) {
-    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), cutRunId = randomUUID();
+  const state = async (agentId: string) => (await db.select().from(agents).where(eq(agents.id, agentId)))[0]!;
+  /** The agent is busy elsewhere: an admitted run stays queued instead of launching a provider. */
+  const busy = (f: { companyId: string; agentId: string }) => db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, status: "running" });
+  const idle = (f: { agentId: string }) => db.delete(heartbeatRuns).where(and(eq(heartbeatRuns.agentId, f.agentId), eq(heartbeatRuns.status, "running")));
+
+  /** One task of the role, with the run the pause cut on it and what that run left behind. */
+  async function cutTask(f: { companyId: string; agentId: string }, options: CutOptions & { taskStatus?: string } = {}) {
+    const issueId = randomUUID(), cutRunId = randomUUID();
     const finishedAt = new Date(Date.now() - (options.finishedMinutesAgo ?? 13 * 60) * 60_000);
-    await db.insert(companies).values({ id: companyId, name: "Pause resume", issuePrefix: `R${companyId.slice(0, 6)}` });
-    await db.insert(agents).values({ id: agentId, companyId, name: "Dev", role: "engineer",
-      adapterType: "claude_local", status: "idle", runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } });
-    await db.insert(issues).values({ id: issueId, companyId, title: "Cut by a pause", status: options.taskStatus ?? "todo",
-      assigneeAgentId: agentId });
-    const [cut] = await db.insert(heartbeatRuns).values({ id: cutRunId, companyId, agentId,
+    await db.insert(issues).values({ id: issueId, companyId: f.companyId, title: "Cut by a pause", status: options.taskStatus ?? "todo",
+      assigneeAgentId: f.agentId });
+    const [cut] = await db.insert(heartbeatRuns).values({ id: cutRunId, companyId: f.companyId, agentId: f.agentId,
       invocationSource: "automation", triggerDetail: "system",
       status: "cancelled", runtimeMode: "legacy", executionStage: "settled", errorCode: options.errorCode ?? "agent_paused",
-      error: "Cancelled due to agent pause", processPid: GONE_PID, contextSnapshot: { issueId },
-      startedAt: new Date(finishedAt.getTime() - 356_000), finishedAt,
-      resultJson: options.resultJson ?? manualPauseStop(finishedAt) }).returning();
-    const [hold] = await db.insert(issueRecoveryActions).values({ companyId, sourceIssueId: issueId,
+      error: "Cancelled due to agent pause", contextSnapshot: { issueId }, finishedAt,
+      ...(options.neverStarted ? {} : { processPid: GONE_PID, startedAt: new Date(finishedAt.getTime() - 356_000) }),
+      resultJson: options.resultJson ?? pauseStop(finishedAt, options.holds) }).returning();
+    if (options.neverStarted) return { issueId, cut: cut!, hold: null };
+    const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: issueId,
       kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${cutRunId}`,
       status: "resolved", outcome: "blocked", ownerType: "board", nextAction: "Automatic recovery stopped.",
       evidence: { runId: cutRunId, automaticRecovery: { policy: "preserve_without_replay_v1", runId: cutRunId, replay: "blocked", actionOutcome: "unknown" } } }).returning();
-    const environment = await environmentService(db).ensureLocalEnvironment(companyId);
+    const environment = await environmentService(db).ensureLocalEnvironment(f.companyId);
     const provider = options.lease ?? "local";
-    await db.insert(environmentLeases).values({ companyId, environmentId: environment.id, heartbeatRunId: cutRunId, issueId,
+    await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId: environment.id, heartbeatRunId: cutRunId, issueId,
       provider, ...(provider === "local" ? {} : { providerLeaseId: `${provider}://worker@mac-03:22/w/${cutRunId}`, cleanupStatus: "success" }),
       status: "expired", leasePolicy: "ephemeral", releasedAt: new Date(finishedAt.getTime() + 70_000),
-      metadata: { agentId, driver: provider } });
-    await db.insert(heartbeatRunEvents).values({ companyId, agentId, runId: cutRunId, seq: 1,
+      metadata: { agentId: f.agentId, driver: provider } });
+    await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: cutRunId, seq: 1,
       eventType: "native.process_identity_recorded", stream: "system", level: "info", message: "identity" });
-    // The agent is busy elsewhere: an admitted run stays queued instead of launching a provider.
-    await db.insert(heartbeatRuns).values({ companyId, agentId, status: "running" });
-    const f = { companyId, agentId, issueId, cut: cut!, hold: hold! };
-    if (options.resumedBy !== "none") await resumeEntry(f, options.resumedBy ?? "user");
-    return f;
+    return { issueId, cut: cut!, hold: hold! };
+  }
+  /** A role, paused through the lifecycle fourteen hours ago, and the run that pause cut on its task. */
+  async function fixture(options: CutOptions & { taskStatus?: string } = {}) {
+    const companyId = randomUUID(), agentId = randomUUID();
+    await db.insert(companies).values({ id: companyId, name: "Pause resume", issuePrefix: `R${companyId.slice(0, 6)}` });
+    await db.insert(agents).values({ id: agentId, companyId, name: "Dev", role: "engineer",
+      adapterType: "claude_local", status: "idle", runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } } });
+    await createAgentLifecycle(db).pauseAgent(agentId);
+    await work.process(agentId);
+    expect(await state(agentId)).toMatchObject({ lifecycleState: "paused", lifecycleHolds: ["manual"] });
+    await db.update(agents).set({ pausedAt: new Date(Date.now() - 14 * HOUR) }).where(eq(agents.id, agentId));
+    const task = await cutTask({ companyId, agentId }, options);
+    await busy({ companyId, agentId });
+    return { companyId, agentId, ...task };
   }
   type Fixture = Awaited<ReturnType<typeof fixture>>;
-  /** The role has resumed: the lifecycle worker calls the driver's ready hook. */
-  async function roleResumes(f: Fixture) {
-    const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
-    await createLifecycleDriver(db, {} as never).onReady!(agent as never);
+  /** The resume route's command, then the lifecycle worker: the role becomes ready and the ready hook runs. */
+  async function roleResumes(f: { agentId: string }, by: { userId: string; source: string } | null = PERSON) {
+    await createAgentLifecycle(db).resumeAgent(f.agentId, "user", by ?? undefined);
+    await work.process(f.agentId);
+    expect((await state(f.agentId)).lifecycleState).toBe("ready");
   }
-  const traces = (f: Fixture) => db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId),
-    eq(activityLog.entityType, "issue"), eq(activityLog.entityId, f.issueId),
-    inArray(activityLog.action, [PAUSE_CUT_WORK_CONTINUED, PAUSE_CUT_WORK_NOT_CONTINUED]))).orderBy(asc(activityLog.createdAt));
-  const wakes = (f: Fixture) => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
-  const continuations = async (f: Fixture) => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
+  type Task = { companyId: string; agentId: string; issueId: string; cut: { id: string } };
+  const traces = (f: Task) => db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId),
+    eq(activityLog.entityType, "issue"), eq(activityLog.entityId, f.issueId), inArray(activityLog.action, TRACES)))
+    .orderBy(asc(activityLog.createdAt));
+  const traceList = async (f: Task) => (await traces(f)).map(entry => entry.details?.reason ? `${entry.action}:${entry.details.reason}` : entry.action);
+  const wakes = (f: Task) => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
+  const retries = async (f: Task) => (await wakes(f)).filter(wake => wake.reason === "task_retry" && wake.payload?.issueId === f.issueId);
+  const continuations = async (f: Task) => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
     .filter(run => run.contextSnapshot?.previousRunId === f.cut.id);
-  async function expectContinued(f: Fixture) {
+  async function expectContinued(f: Task, person = PERSON) {
     const started = await continuations(f);
     expect(started, JSON.stringify((await wakes(f)).map(wake => ({ status: wake.status, wait: wake.payload?.executionWait })))).toHaveLength(1);
     expect(started[0]).toMatchObject({ agentId: f.agentId, status: "queued",
       contextSnapshot: { previousRunId: f.cut.id, explicitUserContinuation: { previousRunId: f.cut.id } } });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
     const recorded = await traces(f);
-    expect(recorded).toHaveLength(1);
-    expect(recorded[0]).toMatchObject({ action: PAUSE_CUT_WORK_CONTINUED, actorType: "system", actorId: "pause-resume",
-      details: { interruptedRunId: f.cut.id, resumedByUserId: "board", continuationRunId: started[0]!.id } });
-    // The request is the Retry of the person who resumed the role.
-    const [retry] = (await wakes(f)).filter(wake => wake.reason === "task_retry");
-    expect(retry).toMatchObject({ requestedByActorType: "user", requestedByActorId: "board" });
+    expect(recorded.map(entry => entry.action)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, PAUSE_CUT_WORK_CONTINUED]);
+    // Every entry names the system as its author, and in its details who asked and how that person was signed in.
+    for (const entry of recorded) expect(entry).toMatchObject({ actorType: "system", actorId: "pause-resume",
+      details: { interruptedRunId: f.cut.id, resumedByUserId: person.userId, actorSource: person.source } });
+    expect(recorded[1]!.details).toMatchObject({ continuationRunId: started[0]!.id });
+    // The request is the Retry of the person who asked to resume.
+    expect(await retries(f)).toMatchObject([{ requestedByActorType: "user", requestedByActorId: person.userId,
+      payload: { taskRetry: { actorId: person.userId, actorSource: person.source } } }]);
   }
-  /** Nothing started, the hold still holds the task, and one entry on the task says why. */
-  async function expectRefused(f: Fixture, reason: string, details: Record<string, unknown> = {}) {
+  /** Nothing started and nothing was filed: one entry on the task says why. */
+  async function expectRefused(f: Task, reason: string, details: Record<string, unknown> = {}) {
     expect(await continuations(f)).toHaveLength(0);
-    const recorded = await traces(f);
-    expect(recorded.map(entry => [entry.action, entry.details?.reason])).toEqual([[PAUSE_CUT_WORK_NOT_CONTINUED, reason]]);
-    expect(recorded[0]!.details).toMatchObject({ interruptedRunId: f.cut.id, ...details });
+    expect(await traceList(f)).toEqual([`${PAUSE_CUT_WORK_NOT_CONTINUED}:${reason}`]);
+    expect((await traces(f))[0]!.details).toMatchObject({ interruptedRunId: f.cut.id, ...details });
+    expect(await retries(f)).toHaveLength(0);
+  }
+  /** The request is filed and waits: nothing started, the hold still holds the task. */
+  async function expectKept(f: Task & { hold: { id: string } | null }, reason: string, wait: string) {
+    expect(await continuations(f)).toHaveLength(0);
+    expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:${reason}`]);
+    expect((await traces(f))[1]!.details).toMatchObject({ interruptedRunId: f.cut.id, wait, actorSource: PERSON.source });
+    expect(await retries(f)).toMatchObject([{ status: "deferred_issue_execution" }]);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ recoveryActionId: f.hold!.id });
   }
   /** Not a run this resume has to look at: no entry, no request, nothing started. */
-  async function expectNotLookedAt(f: Fixture) {
+  async function expectNotLookedAt(f: Task) {
     expect(await continuations(f)).toHaveLength(0);
     expect(await traces(f)).toHaveLength(0);
-    expect((await wakes(f)).filter(wake => wake.reason === "task_retry")).toHaveLength(0);
+    expect(await retries(f)).toHaveLength(0);
   }
 
   describe("continues by itself", () => {
@@ -122,6 +155,9 @@ describe("the runs a pause cut, when the role resumes", () => {
       const f = await fixture();
       await roleResumes(f);
       await expectContinued(f);
+      // The person comes from the resume command, saved with it: no later write is read, so nothing can race.
+      expect(pauseLiftedOf((await state(f.agentId)).lifecycleOperation)).toMatchObject({ requestedBy: PERSON });
+      expect(await db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId), eq(activityLog.action, "agent.resumed")))).toHaveLength(0);
     });
 
     it("the same run over an ssh lease, on the stop proof the pause itself accepted", async () => {
@@ -130,28 +166,72 @@ describe("the runs a pause cut, when the role resumes", () => {
       await expectContinued(f);
     });
 
-    it("once: the ready hook called again, then a second resume, start nothing more", async () => {
+    it("a resume made with a person's board key, recorded as such", async () => {
+      const f = await fixture();
+      const key = { userId: "board", source: "board_key" };
+      await roleResumes(f, key);
+      await expectContinued(f, key);
+    });
+
+    it("every task the pause cut, in one resume", async () => {
+      const f = await fixture();
+      const second = { ...f, ...await cutTask(f) }, third = { ...f, ...await cutTask(f, { lease: "ssh" }) };
+      await roleResumes(f);
+      for (const task of [f, second, third]) await expectContinued(task);
+    });
+
+    it("once: the ready hook called again, then a whole new pause and resume, start nothing more", async () => {
       const f = await fixture();
       await roleResumes(f);
+      await createLifecycleDriver(db, {} as never).onReady!(await state(f.agentId) as never);
+      await idle(f);
+      await createAgentLifecycle(db).pauseAgent(f.agentId);
+      await work.process(f.agentId);
+      expect((await state(f.agentId)).lifecycleState).toBe("paused");
+      await busy(f);
       await roleResumes(f);
-      await resumeEntry(f);
-      await roleResumes(f);
-      await expectContinued(f);
+      expect(await continuations(f)).toHaveLength(1);
+      expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, PAUSE_CUT_WORK_CONTINUED]);
     });
   });
 
-  describe("does not start, and says why on the task", () => {
-    it("a run whose stop is not proven: the request stays saved, and starts when the proof comes", async () => {
+  describe("files the request and keeps it, and says when it starts", () => {
+    it("a run whose stop is not proven: nothing starts until the proof comes", async () => {
       const f = await fixture({ lease: "ssh", finishedMinutesAgo: 5 });
       await roleResumes(f);
-      await expectRefused(f, "stop_not_proven", { wait: "remote_cleanup", saved: true });
-      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ recoveryActionId: f.hold.id });
-      // The delay of the pause's proof passes; the deferred-receipt pass dispatches the saved request.
-      const proven = new Date(Date.now() - 13 * 3600_000);
+      await expectKept(f, "stop_not_proven", "remote_cleanup");
+      // The delay of the pause's proof passes; the deferred-receipt pass dispatches the kept request.
+      const proven = new Date(Date.now() - 13 * HOUR);
       await db.update(heartbeatRuns).set({ finishedAt: proven }).where(eq(heartbeatRuns.id, f.cut.id));
       await db.update(environmentLeases).set({ releasedAt: proven }).where(eq(environmentLeases.heartbeatRunId, f.cut.id));
       await heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
+      const started = await continuations(f);
+      expect(started).toHaveLength(1);
+      expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:stop_not_proven`, PAUSE_CUT_WORK_CONTINUED]);
+      expect((await traces(f))[2]!.details).toMatchObject({ continuationRunId: started[0]!.id, resumedByUserId: "board", actorSource: "local_implicit" });
+    });
+
+    it("a new pause before the proof: the kept request waits for the next resume", async () => {
+      const f = await fixture({ lease: "ssh", finishedMinutesAgo: 5 });
+      await roleResumes(f);
+      await expectKept(f, "stop_not_proven", "remote_cleanup");
+      await idle(f);
+      await createAgentLifecycle(db).pauseAgent(f.agentId);
+      await work.process(f.agentId);
+      expect((await state(f.agentId)).lifecycleState).toBe("paused");
+      await busy(f);
+      const proven = new Date(Date.now() - 13 * HOUR);
+      await db.update(heartbeatRuns).set({ finishedAt: proven }).where(eq(heartbeatRuns.id, f.cut.id));
+      await db.update(environmentLeases).set({ releasedAt: proven }).where(eq(environmentLeases.heartbeatRunId, f.cut.id));
+      // The proof is there, but the role is paused again: nothing starts.
+      await heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
+      expect(await continuations(f)).toHaveLength(0);
+      // The next resume files nothing new for a run an earlier pause cut; the kept request starts.
+      await roleResumes(f);
+      await heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
       expect(await continuations(f)).toHaveLength(1);
+      expect(await retries(f)).toHaveLength(1);
+      expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:stop_not_proven`, PAUSE_CUT_WORK_CONTINUED]);
     });
 
     it("a task where a person's decision is pending", async () => {
@@ -159,87 +239,119 @@ describe("the runs a pause cut, when the role resumes", () => {
       await db.insert(issueThreadInteractions).values({ companyId: f.companyId, issueId: f.issueId,
         kind: "request_confirmation", continuationPolicy: "none", payload: {}, effectiveResolverPolicy: "human_only" } as never);
       await roleResumes(f);
-      await expectRefused(f, "waiting_for_person", { wait: "decision_pending", saved: true });
+      await expectKept(f, "waiting_for_person", "decision_pending");
     });
+  });
 
+  describe("files nothing, and says why on the task", () => {
     it("a blocked task", async () => {
       const f = await fixture({ taskStatus: "blocked" });
       await roleResumes(f);
       await expectRefused(f, "task_blocked");
-      expect((await wakes(f)).filter(wake => wake.reason === "task_retry")).toHaveLength(0);
     });
 
-    it("a task with an unresolved blocker, until a resume that finds the blocker done", async () => {
+    it("a task with an unresolved blocker", async () => {
       const f = await fixture();
       const blockerId = randomUUID();
       await db.insert(issues).values({ id: blockerId, companyId: f.companyId, title: "Blocker", status: "todo" });
       await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blockerId, relatedIssueId: f.issueId, type: "blocks" });
       await roleResumes(f);
       await expectRefused(f, "blocked_by_dependency");
-      expect((await wakes(f)).filter(wake => wake.reason === "task_retry")).toHaveLength(0);
-      // The same resume does not look again; the next resume does.
-      await db.update(issues).set({ status: "done" }).where(eq(issues.id, blockerId));
-      await roleResumes(f);
-      expect(await continuations(f)).toHaveLength(0);
-      await resumeEntry(f);
-      await roleResumes(f);
-      expect(await continuations(f)).toHaveLength(1);
-      expect((await traces(f)).map(entry => entry.action)).toEqual([PAUSE_CUT_WORK_NOT_CONTINUED, PAUSE_CUT_WORK_CONTINUED]);
     });
 
     it("a task a person already asked to continue: the message kept during the pause starts it, once", async () => {
-      const f = await fixture({ resumedBy: "none" });
+      const f = await fixture();
       const commentId = randomUUID();
       await db.insert(issueComments).values({ id: commentId, companyId: f.companyId, issueId: f.issueId, authorType: "user",
         authorUserId: "board", body: "Resume: the fleet is ready." });
-      await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: new Date() }).where(eq(agents.id, f.agentId));
       await expect(heartbeatService(db).wakeup(f.agentId, { source: "automation", triggerDetail: "system",
         reason: "issue_reopened_via_comment", requestedByActorType: "user", requestedByActorId: "board",
         payload: { issueId: f.issueId, commentId }, contextSnapshot: { issueId: f.issueId, wakeCommentId: commentId } }))
         .rejects.toThrow(/not invokable/);
-      await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null }).where(eq(agents.id, f.agentId));
-      await resumeEntry(f);
       await roleResumes(f);
-      const recorded = await traces(f);
-      expect(recorded.map(entry => [entry.action, entry.details?.reason])).toEqual([[PAUSE_CUT_WORK_NOT_CONTINUED, "already_requested_by_person"]]);
-      expect((await wakes(f)).filter(wake => wake.reason === "task_retry")).toHaveLength(0);
+      expect(await traceList(f)).toEqual([`${PAUSE_CUT_WORK_NOT_CONTINUED}:already_requested_by_person`]);
+      expect(await retries(f)).toHaveLength(0);
       await heartbeatService(db).resumeQueuedRuns();
       expect(await continuations(f)).toHaveLength(1);
     });
 
-    it("a task whose hold was already released by a reconciliation", async () => {
-      const f = await fixture();
-      await db.update(issueRecoveryActions).set({ evidence: { runId: f.cut.id } }).where(eq(issueRecoveryActions.id, f.hold.id));
-      expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
-      await roleResumes(f);
-      await expectRefused(f, "hold_already_released");
-      expect((await wakes(f)).filter(wake => wake.reason === "task_retry")).toHaveLength(0);
+    it("a task that nothing holds: a reconciled run, and a run the pause cut before it started", async () => {
+      const reconciled = await fixture();
+      await db.update(issueRecoveryActions).set({ evidence: { runId: reconciled.cut.id } }).where(eq(issueRecoveryActions.id, reconciled.hold!.id));
+      expect(await getExecutionBlocker(db, reconciled.companyId, reconciled.issueId)).toBeNull();
+      await roleResumes(reconciled);
+      await expectRefused(reconciled, "not_held");
+      const queued = await fixture({ neverStarted: true });
+      await roleResumes(queued);
+      await expectRefused(queued, "not_held");
     });
 
-    it("a resume that no person asked for", async () => {
-      const byAgent = await fixture({ resumedBy: "agent" });
-      await roleResumes(byAgent);
-      await expectRefused(byAgent, "resumed_without_a_person");
-      expect((await wakes(byAgent)).filter(wake => wake.reason === "task_retry")).toHaveLength(0);
-      const unrecorded = await fixture({ resumedBy: "none" });
-      await roleResumes(unrecorded);
-      await expectRefused(unrecorded, "resumed_without_a_person");
+    it("a resume no person asked for", async () => {
+      const f = await fixture();
+      await roleResumes(f, null);
+      await expectRefused(f, "resumed_without_a_person");
+      expect((await traces(f))[0]!.details).not.toHaveProperty("resumedByUserId");
+    });
+
+    it("the company's resume, even after a person resumed the role in an earlier pause", async () => {
+      const f = await fixture();
+      await roleResumes(f);
+      await expectContinued(f);
+      // The company is paused: a new pause of the role, which cuts a run on another task. Then the company resumes.
+      await idle(f);
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(and(eq(heartbeatRuns.agentId, f.agentId), eq(heartbeatRuns.status, "queued")));
+      await db.update(companies).set({ status: "paused" }).where(eq(companies.id, f.companyId));
+      await projectCompanyHolds(db, createAgentLifecycleEffects(), f.companyId);
+      await work.process(f.agentId);
+      expect(await state(f.agentId)).toMatchObject({ lifecycleState: "paused", lifecycleHolds: ["company_paused"] });
+      await db.update(agents).set({ pausedAt: new Date(Date.now() - 14 * HOUR) }).where(eq(agents.id, f.agentId));
+      const later = { ...f, ...await cutTask(f, { holds: ["company_paused"] }) };
+      await busy(f);
+      await db.update(companies).set({ status: "active" }).where(eq(companies.id, f.companyId));
+      await projectCompanyHolds(db, createAgentLifecycleEffects(), f.companyId);
+      await work.process(f.agentId);
+      expect((await state(f.agentId)).lifecycleState).toBe("ready");
+      // Nobody asked for this resume: the person of the earlier pause is not reused.
+      await expectRefused(later, "resumed_without_a_person");
+      expect(pauseLiftedOf((await state(f.agentId)).lifecycleOperation)).toMatchObject({ requestedBy: null });
+    });
+
+    it("a resume signed in by a source the Retry does not accept", async () => {
+      const f = await fixture();
+      await roleResumes(f, { userId: "board", source: "mcp_oauth" });
+      await expectRefused(f, "resume_source_not_allowed", { actorSource: "mcp_oauth", resumedByUserId: "board" });
     });
   });
 
   describe("does not look at", () => {
     it("a run a budget pause cut, which has its own continuation", async () => {
-      const f = await fixture({ resultJson: manualPauseStop(new Date(Date.now() - 13 * 3600_000), ["budget"]) });
+      const f = await fixture({ holds: ["budget"] });
       await roleResumes(f);
       await expectNotLookedAt(f);
     });
 
     it("a run that was not cut by a pause", async () => {
-      const at = new Date(Date.now() - 13 * 3600_000).toISOString();
+      const at = new Date(Date.now() - 13 * HOUR).toISOString();
       const f = await fixture({ errorCode: "issue_reassigned",
         resultJson: { cancellation: { reason: "Cancelled because the task was reassigned", source: "control_plane",
           expected: true, initiator: { type: "system" }, recordedAt: at }, stopReason: "cancelled" } });
       await roleResumes(f);
+      await expectNotLookedAt(f);
+    });
+
+    it("a run cut before the pause that is lifted", async () => {
+      const f = await fixture({ finishedMinutesAgo: 20 * 60 });
+      await roleResumes(f);
+      await expectNotLookedAt(f);
+    });
+
+    it("a ready state that follows no pause", async () => {
+      const companyId = randomUUID(), agentId = randomUUID();
+      await db.insert(companies).values({ id: companyId, name: "Pause resume", issuePrefix: `R${companyId.slice(0, 6)}` });
+      await db.insert(agents).values({ id: agentId, companyId, name: "Dev", role: "engineer", adapterType: "claude_local", status: "idle" });
+      const f = { companyId, agentId, ...await cutTask({ companyId, agentId }) };
+      expect(pauseLiftedOf((await state(agentId)).lifecycleOperation)).toBeNull();
+      await createLifecycleDriver(db, {} as never).onReady!(await state(agentId) as never);
       await expectNotLookedAt(f);
     });
 
@@ -260,5 +372,17 @@ describe("the runs a pause cut, when the role resumes", () => {
       await roleResumes(closed);
       await expectNotLookedAt(closed);
     });
+  });
+
+  it("files no request when its record cannot be written, and fails loudly", async () => {
+    const f = await fixture();
+    const second = { ...f, ...await cutTask(f, { taskStatus: "blocked" }) };
+    const lifted = { readyOperationId: randomUUID(), pausedAt: new Date(Date.now() - 14 * HOUR), requestedBy: PERSON };
+    const sweep = continueRunsCutByPause(db, { companyId: f.companyId, agentId: f.agentId, ...lifted,
+      resumeTaskRetry: (companyId, requestId) => heartbeatService(db).resumeTaskRetry(companyId, requestId),
+      record: async () => { throw new Error("activity log unavailable"); } });
+    await expect(sweep).rejects.toThrow(/failed for 2 task\(s\)/);
+    for (const task of [f, second]) await expectNotLookedAt(task);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ recoveryActionId: f.hold!.id });
   });
 });

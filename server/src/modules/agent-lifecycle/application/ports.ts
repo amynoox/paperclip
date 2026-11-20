@@ -14,7 +14,9 @@ export interface LifecycleAgent {
 
 export interface LifecycleStore {
   get(id: string): Promise<LifecycleAgent | null>;
-  change(id: string, command: LifecycleCommand, options?: { version?: number; owner?: string; reason?: string }): Promise<LifecycleAgent | null>;
+  change(id: string, command: LifecycleCommand, options?: { version?: number; owner?: string; reason?: string;
+    /** STUDIO-0074: the person who asks to resume (see adapters/postgres.ts). */
+    requestedBy?: { userId: string; source: string } }): Promise<LifecycleAgent | null>;
   claim(id: string, owner: string, now: Date): Promise<LifecycleAgent | null>;
   renew(agent: LifecycleAgent, owner: string, now: Date): Promise<boolean>;
   setRequiredPlugins(agent: LifecycleAgent, owner: string, pluginIds: string[]): Promise<boolean>;
