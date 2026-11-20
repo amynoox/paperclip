@@ -751,4 +751,122 @@ describe("codex remote execution", () => {
     expect(restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
   });
 
+  // STUDIO-0075: production, 20 Nov 2026. A routed Codex run lost the link to its worker machine after Codex had opened
+  // its thread; the wrapper's entry point threw, nothing was returned, and the retry opened a new thread in the same
+  // remote folder. The adapter now tells the host the thread as soon as Codex announces it.
+  describe("the session of a run that is cut", () => {
+    const REMOTE_EXECUTION = { host: "127.0.0.1", port: 2222, username: "fixture", remoteWorkspacePath: "/remote/workspace",
+      remoteCwd: "/remote/workspace", privateKey: "PRIVATE KEY", knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+      strictHostKeyChecking: true };
+    type Session = { sessionId: string; sessionDisplayId: string | null; sessionParams: Record<string, unknown> };
+    async function runContext(overrides: Record<string, unknown>) {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-cut-"));
+      cleanupDirs.push(rootDir);
+      const workspaceDir = path.join(rootDir, "workspace");
+      const codexHomeDir = path.join(rootDir, "codex-home");
+      await mkdir(workspaceDir, { recursive: true });
+      await mkdir(codexHomeDir, { recursive: true });
+      await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+      return {
+        runId: "run-cut",
+        agent: { id: "agent-1", companyId: "company-1", name: "CodexCoder", adapterType: "codex_local", adapterConfig: {} },
+        runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+        config: { engine: "cli", command: "codex", experimentalLiveSteering: true, env: { CODEX_HOME: codexHomeDir } },
+        context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+        executionTransport: { remoteExecution: REMOTE_EXECUTION },
+        registerInteractiveControl: () => () => {},
+        onLog: async () => {},
+        ...overrides,
+      } as never;
+    }
+    /** The wrapper's entry point: Codex announces its thread in the stream, then the link is lost. */
+    const lostLinkAfter = (lines: string[]) => vi.fn(async (prepared: { options: { onLog: (stream: "stdout", chunk: string) => Promise<void> } }) => {
+      for (const line of lines) await prepared.options.onLog("stdout", `${line}\n`);
+      throw new Error("router_provider_stop_unverified");
+    });
+    const THREAD = JSON.stringify({ type: "thread.started", thread_id: "thread-cut-1" });
+    async function cutRun() {
+      const announced: Session[] = [];
+      await expect(execute(await runContext({ codexPreparedProcess: lostLinkAfter([THREAD]),
+        onSessionAnnounced: async (session: Session) => { announced.push(session); } }))).rejects.toThrow(/router_provider_stop_unverified/);
+      return announced;
+    }
+    /** The next run of the task, given a saved session: which thread does it ask Codex to resume? */
+    async function retryWith(session: Session) {
+      const logs: string[] = [];
+      const codexPreparedProcess = vi.fn(async (prepared: { resumeSessionId: string | null; args: string[];
+        options: { onProcessStopped?: () => void } }) => {
+        prepared.options.onProcessStopped?.();
+        return { exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "", pid: 321, startedAt: new Date().toISOString() };
+      });
+      await execute(await runContext({ codexPreparedProcess,
+        runtime: { sessionId: session.sessionId, sessionParams: session.sessionParams, sessionDisplayId: session.sessionId, taskKey: null },
+        onLog: async (_stream: string, chunk: string) => { logs.push(chunk); } }));
+      const prepared = codexPreparedProcess.mock.calls[0]![0];
+      return { resumeSessionId: prepared.resumeSessionId, args: prepared.args, logs: logs.join("") };
+    }
+
+    it("tells the host the session as soon as Codex announces it, and still fails with the lost link", async () => {
+      const announced = await cutRun();
+      expect(announced).toHaveLength(1);
+      expect(announced[0]).toMatchObject({ sessionId: "thread-cut-1", sessionDisplayId: "thread-cut-1",
+        sessionParams: { sessionId: "thread-cut-1", remoteExecution: { transport: "ssh", host: "127.0.0.1", port: 2222, username: "fixture" } } });
+      // The folder of the task on the machine, the same one in both places.
+      const params = announced[0]!.sessionParams as { cwd: string; remoteExecution: { remoteCwd: string } };
+      expect(params.cwd).toMatch(/^\/remote\/workspace/);
+      expect(params.remoteExecution.remoteCwd).toBe(params.cwd);
+    });
+
+    it("the retry resumes that session on the same machine and folder", async () => {
+      const [session] = await cutRun();
+      const retry = await retryWith(session!);
+      expect(retry.resumeSessionId).toBe("thread-cut-1");
+      expect(retry.args.slice(retry.args.indexOf("resume"))).toEqual(["resume", "thread-cut-1", "-"]);
+    });
+
+    it("does not resume it on another machine nor in another folder, and the run's log says so", async () => {
+      const [session] = await cutRun();
+      const params = session!.sessionParams as { cwd: string; remoteExecution: Record<string, unknown> };
+      const otherMachine = await retryWith({ ...session!, sessionParams: { ...params, remoteExecution: { ...params.remoteExecution, host: "10.0.0.9" } } });
+      expect(otherMachine.resumeSessionId).toBeNull();
+      expect(otherMachine.args).not.toContain("resume");
+      expect(otherMachine.logs).toMatch(/Codex session "thread-cut-1" does not match the current remote execution identity and will not be resumed/);
+      const otherFolder = await retryWith({ ...session!, sessionParams: { ...params, cwd: "/remote/elsewhere",
+        remoteExecution: { ...params.remoteExecution, remoteCwd: "/remote/elsewhere" } } });
+      expect(otherFolder.resumeSessionId).toBeNull();
+      expect(otherFolder.args).not.toContain("resume");
+      expect(otherFolder.logs).toMatch(/Codex session "thread-cut-1" does not match the current remote execution identity and will not be resumed/);
+    });
+
+    it("tells nothing when the link is lost before Codex announced a session", async () => {
+      const onSessionAnnounced = vi.fn(async () => {});
+      await expect(execute(await runContext({ codexPreparedProcess: lostLinkAfter([JSON.stringify({ type: "turn.started" })]),
+        onSessionAnnounced }))).rejects.toThrow(/router_provider_stop_unverified/);
+      expect(onSessionAnnounced).not.toHaveBeenCalled();
+    });
+
+    it("says so in the run's log when the host cannot record the session, and fails with the same error", async () => {
+      const logs: string[] = [];
+      await expect(execute(await runContext({ codexPreparedProcess: lostLinkAfter([THREAD]),
+        onSessionAnnounced: async () => { throw new Error("database unavailable"); },
+        onLog: async (_stream: string, chunk: string) => { logs.push(chunk); } }))).rejects.toThrow(/router_provider_stop_unverified/);
+      expect(logs.join("")).toMatch(/The session "thread-cut-1" announced by Codex could not be recorded before the end of the run: database unavailable/);
+    });
+
+    it("starts a new session and says so when Codex refuses to resume the saved one", async () => {
+      const logs: string[] = [];
+      const process = (overrides: Record<string, unknown>) => ({ exitCode: 0, signal: null, timedOut: false, stdout: "", stderr: "",
+        pid: 123, startedAt: new Date().toISOString(), ...overrides });
+      runChildProcess.mockResolvedValueOnce(process({ exitCode: 1, stderr: "Error: thread session-123 not found" }) as never);
+      runChildProcess.mockResolvedValueOnce(process({ stdout: `${JSON.stringify({ type: "thread.started", thread_id: "thread-new" })}\n` }) as never);
+      const folder = "/remote/workspace/.paperclip-runtime/runs/run-cut/workspace";
+      const result = await execute(await runContext({ config: undefined, registerInteractiveControl: undefined,
+        runtime: { sessionId: "session-123", sessionDisplayId: "session-123", taskKey: null, sessionParams: { sessionId: "session-123",
+          cwd: folder, remoteExecution: { transport: "ssh", host: "127.0.0.1", port: 2222, username: "fixture", remoteCwd: folder } } },
+        onLog: async (_stream: string, chunk: string) => { logs.push(chunk); } }));
+      expect(logs.join("")).toContain('[paperclip] Codex resume session "session-123" is unavailable; retrying with a fresh session.');
+      expect(runChildProcess).toHaveBeenCalledTimes(2);
+      expect(result.sessionId).toBe("thread-new");
+    });
+  });
 });

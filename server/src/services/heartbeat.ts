@@ -192,6 +192,7 @@ import {
   buildReferencedProjectRunObservability,
   assertGitSensitiveAdapterWorkspaceValid,
   createHeartbeatWorkspaceResolver,
+  attachPaperclipSessionMetadataToSessionParams,
 } from "./heartbeat/workspaces.js";
 export {
   WorkspaceValidationFailure,
@@ -249,7 +250,6 @@ export {
   shouldResetTaskSessionForModelChange,
   stripConfiguredModelFromSessionParams,
   stripPaperclipSessionMetadataFromSessionParams,
-  attachPaperclipSessionMetadataToSessionParams,
   resolveTaskSessionConfigFreshness,
 } from "./heartbeat/workspaces.js";
 import { boundHeartbeatRunEventPayloadForStorage } from "./heartbeat/run-log.js";
