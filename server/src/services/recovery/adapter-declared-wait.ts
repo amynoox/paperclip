@@ -144,18 +144,12 @@ export const ADAPTER_DECLARED_WAIT_ERROR_CODES: readonly string[] = Object.freez
 // escalation shows a task that has really waited too long.
 export const ADAPTER_DECLARED_WAIT_MAX_MS = 12 * 60 * 60_000;
 
-// Unproven stop after a cut link, 12 h (STUDIO-0079; 1 h until studio.24).
-// The router keeps the dispatch open without limit, tries the proof every
-// 2 minutes, and settles the dispatch and wakes the assignee when the link
-// returns; it opens its own incident ticket for the maintenance post when the
-// proof fails for 10 minutes. A run started during the cut waits 10 minutes
-// for the proof, then ends `router_previous_dispatch_unsettled`: on 19 Nov 2026
-// eleven such runs in a row, 630 s each, stayed in one series for nearly two
-// hours. The cuts of the office link are frequent and of unknown length, and
-// with a 1 h bound stranded-work recovery blocked the issue while the router
-// was still going to wake it. The bound is now that of a machine wait: past
-// 12 h, normal escalation shows a cut that really lasted too long.
-export const ADAPTER_DECLARED_STOP_WAIT_MAX_MS = 12 * 60 * 60_000;
+// Unproven stop after a cut link, 1 h: the router retries the proof at least
+// every 2 minutes once the machine answers, and opens its own incident ticket
+// for the maintenance post when the proof fails for 10 minutes (machine silent,
+// engine still alive, no launcher trace from a router older than 0.30.10); it
+// then sends no wake, so normal escalation must take over soon after.
+export const ADAPTER_DECLARED_STOP_WAIT_MAX_MS = 60 * 60_000;
 
 const ADAPTER_DECLARED_WAIT_MAX_MS_BY_CODE: Readonly<Record<string, number>> = Object.freeze({
   router_waiting_for_resources: ADAPTER_DECLARED_WAIT_MAX_MS,
