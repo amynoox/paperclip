@@ -947,6 +947,10 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     async function resume(f: Seeded) {
       await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null, lifecycleState: "ready", lifecycleHolds: [] })
         .where(eq(agents.id, f.agentId));
+      await readyStep(f);
+    }
+    /** The lifecycle driver's ready step alone, on the agent as it is. */
+    async function readyStep(f: Seeded) {
       const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
       await createLifecycleDriver(db, {} as never).onReady!(agent as never);
     }
@@ -1201,6 +1205,18 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       await resume(f);
       await expect.poll(async () => (await issueOf(f.issueId)).status, { timeout: 30_000 }).toBe("done");
       expect((await runsOf(f)).length).toBe(f.runIds.length + 1);
+
+      // A new pause lands before the ready step: the queue refuses the start with an error. The step does not fail.
+      const again = await seed("todo", WAITED);
+      await pause(again);
+      await readyStep(again);
+      await heartbeat.drainActiveRunExecutions();
+      expect((await runsOf(again)).map(run => run.id).sort()).toEqual([...again.runIds].sort());
+      expect((await issueOf(again.issueId)).status).toBe("todo");
+      await resume(again);
+      await expect.poll(async () => (await issueOf(again.issueId)).status, { timeout: 30_000 }).toBe("done");
+      await heartbeat.drainActiveRunExecutions();
+      expect((await runsOf(again)).length).toBe(again.runIds.length + 1);
     }, 240_000);
   });
 });
