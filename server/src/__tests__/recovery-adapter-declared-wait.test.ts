@@ -1117,16 +1117,35 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       }
     }, 240_000);
 
-    it("takes the task again by the normal path once the pause lifts, when its last run was not a wait", async () => {
-      for (const [, run, resultJson] of LAST_RUNS) {
+    it("takes the task again by the normal path once the pause lifts, when its last run failed", async () => {
+      for (const [, run] of LAST_RUNS.filter(([, , cancelled]) => !cancelled)) {
         const f = await seed("in_progress", [run]);
-        if (resultJson) await db.update(heartbeatRuns).set({ resultJson, error: "Agent lifecycle stop requested" }).where(eq(heartbeatRuns.id, f.runIds[0]!));
         await pause(f);
         await sweepTwice(f);
         await expectUntouched(f, "in_progress");
         await resume(f);
         await sweepTwice(f);
         await expectTakenAgain(f);
+      }
+    }, 240_000);
+
+    // A run the pause itself cut is not a failure for the sweep: after the resume the sweep neither requeues nor
+    // blocks its task; at most the product's hold of a cut run appears (legacy_execution_requires_reconciliation).
+    // Starting the task again is the resume's own continuation of the runs a pause cut (STUDIO-0074), which is not
+    // in this patch: here the task is only kept from the block.
+    it("leaves to the resume's continuation a task whose last run the lifecycle's stop cut: the sweep does not block it", async () => {
+      for (const [, run, resultJson] of LAST_RUNS.filter(([, , cancelled]) => cancelled)) {
+        const f = await seed("in_progress", [run]);
+        await db.update(heartbeatRuns).set({ resultJson: resultJson!, error: "Agent lifecycle stop requested" }).where(eq(heartbeatRuns.id, f.runIds[0]!));
+        await pause(f);
+        await sweepTwice(f);
+        await expectUntouched(f, "in_progress");
+        await resume(f);
+        await sweepTwice(f);
+        expect((await issueOf(f.issueId)).status).toBe("in_progress");
+        expect((await runsOf(f)).map(row => row.id)).toEqual(f.runIds);
+        expect(await commentsOf(f.issueId)).toHaveLength(0);
+        expect((await actionsOf(f.issueId)).filter(action => action.cause !== "legacy_execution_requires_reconciliation")).toHaveLength(0);
       }
     }, 240_000);
 
