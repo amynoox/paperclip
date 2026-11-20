@@ -64,7 +64,7 @@ export function buildPluginMoreDestinations(contributions: readonly PluginUiCont
   const routeOf = (slot: { routePath?: unknown }) => text(slot.routePath).replace(/^\/+/, "");
   const entries: MoreDestination[] = [];
   for (const contribution of Array.isArray(contributions) ? contributions : []) {
-    const slots = (Array.isArray(contribution?.slots) ? contribution.slots : []).filter(Boolean);
+    const slots: PluginUiContribution["slots"] = Array.isArray(contribution?.slots) ? contribution.slots.filter(Boolean) : [];
     const page = first(slots.filter(slot => slot.type === "page" && routeOf(slot)));
     const menu = first(slots.filter(slot => slot.type === "sidebar"));
     if (!page || !menu) continue;
