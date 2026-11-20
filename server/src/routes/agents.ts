@@ -5942,7 +5942,11 @@ export function agentRoutes(
       action: "agent.resumed",
       entityType: "agent",
       entityId: agent.id,
-      ...(agent.lifecycleState === "pausing" ? { details: { deferredUntilPauseCompletes: true, remainingHolds: agent.lifecycleHolds } } : {}),
+      // STUDIO-0074: how the person who resumed was signed in. The continuation of the runs the pause cut is filed
+      // in that person's name, with this source (pause-resume-continuation.ts).
+      ...(actor.actorType === "user" || agent.lifecycleState === "pausing" ? { details: {
+        ...(actor.actorType === "user" ? { actorSource: actor.actorSource } : {}),
+        ...(agent.lifecycleState === "pausing" ? { deferredUntilPauseCompletes: true, remainingHolds: agent.lifecycleHolds } : {}) } } : {}),
     });
 
     // STUDIO-0061: a resume while the pause is still stopping the agent's runs lifts the holds it may lift, and the

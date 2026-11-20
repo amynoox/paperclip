@@ -481,6 +481,8 @@ describe("agent cross-tenant route authorization", () => {
       action: "agent.resumed",
       entityType: "agent",
       entityId: agentId,
+      // STUDIO-0074: how the person who resumed was signed in.
+      details: { actorSource: "local_implicit" },
     }));
   });
 
@@ -496,7 +498,9 @@ describe("agent cross-tenant route authorization", () => {
     expect(res.body.resumeDeferred).toEqual({ reason: "pause_in_progress", remainingHolds: [],
       message: "The pause is still stopping this agent's runs: the agent resumes by itself when the pause completes." });
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
-      action: "agent.resumed", entityId: agentId, details: { deferredUntilPauseCompletes: true, remainingHolds: [] },
+      action: "agent.resumed", entityId: agentId,
+      // STUDIO-0074: the entry also keeps how the person who resumed was signed in.
+      details: { actorSource: "local_implicit", deferredUntilPauseCompletes: true, remainingHolds: [] },
     }));
 
     mockAgentService.resume.mockResolvedValue({ ...pausingAgent, lifecycleHolds: ["budget"] });

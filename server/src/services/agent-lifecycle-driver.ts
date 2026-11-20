@@ -2,6 +2,7 @@ import { and, eq, inArray, sql } from "drizzle-orm";
 import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./heartbeat/recovery.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { replayWakesMissedDuringPause } from "./pause-missed-wakes.js";
+import { continueRunsCutByPause } from "./pause-resume-continuation.js";
 import { agents, companies, environments, heartbeatRuns, plugins, pluginCompanySettings, type Db } from "@paperclipai/db";
 import { instanceSettingsService } from "./instance-settings.js";
 import { pluginHasAgentEnvironments, pluginServesAgentEnvironment } from "./plugin-environment-driver.js";
@@ -23,6 +24,10 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
       // comments) reach the agent once, per task it still owns.
       await replayWakesMissedDuringPause(db, { companyId: agent.companyId, agentId: agent.id,
         wakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts) });
+      // STUDIO-0074: the runs the pause cut continue by themselves, through the Retry of the person who resumed
+      // the agent. Last, so that a person's message kept during the pause is already back in the queue.
+      await continueRunsCutByPause(db, { companyId: agent.companyId, agentId: agent.id,
+        resumeTaskRetry: (companyId, requestId) => heartbeat.resumeTaskRetry(companyId, requestId) });
     },
     async requiredPluginIds(agent) {
       const selected = agent.lifecycleRequiredPluginIds;
