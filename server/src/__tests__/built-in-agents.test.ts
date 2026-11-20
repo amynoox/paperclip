@@ -706,9 +706,11 @@ describeEmbeddedPostgres("built-in agents", () => {
     expect(result.defaultGrantsEnsured).toBeGreaterThanOrEqual(4);
 
     const rootGrantKeys = await permissionKeysForAgent(root.id);
-    expect(rootGrantKeys).toEqual(expect.arrayContaining([
-      "agents:configure", "agents:suggest-changes", "skills:create", "skills:suggest-changes",
-    ]));
+    // STUDIO-0084: the root agent keeps the two rights its own path gives it (ensureRootAgentDefaultChangeGrants).
+    // The two "suggest" keys came from the list every new agent received, and are no longer given.
+    expect(rootGrantKeys).toEqual(expect.arrayContaining(["agents:configure", "skills:create"]));
+    expect(rootGrantKeys).not.toContain("agents:suggest-changes");
+    expect(rootGrantKeys).not.toContain("skills:suggest-changes");
 
     const state = await builtInAgentService(db).get(companyId, "reflection-coach");
     expect(state).toMatchObject({
