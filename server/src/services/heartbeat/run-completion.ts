@@ -16,6 +16,7 @@ import { escalateRemoteWorkspaceRestoreFailure } from "../remote-workspace-resto
 import { findReusableSandboxResumeError } from "../reusable-sandbox-resume-error.js";
 import { findPluginWorkerUnavailableError, PLUGIN_WORKER_UNAVAILABLE_CODE } from "../plugin-worker-unavailable-error.js";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE, findEnvironmentProviderUnavailableError } from "../environment-provider-unavailable-error.js";
+import { isSshLeaseOutageRun } from "../ssh-lease-outage.js";
 import { REPOSITORY_CATALOG_UNAVAILABLE_CODE, findRepositoryCatalogUnavailableError } from "../repository-catalog-unavailable-error.js";
 import { findWorkspaceProviderFailure } from "../workspace-provider-failure.js";
 import { isRunnerRevisionMismatch, RUNNER_REVISION_MISMATCH_CODE, RUNNER_REVISION_MISMATCH_RETRY } from "../runner-revision-mismatch.js";
@@ -1654,6 +1655,8 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
             || livenessRun.errorCode === ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE
             || livenessRun.errorCode === REPOSITORY_CATALOG_UNAVAILABLE_CODE
             || livenessRun.errorCode === REVIEWED_CHAT_BINDING_NOT_READY)
+            // STUDIO-0079: an ssh lease outage is waited out by its own lane, which carries the interaction too.
+            && !isSshLeaseOutageRun(livenessRun)
             && isResolvedInteractionContinuationWakeContext(livenessRun.contextSnapshot);
           const retry = await (isTransientWorkspacePreparationCode(livenessRun.errorCode) && !interactionOwnsRetry
             ? livenessRun.errorCode === RUNNER_REVISION_MISMATCH_CODE

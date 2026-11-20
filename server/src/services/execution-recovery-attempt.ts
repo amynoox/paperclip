@@ -1,6 +1,7 @@
 import { RUNNER_REVISION_WAIT_RETRY_REASON } from "./runner-revision-mismatch.js";
 import { STORAGE_UNAVAILABLE_WAIT_RETRY_REASON } from "../storage/storage-unavailable.js";
 import { PROVIDER_ATTEMPT_CREDIT_GENERATION_LIMIT } from "./native-runtime/provider-attempt-outcome.js";
+import { SSH_LEASE_OUTAGE_RETRY_REASON } from "./ssh-lease-outage.js";
 
 /**
  * A preparation that a restart interrupted before any provider work started
@@ -16,6 +17,8 @@ export const INTERRUPTED_PREPARATION_RETRY_MAX_ATTEMPTS = PROVIDER_ATTEMPT_CREDI
 const UNCHARGED_RETRY_LANES: ReadonlySet<string> = new Set([
   "workspace_busy", "ai_connection_busy", "ai_connection_pool_wait", RUNNER_REVISION_WAIT_RETRY_REASON,
   INTERRUPTED_PREPARATION_RETRY_REASON, STORAGE_UNAVAILABLE_WAIT_RETRY_REASON,
+  // STUDIO-0079: an ssh lease outage is waited out; it never spends failures.
+  SSH_LEASE_OUTAGE_RETRY_REASON,
 ]);
 
 type RetryRun = {
