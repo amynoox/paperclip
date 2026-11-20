@@ -36,7 +36,8 @@ import type { PauseResumeOperation, ResumeRequester } from "../modules/agent-lif
  *   called where the Retry's run is created).
  *
  * Not looked at: a run a budget pause cut (it has its own continuation); a run cut before the pause that is being
- * lifted; a ready state that follows no pause (first setup). Not covered: a server stop between the agent's
+ * lifted, unless a request filed for it was lost (a new pause cancels a kept request: the next resume files it
+ * again); a ready state that follows no pause (first setup). Not covered: a server stop between the agent's
  * readiness and this call (nothing is filed and nothing is recorded; the task stays held and listed).
  */
 export const PAUSE_CUT_WORK_CONTINUED = "agent.pause_cut_work_continued";
@@ -51,6 +52,8 @@ export const PAUSE_RESUME_RETRY_KEY_PREFIX = `task-retry:${RETRY_KEY}`;
 const CUT_RUNS_READ_AT_MOST = 500;
 const OPEN_TASK_STATUSES = ["todo", "in_progress", "in_review", "blocked"];
 const LIVE_WAKE_STATUSES = ["queued", "deferred_issue_execution", "claimed"];
+/** A filed request that will never start: a pause cancelled it, or its dispatch gave up. */
+const LOST_WAKE_STATUSES = ["cancelled", "skipped", "failed"];
 /**
  * The sign-in sources the product's Retry accepts for its requester (task-retry.ts, taskRetryIntentSchema). Any
  * other source is refused here: it must never be filed as an ordinary session.
@@ -117,8 +120,14 @@ export async function continueRunsCutByPause(db: Db, input: PauseResumeContinuat
   const cancelled = await db.select(cutRunFields).from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId),
     eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "cancelled"), sql`${runEndedAt} >= ${input.pausedAt.toISOString()}::timestamptz`))
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(CUT_RUNS_READ_AT_MOST);
-  const issueIds = [...new Set(cancelled.filter(run => run.issueId && isGovernancePauseStop(run) && !cutForBudget(run))
-    .map(run => run.issueId!))];
+  // Requests an earlier resume filed and that were lost since: their tasks are looked at again.
+  const lost = await db.select({ issueId: sql<string | null>`${agentWakeupRequests.payload}->>'issueId'` }).from(agentWakeupRequests)
+    .where(and(eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+      eq(agentWakeupRequests.reason, "task_retry"), inArray(agentWakeupRequests.status, LOST_WAKE_STATUSES),
+      sql`${agentWakeupRequests.idempotencyKey} like ${`${PAUSE_RESUME_RETRY_KEY_PREFIX}%`}`)).limit(CUT_RUNS_READ_AT_MOST);
+  const issueIds = [...new Set([
+    ...cancelled.filter(run => run.issueId && isGovernancePauseStop(run) && !cutForBudget(run)).map(run => run.issueId!),
+    ...lost.map(wake => wake.issueId).filter((id): id is string => Boolean(id))])];
   const result = { candidates: 0, continued: 0, kept: 0, notContinued: 0 };
   const failures: unknown[] = [];
   for (const issueId of issueIds) {
@@ -154,9 +163,20 @@ async function continueOne(db: Db, input: PauseResumeContinuation, issueId: stri
       sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`));
   const [cut] = await db.select(cutRunFields).from(heartbeatRuns).where(onTask)
     .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
-  // The agent already ran on the task after the cut, its latest run ended another way, or it was cut by an earlier
-  // pause than the one that is lifted: nothing for this resume to continue.
-  if (!cut || !isGovernancePauseStop(cut) || cutForBudget(cut) || new Date(cut.endedAt).getTime() < input.pausedAt.getTime()) return null;
+  // The agent already ran on the task after the cut, or its latest run ended another way: nothing to continue.
+  if (!cut || !isGovernancePauseStop(cut) || cutForBudget(cut)) return null;
+  // A run an earlier pause cut is not this resume's, unless the request filed for it was lost: a new pause cancels
+  // a kept request, and nothing else would file it again.
+  let replacesRetryRequestId: string | null = null;
+  if (new Date(cut.endedAt).getTime() < input.pausedAt.getTime()) {
+    const [lostRequest] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, companyId), eq(agentWakeupRequests.agentId, agentId),
+      inArray(agentWakeupRequests.status, LOST_WAKE_STATUSES),
+      sql`${agentWakeupRequests.idempotencyKey} like ${`${PAUSE_RESUME_RETRY_KEY_PREFIX}${cut.id}:%`}`))
+      .orderBy(desc(agentWakeupRequests.requestedAt)).limit(1);
+    if (!lostRequest) return null;
+    replacesRetryRequestId = lostRequest.id;
+  }
   const [budgetClaim] = await db.select({ id: budgetResumeClaims.runId }).from(budgetResumeClaims)
     .where(eq(budgetResumeClaims.runId, cut.id)).limit(1);
   if (budgetClaim) return null;
@@ -172,7 +192,8 @@ async function continueOne(db: Db, input: PauseResumeContinuation, issueId: stri
   const entry = (action: string, details: Record<string, unknown>): LogActivityInput => ({ companyId, actorType: "system",
     actorId: PAUSE_RESUME_ACTOR_ID, agentId, action, entityType: "issue", entityId: issueId,
     details: { interruptedRunId: cut.id, readyOperationId,
-      ...(person ? { resumedByUserId: person.userId, actorSource: person.source } : {}), ...details } });
+      ...(person ? { resumedByUserId: person.userId, actorSource: person.source } : {}),
+      ...(replacesRetryRequestId ? { replacesRetryRequestId } : {}), ...details } });
   const refuse = async (reason: string, details: Record<string, unknown> = {}) => {
     await write(db, entry(PAUSE_CUT_WORK_NOT_CONTINUED, { reason, ...details }));
     return "notContinued" as const;

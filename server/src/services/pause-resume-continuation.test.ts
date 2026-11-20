@@ -216,7 +216,7 @@ describe("the runs a pause cut, when the role resumes", () => {
       expect((await traces(f))[2]!.details).toMatchObject({ continuationRunId: started[0]!.id, resumedByUserId: "board", actorSource: "local_implicit" });
     });
 
-    it("a new pause before the proof: the kept request waits for the next resume", async () => {
+    it("a new pause before the proof: the pause cancels the kept request, and the next resume files it again", async () => {
       const f = await fixture({ lease: "ssh", finishedMinutesAgo: 5 });
       await roleResumes(f);
       await expectKept(f, "stop_not_proven", "remote_cleanup");
@@ -235,12 +235,16 @@ describe("the runs a pause cut, when the role resumes", () => {
       // The proof is there, but the role is paused again: nothing starts.
       await heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
       expect(await continuations(f)).toHaveLength(0);
-      // The next resume files nothing new for a run an earlier pause cut; the kept request starts.
+      // The new pause cancelled the kept request. The next resume files it again, and it starts.
+      const [keptRequest] = await retries(f);
+      expect(keptRequest).toMatchObject({ status: "cancelled" });
       await roleResumes(f);
-      await heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
-      expect(await continuations(f)).toHaveLength(1);
-      expect(await retries(f)).toHaveLength(1);
-      expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:stop_not_proven`, PAUSE_CUT_WORK_CONTINUED]);
+      expect(await continuations(f), JSON.stringify((await wakes(f)).map(wake => ({ key: wake.idempotencyKey?.slice(0, 24), status: wake.status,
+        error: wake.error, wait: wake.payload?.executionWait })))).toHaveLength(1);
+      expect(await retries(f)).toHaveLength(2);
+      expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:stop_not_proven`,
+        PAUSE_CUT_WORK_REQUEST_FILED, PAUSE_CUT_WORK_CONTINUED]);
+      expect((await traces(f))[2]!.details).toMatchObject({ replacesRetryRequestId: keptRequest!.id });
     });
 
     it("a task where a person's decision is pending", async () => {
