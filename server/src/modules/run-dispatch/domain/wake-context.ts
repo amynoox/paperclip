@@ -21,6 +21,8 @@ export const AI_CONNECTION_POOL_WAIT_RETRY_REASON = "ai_connection_pool_wait";
 export const AI_CONNECTION_BUSY_RETRY_REASON = "ai_connection_busy";
 export const RUNNER_REVISION_WAIT_RETRY_REASON = "runner_revision_wait";
 export const STORAGE_UNAVAILABLE_WAIT_RETRY_REASON = "storage_unavailable_wait";
+// STUDIO-0079: the lane of an ssh lease that cannot be acquired during an outage (services/ssh-lease-outage.ts).
+export const SSH_LEASE_OUTAGE_RETRY_REASON = "ssh_lease_outage_wait";
 export const INTERACTION_CONTINUATION_INFRA_RETRY_REASON = "interaction_continuation_infra_retry";
 export const INTERACTION_CONTINUATION_INFRA_WAKE_REASON = "interaction_continuation_infra_retry";
 export const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
@@ -213,7 +215,7 @@ export function isResolvedInteractionContinuationWakeContext(contextSnapshot: un
   return (
     (mutation === "interaction" && wakeReason === "issue_commented") ||
     (mutation === "interaction" && (retryReason === RUNNER_REVISION_WAIT_RETRY_REASON
-      || retryReason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON)) ||
+      || retryReason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON || retryReason === SSH_LEASE_OUTAGE_RETRY_REASON)) ||
     (mutation === "interaction" && context.dependencyBlockedInteraction === true && retryReason !== null
       && RESOLVED_INTERACTION_RESOURCE_WAIT_REASONS.has(retryReason)) ||
     wakeReason === INTERACTION_CONTINUATION_INFRA_WAKE_REASON ||

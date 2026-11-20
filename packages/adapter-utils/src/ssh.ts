@@ -1159,15 +1159,24 @@ export function buildKnownHostsEntry(input: {
 // where the command is known to be `ssh`, its own connection diagnostics are
 // read and mapped to the network code they mean. Authentication, host key and
 // name resolution failures keep no code (never retried).
-const SSH_CONNECT_FAILURES: Array<[RegExp, "ETIMEDOUT" | "ECONNREFUSED" | "ENETUNREACH"]> = [
+export type SshConnectFailureCode = "ETIMEDOUT" | "ECONNREFUSED" | "ENETUNREACH" | "ECONNRESET" | "EAI_AGAIN";
+
+const SSH_CONNECT_FAILURES: Array<[RegExp, SshConnectFailureCode]> = [
   [/^ssh: connect to host \S+ port \d+: (Connection|Operation) timed out$/m, "ETIMEDOUT"],
   [/^Connection timed out during banner exchange$/m, "ETIMEDOUT"],
   [/^ssh: connect to host \S+ port \d+: Connection refused$/m, "ECONNREFUSED"],
   [/^ssh: connect to host \S+ port \d+: (No route to host|Network is unreachable)$/m, "ENETUNREACH"],
+  // STUDIO-0079: the connection was cut before the key exchange or the
+  // authentication ended (a link that drops while ssh connects), or the name
+  // could not be resolved for now. Nothing ran remotely in any of them.
+  // "Name or service not known" (an unknown host) keeps no code.
+  [/^(kex_exchange_identification|ssh_exchange_identification): (read: )?Connection (reset by peer|closed by remote host)$/m, "ECONNRESET"],
+  [/^Connection (closed|reset) by \S+ port \d+$/m, "ECONNRESET"],
+  [/^ssh: Could not resolve hostname \S+: Temporary failure in name resolution$/m, "EAI_AGAIN"],
 ];
 
 /** The network code an `ssh` exit 255 stands for, when its stderr says the connection never happened. */
-export function sshConnectFailureCode(error: unknown): "ETIMEDOUT" | "ECONNREFUSED" | "ENETUNREACH" | null {
+export function sshConnectFailureCode(error: unknown): SshConnectFailureCode | null {
   const failure = error as { code?: unknown; stdout?: unknown; stderr?: unknown } | null;
   if (!failure || failure.code !== 255 || typeof failure.stderr !== "string") return null;
   // Nothing may have run remotely: a remote command that printed anything is never retried.
@@ -1787,13 +1796,44 @@ async function restoreWorkspaceRootFromSsh(input: {
   });
 }
 
+// STUDIO-0079 (TR-2093, 20 Nov 2026): the lease probe of an ssh environment
+// was killed by its own local timeout, 16 s after it started, with nothing on
+// stderr: `ssh` neither answered nor gave up. It never exited, so there was no
+// exit 255 and no diagnostic to read, and the run was a permanent setup
+// failure. For the lease probe only, whose command creates
+// the workspace folder and prints its path (safe to run again), a local
+// timeout that printed nothing is a network failure too.
+export function sshLeaseProbeFailureCode(error: unknown): SshConnectFailureCode | null {
+  const connect = sshConnectFailureCode(error);
+  if (connect) return connect;
+  const failure = error as { code?: unknown; killed?: unknown; stdout?: unknown } | null;
+  if (!failure || failure.killed !== true) return null;
+  if (failure.code !== null && failure.code !== undefined) return null;
+  // The probe prints the folder it reached: any output means it answered.
+  if (typeof failure.stdout === "string" && failure.stdout !== "") return null;
+  return "ETIMEDOUT";
+}
+
+export function withSshLeaseProbeFailureCause(error: unknown) {
+  const code = sshLeaseProbeFailureCode(error);
+  if (code && error instanceof Error && error.cause === undefined) {
+    error.cause = Object.assign(new Error(`ssh lease probe got no answer (${code})`), { code });
+  }
+  return error;
+}
+
 export async function ensureSshWorkspaceReady(
   config: SshConnectionConfig,
 ): Promise<{ remoteCwd: string }> {
-  const result = await runSshCommand(
-    config,
-    `mkdir -p ${shellQuote(config.remoteWorkspacePath)} && cd ${shellQuote(config.remoteWorkspacePath)} && pwd`,
-  );
+  let result: SshCommandResult;
+  try {
+    result = await runSshCommand(
+      config,
+      `mkdir -p ${shellQuote(config.remoteWorkspacePath)} && cd ${shellQuote(config.remoteWorkspacePath)} && pwd`,
+    );
+  } catch (error) {
+    throw withSshLeaseProbeFailureCause(error);
+  }
   return {
     remoteCwd: result.stdout.trim(),
   };
