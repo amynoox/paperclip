@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
@@ -18,6 +18,7 @@ import {
   issues,
 } from "@paperclipai/db";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
+import { resolvePaperclipInstanceRoot } from "../home-paths.js";
 import { logActivity } from "../services/activity-log.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import {
@@ -26,14 +27,21 @@ import {
   RELAUNCH_LOOP_GUARD_CONTEXT_KEY,
   RELAUNCH_LOOP_SHORT_RUN_MS,
   RELAUNCH_LOOP_TIMEOUT_ERROR_CODES,
+  ROUTER_PRE_LAUNCH_FAILURE_CODES,
   ROUTER_PRE_RESERVATION_REFUSAL_CODES,
+  RUN_LOG_HOST_LINE_PREFIXES,
   applyRelaunchLoopGuard,
   classifyRelaunchLoopRun,
   evaluateRelaunchLoop,
+  isEngineOutputChunk,
+  lastEngineOutputAtInLogPage,
+  readRelaunchLoopDecision,
+  type RelaunchLoopRunLogReader,
   type RelaunchLoopRunSample,
 } from "../services/heartbeat/relaunch-loop-guard.js";
 import { ISSUE_PROGRESS_ACTIVITY_ACTIONS } from "../services/issue-rewake-throttle.js";
 import { issueService } from "../services/issues.js";
+import { getRunLogStore } from "../services/run-log-store.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 
 const describePostgres = recoveryPostgresSupport.supported ? describe : describe.skip;
@@ -43,6 +51,10 @@ if (!recoveryPostgresSupport.supported) console.warn(`Skipping relaunch loop gua
 const OUTPUT_LIMIT = "router_interactive_output_limit";
 const ACK_UNCERTAIN = "router_interactive_ack_uncertain";
 const WAIT = "router_waiting_for_resources";
+// What a run log holds. The engine's lines are its own events; the others are written by the host.
+const ENGINE_LINE = "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n";
+const ROUTER_LINE = "[paperclip-router] waiting for a cost estimate (still waiting)\n";
+const HOST_LINE = "[paperclip] Restoring workspace changes from the remote target.\n";
 
 const at = (minutesAgo: number) => new Date(Date.UTC(2026, 10, 20, 6, 45) - minutesAgo * 60_000);
 function sample(minutesAgo: number, patch: Partial<RelaunchLoopRunSample> = {}): RelaunchLoopRunSample {
@@ -75,6 +87,11 @@ describe("relaunch loop guard: the decision", () => {
     ["a stop wait", { errorCode: "router_previous_dispatch_unsettled" }],
     ["a refusal before any reservation", { errorCode: "router_group_participant_reserved" }],
     ["a later refusal code of the router", { errorCode: "router_reservation_unavailable" }],
+    ...ROUTER_PRE_LAUNCH_FAILURE_CODES.map((errorCode): [string, Partial<RelaunchLoopRunSample>] =>
+      [`the router's failure before any launch \`${errorCode}\``, { errorCode }]),
+    // The same, after the ten minutes the router may wait before it gives up.
+    ...ROUTER_PRE_LAUNCH_FAILURE_CODES.map((errorCode): [string, Partial<RelaunchLoopRunSample>] =>
+      [`\`${errorCode}\` after ten minutes`, { errorCode, finishedAt: new Date(at(3).getTime() + 10 * 60_000) }]),
     ["a cancellation", { status: "cancelled", errorCode: "agent_paused" }],
     ["an interrupted run", { status: "interrupted", errorCode: null }],
     ["a run that never started", { status: "cancelled", errorCode: "issue_waiting_for_response", startedAt: null, finishedAt: null }],
@@ -93,6 +110,56 @@ describe("relaunch loop guard: the decision", () => {
       "router_attempt_already_used", "router_ticket_already_completed", "router_reservation_released",
       "router_reservation_unavailable", "router_stale_reservation_wake", "router_ticket_not_assigned_to_agent",
     ]);
+  });
+
+  it("lists every failure the router returns before it launches an engine, by its own list or as a declared wait", () => {
+    expect(ROUTER_PRE_LAUNCH_FAILURE_CODES).toEqual([
+      "router_estimate_not_received", "router_control_scope_busy", "router_secret_read_limited",
+      "router_worker_unreachable", "router_continuation_deadline_expired",
+    ]);
+    // The router's list of 20 Nov 2026: seven codes. None of them is ever counted, short or long.
+    for (const errorCode of [...ROUTER_PRE_LAUNCH_FAILURE_CODES, WAIT, "router_previous_dispatch_unsettled"]) {
+      expect(classifyRelaunchLoopRun(sample(3, { errorCode }), false)).toBe("skipped");
+      expect(classifyRelaunchLoopRun(sample(30, { errorCode, finishedAt: new Date(at(30).getTime() + 10 * 60_000) }), false)).toBe("skipped");
+    }
+    // The codes of a launched engine are not in it: the loop's own code, and the turn that ran out of time.
+    expect(ROUTER_PRE_LAUNCH_FAILURE_CODES).not.toContain(ACK_UNCERTAIN);
+    expect(ROUTER_PRE_LAUNCH_FAILURE_CODES).not.toContain("router_interactive_timeout");
+    expect(classifyRelaunchLoopRun(sample(3, { errorCode: ACK_UNCERTAIN }), false)).toBe("empty_failure");
+  });
+
+  it("tells the engine's output from the lines the host writes into the run log", () => {
+    expect(RUN_LOG_HOST_LINE_PREFIXES).toEqual(["[paperclip-router] ", "[paperclip] "]);
+    expect(isEngineOutputChunk(ROUTER_LINE)).toBe(false);
+    expect(isEngineOutputChunk(HOST_LINE)).toBe(false);
+    expect(isEngineOutputChunk(`${ROUTER_LINE}${ROUTER_LINE}\n  ${HOST_LINE}`)).toBe(false);
+    expect(isEngineOutputChunk("")).toBe(false);
+    expect(isEngineOutputChunk(" \r\n\n")).toBe(false);
+    expect(isEngineOutputChunk(ENGINE_LINE)).toBe(true);
+    // One chunk that holds both is the engine's.
+    expect(isEngineOutputChunk(`${ROUTER_LINE}${ENGINE_LINE}`)).toBe(true);
+    // An engine that quotes the router is still the engine.
+    expect(isEngineOutputChunk("{\"type\":\"item.completed\",\"item\":{\"text\":\"[paperclip-router] waiting\"}}\n")).toBe(true);
+    // Another bracketed word is not the host's prefix.
+    expect(isEngineOutputChunk("[paperclip-routerX] something\n")).toBe(true);
+    expect(isEngineOutputChunk("[paperclip-router]\n")).toBe(true);
+  });
+
+  it("reads the time of the last engine output of a log page, past the host's later lines", () => {
+    const record = (minute: number, stream: string, chunk: string) => JSON.stringify({ ts: at(60 - minute).toISOString(), stream, chunk, seq: minute });
+    const page = (...records: string[]) => `${records.join("\n")}\n`;
+    expect(lastEngineOutputAtInLogPage(page(
+      record(0, "stdout", ROUTER_LINE), record(1, "stdout", ENGINE_LINE), record(2, "stdout", ENGINE_LINE),
+      record(3, "stdout", ROUTER_LINE), record(4, "stderr", HOST_LINE), record(5, "system", "run settled"),
+    ))).toEqual(at(58));
+    // The engine's stderr is its output too.
+    expect(lastEngineOutputAtInLogPage(page(record(1, "stdout", ENGINE_LINE), record(7, "stderr", "warning: slow link\n")))).toEqual(at(53));
+    // Nothing of the engine: no time.
+    expect(lastEngineOutputAtInLogPage(page(record(0, "stdout", ROUTER_LINE), record(9, "stdout", ROUTER_LINE), record(10, "stderr", HOST_LINE)))).toBeNull();
+    expect(lastEngineOutputAtInLogPage("")).toBeNull();
+    // A cut or foreign line is passed over, as is a record without a readable time.
+    expect(lastEngineOutputAtInLogPage(`{"ts":"2026-11-20T06:0\n${record(2, "stdout", ENGINE_LINE)}\nnot json\n${JSON.stringify({ ts: "never", stream: "stdout", chunk: ENGINE_LINE })}\n`))
+      .toEqual(at(58));
   });
 
   it.each([
@@ -154,7 +221,7 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
   type Step =
     | { kind: "fail"; code: string; session?: string; clearSession?: boolean; comment?: boolean; document?: boolean; productionActivity?: boolean; timedOut?: boolean;
         /** What the engine did before its timeout, as the server records it. */
-        engine?: "output_tokens" | "summary" | "output" }
+        engine?: "output_tokens" | "summary" | "output" | "router_lines" | "host_lines" | "router_around_output" }
     | { kind: "ok"; session: string };
   // What each engine launch was asked to resume, in order, per issue.
   type Launch = { runId: string; agentId: string; resumed: string | null; resumedParams: Record<string, unknown> | null };
@@ -200,9 +267,17 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
             action: "issue.document_upserted", entityType: "issue", entityId: issueId, details: { key: "notes" },
           });
         }
+        // What reaches the run log during the run, each line through its own log call, as the adapters and the
+        // worker router write them.
+        const logged: Array<["stdout" | "stderr", string]> =
+          step.engine === "output" ? [["stdout", ENGINE_LINE]]
+            : step.engine === "router_lines" ? [["stdout", ROUTER_LINE], ["stdout", ROUTER_LINE], ["stderr", ROUTER_LINE]]
+            : step.engine === "host_lines" ? [["stdout", HOST_LINE], ["stderr", HOST_LINE]]
+            : step.engine === "router_around_output" ? [["stdout", ROUTER_LINE], ["stdout", ENGINE_LINE], ["stdout", ROUTER_LINE], ["stderr", HOST_LINE]]
+            : [];
+        for (const [stream, line] of logged) await input.onLog(stream, line);
         // A run that reaches its timeout: the adapter returns the session its engine announced (STUDIO-0080).
         if (step.timedOut) {
-          if (step.engine === "output") await input.onLog("stdout", "{\"type\":\"item.completed\",\"item\":{\"type\":\"command_execution\"}}\n");
           return { exitCode: null, signal: "SIGTERM", timedOut: true, errorCode: "timeout", errorMessage: "Timed out after 1200s",
             ...(step.engine === "output_tokens" ? { usage: { inputTokens: 1200, outputTokens: 5400 }, usageBasis: "per_run" as const } : {}),
             ...(step.engine === "summary" ? { summary: "Built the player and ran the smoke scene." } : {}),
@@ -443,6 +518,222 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
     await turn(f, { kind: "ok", session: "s2" });
     expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", null]);
     expect(await guardNotes(f)).toHaveLength(1);
+  }, 180_000);
+
+  const twentyMinutesEach = (f: Fixture) => db.update(heartbeatRuns).set({ startedAt: sql`${heartbeatRuns.finishedAt} - interval '20 minutes'` })
+    .where(and(eq(heartbeatRuns.agentId, f.devId), sql`${heartbeatRuns.startedAt} is not null`));
+  const decisionWith = (f: Fixture, readRunLog?: RelaunchLoopRunLogReader) => readRelaunchLoopDecision(db, {
+    companyId: f.companyId, agentId: f.devId, issueId: f.issueId, runId: randomUUID(), readRunLog });
+
+  // The worker router writes its own lines into the run log, one a minute while it waits before a launch, and
+  // Paperclip writes its diagnostics there too. A run that received nothing else is a run whose engine did nothing.
+  it.each([
+    ["the worker router's lines", "router_lines"],
+    ["Paperclip's own lines", "host_lines"],
+  ] as const)("three timeouts of twenty minutes during which only the host wrote into the log (%s): the guard acts", async (_name, engine) => {
+    const f = await seed();
+    await openSession(f);
+    const silent = [
+      await turn(f, fail("timeout", { timedOut: true, session: "s1", engine })),
+      await turn(f, fail("timeout", { timedOut: true, session: "s1", engine })),
+      await turn(f, fail("timeout", { timedOut: true, session: "s1", engine })),
+    ];
+    await twentyMinutesEach(f);
+    // The run row says "output was still written late": it does not say whose.
+    for (const run of await devRuns(f)) {
+      if (!silent.some((row) => row.id === run.id)) continue;
+      expect(run.lastOutputAt!.getTime()).toBeGreaterThanOrEqual(run.startedAt!.getTime() + RELAUNCH_LOOP_SHORT_RUN_MS);
+      expect(run.logBytes).toBeGreaterThan(0);
+    }
+    // Without the log, or when it cannot be read, the late chunk is taken as the engine's and the session is kept.
+    expect(await decisionWith(f)).toEqual({ action: "none", streak: 0 });
+    expect(await decisionWith(f, async () => { throw new Error("log storage unavailable"); })).toEqual({ action: "none", streak: 0 });
+    const store = getRunLogStore();
+    expect(await decisionWith(f, (handle, opts) => store.read(handle, opts))).toMatchObject({ action: "fresh_session", sessionId: "s1" });
+
+    await turn(f, { kind: "ok", session: "s2" });
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", null]);
+    expect(await guardNotes(f)).toHaveLength(1);
+  }, 180_000);
+
+  it("the host's lines before and after the engine's output do not hide it: the session is kept", async () => {
+    const f = await seed();
+    await openSession(f);
+    for (let index = 0; index < 3; index += 1) await turn(f, fail("timeout", { timedOut: true, session: "s1", engine: "router_around_output" }));
+    await twentyMinutesEach(f);
+    await turn(f, fail(ACK_UNCERTAIN));
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", "s1"]);
+    expect(await guardNotes(f)).toHaveLength(0);
+  }, 180_000);
+
+  it("the log is read from its end, page by page, and only as far as needed", async () => {
+    const f = await seed();
+    await openSession(f);
+    const [newest] = [await turn(f, fail("timeout", { timedOut: true, session: "s1", engine: "router_lines" }))];
+    await twentyMinutesEach(f);
+    const record = (chunk: string) => `${JSON.stringify({ ts: new Date().toISOString(), stream: "stdout", chunk })}\n`;
+    const reads: Array<{ logRef: string; offset: number; limitBytes: number; alignStartToRecord: boolean }> = [];
+    const reader = (content: (offset: number) => string): RelaunchLoopRunLogReader => async (handle, opts) => {
+      reads.push({ logRef: handle.logRef, ...opts });
+      return { content: content(opts.offset) };
+    };
+    const logRef = (await devRuns(f)).find((run) => run.id === newest!.id)!.logRef!;
+    // A log of 300 000 bytes whose last page holds only the router's lines, and the page before it the engine's.
+    await db.update(heartbeatRuns).set({ logBytes: 300_000 }).where(eq(heartbeatRuns.id, newest!.id));
+    await decisionWith(f, reader((offset) => (offset === 0 ? record(ENGINE_LINE) : record(ROUTER_LINE))));
+    expect(reads).toEqual([
+      { logRef, offset: 44_000, limitBytes: 256_000, alignStartToRecord: true },
+      { logRef, offset: 0, limitBytes: 44_000, alignStartToRecord: true },
+    ]);
+    // The engine's output is in the last page: one read.
+    reads.length = 0;
+    await decisionWith(f, reader(() => record(ENGINE_LINE)));
+    expect(reads).toHaveLength(1);
+    // A log longer than what is read back, with the host's lines only as far as it was read: not known, the session is kept.
+    reads.length = 0;
+    await db.update(heartbeatRuns).set({ logBytes: 4_000_000 }).where(eq(heartbeatRuns.id, newest!.id));
+    await turn(f, fail("timeout", { timedOut: true, session: "s1", engine: "router_lines" }));
+    await turn(f, fail("timeout", { timedOut: true, session: "s1", engine: "router_lines" }));
+    await twentyMinutesEach(f);
+    await db.update(heartbeatRuns).set({ logBytes: 4_000_000 }).where(and(eq(heartbeatRuns.agentId, f.devId), sql`${heartbeatRuns.logRef} is not null`));
+    expect(await decisionWith(f, reader(() => record(ROUTER_LINE)))).toEqual({ action: "none", streak: 0 });
+    expect(reads.filter((read) => read.logRef === logRef)).toHaveLength(8);
+    // The same three runs with their real logs, read whole: three empty timeouts.
+    const store = getRunLogStore();
+    await db.update(heartbeatRuns).set({ logBytes: 4_000 }).where(and(eq(heartbeatRuns.agentId, f.devId), sql`${heartbeatRuns.logRef} is not null`));
+    expect(await decisionWith(f, (handle, opts) => store.read(handle, opts))).toMatchObject({ action: "fresh_session" });
+  }, 180_000);
+
+  it("the engine's last output is set against the run's first five minutes, and at most six logs are read", async () => {
+    const f = await seed();
+    // Eight timeouts of twenty minutes on the session, written as the server writes them, each with a late log chunk.
+    for (let index = 0; index < 8; index += 1) {
+      const startedAt = new Date(Date.now() - 30 * (index + 1) * 60_000);
+      await insertDevRun(f, { status: "timed_out", errorCode: "timeout", createdAt: startedAt, startedAt, finishedAt: new Date(startedAt.getTime() + 20 * 60_000),
+        lastOutputAt: new Date(startedAt.getTime() + 19 * 60_000), logStore: "local_file", logRef: `log-${index}`, logBytes: 2_000 });
+    }
+    const startOf = new Map((await devRuns(f)).map((run) => [run.logRef!, run.startedAt!]));
+    const read: string[] = [];
+    // The router's line comes nineteen minutes after the start; the engine's, when the case says.
+    const engineAt = (minutes: number): RelaunchLoopRunLogReader => async (handle) => {
+      read.push(handle.logRef);
+      const at = (after: number) => new Date(startOf.get(handle.logRef)!.getTime() + after * 60_000).toISOString();
+      return { content: `${JSON.stringify({ ts: at(minutes), stream: "stdout", chunk: ENGINE_LINE })}\n${JSON.stringify({ ts: at(19), stream: "stdout", chunk: ROUTER_LINE })}\n` };
+    };
+    // The engine wrote one minute after the start and then nothing: it did nothing.
+    const silent = await decisionWith(f, engineAt(1));
+    expect(silent).toMatchObject({ action: "fresh_session", sessionId: "s1" });
+    // Six logs are read, the newest runs first; the seventh run keeps "the engine worked" and ends the series.
+    expect(read).toEqual(["log-0", "log-1", "log-2", "log-3", "log-4", "log-5"]);
+    expect(silent.action === "fresh_session" && silent.failedRuns).toHaveLength(6);
+    expect(await decisionWith(f, engineAt(4))).toMatchObject({ action: "fresh_session" });
+    // Five minutes after the start, or later: the engine was at work, and the newest run ends the series.
+    expect(await decisionWith(f, engineAt(5))).toEqual({ action: "none", streak: 0 });
+    expect(await decisionWith(f, engineAt(12))).toEqual({ action: "none", streak: 0 });
+  }, 60_000);
+
+  // The worker router's own shape for a turn that ran out of time (its chat, 20 Nov 2026): a failed run,
+  // `timedOut: false`, under `router_interactive_timeout`. Its engine was launched and was at work.
+  it("the router's `router_interactive_timeout`, a failed run with timedOut false: the engine's output keeps it out of the series", async () => {
+    const f = await seed();
+    await openSession(f);
+    const turns = [
+      await turn(f, fail("router_interactive_timeout", { session: "s1", engine: "router_around_output" })),
+      await turn(f, fail("router_interactive_timeout", { session: "s1", engine: "router_around_output" })),
+      await turn(f, fail("router_interactive_timeout", { session: "s1", engine: "router_around_output" })),
+    ];
+    expect(turns.map((run) => `${run.status}:${run.errorCode}:${run.exitCode}:${run.sessionIdAfter}`))
+      .toEqual(["failed:router_interactive_timeout:1:s1", "failed:router_interactive_timeout:1:s1", "failed:router_interactive_timeout:1:s1"]);
+    await twentyMinutesEach(f);
+    await turn(f, fail(ACK_UNCERTAIN));
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", "s1"]);
+    expect(await guardNotes(f)).toHaveLength(0);
+  }, 180_000);
+
+  // A steered routed run that ends on a timeout carries neither tokens nor a summary, even with STUDIO-0080: the
+  // router's own envelope builds its whole result. What the engine wrote live into the run log is its only sign.
+  // A trial cannot wait fifteen minutes, so the time of the engine's records is moved in the log file itself,
+  // which the guard then reads through the real store; the router's notes keep their time, the end of the run.
+  async function engineLastWroteAt(f: Fixture, minutesAfterStart: number) {
+    const base = process.env.RUN_LOG_BASE_PATH ?? path.resolve(resolvePaperclipInstanceRoot(), "data", "run-logs");
+    let moved = 0;
+    for (const run of await devRuns(f)) {
+      if (!run.logRef || !run.startedAt) continue;
+      const file = path.resolve(base, run.logRef);
+      const records = (await readFile(file, "utf8")).split("\n").filter(Boolean).map((line) => JSON.parse(line) as { ts: string; chunk: string });
+      for (const record of records) {
+        if (!isEngineOutputChunk(record.chunk)) continue;
+        record.ts = new Date(run.startedAt.getTime() + minutesAfterStart * 60_000).toISOString();
+        moved += 1;
+      }
+      const content = records.map((record) => `${JSON.stringify(record)}\n`).join("");
+      await writeFile(file, content);
+      await db.update(heartbeatRuns).set({ logBytes: Buffer.byteLength(content) }).where(eq(heartbeatRuns.id, run.id));
+    }
+    return moved;
+  }
+
+  it.each([
+    [15, "is not counted: the session is kept", false],
+    [1, "is counted: nothing of the engine after its announcement", true],
+  ] as const)("a `router_interactive_timeout` of twenty minutes whose engine last wrote live at minute %i %s", async (minute, _name, counted) => {
+    const f = await seed();
+    await openSession(f);
+    const timedOut = [];
+    for (let index = 0; index < 3; index += 1) timedOut.push(await turn(f, fail("router_interactive_timeout", { session: "s1", engine: "router_around_output" })));
+    await twentyMinutesEach(f);
+    expect(await engineLastWroteAt(f, minute)).toBe(3);
+    // The router's envelope: a failed run, no timedOut, no tokens, no summary; the run row says only that
+    // something was still written late, which is the router's own note.
+    for (const run of (await devRuns(f)).filter((row) => timedOut.some((failed) => failed.id === row.id))) {
+      expect(run).toMatchObject({ status: "failed", errorCode: "router_interactive_timeout", exitCode: 1 });
+      expect(run.resultJson).not.toHaveProperty("summary");
+      expect(Number((run.usageJson as Record<string, unknown> | null)?.outputTokens ?? 0)).toBe(0);
+      expect(run.lastOutputAt!.getTime()).toBeGreaterThanOrEqual(run.startedAt!.getTime() + RELAUNCH_LOOP_SHORT_RUN_MS);
+    }
+    await turn(f, counted ? { kind: "ok", session: "s2" } : fail(ACK_UNCERTAIN));
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", counted ? null : "s1"]);
+    expect(await guardNotes(f)).toHaveLength(counted ? 1 : 0);
+  }, 180_000);
+
+  it("three `router_interactive_timeout` during which the engine wrote nothing: the guard acts, and the note names the code", async () => {
+    const f = await seed();
+    await openSession(f);
+    for (let index = 0; index < 3; index += 1) await turn(f, fail("router_interactive_timeout", { session: "s1", engine: "router_lines" }));
+    await twentyMinutesEach(f);
+    await turn(f, { kind: "ok", session: "s2" });
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", null]);
+    const notes = await guardNotes(f);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]!.body).toContain("each on a timeout and without leaving anything behind (`router_interactive_timeout`)");
+  }, 180_000);
+
+  // The router's failures before any launch (its chat, 20 Nov 2026) reach the server as failed runs whose adapter
+  // was admitted: nothing but their code tells them from a launched engine.
+  it.each(ROUTER_PRE_LAUNCH_FAILURE_CODES)("two failures, the router's pre-launch failure `%s`, a failure: the guard still acts", async (code) => {
+    const f = await seed();
+    await openSession(f);
+    await turn(f, fail(ACK_UNCERTAIN));
+    await turn(f, fail(ACK_UNCERTAIN));
+    const preLaunch = await turn(f, fail(code, { session: "s1", engine: "router_lines" }));
+    expect(preLaunch).toMatchObject({ status: "failed", errorCode: code, runtimeMode: "legacy", executionStage: "dispatching" });
+    await turn(f, fail(ACK_UNCERTAIN));
+    await turn(f, { kind: "ok", session: "s2" });
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", "s1", null]);
+    expect(await guardNotes(f)).toHaveLength(1);
+  }, 180_000);
+
+  it("three pre-launch failures of the router in a row, ten minutes each, are no series: the session is kept", async () => {
+    const f = await seed();
+    await openSession(f);
+    await turn(f, fail("router_estimate_not_received", { session: "s1", engine: "router_lines" }));
+    await turn(f, fail("router_worker_unreachable", { session: "s1" }));
+    await turn(f, fail("router_continuation_deadline_expired", { session: "s1" }));
+    await db.update(heartbeatRuns).set({ startedAt: sql`${heartbeatRuns.finishedAt} - interval '10 minutes'` })
+      .where(and(eq(heartbeatRuns.agentId, f.devId), sql`${heartbeatRuns.startedAt} is not null`));
+    await turn(f, fail(ACK_UNCERTAIN));
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", "s1"]);
+    expect(await guardNotes(f)).toHaveLength(0);
   }, 180_000);
 
   it("a twenty-minute failure that is not a timeout still ends the series, among two timeouts", async () => {

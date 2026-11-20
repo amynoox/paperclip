@@ -2608,6 +2608,7 @@ export function heartbeatService(
       // STUDIO-0078: a series of empty failures on one engine session drops that session before it is chosen again.
       await applyRelaunchLoopGuard(db, {
         clearTaskSessions,
+        readRunLog: (handle, opts) => runLogStore.read(handle, opts),
         onDecision: (decision) => appendRunEvent(run, { eventType: "lifecycle", stream: "system", level: "warn",
           message: "Relaunch guard: the kept session failed several times in a row; this run starts on a fresh session",
           payload: { droppedSessionId: decision.sessionId, failedRunIds: decision.failedRuns.map((failed) => failed.id) } }),

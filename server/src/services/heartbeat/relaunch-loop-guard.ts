@@ -22,9 +22,10 @@
 //   compiles, plays or migrates through its whole timeout and comments only
 //   at the end left nothing on the issue either, and must keep its session;
 // - declared waits, refusals the worker router returns before any reservation,
-//   cancellations, and runs that failed in setup before their adapter was
-//   admitted (a lease that could not be acquired) are neither counted nor do
-//   they end the series: none of them says anything about the session;
+//   failures it returns before it launches any engine, cancellations, and runs
+//   that failed in setup before their adapter was admitted (a lease that could
+//   not be acquired) are neither counted nor do they end the series: none of
+//   them says anything about the session;
 // - runs of other agents are not read at all, so another role's run or comment
 //   between two failures does not end the series;
 // - any other run of the agent (a success, a failure that left something
@@ -46,6 +47,7 @@ import {
   ROUTER_REFUSAL_ERROR_CODES,
 } from "../recovery/adapter-declared-wait.js";
 import { keyValueRow, runLinkRow, systemNoticePresentation } from "../recovery/notice-format.js";
+import { isRunLogStoreType, type RunLogStoreType } from "../run-log-store.js";
 
 /** Consecutive empty failures on one session before the session is dropped. */
 export const RELAUNCH_LOOP_FAILURE_THRESHOLD = 3;
@@ -86,6 +88,62 @@ export const ROUTER_PRE_RESERVATION_REFUSAL_CODES: readonly string[] = Object.fr
   "router_ticket_not_assigned_to_agent",
 ]);
 
+// Failures the worker router returns before it launches any engine (its own
+// list, 20 Nov 2026, router commit 6d298b0): an estimate that never came, a
+// control scope or a secret read that stayed busy, a machine that stopped
+// answering during preparation, no time left before the launch. Their cause is
+// outside the session, and the server cannot tell them from a launched engine
+// by the run's stage (the adapter is admitted before the router decides).
+// `router_waiting_for_resources` and `router_previous_dispatch_unsettled` are
+// declared waits and are skipped as such.
+export const ROUTER_PRE_LAUNCH_FAILURE_CODES: readonly string[] = Object.freeze([
+  "router_estimate_not_received",
+  "router_control_scope_busy",
+  "router_secret_read_limited",
+  "router_worker_unreachable",
+  "router_continuation_deadline_expired",
+]);
+
+// Lines the host writes into a run log itself, each through its own log call:
+// the worker router's notes (one a minute while it waits before a launch) and
+// Paperclip's own diagnostics. They are not the engine's output.
+export const RUN_LOG_HOST_LINE_PREFIXES: readonly string[] = Object.freeze([
+  "[paperclip-router] ",
+  "[paperclip] ",
+]);
+
+/** True when a run log chunk holds at least one line the host did not write. */
+export function isEngineOutputChunk(chunk: string): boolean {
+  return chunk.split(/\r?\n/).some((line) => {
+    const text = line.trimStart();
+    return text.length > 0 && !RUN_LOG_HOST_LINE_PREFIXES.some((prefix) => text.startsWith(prefix));
+  });
+}
+
+/**
+ * The time of the last record of a run log page (NDJSON, one record per log
+ * call) that holds engine output; null when the page holds none.
+ */
+export function lastEngineOutputAtInLogPage(content: string): Date | null {
+  const lines = content.split("\n");
+  for (let index = lines.length - 1; index >= 0; index -= 1) {
+    const line = lines[index]!.trim();
+    if (!line) continue;
+    let record: { ts?: unknown; stream?: unknown; chunk?: unknown };
+    try {
+      record = JSON.parse(line) as typeof record;
+    } catch {
+      continue;
+    }
+    if (record.stream !== "stdout" && record.stream !== "stderr") continue;
+    if (typeof record.chunk !== "string" || !isEngineOutputChunk(record.chunk)) continue;
+    const at = typeof record.ts === "string" ? new Date(record.ts) : null;
+    if (!at || Number.isNaN(at.getTime())) continue;
+    return at;
+  }
+  return null;
+}
+
 export interface RelaunchLoopRunSample {
   id: string;
   status: string;
@@ -96,9 +154,10 @@ export interface RelaunchLoopRunSample {
   sessionIdBefore: string | null;
   /**
    * The server holds a sign that the engine worked during the run: output
-   * tokens of the model, a summary returned by the adapter, or output still
-   * being written after the run's first RELAUNCH_LOOP_SHORT_RUN_MS. Read only
-   * for a run that ended on a timeout after that long.
+   * tokens of the model, a summary returned by the adapter, or output the
+   * engine itself was still writing after the run's first
+   * RELAUNCH_LOOP_SHORT_RUN_MS (the host's own log lines are not the engine).
+   * Read only for a run that ended on a timeout after that long.
    */
   engineWorked: boolean;
   /**
@@ -112,6 +171,14 @@ export interface RelaunchLoopRunSample {
 }
 
 export type RelaunchLoopRunClass = "skipped" | "empty_failure" | "other";
+
+/** A failed run that ended on a timeout after RELAUNCH_LOOP_SHORT_RUN_MS: whether it counts hangs on its engine's work. */
+function engineWorkDecides(run: RelaunchLoopRunSample): boolean {
+  return Boolean(
+    run.startedAt && run.finishedAt && FAILED_STATUSES.includes(run.status) && isRelaunchLoopTimeout(run)
+    && run.finishedAt.getTime() - run.startedAt.getTime() >= RELAUNCH_LOOP_SHORT_RUN_MS,
+  );
+}
 
 const FAILED_STATUSES: readonly string[] = Object.freeze(["failed", "timed_out"]);
 const CUT_STATUSES: readonly string[] = Object.freeze(["cancelled", "interrupted"]);
@@ -129,6 +196,7 @@ export function classifyRelaunchLoopRun(
   if (!FAILED_STATUSES.includes(run.status)) return "other";
   if (run.errorCode && ADAPTER_DECLARED_WAIT_ERROR_CODES.includes(run.errorCode)) return "skipped";
   if (run.errorCode && ROUTER_PRE_RESERVATION_REFUSAL_CODES.includes(run.errorCode)) return "skipped";
+  if (run.errorCode && ROUTER_PRE_LAUNCH_FAILURE_CODES.includes(run.errorCode)) return "skipped";
   if (run.engineNeverStarted) return "skipped";
   if (!run.finishedAt) return "other";
   if (run.finishedAt.getTime() - run.startedAt.getTime() >= RELAUNCH_LOOP_SHORT_RUN_MS) {
@@ -197,19 +265,58 @@ export function relaunchLoopFreshSessionNoteBody(input: {
 // - the model's output tokens (usage_json, written from the adapter's result; Claude reports them as its stream
 //   goes, so a run cut by its timeout has them);
 // - the summary the adapter returned (result_json.summary: text the engine wrote);
-// - the time of the last output chunk of the run log (last_output_at): an engine still writing after its first
-//   RELAUNCH_LOOP_SHORT_RUN_MS was at work, one that fell silent before that only waited for its timeout.
+// - output the engine was still writing after the run's first RELAUNCH_LOOP_SHORT_RUN_MS: an engine that fell silent
+//   before that only waited for its timeout. The run row keeps the time of its last log chunk (last_output_at)
+//   whoever wrote it, and the host writes lines of its own (the worker router, one a minute while it waits before a
+//   launch): when that time is late, the run log itself is read from its end for the last chunk that is not the
+//   host's. The worker router returns neither tokens nor a summary with a failure, so for a routed role this third
+//   sign is the only one.
 const outputTokensOf = (key: string) =>
   sql`(jsonb_typeof(${heartbeatRuns.usageJson} -> ${key}) = 'number' and (${heartbeatRuns.usageJson} ->> ${key})::numeric > 0)`;
-const ENGINE_WORKED_SQL = sql<boolean>`coalesce(
+const ENGINE_REPORTED_SQL = sql<boolean>`coalesce(
   ${outputTokensOf("outputTokens")} or ${outputTokensOf("rawOutputTokens")}
-  or nullif(btrim(${heartbeatRuns.resultJson} ->> 'summary'), '') is not null
-  or ${heartbeatRuns.lastOutputAt} >= ${heartbeatRuns.startedAt} + make_interval(secs => ${RELAUNCH_LOOP_SHORT_RUN_MS / 1000}),
+  or nullif(btrim(${heartbeatRuns.resultJson} ->> 'summary'), '') is not null,
   false)`;
+const LATE_OUTPUT_SQL = sql<boolean>`coalesce(
+  ${heartbeatRuns.lastOutputAt} >= ${heartbeatRuns.startedAt} + make_interval(secs => ${RELAUNCH_LOOP_SHORT_RUN_MS / 1000}),
+  false)`;
+
+/** Reads a page of a run's log (the run log store's `read`). */
+export type RelaunchLoopRunLogReader = (
+  handle: { store: RunLogStoreType; logRef: string },
+  opts: { offset: number; limitBytes: number; alignStartToRecord: boolean },
+) => Promise<{ content: string }>;
+
+const RUN_LOG_PAGE_BYTES = 256_000;
+const RUN_LOG_MAX_PAGES = 8;
+/** Run logs read per decision, newest runs first; an older run with late output keeps "the engine worked". */
+const RUN_LOG_MAX_READS = 6;
+
+type RunLogRef = { logStore: string | null; logRef: string | null; logBytes: number | null };
+
+// The time of the last engine output of a finished run, read from the end of its log. `null`: the log holds none.
+// `undefined`: not known (no reader, no log, a log too long to read back, an error), and the caller keeps
+// "the engine worked": dropping the session of a role at work costs more than one more run on a dead one.
+async function readLastEngineOutputAt(readRunLog: RelaunchLoopRunLogReader | undefined, run: RunLogRef): Promise<Date | null | undefined> {
+  if (!readRunLog || !run.logRef || !isRunLogStoreType(run.logStore) || run.logBytes === null) return undefined;
+  try {
+    let end = Number(run.logBytes);
+    for (let page = 0; page < RUN_LOG_MAX_PAGES && end > 0; page += 1) {
+      const offset = Math.max(0, end - RUN_LOG_PAGE_BYTES);
+      const { content } = await readRunLog({ store: run.logStore, logRef: run.logRef }, { offset, limitBytes: end - offset, alignStartToRecord: true });
+      const at = lastEngineOutputAtInLogPage(content);
+      if (at) return at;
+      end = offset;
+    }
+    return end > 0 ? undefined : null;
+  } catch {
+    return undefined;
+  }
+}
 
 async function readStartedRuns(
   db: Db,
-  input: { companyId: string; agentId: string; issueId: string; exceptRunId: string },
+  input: { companyId: string; agentId: string; issueId: string; exceptRunId: string; readRunLog?: RelaunchLoopRunLogReader },
 ): Promise<RelaunchLoopRunSample[]> {
   const rows = await db
     .select({
@@ -220,7 +327,11 @@ async function readStartedRuns(
       finishedAt: heartbeatRuns.finishedAt,
       sessionIdBefore: heartbeatRuns.sessionIdBefore,
       engineNeverStarted: sql<boolean>`coalesce(${heartbeatRuns.runtimeMode} = 'legacy' and ${heartbeatRuns.executionStage} = 'preparing', false)`,
-      engineWorked: ENGINE_WORKED_SQL,
+      engineReported: ENGINE_REPORTED_SQL,
+      lateOutput: LATE_OUTPUT_SQL,
+      logStore: heartbeatRuns.logStore,
+      logRef: heartbeatRuns.logRef,
+      logBytes: heartbeatRuns.logBytes,
     })
     .from(heartbeatRuns)
     .where(and(
@@ -232,7 +343,23 @@ async function readStartedRuns(
     ))
     .orderBy(desc(heartbeatRuns.startedAt), desc(heartbeatRuns.id))
     .limit(RELAUNCH_LOOP_RUN_SAMPLE_LIMIT);
-  return rows.map((row) => ({ ...row, engineNeverStarted: row.engineNeverStarted === true, engineWorked: row.engineWorked === true }));
+  const samples: RelaunchLoopRunSample[] = [];
+  let logReads = 0;
+  for (const { engineReported, lateOutput, logStore, logRef, logBytes, ...row } of rows) {
+    let engineWorked = engineReported === true || lateOutput === true;
+    // The late chunk may be the host's own: ask the log, for the runs where the answer decides.
+    if (engineReported !== true && lateOutput === true && row.startedAt && engineWorkDecides({ ...row, engineWorked: false, engineNeverStarted: false })
+      && logReads < RUN_LOG_MAX_READS) {
+      logReads += 1;
+      const lastEngineOutputAt = await readLastEngineOutputAt(input.readRunLog, { logStore, logRef, logBytes });
+      if (lastEngineOutputAt !== undefined) {
+        engineWorked = lastEngineOutputAt !== null
+          && lastEngineOutputAt.getTime() >= row.startedAt.getTime() + RELAUNCH_LOOP_SHORT_RUN_MS;
+      }
+    }
+    samples.push({ ...row, engineNeverStarted: row.engineNeverStarted === true, engineWorked });
+  }
+  return samples;
 }
 
 // "Left something behind": the product's own list of issue-visible progress
@@ -272,13 +399,14 @@ async function readRunIdsThatProducedSomething(
 /** Read the history of the agent on the issue and decide. Writes nothing. */
 export async function readRelaunchLoopDecision(
   db: Db,
-  input: { companyId: string; agentId: string; issueId: string; runId: string },
+  input: { companyId: string; agentId: string; issueId: string; runId: string; readRunLog?: RelaunchLoopRunLogReader },
 ): Promise<RelaunchLoopDecision> {
   const runs = await readStartedRuns(db, {
     companyId: input.companyId,
     agentId: input.agentId,
     issueId: input.issueId,
     exceptRunId: input.runId,
+    readRunLog: input.readRunLog,
   });
   // Only failures can be counted, so only theirs is worth reading.
   const candidateIds = runs
@@ -378,6 +506,8 @@ export interface RelaunchLoopGuardDeps {
   ) => Promise<unknown>;
   onDecision?: (decision: Extract<RelaunchLoopDecision, { action: "fresh_session" }>) => Promise<unknown>;
   onError?: (error: unknown) => void;
+  /** The run log store's reader; without it a late log chunk counts as the engine's. */
+  readRunLog?: RelaunchLoopRunLogReader;
 }
 
 /**
@@ -408,6 +538,7 @@ export async function applyRelaunchLoopGuard(
       agentId: input.agent.id,
       issueId: input.issueId,
       runId: input.run.id,
+      readRunLog: deps.readRunLog,
     });
     if (decision.action !== "fresh_session") return decision;
 
