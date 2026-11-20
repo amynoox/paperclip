@@ -751,4 +751,62 @@ describe("codex remote execution", () => {
     expect(restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
   });
 
+  // STUDIO-0075: the session the worker router returns for a cut run carries the folder of the task on the machine and
+  // the machine's ssh identity. The existing rule decides whether the next run resumes it; these cases pin that rule on
+  // that shape, and that the run's log says why a saved session is not resumed.
+  describe("a session saved for a cut run, in the worker router's shape", () => {
+    const FOLDER = "/remote/workspace/.paperclip-runtime/runs/run-ssh-kept/workspace";
+    const SAVED = { transport: "ssh", host: "127.0.0.1", port: 2222, username: "fixture", remoteCwd: FOLDER };
+    async function nextRun(saved: { cwd: string; remoteExecution: Record<string, unknown> }) {
+      const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-remote-kept-"));
+      cleanupDirs.push(rootDir);
+      const workspaceDir = path.join(rootDir, "workspace");
+      const codexHomeDir = path.join(rootDir, "codex-home");
+      await mkdir(workspaceDir, { recursive: true });
+      await mkdir(codexHomeDir, { recursive: true });
+      await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+      const logs: string[] = [];
+      await execute({
+        runId: "run-ssh-kept",
+        agent: { id: "agent-1", companyId: "company-1", name: "CodexCoder", adapterType: "codex_local", adapterConfig: {} },
+        runtime: { sessionId: "thread-kept", sessionParams: { sessionId: "thread-kept", ...saved }, sessionDisplayId: "thread-kept", taskKey: null },
+        config: { engine: "cli", command: "codex", env: { CODEX_HOME: codexHomeDir } },
+        context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+        executionTransport: { remoteExecution: { host: "127.0.0.1", port: 2222, username: "fixture",
+          remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace", privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true } },
+        onLog: async (_stream, chunk) => { logs.push(chunk); },
+      } as never);
+      const call = runChildProcess.mock.calls.at(-1) as unknown as [string, string, string[]];
+      return { args: call[2].slice(call[2].indexOf("exec")), logs: logs.join("") };
+    }
+    const NOT_RESUMED = /Codex session "thread-kept" does not match the current remote execution identity and will not be resumed/;
+
+    it("is resumed on the same machine and folder", async () => {
+      const next = await nextRun({ cwd: FOLDER, remoteExecution: SAVED });
+      expect(next.args).toEqual(["exec", "--json", "--dangerously-bypass-approvals-and-sandbox", "resume", "thread-kept", "-"]);
+      expect(next.logs).not.toMatch(NOT_RESUMED);
+    });
+
+    it("is not resumed on another machine, and the run's log says so", async () => {
+      const next = await nextRun({ cwd: FOLDER, remoteExecution: { ...SAVED, host: "10.0.0.9" } });
+      expect(next.args).not.toContain("resume");
+      expect(next.logs).toMatch(NOT_RESUMED);
+    });
+
+    it("is not resumed in another folder, and the run's log says so", async () => {
+      const elsewhere = "/remote/elsewhere";
+      const next = await nextRun({ cwd: elsewhere, remoteExecution: { ...SAVED, remoteCwd: elsewhere } });
+      expect(next.args).not.toContain("resume");
+      expect(next.logs).toMatch(NOT_RESUMED);
+    });
+
+    it("a port saved as a string of digits is the same port; any other string is not", async () => {
+      const digits = await nextRun({ cwd: FOLDER, remoteExecution: { ...SAVED, port: "2222" } });
+      expect(digits.args).toContain("resume");
+      const other = await nextRun({ cwd: FOLDER, remoteExecution: { ...SAVED, port: "ssh" } });
+      expect(other.args).not.toContain("resume");
+      expect(other.logs).toMatch(NOT_RESUMED);
+    });
+  });
 });
