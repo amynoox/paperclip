@@ -114,6 +114,7 @@ import {
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  agentTaskSessions,
   caseHandoffs,
   cases,
   agentWakeupRequests,

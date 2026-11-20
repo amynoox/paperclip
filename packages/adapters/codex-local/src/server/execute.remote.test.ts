@@ -757,7 +757,7 @@ describe("codex remote execution", () => {
   describe("a session saved for a cut run, in the worker router's shape", () => {
     const FOLDER = "/remote/workspace/.paperclip-runtime/runs/run-ssh-kept/workspace";
     const SAVED = { transport: "ssh", host: "127.0.0.1", port: 2222, username: "fixture", remoteCwd: FOLDER };
-    async function nextRun(saved: { cwd: string; remoteExecution: Record<string, unknown> }) {
+    async function nextRun(saved: { cwd?: string; remoteExecution?: Record<string, unknown> }) {
       const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-remote-kept-"));
       cleanupDirs.push(rootDir);
       const workspaceDir = path.join(rootDir, "workspace");
@@ -799,6 +799,12 @@ describe("codex remote execution", () => {
       const next = await nextRun({ cwd: elsewhere, remoteExecution: { ...SAVED, remoteCwd: elsewhere } });
       expect(next.args).not.toContain("resume");
       expect(next.logs).toMatch(NOT_RESUMED);
+    });
+
+    // A session saved with neither its folder nor its machine names no place: on a remote machine it is not resumed.
+    it("is not resumed when it was saved without its folder and its machine", async () => {
+      const next = await nextRun({});
+      expect(next.args).not.toContain("resume");
     });
 
     it("a port saved as a string of digits is the same port; any other string is not", async () => {

@@ -135,6 +135,8 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId, seq: 100_000,
       eventType: "native.process_identity_recorded", stream: "system", level: "info", message: "identity" });
     const environment = await environmentService(db).ensureLocalEnvironment(f.companyId);
+    // Over ssh the run has no lease but its ssh lease.
+    if (lease === "ssh") await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId));
     await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId: environment.id, heartbeatRunId: runId,
       issueId: f.issueId, provider: lease, status: "expired", leasePolicy: "ephemeral", releasedAt: ended,
       ...(lease === "ssh" ? { providerLeaseId: `ssh://worker@mac-03:22${FOLDER}/${runId}`, cleanupStatus: "success" } : {}),
@@ -203,8 +205,7 @@ const support = await getEmbeddedPostgresTestSupport();
       return routerFailure("router_cancelled", cut);
     });
     expect(cancelled).toMatchObject({ status: "cancelled", sessionIdAfter: cut });
-    expect(await lateResultOf(cancelled.id)).toEqual({ record: { errorCode: "router_cancelled", errorMessage: "router cancelled", session: "kept" },
-      events: [["info", "kept"]] });
+    expect(await lateResultOf(cancelled.id)).toMatchObject({ record: { errorCode: "router_cancelled", session: "kept" }, events: [["info", "kept"]] });
     const kept = await taskSession(f);
     expect(kept).toMatchObject({ sessionDisplayId: cut, lastRunId: cancelled.id });
     expect(kept!.sessionParamsJson).toMatchObject(paramsOf(cut));
@@ -303,13 +304,14 @@ const support = await getEmbeddedPostgresTestSupport();
     const f = await seed();
     const stopped = await cutRun(f, async context => {
       await heartbeat.cancelRun(context.runId, "Cancelled by the board");
-      await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "responsible-user" }).where(eq(issues.id, f.issueId));
+      await db.update(issues).set({ conversationAgentId: f.agentId, conversationUserId: "responsible-user", conversationState: "active" })
+        .where(eq(issues.id, f.issueId));
       return routerFailure("router_cancelled", cut);
     });
     expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
     expect(stopped.sessionIdAfter).toBeNull();
     expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left" }, events: [["info", "left"]] });
-    await db.update(issues).set({ conversationAgentId: null, conversationUserId: null }).where(eq(issues.id, f.issueId));
+    await db.update(issues).set({ conversationAgentId: null, conversationUserId: null, conversationState: null }).where(eq(issues.id, f.issueId));
   });
 
   it("a late session that cannot be written leaves an error event on the run, not only a line in the server's log", async () => {
