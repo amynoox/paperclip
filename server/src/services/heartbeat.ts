@@ -48,6 +48,7 @@ import { readRecoverableRunLog } from "./native-runtime/native-run-log-recovery.
 import { observabilitySecretValues } from "@paperclipai/adapter-utils/agent-observability";
 import { prepareHeartbeatSession, resolveHeartbeatAdapterSession } from "./heartbeat/session-preparation.js";
 import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
+import { applyRelaunchLoopGuard } from "./heartbeat/relaunch-loop-guard.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { reconcileMuseNativeTerminalRun } from "./native-runtime/muse-terminal-reconciliation.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
@@ -2604,6 +2605,14 @@ export function heartbeatService(
         context.executionPolicy = retainedTrust.executionPolicy;
       }
       let config = parseObject(agent.adapterConfig);
+      // STUDIO-0078: a series of empty failures on one engine session drops that session before it is chosen again.
+      await applyRelaunchLoopGuard(db, {
+        clearTaskSessions,
+        onDecision: (decision) => appendRunEvent(run, { eventType: "lifecycle", stream: "system", level: "warn",
+          message: "Relaunch guard: the kept session failed several times in a row; this run starts on a fresh session",
+          payload: { droppedSessionId: decision.sessionId, failedRunIds: decision.failedRuns.map((failed) => failed.id) } }),
+        onError: (error) => logger.error({ err: error, runId: run.id }, "relaunch loop guard failed; the run goes on without it"),
+      }, { run, agent, issueId, taskKey, context });
       const taskSession = taskKey
         ? await getTaskSession(
             agent.companyId,
