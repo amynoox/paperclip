@@ -444,6 +444,60 @@ describePostgres("a ticket the worker router refuses goes to the role's direct m
     expect((await issueOf(f.issueId)).status).not.toBe("blocked");
   }, 180_000);
 
+  // Independent review of 71b1208a. The answer "this run already handed" protects a ticket the manager has just given
+  // back, on the refusal path. Asked by another path, the escalation must keep its block: here the role is no longer
+  // invokable, and its latest run on the ticket is still the refusal already handed (the manager gave the ticket back
+  // from a run on another ticket). Without the block, nothing was written and nobody was told, at every sweep.
+  it("given back, then the role is no longer invokable: the ticket is blocked for the Board as before, not left without a word", async () => {
+    const f = await seed("todo", [{ minutesAgo: 30, errorCode: ENDED }]);
+    await sweep(f);
+    await expectHanded(f, ENDED, "todo");
+    await db.update(issues).set({ assigneeAgentId: f.agentId, status: "todo", updatedAt: new Date() }).where(eq(issues.id, f.issueId));
+    await endHeldRuns();
+    holdRuns = true;
+    // The manager's run was not a run on this ticket: the role's refused run is the ticket's latest run.
+    await db.update(heartbeatRuns).set({ contextSnapshot: {} }).where(eq(heartbeatRuns.agentId, f.managerId));
+    // Not a pause (a paused role is refused by the hand-over itself): the role was terminated.
+    await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, f.agentId));
+    await sweep(f);
+    expect(await issueOf(f.issueId)).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId });
+    expect(await actionsOf(f.issueId)).toEqual([expect.objectContaining({ kind: "stranded_assigned_issue", status: "active", ownerType: "board" })]);
+    expect(await handoversOf(f.issueId)).toHaveLength(1);
+    // And it stays so: a second sweep adds nothing.
+    await sweep(f);
+    expect(await actionsOf(f.issueId)).toHaveLength(1);
+  }, 180_000);
+
+  // A pause by the Board does not move the role's work to somebody else (at an install every role is paused).
+  it("a role the Board paused, whose latest run was refused, keeps its ticket: blocked as before, not handed", async () => {
+    const f = await seed("todo", [{ minutesAgo: 6, errorCode: ENDED }]);
+    await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: new Date() }).where(eq(agents.id, f.agentId));
+    await sweep(f);
+    expect(await issueOf(f.issueId)).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId });
+    expect(await actionsOf(f.issueId)).toEqual([expect.objectContaining({ kind: "stranded_assigned_issue", status: "active", ownerType: "board" })]);
+    expect(await handoversOf(f.issueId)).toHaveLength(0);
+    expect(await wakesOf(f.companyId, f.managerId, MANAGER_HANDOVER_WAKE_REASON)).toHaveLength(0);
+    // The function itself refuses a paused role, whoever asks (the release of a refused run, for one).
+    const g = await seed("todo", [{ minutesAgo: 6, errorCode: ENDED }]);
+    await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: new Date() }).where(eq(agents.id, g.agentId));
+    expect(await handIssueToManager(db, { enqueueWakeup: async () => null }, {
+      issue: { id: g.issueId, companyId: g.companyId }, fromAgentId: g.agentId, cause: "router_refusal", code: ENDED,
+      sourceRun: { id: g.runIds[0]!, status: "failed", agentId: g.agentId }, note: routerRefusalHandoverNote(ENDED, null)!,
+    })).toEqual({ handed: false, reason: "role_paused" });
+    expect(await issueOf(g.issueId)).toMatchObject({ status: "todo", assigneeAgentId: g.agentId });
+  }, 180_000);
+
+  it("a wake that cannot be enqueued does not fail the caller: the ticket is handed, in review at the manager", async () => {
+    const f = await seed("todo", [{ minutesAgo: 6, errorCode: ENDED }]);
+    const result = await handIssueToManager(db, { enqueueWakeup: async () => { throw new Error("queue unavailable"); } }, {
+      issue: { id: f.issueId, companyId: f.companyId }, fromAgentId: f.agentId, cause: "router_refusal", code: ENDED,
+      sourceRun: { id: f.runIds[0]!, status: "failed", agentId: f.agentId }, note: routerRefusalHandoverNote(ENDED, null)!,
+    });
+    expect(result).toMatchObject({ handed: true, managerAgentId: f.managerId });
+    await expectHanded(f, ENDED, "todo");
+    expect(await handoverNotices(f.issueId)).toHaveLength(1);
+  }, 180_000);
+
   // What follows when the manager does nothing with the ticket it received: the product's own path for a ticket in
   // review that nobody reviews. One more wake of the manager, then a block with a Board action.
   it("the manager decides nothing: it is woken once more by the review path, then the ticket is blocked for the Board", async () => {

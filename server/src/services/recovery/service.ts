@@ -4294,7 +4294,9 @@ export function recoveryService(
     successfulRunHandoffEvidence?: SuccessfulRunHandoffRecoveryEvidence | null;
   }) {
     // STUDIO-0083: a run the worker router refused on a ticket at work goes to the role's direct manager, with a
-    // notice and without a Board action. Both callers pass here: the release of the refused run and the sweep.
+    // notice and without a Board action. Both callers of the refusal path pass here (the release of the refused run
+    // and the sweep) and say so by their notice; any other escalation of a ticket whose latest run happens to be a
+    // refusal (an assignee that is no longer invokable, for one) keeps the block below.
     const handed = await handRouterRefusalToManager(input);
     if (handed === "skip") return null;
     if (handed) return handed;
@@ -4365,6 +4367,9 @@ export function recoveryService(
   ): Promise<typeof issues.$inferSelect | "skip" | null> {
     const run = input.latestRun;
     if (input.recoveryCause || !run || run.status !== "failed" || !run.errorCode) return null;
+    // Only when the refusal path asks: the "skip" below protects a ticket the manager has just given back, and must
+    // never swallow the block another path asked for.
+    if (input.notice?.routerRefusalCode !== run.errorCode) return null;
     if (routerRefusalOutcome(run.errorCode, input.issue.status) !== "block") return null;
     if (!input.issue.assigneeAgentId || run.agentId !== input.issue.assigneeAgentId) return null;
     if (isStrandedIssueRecoveryIssue(input.issue)) return null;

@@ -8,6 +8,7 @@
 // The ticket is NOT handed, and the caller keeps today's path, when:
 // - the ticket is not at work (`todo`, `in_progress`), is hidden, or is no longer assigned to that role;
 // - the role has no manager, or the manager is the role itself, another company's, or not invokable;
+// - the role itself is paused: a pause does not move the role's work to somebody else;
 // - the ticket still holds something on the server: a queued or running run, an execution or checkout lock on a
 //   run that has not ended, an environment lease not released (the lease of the run that caused the hand-over
 //   aside: its own end releases it);
@@ -19,6 +20,7 @@ import { activityLog, agents, environmentLeases, heartbeatRuns, issues } from "@
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { logActivity, publishActivity, type ActivityPublication } from "../activity-log.js";
 import { executeIssuePostCommitActions, issueService, type IssuePostCommitAction } from "../issues.js";
+import { logger } from "../../middleware/logger.js";
 import { agentLinkRow, keyValueRow, runLinkRow, systemNoticePresentation } from "./notice-format.js";
 
 export const MANAGER_HANDOVER_ACTIVITY_ACTION = "issue.handed_to_manager";
@@ -56,6 +58,7 @@ export type ManagerHandoverRefusal =
   | "issue_not_found"
   | "issue_not_at_work"
   | "assignee_changed"
+  | "role_paused"
   | "no_manager"
   | "manager_not_invokable"
   | "still_held"
@@ -134,6 +137,8 @@ export async function handIssueToManager(
 
     const [role] = await tx.select().from(agents)
       .where(and(eq(agents.companyId, current.companyId), eq(agents.id, input.fromAgentId))).limit(1);
+    // A pause of the role, by the Board or any other hold, keeps the role's work with the role.
+    if (role?.status === "paused") return { handed: false, reason: "role_paused" };
     if (!role?.reportsTo || role.reportsTo === role.id) return { handed: false, reason: "no_manager" };
     const [manager] = await tx.select().from(agents)
       .where(and(eq(agents.companyId, current.companyId), eq(agents.id, role.reportsTo))).limit(1);
@@ -253,7 +258,9 @@ export async function handIssueToManager(
   // At the release of the refused run the previous owner's execution is not settled yet: the queue keeps this wake
   // (STUDIO-0066, a hand-over wake while the previous run stops) and its periodic pass admits it once the ticket
   // has no execution blocker left.
-  await deps.enqueueWakeup(result.managerAgentId, {
+  // A wake that cannot be enqueued never fails the caller (the sweep goes on with its other tickets): the hand-over
+  // is written, the ticket is in review at the manager, and the failure is in the server's log.
+  await Promise.resolve().then(() => deps.enqueueWakeup(result.managerAgentId, {
     source: "automation",
     triggerDetail: "system",
     reason: MANAGER_HANDOVER_WAKE_REASON,
@@ -270,6 +277,9 @@ export async function handIssueToManager(
       ...(input.code ? { handoverCode: input.code } : {}),
       ...(input.sourceRun ? { handoverSourceRunId: input.sourceRun.id } : {}),
     },
+  })).catch((error: unknown) => {
+    logger.warn({ err: error, issueId: input.issue.id, managerAgentId: result.managerAgentId, cause: input.cause },
+      "the ticket was handed to the manager but its wake could not be enqueued");
   });
   return result;
 }
