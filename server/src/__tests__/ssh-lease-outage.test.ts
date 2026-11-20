@@ -14,6 +14,7 @@ import {
   heartbeatRunEvents,
   heartbeatRuns,
   issueRecoveryActions,
+  issueThreadInteractions,
   issues,
   projects,
   projectWorkspaces,
@@ -30,6 +31,10 @@ import {
   isSshLeaseOutageRun,
   sshLeaseOutageRetryDelayMs,
 } from "../services/ssh-lease-outage.js";
+import { isResolvedInteractionContinuationWakeContext } from "../modules/run-dispatch/domain/wake-context.js";
+import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { taskInterruptionPresentation } from "../services/task-interruption-presentation.js";
+import { requestTaskRetry } from "../services/task-retry.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -306,6 +311,87 @@ describeEmbeddedPostgres("ssh lease outage on the real run path (TR-2093)", () =
     // Same outage: its clock began at the first failure, so nothing more is queued.
     expect((await readSshLeaseOutageStart(db, woken)).getTime()).toBe((await heartbeat.getRun(first.id))!.finishedAt!.getTime());
     expect(await scheduledOf(f)).toHaveLength(0);
+  }, 180_000);
+
+  it("while it waits, the task shows a retry scheduled by the system, with the ssh failure, and no hold", async () => {
+    const f = await seed();
+    probe.failure = killedByLocalTimeout;
+    await start(f);
+    const waiting = await issueOf(f);
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    expect(await taskInterruptionPresentation(db, waiting)).toMatchObject({ state: "retry_scheduled", responsibility: "system",
+      providerFailure: { provider: "ssh", phase: "startup", retryability: "transient" } });
+  }, 180_000);
+
+  it("the Board's Retry during the outage fails on the lease too, and its run keeps being retried", async () => {
+    const f = await seed();
+    // A first run failed for a reason that is not the network (a refused key): nothing is retried.
+    probe.failure = sshExit255("pk-infra@100.124.59.108: Permission denied (publickey).");
+    const first = await start(f);
+    expect(first).toMatchObject({ status: "failed", errorCode: "setup_failed" });
+    expect(await scheduledOf(f)).toHaveLength(0);
+    // The key is repaired, a person clicks Retry, and the link drops at that moment.
+    probe.failure = killedByLocalTimeout;
+    const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "responsible-user",
+      actorSource: "local_implicit", observedRunId: first.id, idempotencyKey: randomUUID() });
+    expect(receipt).toMatchObject({ accepted: true });
+    await heartbeat.resumeTaskRetry(f.companyId, receipt.requestId!);
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    const runs = await runsOf(f);
+    const retried = runs.filter((run) => run.status === "failed" && run.id !== first.id);
+    expect(retried).toHaveLength(1);
+    expect(retried[0]).toMatchObject({ errorCode: "environment_provider_unavailable" });
+    // The person's run is waited out like any other: one retry of the lane is scheduled behind it.
+    const scheduled = runs.filter((run) => run.status === "scheduled_retry");
+    expect(scheduled).toHaveLength(1);
+    expect(scheduled[0]).toMatchObject({ retryOfRunId: retried[0]!.id, scheduledRetryReason: SSH_LEASE_OUTAGE_RETRY_REASON });
+    expect((await issueOf(f)).status).toBe("in_progress");
+    // What such a run needs once it has its lease is the same as for any retried run; the link's return is
+    // proven on the first case above.
+  }, 180_000);
+
+  it("the continuation of an answered question fails on the lease: it takes the lane and still carries the question", async () => {
+    const f = await seed();
+    probe.failure = killedByLocalTimeout;
+    const interactionId = randomUUID();
+    // The question exists and a person accepted it: the server keeps its reference on the run only then.
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId, companyId: f.companyId, issueId: f.issueId, status: "accepted", kind: "request_confirmation",
+      continuationPolicy: "wake_assignee", payload: { version: 1, prompt: "Restart the service now?" },
+    } as never);
+    // The wake the server sends when a question is answered (routes/issues.ts).
+    const run = await heartbeat.wakeup(f.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      payload: { issueId: f.issueId, interactionId, interactionKind: "request_confirmation", interactionStatus: "accepted",
+        sourceCommentId: null, sourceRunId: null, mutation: "interaction" },
+      idempotencyKey: `interaction:${interactionId}:accepted`,
+      requestedByActorType: "user", requestedByActorId: "responsible-user",
+      // The context of a continuation the server recognises as the answer to a question
+      // (isResolvedInteractionContinuationWakeContext): the mark is in the context too.
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, interactionId, interactionKind: "request_confirmation",
+        interactionStatus: "accepted", sourceCommentId: null, sourceRunId: null, wakeReason: "issue_commented",
+        mutation: "interaction", source: "issue.interaction.accept" },
+    });
+    expect(run).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    const failed = (await heartbeat.getRun(run!.id))!;
+    expect(failed).toMatchObject({ status: "failed", errorCode: "environment_provider_unavailable" });
+    expect(isResolvedInteractionContinuationWakeContext(failed.contextSnapshot)).toBe(true);
+    const [retry] = await scheduledOf(f);
+    // Not the interaction lane and its two attempts: the outage lane.
+    expect(retry).toMatchObject({ retryOfRunId: failed.id, scheduledRetryReason: SSH_LEASE_OUTAGE_RETRY_REASON, scheduledRetryAttempt: 1 });
+    expect(retry!.contextSnapshot).toMatchObject({ mutation: "interaction", interactionId, interactionStatus: "accepted",
+      retryReason: SSH_LEASE_OUTAGE_RETRY_REASON });
+    expect(isResolvedInteractionContinuationWakeContext(retry!.contextSnapshot)).toBe(true);
+    // A third and a fourth failure: still the lane, past the interaction lane's two attempts.
+    await promote(f);
+    await promote(f);
+    const third = await promote(f);
+    expect(third.status).toBe("failed");
+    expect((await scheduledOf(f))[0]).toMatchObject({ scheduledRetryReason: SSH_LEASE_OUTAGE_RETRY_REASON, scheduledRetryAttempt: 4 });
+    expect((await issueOf(f)).status).toBe("in_progress");
+    expect(await actionsOf(f)).toHaveLength(0);
   }, 180_000);
 
   it("a run that got its lease ends the outage: the next one has its own 12 h", async () => {

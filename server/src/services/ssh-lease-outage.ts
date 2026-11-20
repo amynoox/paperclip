@@ -7,9 +7,12 @@
 // every place that already treats that code as "nothing started, safe to retry"
 // keeps doing so. What tells an ssh outage apart is the provider recorded with
 // the failure: the environment's driver.
+import { SSH_LEASE_OUTAGE_RETRY_REASON } from "../modules/run-dispatch/domain/wake-context.js";
 import { ENVIRONMENT_PROVIDER_UNAVAILABLE_CODE } from "./environment-provider-unavailable-error.js";
 
-export const SSH_LEASE_OUTAGE_RETRY_REASON = "ssh_lease_outage_wait";
+// Defined with the other retry reasons, where a retried run is recognised as the
+// continuation of an answered question.
+export { SSH_LEASE_OUTAGE_RETRY_REASON };
 
 export const SSH_LEASE_OUTAGE_WAKE_REASON = "ssh_lease_outage_retry";
 
