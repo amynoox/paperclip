@@ -451,6 +451,66 @@ describeEmbeddedPostgres("ssh lease outage on the real run path (TR-2093)", () =
     expect(await actionsOf(f)).toHaveLength(0);
   }, 180_000);
 
+  // Independent review of 0035512b: the continuation of an accepted plan was escalated at the exhaustion of the
+  // interaction lane; in the outage lane it ended `retry_exhausted` and nobody was told (a role resumes after an
+  // approval, and the machine stays cut for more than 12 h).
+  it("past 12 h, the continuation of an accepted plan is escalated: the issue is blocked for the Board and the plan card says so", async () => {
+    const f = await seed();
+    probe.failure = killedByLocalTimeout;
+    const interactionId = randomUUID();
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId, companyId: f.companyId, issueId: f.issueId, status: "accepted", kind: "request_confirmation",
+      continuationPolicy: "wake_assignee",
+      payload: { version: 1, prompt: "Approve the plan?", target: { type: "issue_document", key: "plan" } },
+    } as never);
+    const run = await heartbeat.wakeup(f.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      payload: { issueId: f.issueId, interactionId, interactionKind: "request_confirmation", interactionStatus: "accepted",
+        sourceCommentId: null, sourceRunId: null, mutation: "interaction" },
+      idempotencyKey: `interaction:${interactionId}:accepted`,
+      requestedByActorType: "user", requestedByActorId: "responsible-user",
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, interactionId, interactionKind: "request_confirmation",
+        interactionStatus: "accepted", sourceCommentId: null, sourceRunId: null, wakeReason: "issue_commented",
+        mutation: "interaction", source: "issue.interaction.accept" },
+    });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await heartbeat.getRun(run!.id))!).toMatchObject({ status: "failed", errorCode: "environment_provider_unavailable" });
+    expect((await scheduledOf(f))[0]).toMatchObject({ scheduledRetryReason: SSH_LEASE_OUTAGE_RETRY_REASON });
+    await promote(f);
+    // Within the 12 h nothing is escalated: the lane waits.
+    expect((await issueOf(f)).status).toBe("in_progress");
+    expect(await actionsOf(f)).toHaveLength(0);
+    await age(f, 12 * 60 + 1);
+    const last = await promote(f);
+    expect(last).toMatchObject({ status: "failed", errorCode: "environment_provider_unavailable" });
+    expect(isResolvedInteractionContinuationWakeContext(last.contextSnapshot)).toBe(true);
+    expect(await scheduledOf(f)).toHaveLength(0);
+    // The exhaustion is escalated, as the interaction lane did: blocked, a Board action, and the card of the plan.
+    await expect.poll(async () => (await issueOf(f)).status, { timeout: 30_000 }).toBe("blocked");
+    expect(await actionsOf(f)).toEqual([expect.objectContaining({ status: "active", ownerType: "board" })]);
+    const [interaction] = await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.id, interactionId));
+    expect(JSON.stringify(interaction!.result)).toContain("needs_attention");
+    expect(JSON.stringify(interaction!.result)).toContain(last.id);
+  }, 180_000);
+
+  // What the general case becomes past 12 h: the release of the exhausted run blocks the issue at once, by the
+  // block of stranded work (escalateStrandedAssignedIssue), with its Board action. That is the one place STUDIO-0083
+  // wakes the role's direct manager from.
+  it("past 12 h, a run that carries no answered question ends exhausted and the issue is blocked with the Board action of stranded work", async () => {
+    const f = await seed();
+    probe.failure = killedByLocalTimeout;
+    await start(f);
+    await promote(f);
+    expect((await issueOf(f)).status).toBe("in_progress");
+    await age(f, 12 * 60 + 1);
+    const last = await promote(f);
+    expect(await scheduledOf(f)).toHaveLength(0);
+    const events = await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, last.id));
+    expect(events.some((event) => String(event.message).includes("Bounded retry exhausted"))).toBe(true);
+    await expect.poll(async () => (await issueOf(f)).status, { timeout: 30_000 }).toBe("blocked");
+    expect(await actionsOf(f)).toEqual([expect.objectContaining({ kind: "stranded_assigned_issue", status: "active", ownerType: "board" })]);
+  }, 180_000);
+
   it("an old outage of the role on another issue does not shorten this one", async () => {
     const f = await seed();
     const [other] = await db.insert(issues).values({ companyId: f.companyId, title: "Another infra task", status: "in_progress",
