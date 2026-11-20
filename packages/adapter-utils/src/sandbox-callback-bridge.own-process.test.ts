@@ -42,13 +42,17 @@ describe("sandbox callback bridge: each bridge is known by the process its own l
   });
 
   type ExecInput = { command: string; args?: string[]; cwd?: string; env?: Record<string, string>; stdin?: string; timeoutMs?: number };
-  /** Executes each command on this machine. `rewriteLaunchReport` stands in for a launch whose report differs. */
-  function createExecRunner(rewriteLaunchReport?: (stdout: string) => string) {
+  /**
+   * Executes each command on this machine. `rewriteLaunchReport` stands in for a launch whose report differs,
+   * `rewriteReady` for a bridge whose `ready.json` reads otherwise, `pathFirst` for a machine whose programs differ.
+   */
+  function createExecRunner(rewriteLaunchReport?: (stdout: string) => string, more: { rewriteReady?: (stdout: string) => string; pathFirst?: string } = {}) {
     return {
       execute: async (input: ExecInput): Promise<RunProcessResult> => {
         const startedAt = new Date().toISOString();
         const command = input.command === "sh" ? "/bin/sh" : input.command === "bash" ? "/bin/bash" : input.command;
         const env: Record<string, string | undefined> = { ...process.env, ...input.env };
+        if (more.pathFirst) env.PATH = `${more.pathFirst}:${env.PATH ?? ""}`;
         const args = [...(input.args ?? [])];
         // The command's input, as the existing bridge tests give it to a local shell.
         if (input.stdin != null && (input.command === "sh" || input.command === "bash") && (args[0] === "-c" || args[0] === "-lc") && typeof args[1] === "string") {
@@ -58,8 +62,10 @@ describe("sandbox callback bridge: each bridge is known by the process its own l
         try {
           const result = await execFile(command, args, { cwd: input.cwd, env, maxBuffer: 32 * 1024 * 1024, timeout: input.timeoutMs });
           const isLaunchReport = /^\{"pid":\d+,"stoppedStalePid":\d+\}\s*$/.test(result.stdout);
+          const isReady = /^\{"pid":\d+,"host":/.test(result.stdout);
           return { exitCode: 0, signal: null, timedOut: false, stderr: result.stderr, pid: null, startedAt,
-            stdout: isLaunchReport && rewriteLaunchReport ? rewriteLaunchReport(result.stdout) : result.stdout };
+            stdout: isLaunchReport && rewriteLaunchReport ? rewriteLaunchReport(result.stdout)
+              : isReady && more.rewriteReady ? more.rewriteReady(result.stdout) : result.stdout };
         } catch (error) {
           const err = error as NodeJS.ErrnoException & { stdout?: string; stderr?: string; code?: string | number | null; signal?: NodeJS.Signals | null; killed?: boolean };
           return { exitCode: typeof err.code === "number" ? err.code : null, signal: err.signal ?? null, timedOut: Boolean(err.killed && input.timeoutMs),
@@ -85,15 +91,20 @@ describe("sandbox callback bridge: each bridge is known by the process its own l
     });
     const queueDir = path.posix.join(prepared.runtimeRootDir, "paperclip-bridge");
     const directories = sandboxCallbackBridgeDirectories(queueDir);
-    const launch = async (runner = createExecRunner()) => {
+    const launch = async (runner = createExecRunner(), nodeCommand?: string) => {
       const bridge = await startSandboxCallbackBridgeServer({
         runner, remoteCwd: remoteWorkspaceDir, assetRemoteDir: prepared.assetDirs.bridge, queueDir,
-        bridgeToken: createSandboxCallbackBridgeToken(), timeoutMs: 30_000,
+        bridgeToken: createSandboxCallbackBridgeToken(), timeoutMs: 30_000, nodeCommand,
       });
-      startedPids.push(bridge.pid);
+      // Never 0: for the system that number means this very process group.
+      startedPids.push(...[bridge.pid, bridge.launchPid].filter((pid) => pid > 1));
       return bridge;
     };
-    return { directories, launch };
+    // A version-manager shim (Volta, fnm): the command named `node` is a program that runs the real node as its
+    // child. The launching shell then records the shim, and the bridge is another process (upstream #18724).
+    const shim = path.join(rootDir, "node-shim");
+    await writeFile(shim, `#!/bin/sh\n${JSON.stringify(process.execPath)} "$@"\n`, { mode: 0o755 });
+    return { directories, launch, shim };
   }
 
   const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
@@ -218,19 +229,103 @@ describe("sandbox callback bridge: each bridge is known by the process its own l
     await elsewhere.stop();
   }, 90_000);
 
-  it("stop() does not end a process that took the bridge's number, and leaves a server.pid that is not its own", async () => {
+  it("stop() does not end a process that took one of the bridge's numbers", async () => {
     const folder = await taskFolder();
     const stranger = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
     strays.push(stranger);
     // The launch reports a number that the system shows, at the stop, to be another program.
     const bridge = await folder.launch(createExecRunner((stdout) => stdout.replace(/"pid":\d+/, `"pid":${stranger.pid}`)));
     expect(bridge.launchPid).toBe(stranger.pid);
+    expect(bridge.pid).not.toBe(stranger.pid);
     await bridge.stop();
     expect(alive(stranger.pid!)).toBe(true);
-    // server.pid holds another number than the one this handle knows: it is not removed.
-    expect(await pidFileOf(folder.directories)).toBe(String(bridge.pid));
-    // ready.json is exactly what this bridge wrote: it is removed.
+    // The bridge itself, known by the number it reported, is ended, and its files go.
+    expect(alive(bridge.pid)).toBe(false);
+    expect(await pidFileOf(folder.directories)).toBeNull();
     expect(await readyPidOf(folder.directories)).toBeNull();
+  }, 60_000);
+
+  it("when `node` is a shim, the bridge and the process the shell started are two numbers: stop() ends both", async () => {
+    const folder = await taskFolder();
+    const bridge = await folder.launch(createExecRunner(), folder.shim);
+    expect(bridge.launchPid).not.toBe(bridge.pid);
+    expect(alive(bridge.pid)).toBe(true);
+    expect(alive(bridge.launchPid)).toBe(true);
+    // server.pid holds the shim, ready.json the bridge.
+    expect(await pidFileOf(folder.directories)).toBe(String(bridge.launchPid));
+    expect(await readyPidOf(folder.directories)).toBe(bridge.pid);
+    await bridge.stop();
+    expect(alive(bridge.pid)).toBe(false);
+    expect(alive(bridge.launchPid)).toBe(false);
+    expect(await reachable(bridge.baseUrl)).toBe(false);
+    expect(await pidFileOf(folder.directories)).toBeNull();
+    expect(await readyPidOf(folder.directories)).toBeNull();
+  }, 60_000);
+
+  it("a bridge run through a shim and left by a previous run is stopped at the next launch, shim and bridge", async () => {
+    const folder = await taskFolder();
+    const a = await folder.launch(createExecRunner(), folder.shim);
+    const b = await folder.launch(createExecRunner(), folder.shim);
+    expect(alive(a.pid)).toBe(false);
+    expect(alive(a.launchPid)).toBe(false);
+    expect(await reachable(a.baseUrl)).toBe(false);
+    // The last one it stopped is the bridge itself, read from the ready.json the previous run left.
+    expect(b.stoppedStalePid).toBe(a.pid);
+    // A's timer, later: B and its shim are untouched, and B's files stay.
+    await keptBridgeTimerFires(a);
+    expect(alive(b.pid)).toBe(true);
+    expect(alive(b.launchPid)).toBe(true);
+    expect(await reachable(b.baseUrl)).toBe(true);
+    expect(await pidFileOf(folder.directories)).toBe(String(b.launchPid));
+    expect(await readyPidOf(folder.directories)).toBe(b.pid);
+    await b.stop();
+    expect(alive(b.pid)).toBe(false);
+    expect(alive(b.launchPid)).toBe(false);
+  }, 60_000);
+
+  it("a bridge whose ready.json gives no number is ended by the process the shell started", async () => {
+    const folder = await taskFolder();
+    const bridge = await folder.launch(createExecRunner(undefined, { rewriteReady: (stdout) => stdout.replace(/"pid":\d+,/, "") }));
+    expect(bridge.pid).toBe(0);
+    expect(bridge.launchPid).toBeGreaterThan(0);
+    expect(alive(bridge.launchPid)).toBe(true);
+    await bridge.stop();
+    expect(alive(bridge.launchPid)).toBe(false);
+    expect(await reachable(bridge.baseUrl)).toBe(false);
+    expect(await pidFileOf(folder.directories)).toBeNull();
+  }, 60_000);
+
+  it("a previous bridge whose ready.json is gone is still stopped at the next launch, by the number in server.pid", async () => {
+    const folder = await taskFolder();
+    const a = await folder.launch();
+    await rm(folder.directories.readyFile);
+    const b = await folder.launch();
+    expect(b.stoppedStalePid).toBe(a.launchPid);
+    expect(alive(a.pid)).toBe(false);
+    expect(alive(b.pid)).toBe(true);
+    await b.stop();
+  }, 60_000);
+
+  it("on a machine that cannot show a process's command line, a launch ends nothing another run recorded and a stop still ends its own bridge", async () => {
+    const folder = await taskFolder();
+    // A `ps` that answers nothing, first on the path.
+    const bin = path.join(path.dirname(folder.shim), "no-ps");
+    await mkdir(bin, { recursive: true });
+    await writeFile(path.join(bin, "ps"), "#!/bin/sh\nexit 1\n", { mode: 0o755 });
+    const runner = () => createExecRunner(undefined, { pathFirst: bin });
+    const a = await folder.launch(runner());
+    const b = await folder.launch(runner());
+    // Not shown to be a bridge of this folder: the previous bridge is left, as before this patch.
+    expect(b.stoppedStalePid).toBe(0);
+    expect(alive(a.pid)).toBe(true);
+    // Each bridge's own stop still ends it, and only it.
+    await a.stop();
+    expect(alive(a.pid)).toBe(false);
+    expect(alive(b.pid)).toBe(true);
+    expect(await pidFileOf(folder.directories)).toBe(String(b.pid));
+    await b.stop();
+    expect(alive(b.pid)).toBe(false);
+    expect(await pidFileOf(folder.directories)).toBeNull();
   }, 60_000);
 
   it("a launch whose report cannot be read falls back on the number the bridge wrote in ready.json", async () => {

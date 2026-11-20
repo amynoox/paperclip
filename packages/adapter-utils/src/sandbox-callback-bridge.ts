@@ -320,8 +320,9 @@ export interface StartedSandboxCallbackBridgeServer {
   baseUrl: string;
   host: string;
   port: number;
+  /** The bridge's own process, as it reported it in `ready.json`. */
   pid: number;
-  /** The process this launch started, as its shell reported it: the one `stop()` ends, and no other. */
+  /** The process the launching shell started and recorded in `server.pid`: the bridge itself, or the shim that runs it. */
   launchPid: number;
   /** The bridge a previous run had left in this folder and that this launch stopped first; 0 when there was none. */
   stoppedStalePid: number;
@@ -337,14 +338,39 @@ function shellQuote(value: string) {
 // folder with its `server.pid` and `ready.json`. A bridge kept after an unproven provider stop is stopped up to ten
 // minutes later, when the next run has already launched its own bridge there: reading the process to stop from
 // `server.pid` at that moment killed the bridge of the run at work and removed its files, and left the old one alive.
-// So a bridge is known by the process its own launch started, and the shell lines below are the three rules:
-// - `stop()` ends that process and no other, and removes `server.pid` and `ready.json` only while they are still its own;
-// - a launch first stops the bridge a previous run left in the folder, by the number that run recorded;
+// So a bridge is known by the processes of its own launch, and the shell lines below hold three rules:
+// - `stop()` ends those processes and no other, and removes `server.pid` and `ready.json` only while they are still
+//   its own. Its processes are the bridge itself, by the number it reported in `ready.json`, and the one the launching
+//   shell started when that is another: a version-manager shim that runs `node` as its child (upstream
+//   paperclipai/paperclip#18724, which stops the bridge by the number of `ready.json` for that reason);
+// - a launch first stops the bridge a previous run left in the folder, by the numbers that run recorded;
 // - neither ends a process that the system shows to be something else (a number reused after a restart).
 
-/** Shell lines that set `$1_args` to the command line of process `$2`, or to nothing when it cannot be read. */
-function bridgeProcessArgsLines(variable: string, pidExpression: string): string[] {
-  return [`${variable}="$(ps -p ${pidExpression} -o args= 2>/dev/null || true)"`];
+/**
+ * Shell function `bridge_end <pid> <strict|own>`: ends the process when it is a bridge of this folder, which is read
+ * from its command line (it holds the bridge's entrypoint). `strict` (a number another run recorded): only a process
+ * shown to be one. `own` (a number of this very launch): also a live process whose command line cannot be read, as
+ * before this patch. Returns 0 when it ended a process.
+ */
+function bridgeEndShellFunction(entrypoint: string): string[] {
+  return [
+    "bridge_end() {",
+    `  case "$1" in ''|*[!0-9]*) return 1 ;; esac`,
+    `  bridge_args="$(ps -p "$1" -o args= 2>/dev/null || true)"`,
+    `  case "$bridge_args" in`,
+    `    *${shellQuote(entrypoint)}*) ;;`,
+    `    '') if [ "$2" = strict ]; then return 1; fi; kill -0 "$1" 2>/dev/null || return 1 ;;`,
+    "    *) return 1 ;;",
+    "  esac",
+    `  kill "$1" 2>/dev/null || true`,
+    "  i=0",
+    `  while kill -0 "$1" 2>/dev/null && [ "$i" -lt 40 ]; do`,
+    "    i=$((i + 1))",
+    "    sleep 0.05",
+    "  done",
+    "  return 0",
+    "}",
+  ];
 }
 
 /** The last `{"pid":N,...}` line a launch printed. */
@@ -1848,31 +1874,19 @@ export async function startSandboxCallbackBridgeServer(input: {
     maxBodyBytes: input.maxBodyBytes,
   });
   const nodeCommand = input.nodeCommand?.trim() || "node";
-  // What the command line of a bridge of this folder holds: its entrypoint, the same file for every run of the folder.
-  const bridgeProcessMarker = remoteEntrypoint;
   const startResult = await runSandboxBridgeControlCommand(input.runner, {
     command: shellCommand,
     args: shellCommandArgs(
       [
         `mkdir -p ${shellQuote(directories.requestsDir)} ${shellQuote(directories.responsesDir)} ${shellQuote(directories.logsDir)}`,
-        // The bridge a previous run left in this folder is stopped first, by the number that run recorded, and
-        // only when the system shows that process to be a bridge of this folder.
+        // STUDIO-0082: the bridge a previous run left in this folder is stopped first, by the numbers that run
+        // recorded, and only when the system shows each to be a bridge of this folder.
+        ...bridgeEndShellFunction(remoteEntrypoint),
         "stale=0",
-        `old="$(cat ${shellQuote(directories.pidFile)} 2>/dev/null || true)"`,
-        `case "$old" in ''|*[!0-9]*) old="" ;; esac`,
-        `if [ -n "$old" ]; then`,
-        ...bridgeProcessArgsLines("  old_args", '"$old"'),
-        `  case "$old_args" in *${shellQuote(bridgeProcessMarker)}*)`,
-        '    kill "$old" 2>/dev/null || true',
-        "    i=0",
-        '    while kill -0 "$old" 2>/dev/null && [ "$i" -lt 40 ]; do',
-        "      i=$((i + 1))",
-        "      sleep 0.05",
-        "    done",
-        '    stale="$old"',
-        "    ;;",
-        "  esac",
-        "fi",
+        `old_launch="$(cat ${shellQuote(directories.pidFile)} 2>/dev/null || true)"`,
+        `old_bridge="$(sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\\([0-9][0-9]*\\).*/\\1/p' ${shellQuote(directories.readyFile)} 2>/dev/null | head -n 1)"`,
+        'if bridge_end "$old_launch" strict; then stale="$old_launch"; fi',
+        'if bridge_end "$old_bridge" strict; then stale="$old_bridge"; fi',
         `rm -f ${shellQuote(directories.readyFile)} ${shellQuote(directories.pidFile)}`,
         `nohup ${shellQuote(nodeCommand)} ${shellQuote(remoteEntrypoint)} ` +
           `>> ${shellQuote(directories.logFile)} 2>&1 < /dev/null &`,
@@ -1938,18 +1952,17 @@ export async function startSandboxCallbackBridgeServer(input: {
       ? readyData.baseUrl.trim()
       : `http://${host}:${port}`;
 
-  const readyPid = typeof readyData.pid === "number" && Number.isFinite(readyData.pid) ? readyData.pid : 0;
-  // The process of this launch: what its shell reported, which is also what it wrote in `server.pid`. The bridge's
-  // own number in `ready.json` is the same process on a POSIX shell, and stands in when no report could be read.
-  const launchPid = launchReport.pid || readyPid;
-  // `ready.json` as this bridge wrote it: the file is this bridge's only while it still reads so.
+  // STUDIO-0082: the processes of this launch, and `ready.json` as this bridge wrote it.
+  const bridgePid = typeof readyData.pid === "number" && Number.isInteger(readyData.pid) && readyData.pid > 0 ? readyData.pid : 0;
+  const launchPid = launchReport.pid || bridgePid;
   const ownReadyText = readyResult.stdout.trim();
+  const numberOrNothing = (pid: number) => shellQuote(pid > 0 ? String(pid) : "");
 
   return {
     baseUrl,
     host,
     port,
-    pid: readyPid,
+    pid: bridgePid,
     launchPid,
     stoppedStalePid: launchReport.stoppedStalePid,
     directories,
@@ -1958,25 +1971,14 @@ export async function startSandboxCallbackBridgeServer(input: {
         command: shellCommand,
         args: shellCommandArgs(
           [
-            // End the process this launch started, and no other. Whatever `server.pid` holds by now belongs to
-            // whoever wrote it last: the bridge of a later run of the same folder, at work.
-            `pid=${shellQuote(launchPid > 0 ? String(launchPid) : "")}`,
-            `if [ -n "$pid" ]; then`,
-            ...bridgeProcessArgsLines("  args", '"$pid"'),
-            // A number the system shows to be something else was reused: it is not this bridge any more.
-            "  own=1",
-            `  if [ -n "$args" ]; then case "$args" in *${shellQuote(bridgeProcessMarker)}*) ;; *) own=0 ;; esac; fi`,
-            '  if [ "$own" = 1 ]; then',
-            "    kill \"$pid\" 2>/dev/null || true",
-            "    i=0",
-            "    while kill -0 \"$pid\" 2>/dev/null && [ \"$i\" -lt 40 ]; do",
-            "      i=$((i + 1))",
-            "      sleep 0.05",
-            "    done",
-            "  fi",
+            // End the processes of this launch, and no other. Whatever `server.pid` holds by now belongs to whoever
+            // wrote it last: the bridge of a later run of the same folder, at work.
+            ...bridgeEndShellFunction(remoteEntrypoint),
+            `bridge_end ${numberOrNothing(bridgePid)} own || true`,
+            `bridge_end ${numberOrNothing(launchPid)} own || true`,
             // The two files are removed only while they are still this bridge's.
-            `  if [ "$(cat ${shellQuote(directories.pidFile)} 2>/dev/null || true)" = "$pid" ]; then rm -f ${shellQuote(directories.pidFile)}; fi`,
-            "fi",
+            `recorded="$(cat ${shellQuote(directories.pidFile)} 2>/dev/null || true)"`,
+            `if [ -n "$recorded" ] && { [ "$recorded" = ${numberOrNothing(launchPid)} ] || [ "$recorded" = ${numberOrNothing(bridgePid)} ]; }; then rm -f ${shellQuote(directories.pidFile)}; fi`,
             `if [ "$(cat ${shellQuote(directories.readyFile)} 2>/dev/null || true)" = ${shellQuote(ownReadyText)} ]; then rm -f ${shellQuote(directories.readyFile)}; fi`,
           ].join("\n"),
         ),
