@@ -33,6 +33,7 @@ import {
   MANAGER_HANDOVER_MAX_PER_SERIES,
   MANAGER_HANDOVER_WAKE_REASON,
   handIssueToManager,
+  wakeManagerOfBlockedIssue,
 } from "../services/recovery/manager-handover.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 
@@ -610,6 +611,23 @@ describePostgres("a ticket the worker router refuses goes to the role's direct m
       expect(await wakesOf(f.companyId, f.managerId, BOARD_WAKE)).toHaveLength(1);
       expect(await managerNotices(f.issueId)).toHaveLength(1);
       expect(await actionsOf(f.issueId)).toHaveLength(1);
+      // The notice is addressed to the manager and wakes the manager alone. The assignee, the role the router or
+      // the engine failed, is NOT woken by it: no wake, no run, during the manager's run and after it ends.
+      const roleIsLeftAlone = async () => {
+        expect(await db.select().from(agentWakeupRequests)
+          .where(and(eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.agentId, f.agentId)))).toHaveLength(0);
+        expect((await runsOf(f.companyId, f.agentId)).map((row) => row.id).sort()).toEqual([...f.runIds].sort());
+        expect(launched.filter((launch) => launch.issueId === f.issueId && launch.agentId === f.agentId)).toHaveLength(0);
+      };
+      await roleIsLeftAlone();
+      await endHeldRuns();
+      await sweep(f);
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
+      await roleIsLeftAlone();
+      expect(await issueOf(f.issueId)).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId });
+      expect(await actionsOf(f.issueId)).toHaveLength(1);
+      expect(managerLaunches(f)).toHaveLength(1);
     }, 180_000);
 
     it("a role without a manager wakes nobody; a manager that is not invokable is not woken", async () => {
@@ -625,6 +643,22 @@ describePostgres("a ticket the worker router refuses goes to the role's direct m
       expect(await db.select().from(agentWakeupRequests)
         .where(and(eq(agentWakeupRequests.companyId, paused.companyId), eq(agentWakeupRequests.reason, BOARD_WAKE)))).toHaveLength(0);
       expect(await managerNotices(paused.issueId)).toHaveLength(0);
+    }, 180_000);
+
+    it("a manager whose own run led to the block is not woken on it", async () => {
+      const f = await seed("blocked", []);
+      const woken: string[] = [];
+      const call = (runAgentId: string) => wakeManagerOfBlockedIssue(db, { enqueueWakeup: async (agentId) => { woken.push(agentId); return null; } }, {
+        issue: { id: f.issueId, companyId: f.companyId, assigneeAgentId: f.agentId },
+        recoveryActionId: randomUUID(), cause: "stranded_assigned_issue",
+        sourceRun: { id: randomUUID(), agentId: runAgentId, errorCode: "timeout" },
+      });
+      expect(await call(f.managerId)).toEqual({ woken: false, reason: "manager_is_the_cause" });
+      expect(woken).toEqual([]);
+      expect(await managerNotices(f.issueId)).toHaveLength(0);
+      expect(await call(f.agentId)).toEqual({ woken: true, managerAgentId: f.managerId });
+      expect(woken).toEqual([f.managerId]);
+      expect(await managerNotices(f.issueId)).toHaveLength(1);
     }, 180_000);
 
     it("a refusal blocked for the Board (no hand-over possible) wakes the manager's manager of nobody, and the CEO's ticket nobody", async () => {
