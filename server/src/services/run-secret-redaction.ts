@@ -35,11 +35,45 @@ function registryEntries(contextSnapshot: unknown): RegistryEntry[] {
   });
 }
 
+// STUDIO-0085: the local address of a KitWright broker carries the broker's access token in its path,
+// http://127.0.0.1:<port>/p/<8 characters>/t/<32 characters>/, and an engine prints it whole in its own errors.
+// It is masked by its form, when a run's output is written and again at every read of a run. Only the token is
+// replaced. Another host, other lengths, or a token already masked by the engine are left as they are.
+const BROKER_ADDRESS = /(http:\/\/127\.0\.0\.1:\d{1,5}\/p\/[\w-]{8}\/t\/)[\w-]{32}(?![\w-])/g;
+const BROKER_ADDRESS_OPEN = /http:\/\/127\.0\.0\.1:(?:\d{0,5}|\d{1,5}\/(?:p(?:\/(?:[\w-]{0,8}|[\w-]{8}\/(?:t(?:\/[\w-]{0,32})?)?))?)?)$/;
+const BROKER_ADDRESS_HEAD = "http://127.0.0.1:";
+
+export function maskBrokerAddresses(text: string) {
+  return text.includes("/t/") ? text.replace(BROKER_ADDRESS, `$1${REDACTED_EVENT_VALUE}`) : text;
+}
+
+/** How many characters at the end of the text could be the beginning of a broker address that is not closed yet. */
+export function openBrokerAddressLength(text: string) {
+  const open = BROKER_ADDRESS_OPEN.exec(text.slice(-68));
+  if (open) return open[0].length;
+  for (let size = Math.min(BROKER_ADDRESS_HEAD.length - 1, text.length); size > 0; size--) {
+    if (text.endsWith(BROKER_ADDRESS_HEAD.slice(0, size))) return size;
+  }
+  return 0;
+}
+
+// A page of a run log is read by byte offset and can end inside a broker address: it is ended just before, and the
+// next page starts there (an address is ASCII, so one character is one byte). In a page the mask keeps the length
+// of the token: a reader that has no next offset computes it from the size of what it received.
+function maskBrokerAddressesOfLogPage<T>(value: T): T {
+  const page = asRecord(value);
+  if (!page || typeof page.content !== "string" || !("logRef" in page)) return value;
+  const held = openBrokerAddressLength(page.content);
+  return { ...page,
+    content: page.content.slice(0, page.content.length - held).replace(BROKER_ADDRESS, `$1${REDACTED_EVENT_VALUE.padEnd(32, "*")}`),
+    ...(held && typeof page.nextOffset === "number" ? { nextOffset: page.nextOffset - held } : {}) } as T;
+}
+
 function redactText(input: string, values: string[]) {
-  return values.reduce(
+  return maskBrokerAddresses(values.reduce(
     (result, value) => value.length > 0 ? result.split(value).join(REDACTED_EVENT_VALUE) : result,
     input,
-  );
+  ));
 }
 
 export function redactRegisteredSecretValues<T>(input: T, values: string[], credentialConnectionName: string | null = null): T {
@@ -150,7 +184,7 @@ export function createRunSecretRedactionRegistry(db: Db) {
     },
     redactForRun: async <T>(companyId: string, runId: string, value: T, viewerUserId: string | null = null): Promise<T> => {
       const disclosure = await valuesForRun(companyId, runId, viewerUserId);
-      return redactRegisteredSecretValues(value, disclosure.values, disclosure.credentialConnectionName);
+      return redactRegisteredSecretValues(maskBrokerAddressesOfLogPage(value), disclosure.values, disclosure.credentialConnectionName);
     },
     redactForIssue: async <T>(companyId: string, issueId: string, value: T): Promise<T> =>
       redactRegisteredSecretValues(value, await valuesForIssue(companyId, issueId)),
