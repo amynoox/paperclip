@@ -205,6 +205,19 @@ describe("the runs a pause cut, when the role resumes", () => {
       await expectContinued(f, key);
     });
 
+    it("a person who resumes again while the role is already resuming is still the one who asked", async () => {
+      const f = await fixture();
+      const store = createLifecycleStore(db, createAgentLifecycleEffects());
+      // The first resume is committed; the role is resuming. The same person clicks again before it is ready.
+      await store.change(f.agentId, "resume", { reason: "user", requestedBy: PERSON });
+      expect(await state(f.agentId)).toMatchObject({ lifecycleState: "resuming", lifecycleOperation: { resumeRequestedBy: PERSON } });
+      await store.change(f.agentId, "resume", { reason: "user", requestedBy: PERSON });
+      expect(await state(f.agentId)).toMatchObject({ lifecycleState: "resuming", lifecycleOperation: { resumeRequestedBy: PERSON } });
+      await work.process(f.agentId);
+      expect((await state(f.agentId)).lifecycleState).toBe("ready");
+      await expectContinued(f);
+    });
+
     it("every task the pause cut, in one resume", async () => {
       const f = await fixture();
       const second = { ...f, ...await cutTask(f) }, third = { ...f, ...await cutTask(f, { lease: "ssh" }) };

@@ -152,10 +152,11 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   const recordedRequester = (agent.lifecycleOperation as PauseResumeOperation | null)?.resumeRequestedBy;
   const resumeRequestedBy = command === "resume" ? options.requestedBy : recordedRequester;
   if (next === agent.lifecycleState) {
-    // A person's resume that does not change the state yet (the pause is still stopping runs, or another hold
-    // remains) still says who asked, on the operation of the pause in progress.
+    // A person's resume that does not change the state yet (the pause is still stopping runs, another hold remains,
+    // or the agent is already resuming: a second click, or a second person just after the first) still says who
+    // asked, on the operation in progress.
     const requester = command === "resume" && options.requestedBy && agent.lifecycleOperation
-      && ["pausing", "paused"].includes(agent.lifecycleState) ? options.requestedBy : null;
+      && ["pausing", "paused", "resuming"].includes(agent.lifecycleState) ? options.requestedBy : null;
     // The earlier requester no longer stands once the agent is paused again on purpose, once a policy adds a hold,
     // or once a resume names nobody: the runs would otherwise continue in that person's name against a later pause.
     const holdAdded = holds.some(hold => !agent.lifecycleHolds.includes(hold));
