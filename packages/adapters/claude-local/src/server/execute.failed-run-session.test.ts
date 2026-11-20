@@ -200,9 +200,12 @@ describe("claude_local: the session of a run that failed", () => {
     expect(result.clearSession).toBe(false);
   });
 
-  it("a resumed run cut before any announcement returns no session: the kept one is neither replaced nor cleared", async () => {
-    engineAnswers({ exitCode: null, signal: "SIGTERM", stdout: "" });
-    const { result } = await run({ runtime: { sessionId: KEPT, sessionParams: { sessionId: KEPT } } });
+  it.each([
+    ["killed", { exitCode: null, signal: "SIGTERM", stdout: "" }],
+    ["timed out", { exitCode: null, signal: "SIGTERM", timedOut: true, stdout: "" }],
+  ] as Array<[string, Engine]>)("a resumed run %s before any announcement returns no session: the kept one is neither replaced nor cleared", async (_name, engine) => {
+    engineAnswers(engine);
+    const { result } = await run({ timeoutSec: 30, runtime: { sessionId: KEPT, sessionParams: { sessionId: KEPT } } });
     expect(resumedIn(launches()[0]!)).toBe(KEPT);
     expect(result.sessionId).toBeUndefined();
     expect(result.clearSession).toBe(false);
@@ -229,9 +232,12 @@ describe("claude_local: the session of a run that failed", () => {
     expect(next.clearSession).toBe(false);
   });
 
-  it("the fresh retry after a refused resume is cut too: its own session replaces the refused one", async () => {
-    engineAnswers(rejected(KEPT), killedAfterInit(FRESH));
-    const { result } = await run({ runtime: { sessionId: KEPT, sessionParams: { sessionId: KEPT } } });
+  it.each([
+    ["is killed", killedAfterInit],
+    ["reaches its timeout", timedOutAfterInit],
+  ] as Array<[string, (sessionId: string) => Engine]>)("the fresh retry after a refused resume %s after its announcement: its own session replaces the refused one", async (_name, cut) => {
+    engineAnswers(rejected(KEPT), cut(FRESH));
+    const { result } = await run({ timeoutSec: 30, runtime: { sessionId: KEPT, sessionParams: { sessionId: KEPT } } });
     expect(launches().map(resumedIn)).toEqual([KEPT, null]);
     expect(result.sessionId).toBe(FRESH);
     expect(result.sessionParams).toMatchObject({ sessionId: FRESH });
@@ -239,9 +245,12 @@ describe("claude_local: the session of a run that failed", () => {
     expect(result.clearSession).toBe(false);
   });
 
-  it("the fresh retry after a refused resume is cut before any announcement: the refused session is cleared, as before", async () => {
-    engineAnswers(rejected(KEPT), { exitCode: null, signal: "SIGTERM", stdout: "" });
-    const { result } = await run({ runtime: { sessionId: KEPT, sessionParams: { sessionId: KEPT } } });
+  it.each([
+    ["is killed", { exitCode: null, signal: "SIGTERM", stdout: "" }],
+    ["reaches its timeout", { exitCode: null, signal: "SIGTERM", timedOut: true, stdout: "" }],
+  ] as Array<[string, Engine]>)("the fresh retry after a refused resume %s before any announcement: the refused session is cleared, as before", async (_name, engine) => {
+    engineAnswers(rejected(KEPT), engine);
+    const { result } = await run({ timeoutSec: 30, runtime: { sessionId: KEPT, sessionParams: { sessionId: KEPT } } });
     expect(launches().map(resumedIn)).toEqual([KEPT, null]);
     expect(result.sessionId).toBeUndefined();
     expect(result.clearSession).toBe(true);
