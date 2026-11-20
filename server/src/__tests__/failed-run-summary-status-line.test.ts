@@ -102,6 +102,17 @@ describe("the summary of a run that did not succeed: the status line", () => {
     }
   });
 
+  it("a response bound to an external chat takes no line: what a person outside reads is left as it was", () => {
+    for (const outcome of ["timed_out", "failed", "cancelled"] as const) {
+      const resolved = resolveHeartbeatRunResponse({ resultJson: persisted(outcome), preferFinalResponseOverExistingComment: true });
+      expect(resolved.text).toBe(SAID);
+      expect(resolved.decision).toMatchObject({ chosenSource: "adapter_final_response", commentAction: "create",
+        reasonCodes: ["legacy_adapter_summary_compatibility", "external_chat_final_precedence"] });
+    }
+    // The same result, not bound to an external chat: the line.
+    expect(resolveHeartbeatRunResponse({ resultJson: persisted("timed_out"), preferFinalResponseOverExistingComment: false }).text).toBe(under("timed_out"));
+  });
+
   it("the other sources of a response take no line: a comment the run posted itself, a marked final answer", () => {
     const resultJson = persisted("timed_out");
     expect(resolveHeartbeatRunResponse({ resultJson, existingComment: { id: "c1", body: "Posted by the role during the run." } }))

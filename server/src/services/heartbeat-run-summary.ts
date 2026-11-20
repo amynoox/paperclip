@@ -646,7 +646,9 @@ export function resolveHeartbeatRunResponse(input: {
       readCommentText(resultJson.message);
     if (legacyText && !NARRATION_OPENERS.test(legacyText.trimStart())) {
       // STUDIO-0080: the summary of a run that did not succeed is posted under a line that says so.
-      const unfinished = readUnfinishedRunStatus(resultJson);
+      // Not on a response bound to an external chat: that text is what a person outside reads in their own chat
+      // tool, and it is left as it was.
+      const unfinished = input.preferFinalResponseOverExistingComment === true ? null : readUnfinishedRunStatus(resultJson);
       return {
         text: unfinished ? `${unfinishedRunStatusLine(unfinished)}\n\n${legacyText}` : legacyText,
         decision: decision("adapter_final_response", {
