@@ -37,6 +37,8 @@ import { REPOSITORY_CATALOG_UNAVAILABLE_CODE } from "../repository-catalog-unava
 import { REVIEWED_CHAT_BINDING_NOT_READY } from "../reviewed-chat-binding-diagnostics.js";
 import { RUNNER_REVISION_MISMATCH_CODE, RUNNER_REVISION_MISMATCH_RETRY, RUNNER_REVISION_WAIT_RETRY_REASON } from "../runner-revision-mismatch.js";
 import { STORAGE_UNAVAILABLE_CODE, STORAGE_UNAVAILABLE_RETRY, STORAGE_UNAVAILABLE_WAIT_RETRY_REASON } from "../../storage/storage-unavailable.js";
+import { SSH_LEASE_OUTAGE_RETRY_REASON, isSshLeaseOutageRun } from "../ssh-lease-outage.js";
+import { sshLeaseOutageRetry } from "./ssh-lease-outage-retry.js";
 import { CONTROLLER_LEASE_LOST_FAILURE_CODE } from "../legacy-controller-lease.js";
 import { randomUUID } from "node:crypto";
 import {
@@ -490,6 +492,8 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     }
     if (!opts?.retryReason && run.errorCode === RUNNER_REVISION_MISMATCH_CODE) opts = { ...RUNNER_REVISION_MISMATCH_RETRY, ...opts };
     if (!opts?.retryReason && run.errorCode === STORAGE_UNAVAILABLE_CODE) opts = { ...STORAGE_UNAVAILABLE_RETRY, ...opts };
+    // STUDIO-0079: an ssh lease outage has its own lane, bounded by time (heartbeat/ssh-lease-outage-retry.ts).
+    if (!opts?.retryReason && isSshLeaseOutageRun(run)) opts = { ...(await sshLeaseOutageRetry(db, run, opts?.now)), ...opts };
     if (await hasCaseHandoffForRun(run)) return { outcome: "not_scheduled" as const,
       reason: "The durable case handoff owns successor work.", issueId: readNonEmptyString(run.contextSnapshot?.issueId) };
     if (["openai_dot", "muse"].includes(String(parseObject(agent.adapterConfig).provider))
@@ -704,7 +708,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
     const taskKey = deriveTaskKeyWithHeartbeatFallback(contextSnapshot, null);
     const sessionBefore = await resolveSessionBeforeForWakeup(agent, taskKey);
     const interactionRunnerWait = (retryReason === RUNNER_REVISION_WAIT_RETRY_REASON
-      || retryReason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON)
+      || retryReason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON || retryReason === SSH_LEASE_OUTAGE_RETRY_REASON)
       && isResolvedInteractionContinuationWakeContext(run.contextSnapshot);
     const interactionContinuationPayload =
       retryReason === INTERACTION_CONTINUATION_INFRA_RETRY_REASON || interactionRunnerWait
@@ -1095,7 +1099,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
         const scheduledRunId = randomUUID();
         if (contextSnapshot.explicitUserContinuation) {
           const continuation = issueId && (retryReason === "transient_failure" || retryReason === RUNNER_REVISION_WAIT_RETRY_REASON
-            || retryReason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON) ? await admitExplicitContinuationRetry({
+            || retryReason === STORAGE_UNAVAILABLE_WAIT_RETRY_REASON || retryReason === SSH_LEASE_OUTAGE_RETRY_REASON) ? await admitExplicitContinuationRetry({
             db: tx as unknown as Db, companyId: run.companyId, issueId, agentId: run.agentId,
             parentRunId: run.id, successorRunId: scheduledRunId, now,
           }) : null;
