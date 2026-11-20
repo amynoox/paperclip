@@ -31,7 +31,20 @@
 // - any other run of the agent (a success, a failure that left something
 //   behind, a long failure, a failure on another session) ends it;
 // - at RELAUNCH_LOOP_FAILURE_THRESHOLD, the run about to start drops the
-//   session and starts on a fresh one, with one note on the issue.
+//   session and starts on a fresh one, with one note on the issue;
+// - if that run on a fresh session fails the same way (an empty failure), the
+//   session was not the cause: the issue is handed to the direct manager of
+//   the role (STUDIO-0083, manager-handover.ts), with a note that gives the
+//   code and the number of failures, and no Board action. The role is no
+//   longer the assignee, so nothing relaunches it on the issue until the
+//   manager gives it back. The hand-over is made when that run ends. It is
+//   not asked again at the start of the role's next run: a run that starts
+//   holds the issue, and an issue that holds a live run is not handed. If the
+//   server stops between the end of the fresh run and the hand-over, the role
+//   goes on, a new series forms on the session of the fresh run, and the
+//   hand-over is made at the end of the next fresh run. Where no manager can
+//   receive the issue (none, not invokable, or handed twice already), the
+//   issue is blocked with a Board action, as stranded work is today.
 //
 // Reading the history at each start, with no counter of its own, is what makes
 // the guard survive a server restart or a cut in the middle of the gesture:
@@ -46,6 +59,7 @@ import {
   ADAPTER_DECLARED_WAIT_ERROR_CODES,
   ROUTER_REFUSAL_ERROR_CODES,
 } from "../recovery/adapter-declared-wait.js";
+import { handIssueToManager, type ManagerHandoverWakeup } from "../recovery/manager-handover.js";
 import { keyValueRow, runLinkRow, systemNoticePresentation } from "../recovery/notice-format.js";
 import { isRunLogStoreType, type RunLogStoreType } from "../run-log-store.js";
 
@@ -76,7 +90,8 @@ export const RELAUNCH_LOOP_FRESH_SESSION_ACTIVITY_ACTION = "issue.relaunch_loop_
 // Refusals the worker router returns before it reserves any machine: no engine
 // was launched, so the session was not tried. The first four are STUDIO-0059's;
 // the others are the router's remaining pre-reservation refusals.
-export const ROUTER_PRE_RESERVATION_REFUSAL_CODES: readonly string[] = Object.freeze([
+export const ROUTER_PRE_RESERVATION_REFUSAL_CODES: readonly string[] = Object.freeze([...new Set([
+  // STUDIO-0083 names eight of them as refusals of its own; the list is kept whole here.
   ...ROUTER_REFUSAL_ERROR_CODES,
   "router_request_block_invalid",
   "router_request_system_unknown",
@@ -86,7 +101,7 @@ export const ROUTER_PRE_RESERVATION_REFUSAL_CODES: readonly string[] = Object.fr
   "router_reservation_unavailable",
   "router_stale_reservation_wake",
   "router_ticket_not_assigned_to_agent",
-]);
+])]);
 
 // Failures the worker router returns before it launches any engine (its own
 // list, 20 Nov 2026, router commit 6d298b0): an estimate that never came, a
@@ -182,6 +197,11 @@ export interface RelaunchLoopRunSample {
    * failures of a launched engine too, and those are the ones to count.
    */
   engineNeverStarted: boolean;
+  /**
+   * Set when the guard started this run on a fresh session: the number of
+   * failures of the series that led to it. Null or absent for any other run.
+   */
+  guardFailedRunCount?: number | null;
 }
 
 export type RelaunchLoopRunClass = "skipped" | "empty_failure" | "other";
@@ -252,6 +272,53 @@ export function evaluateRelaunchLoop(input: {
     return { action: "none", streak: series.length };
   }
   return { action: "fresh_session", sessionId, failedRuns: [...series].reverse() };
+}
+
+export const RELAUNCH_LOOP_HANDOVER_CAUSE = "relaunch_loop";
+
+export type RelaunchLoopHandoverDecision =
+  | { handover: false }
+  | { handover: true; freshRun: RelaunchLoopRunSample };
+
+/**
+ * Pure decision over the same runs: the newest run that says something about
+ * the session is the one the guard started on a fresh session, and it is an
+ * empty failure too. A run that only waited or was refused says nothing and
+ * is passed over; any other run of the agent since then ends the matter.
+ */
+export function evaluateRelaunchLoopHandover(input: {
+  runs: readonly RelaunchLoopRunSample[];
+  runIdsThatProducedSomething: ReadonlySet<string>;
+}): RelaunchLoopHandoverDecision {
+  for (const run of input.runs) {
+    const kind = classifyRelaunchLoopRun(run, input.runIdsThatProducedSomething.has(run.id));
+    if (kind === "skipped") continue;
+    return kind === "empty_failure" && typeof run.guardFailedRunCount === "number"
+      ? { handover: true, freshRun: run }
+      : { handover: false };
+  }
+  return { handover: false };
+}
+
+export function relaunchLoopHandoverNote(input: { agentName: string; failedRunCount: number; code: string | null }) {
+  const code = input.code ?? "no code";
+  return {
+    title: "Relaunch guard: handed to the manager",
+    body:
+      `${input.agentName} failed ${input.failedRunCount} times in a row on this issue while resuming the same engine session, `
+      + `then failed again on a fresh session (\`${code}\`), each time without leaving anything behind. `
+      + `The session was not the cause, so ${input.agentName} is no longer relaunched on this issue. `
+      + `Handed to {manager} for review: read the failed runs, then give the issue back to ${input.agentName}, reassign it, or close it.`,
+    nextAction: `Read the failed runs, then give the issue back to ${input.agentName}, reassign it, or close it.`,
+  };
+}
+
+export function relaunchLoopBoardBlockBody(input: { agentName: string; failedRunCount: number; code: string | null }): string {
+  return (
+    `${input.agentName} failed ${input.failedRunCount} times in a row on this issue while resuming the same engine session, `
+    + `then failed again on a fresh session (\`${input.code ?? "no code"}\`), each time without leaving anything behind. `
+    + "No manager can receive the issue. Moving it to `blocked` so it is visible for intervention."
+  );
 }
 
 export function relaunchLoopFreshSessionNoteBody(input: {
@@ -330,7 +397,7 @@ async function readLastEngineOutputAt(readRunLog: RelaunchLoopRunLogReader | und
 
 async function readStartedRuns(
   db: Db,
-  input: { companyId: string; agentId: string; issueId: string; exceptRunId: string; readRunLog?: RelaunchLoopRunLogReader },
+  input: { companyId: string; agentId: string; issueId: string; exceptRunId: string | null; readRunLog?: RelaunchLoopRunLogReader },
 ): Promise<RelaunchLoopRunSample[]> {
   const rows = await db
     .select({
@@ -343,6 +410,8 @@ async function readStartedRuns(
       engineNeverStarted: sql<boolean>`coalesce(${heartbeatRuns.runtimeMode} = 'legacy' and ${heartbeatRuns.executionStage} = 'preparing', false)`,
       engineReported: ENGINE_REPORTED_SQL,
       lateOutput: LATE_OUTPUT_SQL,
+      guardFailedRunCount: sql<number | null>`case when ${heartbeatRuns.contextSnapshot} -> ${RELAUNCH_LOOP_GUARD_CONTEXT_KEY} ->> 'action' = 'fresh_session'
+        then jsonb_array_length(coalesce(${heartbeatRuns.contextSnapshot} -> ${RELAUNCH_LOOP_GUARD_CONTEXT_KEY} -> 'failedRunIds', '[]'::jsonb)) end`,
       logStore: heartbeatRuns.logStore,
       logRef: heartbeatRuns.logRef,
       logBytes: heartbeatRuns.logBytes,
@@ -353,7 +422,7 @@ async function readStartedRuns(
       eq(heartbeatRuns.agentId, input.agentId),
       sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${input.issueId}`,
       isNotNull(heartbeatRuns.startedAt),
-      ne(heartbeatRuns.id, input.exceptRunId),
+      input.exceptRunId ? ne(heartbeatRuns.id, input.exceptRunId) : undefined,
     ))
     .orderBy(desc(heartbeatRuns.startedAt), desc(heartbeatRuns.id))
     .limit(RELAUNCH_LOOP_RUN_SAMPLE_LIMIT);
@@ -371,7 +440,12 @@ async function readStartedRuns(
           && lastEngineOutputAt.getTime() >= row.startedAt.getTime() + RELAUNCH_LOOP_SHORT_RUN_MS;
       }
     }
-    samples.push({ ...row, engineNeverStarted: row.engineNeverStarted === true, engineWorked });
+    samples.push({
+      ...row,
+      engineNeverStarted: row.engineNeverStarted === true,
+      engineWorked,
+      guardFailedRunCount: row.guardFailedRunCount === null || row.guardFailedRunCount === undefined ? null : Number(row.guardFailedRunCount),
+    });
   }
   return samples;
 }
@@ -510,6 +584,66 @@ async function ensureFreshSessionNote(
     });
     return true;
   });
+}
+
+export interface RelaunchLoopHandoverDeps {
+  enqueueWakeup: ManagerHandoverWakeup;
+  readRunLog?: RelaunchLoopRunLogReader;
+  /** No manager can receive the issue: the caller blocks it with a Board action, as stranded work is today. */
+  blockForBoard?: (input: { issueId: string; runId: string; comment: string }) => Promise<unknown>;
+  onError?: (error: unknown) => void;
+}
+
+export type RelaunchLoopHandoverOutcome = "none" | "handed" | "blocked_for_board" | "left";
+
+const HANDOVER_REFUSALS_FOR_THE_BOARD: readonly string[] = Object.freeze(["no_manager", "manager_not_invokable", "handed_before"]);
+
+/**
+ * The run the guard started on a fresh session failed empty too: hand the issue
+ * to the role's direct manager. Called when that run ends. It reads the runs
+ * and writes nothing of its own: the hand-over refuses a run that already
+ * caused one, so asking twice hands once. It never fails its caller.
+ */
+export async function handOverAfterFreshSessionFailure(
+  db: Db,
+  deps: RelaunchLoopHandoverDeps,
+  input: { companyId: string; agent: { id: string; name: string }; issueId: string | null; exceptRunId?: string | null },
+): Promise<RelaunchLoopHandoverOutcome> {
+  if (!input.issueId) return "none";
+  try {
+    const runs = await readStartedRuns(db, {
+      companyId: input.companyId,
+      agentId: input.agent.id,
+      issueId: input.issueId,
+      exceptRunId: input.exceptRunId ?? null,
+      readRunLog: deps.readRunLog,
+    });
+    const candidateIds = runs
+      .filter((run) => classifyRelaunchLoopRun(run, false) === "empty_failure")
+      .map((run) => run.id);
+    const runIdsThatProducedSomething = await readRunIdsThatProducedSomething(db, { companyId: input.companyId, runIds: candidateIds });
+    const decision = evaluateRelaunchLoopHandover({ runs, runIdsThatProducedSomething });
+    if (!decision.handover) return "none";
+    const run = decision.freshRun;
+    const said = { agentName: input.agent.name, failedRunCount: run.guardFailedRunCount ?? RELAUNCH_LOOP_FAILURE_THRESHOLD, code: run.errorCode };
+    const result = await handIssueToManager(db, { enqueueWakeup: deps.enqueueWakeup }, {
+      issue: { id: input.issueId, companyId: input.companyId },
+      fromAgentId: input.agent.id,
+      cause: RELAUNCH_LOOP_HANDOVER_CAUSE,
+      code: run.errorCode,
+      sourceRun: { id: run.id, status: run.status, agentId: input.agent.id },
+      note: relaunchLoopHandoverNote(said),
+    });
+    if (result.handed) return "handed";
+    if (HANDOVER_REFUSALS_FOR_THE_BOARD.includes(result.reason) && deps.blockForBoard) {
+      await deps.blockForBoard({ issueId: input.issueId, runId: run.id, comment: relaunchLoopBoardBlockBody(said) });
+      return "blocked_for_board";
+    }
+    return "left";
+  } catch (error) {
+    deps.onError?.(error);
+    return "none";
+  }
 }
 
 export interface RelaunchLoopGuardDeps {

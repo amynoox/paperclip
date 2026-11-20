@@ -7,6 +7,7 @@ import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agentTaskSessions,
+  agentWakeupRequests,
   agents,
   authUsers,
   companies,
@@ -14,6 +15,7 @@ import {
   createDb,
   heartbeatRuns,
   issueComments,
+  issueRecoveryActions,
   issueThreadInteractions,
   issues,
 } from "@paperclipai/db";
@@ -33,9 +35,13 @@ import {
   applyRelaunchLoopGuard,
   classifyRelaunchLoopRun,
   evaluateRelaunchLoop,
+  evaluateRelaunchLoopHandover,
+  handOverAfterFreshSessionFailure,
   isEngineOutputChunk,
   lastEngineOutputAtInLogPage,
   readRelaunchLoopDecision,
+  relaunchLoopHandoverNote,
+  RELAUNCH_LOOP_HANDOVER_CAUSE,
   type RelaunchLoopRunLogReader,
   type RelaunchLoopRunSample,
 } from "../services/heartbeat/relaunch-loop-guard.js";
@@ -219,6 +225,58 @@ describe("relaunch loop guard: the decision", () => {
 
   it("a timed-out run under five minutes counts like a failure", () => {
     expect(decide([sample(1, { status: "timed_out", errorCode: "timeout" }), sample(3), sample(5)]).action).toBe("fresh_session");
+  });
+});
+
+// Step three: the run on a fresh session failed the same way.
+describe("relaunch loop guard: the hand-over decision", () => {
+  const hand = (runs: RelaunchLoopRunSample[], produced: string[] = []) =>
+    evaluateRelaunchLoopHandover({ runs, runIdsThatProducedSomething: new Set(produced) });
+  const freshRun = (minutesAgo: number, patch: Partial<RelaunchLoopRunSample> = {}) =>
+    sample(minutesAgo, { sessionIdBefore: null, guardFailedRunCount: 3, ...patch });
+
+  it("hands over when the newest run is the one the guard started fresh and it is an empty failure too", () => {
+    const fresh = freshRun(1);
+    expect(hand([fresh, sample(5), sample(9), sample(13)])).toEqual({ handover: true, freshRun: fresh });
+    // A timeout of the fresh run counts as for the series: only when its engine did nothing.
+    const hung = freshRun(21, { status: "timed_out", errorCode: "timeout", finishedAt: at(1) });
+    expect(hand([hung, sample(25)])).toMatchObject({ handover: true });
+    expect(hand([{ ...hung, engineWorked: true }, sample(25)])).toEqual({ handover: false });
+  });
+
+  it("does not hand over a fresh run that worked: a success, a failure that left something, a long failure", () => {
+    expect(hand([freshRun(1, { status: "succeeded", errorCode: null })])).toEqual({ handover: false });
+    const produced = freshRun(1);
+    expect(hand([produced], [produced.id])).toEqual({ handover: false });
+    expect(hand([freshRun(10, { finishedAt: at(2) })])).toEqual({ handover: false });
+  });
+
+  it("passes over runs that say nothing about the session, and stops at any other run of the role", () => {
+    const fresh = freshRun(9);
+    // A wait, a refusal before any reservation and a cancelled retry after the fresh run: still to hand.
+    expect(hand([
+      sample(1, { status: "cancelled", errorCode: "issue_waiting_for_response" }),
+      sample(3, { errorCode: "router_group_participant_ended" }),
+      sample(5, { errorCode: WAIT }),
+      fresh,
+    ])).toEqual({ handover: true, freshRun: fresh });
+    // The role ran again since (the manager gave the issue back): the fresh run is no longer the newest.
+    expect(hand([sample(1, { sessionIdBefore: "s2" }), fresh])).toEqual({ handover: false });
+    // A failure the guard did not start fresh is never handed by itself.
+    expect(hand([sample(1, { sessionIdBefore: null }), sample(5), sample(9), sample(13)])).toEqual({ handover: false });
+    expect(hand([])).toEqual({ handover: false });
+  });
+
+  it("says in the note who failed, how many times, under which code, and what the manager may do", () => {
+    const note = relaunchLoopHandoverNote({ agentName: "Dev Unity", failedRunCount: 3, code: ACK_UNCERTAIN });
+    expect(note.title).toBe("Relaunch guard: handed to the manager");
+    expect(note.body).toBe(
+      "Dev Unity failed 3 times in a row on this issue while resuming the same engine session, then failed again on a fresh session "
+      + "(`router_interactive_ack_uncertain`), each time without leaving anything behind. "
+      + "The session was not the cause, so Dev Unity is no longer relaunched on this issue. "
+      + "Handed to {manager} for review: read the failed runs, then give the issue back to Dev Unity, reassign it, or close it.");
+    expect(relaunchLoopHandoverNote({ agentName: "Dev Unity", failedRunCount: 4, code: null }).body).toContain("failed 4 times in a row");
+    expect(relaunchLoopHandoverNote({ agentName: "Dev Unity", failedRunCount: 4, code: null }).body).toContain("(`no code`)");
   });
 });
 
@@ -1027,4 +1085,122 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
     expect(context.forceFreshSession).toBeUndefined();
     await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.id, run!.id));
   }, 180_000);
+  // Step three, on the real path. The session was not the cause: the role fails on a fresh session too.
+  const issueRow = async (f: Fixture) => (await db.select().from(issues).where(eq(issues.id, f.issueId)))[0]!;
+  const handovers = async (f: Fixture) => (await db.select().from(activityLog)
+    .where(and(eq(activityLog.entityId, f.issueId), eq(activityLog.action, "issue.handed_to_manager"))))
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  const handoverNotes = async (f: Fixture) => (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+    .filter((row) => row.authorType === "system" && row.body.includes("Handed to CTO for review"));
+  const boardActions = (f: Fixture) => db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+  // Three empty failures on the session, then the run on a fresh session, which fails too and returns its session.
+  async function failThroughTheFreshSession(f: Fixture, session: string, next: string) {
+    for (let index = 0; index < 3; index += 1) await turn(f, fail(ACK_UNCERTAIN, { session }));
+    return turn(f, fail(ACK_UNCERTAIN, { session: next }));
+  }
+  const giveBack = (f: Fixture) => db.update(issues)
+    .set({ assigneeAgentId: f.devId, status: "in_progress", updatedAt: new Date() }).where(eq(issues.id, f.issueId));
+
+  it("TR-2069 to its end: the fresh session fails too, and the issue goes to the CTO, with a note and no Board action", async () => {
+    const f = await seed();
+    await openSession(f);
+    const fresh = await failThroughTheFreshSession(f, "s1", "s2");
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", null]);
+    expect(fresh).toMatchObject({ status: "failed", errorCode: ACK_UNCERTAIN, sessionIdBefore: null });
+    expect(fresh.contextSnapshot).toMatchObject({ [RELAUNCH_LOOP_GUARD_CONTEXT_KEY]: { action: "fresh_session", droppedSessionId: "s1" } });
+    await expect.poll(async () => (await issueRow(f)).assigneeAgentId, { timeout: 30_000 }).toBe(f.ctoId);
+    expect(await issueRow(f)).toMatchObject({ status: "in_review", assigneeAgentId: f.ctoId });
+    expect(await boardActions(f)).toHaveLength(0);
+    const [handed] = await handovers(f);
+    expect(handed!.details).toMatchObject({
+      cause: RELAUNCH_LOOP_HANDOVER_CAUSE, code: ACK_UNCERTAIN, fromAgentId: f.devId, toAgentId: f.ctoId, sourceRunId: fresh.id, handoverInSeries: 1,
+    });
+    const [note] = await handoverNotes(f);
+    expect(note!.body).toBe(relaunchLoopHandoverNote({ agentName: "Dev Unity", failedRunCount: 3, code: ACK_UNCERTAIN }).body.replace("{manager}", "CTO"));
+    expect(await guardNotes(f)).toHaveLength(1);
+    // The CTO is woken on it; the role is not relaunched: the retry of its failed run does not start.
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    expect((await db.select().from(agentWakeupRequests)
+      .where(and(eq(agentWakeupRequests.agentId, f.ctoId), eq(agentWakeupRequests.reason, "issue_handed_to_manager")))).length).toBeGreaterThanOrEqual(1);
+    expect(devLaunches(f)).toHaveLength(5);
+    expect(await handovers(f)).toHaveLength(1);
+  }, 240_000);
+
+  it("a fresh session that left something behind before it failed is not handed", async () => {
+    const f = await seed();
+    await openSession(f);
+    for (let index = 0; index < 3; index += 1) await turn(f, fail(ACK_UNCERTAIN, { session: "s1" }));
+    const fresh = await turn(f, fail(ACK_UNCERTAIN, { session: "s2", comment: true }));
+    expect(fresh.contextSnapshot).toMatchObject({ [RELAUNCH_LOOP_GUARD_CONTEXT_KEY]: { action: "fresh_session" } });
+    expect(await issueRow(f)).toMatchObject({ status: "in_progress", assigneeAgentId: f.devId });
+    expect(await handovers(f)).toHaveLength(0);
+    expect(await boardActions(f)).toHaveLength(0);
+  }, 240_000);
+
+  it("a role without a manager: the issue is blocked with a Board action, as stranded work is", async () => {
+    const f = await seed();
+    await db.update(agents).set({ reportsTo: null }).where(eq(agents.id, f.devId));
+    await openSession(f);
+    await failThroughTheFreshSession(f, "s1", "s2");
+    await expect.poll(async () => (await issueRow(f)).status, { timeout: 30_000 }).toBe("blocked");
+    expect(await issueRow(f)).toMatchObject({ assigneeAgentId: f.devId });
+    expect(await handovers(f)).toHaveLength(0);
+    expect(await boardActions(f)).toEqual([expect.objectContaining({ ownerType: "board", status: "active" })]);
+    const notes = (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+      .filter((row) => row.authorType === "system" && row.body.includes("No manager can receive the issue"));
+    expect(notes).toHaveLength(1);
+  }, 240_000);
+
+  it("given back by the CTO: the old failure hands nothing again; a new series goes through the fresh session once more; a third is the Board's", async () => {
+    const f = await seed();
+    await openSession(f);
+    await failThroughTheFreshSession(f, "s1", "s2");
+    await expect.poll(async () => (await handovers(f)).length, { timeout: 30_000 }).toBe(1);
+    // Given back. The role's next run resumes the session of the failed fresh run; one failure hands nothing.
+    await giveBack(f);
+    await turn(f, fail(ACK_UNCERTAIN, { session: "s2" }));
+    expect(await handovers(f)).toHaveLength(1);
+    expect(await issueRow(f)).toMatchObject({ status: "in_progress", assigneeAgentId: f.devId });
+    // The series starts again on s2: two more failures, a fresh session (the first gesture, once), which fails.
+    await turn(f, fail(ACK_UNCERTAIN, { session: "s2" }));
+    await turn(f, fail(ACK_UNCERTAIN, { session: "s2" }));
+    const fresh = await turn(f, fail(ACK_UNCERTAIN, { session: "s3" }));
+    expect(fresh.sessionIdBefore).toBeNull();
+    await expect.poll(async () => (await handovers(f)).length, { timeout: 30_000 }).toBe(2);
+    expect((await handovers(f))[1]!.details).toMatchObject({ sourceRunId: fresh.id, handoverInSeries: 2 });
+    expect((await handoverNotes(f)).filter((note) => note.body.includes("it will not be handed a third time"))).toHaveLength(1);
+    expect(await boardActions(f)).toHaveLength(0);
+    // Given back again, and the same again: the manager received it twice, the third time is the Board's.
+    await giveBack(f);
+    await failThroughTheFreshSession(f, "s3", "s4");
+    await expect.poll(async () => (await issueRow(f)).status, { timeout: 30_000 }).toBe("blocked");
+    expect(await handovers(f)).toHaveLength(2);
+    expect(await boardActions(f)).toEqual([expect.objectContaining({ ownerType: "board", status: "active" })]);
+  }, 300_000);
+
+  it("the server stopped before the hand-over: asked later, the issue is handed once, under the fresh run", async () => {
+    const f = await seed();
+    await openSession(f);
+    for (let index = 0; index < 3; index += 1) await turn(f, fail(ACK_UNCERTAIN, { session: "s1" }));
+    // The run on the fresh session, as it stands after a stop of the server at its end: failed, marked, nothing handed.
+    const now = new Date();
+    const [fresh] = await db.insert(heartbeatRuns).values({
+      companyId: f.companyId, agentId: f.devId, invocationSource: "automation", triggerDetail: "system", status: "failed", errorCode: ACK_UNCERTAIN,
+      createdAt: now, startedAt: now, finishedAt: now, updatedAt: now, sessionIdBefore: null,
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented", forceFreshSession: true,
+        [RELAUNCH_LOOP_GUARD_CONTEXT_KEY]: { version: 1, action: "fresh_session", droppedSessionId: "s1", failedRunIds: ["a", "b", "c"] } },
+    }).returning();
+    expect(await handovers(f)).toHaveLength(0);
+    // Asked directly, as the start of a run asks it; then asked again: one hand-over.
+    const woken: string[] = [];
+    const ask = () => handOverAfterFreshSessionFailure(db, { enqueueWakeup: async (agentId) => { woken.push(agentId); return null; } },
+      { companyId: f.companyId, agent: { id: f.devId, name: "Dev Unity" }, issueId: f.issueId, exceptRunId: randomUUID() });
+    expect(await ask()).toBe("handed");
+    // Asked again: the issue is the manager's, nothing more is handed.
+    expect(await ask()).toBe("left");
+    expect(woken).toEqual([f.ctoId]);
+    expect((await handovers(f)).map((row) => (row.details as Record<string, unknown>).sourceRunId)).toEqual([fresh!.id]);
+    expect(await issueRow(f)).toMatchObject({ status: "in_review", assigneeAgentId: f.ctoId });
+  }, 240_000);
 });

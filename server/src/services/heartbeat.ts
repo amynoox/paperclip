@@ -48,7 +48,7 @@ import { readRecoverableRunLog } from "./native-runtime/native-run-log-recovery.
 import { observabilitySecretValues } from "@paperclipai/adapter-utils/agent-observability";
 import { prepareHeartbeatSession, resolveHeartbeatAdapterSession } from "./heartbeat/session-preparation.js";
 import { prepareHeartbeatTaskContext } from "./heartbeat/task-context.js";
-import { applyRelaunchLoopGuard } from "./heartbeat/relaunch-loop-guard.js";
+import { applyRelaunchLoopGuard, handOverAfterFreshSessionFailure, RELAUNCH_LOOP_GUARD_CONTEXT_KEY, type RelaunchLoopHandoverDeps } from "./heartbeat/relaunch-loop-guard.js";
 import { selectHeartbeatEnvironment } from "./heartbeat/environment-selection.js";
 import { reconcileMuseNativeTerminalRun } from "./native-runtime/muse-terminal-reconciliation.js";
 import { prepareHeartbeatWorkspace } from "./heartbeat/workspace-preparation.js";
@@ -1163,6 +1163,22 @@ export function heartbeatService(
       }
     }
   }
+
+  // STUDIO-0078: what the relaunch guard needs to hand an issue to the role's manager, and its fallback when no
+  // manager can receive it: the block of stranded work, with its Board action.
+  const relaunchLoopHandoverDeps: RelaunchLoopHandoverDeps = {
+    enqueueWakeup: (agentId, opts) => enqueueWakeup(agentId, opts),
+    readRunLog: (handle, opts) => runLogStore.read(handle, opts),
+    blockForBoard: async (input) => {
+      const [issueRow] = await db.select().from(issues).where(eq(issues.id, input.issueId));
+      const [runRow] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.runId));
+      if (!issueRow || !runRow || (issueRow.status !== "todo" && issueRow.status !== "in_progress")) return;
+      await recovery.escalateStrandedAssignedIssue({
+        issue: issueRow, previousStatus: issueRow.status, latestRun: runRow, comment: input.comment,
+      });
+    },
+    onError: (error) => logger.error({ err: error }, "relaunch loop guard: the hand-over to the manager failed"),
+  };
 
   // The wake-queue module's plain snapshots hold only the fields the release
   // decision needs; escalation needs the full row, so this re-reads both by
@@ -3703,6 +3719,11 @@ export function heartbeatService(
           onProviderTraceFinalized: () => { providerTraceFinalized = true; },
           issueContext, onLog,
         }));
+        // STUDIO-0078: the run the relaunch guard started on a fresh session has ended. If it failed empty too, the
+        // issue goes to the role's direct manager (or, with no manager to receive it, to the Board).
+        if (context[RELAUNCH_LOOP_GUARD_CONTEXT_KEY]) {
+          await handOverAfterFreshSessionFailure(db, relaunchLoopHandoverDeps, { companyId: agent.companyId, agent, issueId });
+        }
       } catch (err) {
         await persistUsageCaptureFailure?.();
         if (err instanceof NativeStartupCleanupPendingError) {
