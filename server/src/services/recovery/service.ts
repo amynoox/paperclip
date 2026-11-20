@@ -27,6 +27,7 @@ import {
   adapterDeclaredWaitSeriesCodes,
   isAdapterDeclaredWaitErrorCode,
   adapterDeclaredWaitNoteBody,
+  DECLARED_WAIT_PAUSE_LIFTED_WAKE_REASON,
   routerRefusalNoteBody,
   routerRefusalOutcome,
   routerRefusalText,
@@ -1220,6 +1221,66 @@ export function recoveryService(
     const waitStart = await readAdapterDeclaredWaitBoundStart(issue.companyId, issue.id, agentId, run!.errorCode);
     const waitDeadline = waitStart ? waitStart.getTime() + adapterDeclaredWaitMaxMs(run!.errorCode) : null;
     return waitDeadline !== null && now.getTime() < waitDeadline ? waitDeadline : null;
+  }
+
+  /**
+   * STUDIO-0076: when a pause lifts, start once each task of the agent that waits on a declared wait still within
+   * its bound. The owner of the wait wakes the assignee itself, but that wake can be lost to the pause: a plugin's
+   * wake is refused before the queue, and written nowhere, while the agent's budget is reached or its company or
+   * project is paused (plugin-host-services `issues.requestWakeup`); only a wake refused for the agent's own pause
+   * is kept and replayed (STUDIO-0028). Called after that replay: no start when a wake or a run of the agent is
+   * already live for the task. A run that waits again extends the same series, so the bound does not start over.
+   */
+  async function wakeDeclaredWaitsAfterPause(input: { companyId: string; agentId: string; now?: Date }) {
+    const waiting = await db.select({ id: issues.id, companyId: issues.companyId }).from(issues).where(and(
+      eq(issues.companyId, input.companyId),
+      eq(issues.assigneeAgentId, input.agentId),
+      isNull(issues.assigneeUserId),
+      inArray(issues.status, ["todo", "in_progress"]),
+      isNull(issues.hiddenAt),
+    ));
+    let woken = 0;
+    for (const issue of waiting) {
+      const run = await getLatestStartedIssueRunForAgent(issue.companyId, issue.id, input.agentId);
+      if (!run || await liveAdapterDeclaredWaitDeadline(issue, input.agentId, run, input.now ?? new Date()) === null) continue;
+      const [liveWake] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        inArray(agentWakeupRequests.status, ["queued", "deferred_issue_execution", "claimed"]),
+        sql`${agentWakeupRequests.payload} ->> 'issueId' = ${issue.id}`,
+      )).limit(1);
+      if (liveWake) continue;
+      const [liveRun] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, input.companyId),
+        eq(heartbeatRuns.agentId, input.agentId),
+        inArray(heartbeatRuns.status, ["queued", "running"]),
+        sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issue.id}`,
+      )).limit(1);
+      if (liveRun) continue;
+      try {
+        const queued = await deps.enqueueWakeup(input.agentId, {
+          source: "automation",
+          triggerDetail: "system",
+          reason: DECLARED_WAIT_PAUSE_LIFTED_WAKE_REASON,
+          payload: { issueId: issue.id, mutation: "pause_lifted", declaredWaitRunId: run.id },
+          idempotencyKey: `pause-declared-wait:${input.agentId}:${issue.id}:${run.id}`,
+          requestedByActorType: "system",
+          requestedByActorId: "pause-declared-waits",
+          contextSnapshot: {
+            issueId: issue.id,
+            taskId: issue.id,
+            wakeReason: DECLARED_WAIT_PAUSE_LIFTED_WAKE_REASON,
+            source: "agent.pause_lifted",
+            declaredWaitRunId: run.id,
+          },
+        });
+        if (queued) woken += 1;
+      } catch {
+        // A start refused now (a new pause, a budget still reached) loses nothing: the task is still a wait within
+        // its bound, the next resume starts it, and past the bound the normal path applies.
+      }
+    }
+    return { issues: waiting.length, woken };
   }
 
   async function readAdapterDeclaredWaitBoundStart(
@@ -5024,10 +5085,10 @@ export function recoveryService(
       // `blocked` two seconds later ("the original assignee is not invokable"). After the resume nothing started
       // them again: the router never serves a blocked task. A pause does not end a declared wait: while the wait
       // is within its bound, neither block nor requeue, and leave the series' note, as for an invokable assignee
-      // (the gate further down). Any pause (manual, company, budget); an agent in error or terminated is not
-      // paused and keeps today's path. Past the bound the normal path applies, the block below included.
-      if (agent?.status === "paused" && agent.companyId === issue.companyId
-        && (issue.status !== "in_review" || participantAgentId)) {
+      // (the gate further down). Any pause (manual, company, budget); a terminated agent or one pending approval
+      // is not paused and keeps today's path. Past the bound the normal path applies, the block below included.
+      // In review nothing changes: the block below serves work statuses only, and the gate already holds the wait.
+      if (agent?.status === "paused" && agent.companyId === issue.companyId && issue.status !== "in_review") {
         const pausedOwnRun = latestRun?.agentId === agentId && latestRun.startedAt
           ? latestRun
           : await getLatestStartedIssueRunForAgent(issue.companyId, issue.id, agentId);
@@ -7047,6 +7108,7 @@ export function recoveryService(
     scanSilentActiveRuns,
     registerActiveRunSilenceWork: watchdog.registerSilenceWork,
     reconcileStrandedAssignedIssues,
+    wakeDeclaredWaitsAfterPause,
     reconcileUnassignedBlockingIssues,
     reconcileActiveRecoveryActions,
     reconcileLegacyContinuation,

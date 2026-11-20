@@ -1072,5 +1072,116 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
         expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
       }
     }, 240_000);
+
+    // Point 2: the router's wake can be lost to the pause. The plugin's wake is refused before the queue, and written
+    // nowhere, while the agent's budget is reached or its company is paused; the resume then starts the task once.
+    const LIFTED = "issue_declared_wait_pause_lifted";
+    const wakesOf = (f: Seeded) => db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.agentId, f.agentId)));
+    const liftedWakes = async (f: Seeded) => (await wakesOf(f)).filter(wake => wake.reason === LIFTED);
+    const companyIs = (f: Seeded, paused: boolean) => db.update(companies).set(paused
+      ? { status: "paused", pauseReason: "manual", pausedAt: new Date() }
+      : { status: "active", pauseReason: null, pausedAt: null }).where(eq(companies.id, f.companyId));
+    async function routerWakeRefusedBeforeTheQueue(f: Seeded) {
+      const host = routerHost();
+      try {
+        await expect(host.issues.requestWakeup({ companyId: f.companyId, issueId: f.issueId,
+          reason: "worker_router_group_ready", idempotencyKey: `router-ready/${randomUUID()}` } as any)).rejects.toThrow();
+      } finally { host.dispose(); }
+      expect(await wakesOf(f)).toHaveLength(0);
+    }
+    async function expectStartedOnceAndDone(f: Seeded) {
+      await expect.poll(async () => (await runsOf(f)).length, { timeout: 30_000 }).toBe(f.runIds.length + 1);
+      const started = (await runsOf(f)).find(run => !f.runIds.includes(run.id))!;
+      expect(started.contextSnapshot).toMatchObject({ issueId: f.issueId, wakeReason: LIFTED, declaredWaitRunId: f.runIds.at(-1) });
+      await expect.poll(async () => (await runsOf(f)).find(run => run.id === started.id)?.status, { timeout: 30_000 }).toBe("succeeded");
+      expect((await issueOf(f.issueId)).status).toBe("done");
+      expect(await liftedWakes(f)).toHaveLength(1);
+    }
+
+    it("starts the task once at the resume when the router's wake was lost to a budget pause or a company pause", async () => {
+      for (const kind of ["budget", "company"] as const) {
+        const f = await seed("todo", WAITED);
+        await pause(f, kind === "budget" ? "budget" : "company_paused");
+        if (kind === "company") await companyIs(f, true);
+        await sweepTwice(f);
+        await routerWakeRefusedBeforeTheQueue(f);
+        await expectKept(f, "todo");
+        if (kind === "company") await companyIs(f, false);
+        await resume(f);
+        await expectStartedOnceAndDone(f);
+        // A second resume starts nothing more.
+        await resume(f);
+        await heartbeat.drainActiveRunExecutions();
+        expect(await liftedWakes(f)).toHaveLength(1);
+        expect((await runsOf(f)).length).toBe(f.runIds.length + 1);
+      }
+    }, 240_000);
+
+    it("starts the task once, not twice, when the wake refused during the pause was kept and replayed", async () => {
+      const f = await seed("todo", WAITED);
+      await pause(f);
+      const host = routerHost();
+      try {
+        await expect(host.issues.requestWakeup({ companyId: f.companyId, issueId: f.issueId,
+          reason: "worker_router_group_ready", idempotencyKey: `router-ready/${randomUUID()}` } as any)).rejects.toThrow();
+      } finally { host.dispose(); }
+      await resume(f);
+      await expect.poll(async () => (await issueOf(f.issueId)).status, { timeout: 30_000 }).toBe("done");
+      await heartbeat.drainActiveRunExecutions();
+      expect(await liftedWakes(f)).toHaveLength(0);
+      expect((await runsOf(f)).length).toBe(f.runIds.length + 1);
+    }, 240_000);
+
+    it("starts nothing at the resume while a wake or a run of the agent is live for the task", async () => {
+      const wake = await seed("todo", WAITED);
+      const [live] = await db.insert(agentWakeupRequests).values({ companyId: wake.companyId, agentId: wake.agentId,
+        source: "automation", triggerDetail: "system", reason: "issue_assigned", status: "queued", payload: { issueId: wake.issueId } }).returning();
+      expect(await heartbeat.wakeDeclaredWaitsAfterPause({ companyId: wake.companyId, agentId: wake.agentId })).toEqual({ issues: 1, woken: 0 });
+      await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, live.id));
+      const run = await seed("in_progress", WAITED);
+      const [queued] = await db.insert(heartbeatRuns).values({ companyId: run.companyId, agentId: run.agentId,
+        invocationSource: "assignment", triggerDetail: "system", status: "queued",
+        contextSnapshot: { issueId: run.issueId, taskId: run.issueId } }).returning();
+      expect(await heartbeat.wakeDeclaredWaitsAfterPause({ companyId: run.companyId, agentId: run.agentId })).toEqual({ issues: 1, woken: 0 });
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, queued.id));
+      // Without them, the same call starts each task.
+      for (const f of [wake, run]) {
+        expect(await heartbeat.wakeDeclaredWaitsAfterPause({ companyId: f.companyId, agentId: f.agentId })).toEqual({ issues: 1, woken: 1 });
+        await expect.poll(async () => (await issueOf(f.issueId)).status, { timeout: 30_000 }).toBe("done");
+      }
+      await heartbeat.drainActiveRunExecutions();
+    }, 240_000);
+
+    it("starts nothing at the resume for a wait past its bound, another failure, or a task not at work", async () => {
+      const machine = ADAPTER_DECLARED_WAIT_MAX_MS / 60_000;
+      const past = await seed("todo", [{ minutesAgo: machine + 12, errorCode: WAIT }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
+      const failed = await seed("todo", [{ minutesAgo: 40, errorCode: "process_lost" }]);
+      const blocked = await seed("blocked", WAITED);
+      const backlog = await seed("backlog", WAITED);
+      const review = await seed("in_review", WAITED, { review: true });
+      for (const f of [past, failed, blocked, backlog, review]) {
+        await pause(f);
+        await resume(f);
+        expect(await liftedWakes(f)).toHaveLength(0);
+        expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+      }
+      await heartbeat.drainActiveRunExecutions();
+    }, 240_000);
+
+    it("loses nothing when the start is refused at the resume: the next resume starts the task", async () => {
+      const f = await seed("todo", WAITED);
+      await pause(f, "company_paused");
+      await companyIs(f, true);
+      // The role is ready again while its company is still paused: the start is refused, and the resume does not fail.
+      await resume(f);
+      await heartbeat.drainActiveRunExecutions();
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+      expect((await issueOf(f.issueId)).status).toBe("todo");
+      await companyIs(f, false);
+      await resume(f);
+      await expect.poll(async () => (await issueOf(f.issueId)).status, { timeout: 30_000 }).toBe("done");
+      expect((await runsOf(f)).length).toBe(f.runIds.length + 1);
+    }, 240_000);
   });
 });

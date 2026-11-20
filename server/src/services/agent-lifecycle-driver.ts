@@ -23,6 +23,8 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
       // comments) reach the agent once, per task it still owns.
       await replayWakesMissedDuringPause(db, { companyId: agent.companyId, agentId: agent.id,
         wakeup: (agentId, opts) => heartbeat.wakeup(agentId, opts) });
+      // STUDIO-0076: a task that waits on a declared wait starts once; its owner's wake can be lost to the pause.
+      await heartbeat.wakeDeclaredWaitsAfterPause({ companyId: agent.companyId, agentId: agent.id });
     },
     async requiredPluginIds(agent) {
       const selected = agent.lifecycleRequiredPluginIds;
