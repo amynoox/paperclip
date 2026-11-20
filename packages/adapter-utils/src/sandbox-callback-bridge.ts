@@ -347,21 +347,27 @@ function shellQuote(value: string) {
 // - neither ends a process that the system shows to be something else (a number reused after a restart).
 
 /**
- * Shell function `bridge_end <pid> <strict|own>`: ends the process when it is a bridge of this folder, which is read
- * from its command line (it holds the bridge's entrypoint). `strict` (a number another run recorded): only a process
- * shown to be one. `own` (a number of this very launch): also a live process whose command line cannot be read, as
- * before this patch. Returns 0 when it ended a process.
+ * Shell function `bridge_end <pid> <strict|own>`: ends the process when its command line shows it to be a bridge.
+ * - `strict`, for a number another run recorded: only a process whose command line holds the entrypoint of THIS
+ *   folder's bridge. A process that cannot be read is left.
+ * - `own`, for a number of this very launch: a process whose command line holds the bridge's entrypoint file name
+ *   (the folder is known already), and also a live process whose command line cannot be read, as before this patch.
+ * The whole command line is asked for (`-ww`): without a terminal a BSD `ps` cuts it at 79 columns, which is shorter
+ * than the path of a bridge's entrypoint. Returns 0 when it ended a process.
  */
 function bridgeEndShellFunction(entrypoint: string): string[] {
   return [
     "bridge_end() {",
     `  case "$1" in ''|*[!0-9]*) return 1 ;; esac`,
-    `  bridge_args="$(ps -p "$1" -o args= 2>/dev/null || true)"`,
-    `  case "$bridge_args" in`,
-    `    *${shellQuote(entrypoint)}*) ;;`,
-    `    '') if [ "$2" = strict ]; then return 1; fi; kill -0 "$1" 2>/dev/null || return 1 ;;`,
-    "    *) return 1 ;;",
-    "  esac",
+    `  bridge_args="$(ps -ww -p "$1" -o args= 2>/dev/null || true)"`,
+    `  if [ -z "$bridge_args" ]; then`,
+    `    if [ "$2" = strict ]; then return 1; fi`,
+    `    kill -0 "$1" 2>/dev/null || return 1`,
+    `  elif [ "$2" = strict ]; then`,
+    `    case "$bridge_args" in *${shellQuote(entrypoint)}*) ;; *) return 1 ;; esac`,
+    "  else",
+    `    case "$bridge_args" in *${shellQuote(SANDBOX_CALLBACK_BRIDGE_ENTRYPOINT)}*) ;; *) return 1 ;; esac`,
+    "  fi",
     `  kill "$1" 2>/dev/null || true`,
     "  i=0",
     `  while kill -0 "$1" 2>/dev/null && [ "$i" -lt 40 ]; do`,

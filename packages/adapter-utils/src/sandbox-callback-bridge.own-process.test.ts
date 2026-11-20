@@ -328,6 +328,29 @@ describe("sandbox callback bridge: each bridge is known by the process its own l
     expect(await pidFileOf(folder.directories)).toBeNull();
   }, 60_000);
 
+  it("on a machine whose `ps` cuts a command line at 79 columns unless asked for all of it, the bridges are still recognised", async () => {
+    const folder = await taskFolder();
+    // A BSD `ps` with no terminal attached, as on a Mac reached over ssh: 79 columns, unless `-ww` is given.
+    const bin = path.join(path.dirname(folder.shim), "bsd-ps");
+    await mkdir(bin, { recursive: true });
+    await writeFile(path.join(bin, "ps"), [
+      "#!/bin/sh",
+      'for arg in "$@"; do if [ "$arg" = "-ww" ]; then exec /bin/ps "$@"; fi; done',
+      '/bin/ps "$@" | cut -c1-79',
+      "",
+    ].join("\n"), { mode: 0o755 });
+    const runner = () => createExecRunner(undefined, { pathFirst: bin });
+    const a = await folder.launch(runner());
+    // The path of the entrypoint is longer than what such a `ps` shows by default.
+    expect(folder.directories.readyFile.length).toBeGreaterThan(79);
+    const b = await folder.launch(runner());
+    expect(b.stoppedStalePid).toBe(a.pid);
+    expect(alive(a.pid)).toBe(false);
+    await b.stop();
+    expect(alive(b.pid)).toBe(false);
+    expect(await pidFileOf(folder.directories)).toBeNull();
+  }, 60_000);
+
   it("a launch whose report cannot be read falls back on the number the bridge wrote in ready.json", async () => {
     const folder = await taskFolder();
     const bridge = await folder.launch(createExecRunner(() => "some wrapper banner\n"));
