@@ -4,7 +4,7 @@ import { once } from "node:events";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { activityLog, agents, agentWakeupRequests, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns,
   instanceUserRoles, issueComments, issueRecoveryActions, issueRelations, issueThreadInteractions, issues } from "@paperclipai/db";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { projectCompanyHolds } from "../modules/agent-lifecycle/adapters/company-policy.js";
 import { createLifecycleStore } from "../modules/agent-lifecycle/adapters/postgres.js";
@@ -341,6 +341,26 @@ describe("the runs a pause cut, when the role resumes", () => {
       } finally { await other.stop().catch(() => undefined); }
     });
 
+    // The leader of the recorded group is gone and a program it started still runs under the group's number. The
+    // birth time of the leader cannot be read, so nothing says the number changed hands: the stop is not proven.
+    it("the leader of the recorded group is gone but one of its programs still runs: the request is kept, and starts once the group is empty", async () => {
+      const leader = spawn("sh", ["-c", "sleep 120 & exit 0"], { stdio: "ignore", detached: true });
+      const group = leader.pid!;
+      await once(leader, "exit");
+      const groupRuns = () => { try { process.kill(-group, 0); return true; } catch { return false; } };
+      try {
+        expect(groupRuns()).toBe(true);
+        const f = await fixture();
+        await db.update(heartbeatRuns).set({ processGroupId: group }).where(eq(heartbeatRuns.id, f.cut.id));
+        await roleResumes(f);
+        await expectKept(f, "stop_not_proven", "process_running");
+        process.kill(-group, "SIGKILL");
+        await vi.waitFor(() => expect(groupRuns()).toBe(false), { timeout: 10_000, interval: 50 });
+        await keptRequestsAreLookedAtAgain(f);
+        expect(await continuations(f)).toHaveLength(1);
+      } finally { try { process.kill(-group, "SIGKILL"); } catch { /* the group is already empty */ } }
+    });
+
     // The resume follows the pause closely: the environment of the cut run is not released yet.
     it("the local environment of the cut run is not released yet: the request is kept, and starts once it is", async () => {
       const f = await fixture({ leaseNotReleased: true });
@@ -459,6 +479,12 @@ describe("the runs a pause cut, when the role resumes", () => {
       // The ready hook called again for the same ready state does not take its own kept request for a person's.
       await createLifecycleDriver(db, {} as never).onReady!(await state(f.agentId) as never);
       await expectKept(f, "waiting_for_person", "decision_pending");
+      // The note of thirty minutes is about a stop that is not proven: a request that waits for a person gets none.
+      await db.update(agentWakeupRequests).set({ createdAt: new Date(Date.now() - 31 * 60_000) })
+        .where(and(eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      for (let look = 0; look < 2; look += 1) await keptRequestsAreLookedAtAgain(f);
+      expect(await systemNotes(f)).toHaveLength(0);
+      expect(await traceList(f)).not.toContain(`${PAUSE_CUT_WORK_KEPT}:still_waiting_for_stop_proof`);
     });
 
     it("a kept request whose task its owner then blocks: nothing starts while it is blocked, and the task says so once", async () => {
