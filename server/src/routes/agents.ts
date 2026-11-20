@@ -5925,13 +5925,16 @@ export function agentRoutes(
       });
       return;
     }
-    const agent = await svcLifecycle.resumeAgent(id);
+    const actor = getActorInfo(req);
+    // STUDIO-0074: a person's resume says who asks, in the resume command itself. The runs this pause cut continue
+    // in that person's name once the agent is ready (pause-resume-continuation.ts). An agent's resume names nobody.
+    const agent = await svcLifecycle.resumeAgent(id, "user",
+      actor.actorType === "user" ? { userId: actor.actorId, source: actor.actorSource } : undefined);
     if (!agent) {
       res.status(404).json({ error: "Agent not found" });
       return;
     }
 
-    const actor = getActorInfo(req);
     await logActivity(db, {
       companyId: agent.companyId,
       actorType: actor.actorType,

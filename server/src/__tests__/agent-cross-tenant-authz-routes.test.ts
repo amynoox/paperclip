@@ -191,6 +191,8 @@ vi.mock("../routes/authz.js", async () => {
       agentId: null,
       runId: req.actor.runId ?? null,
       agentApiKeyId: null,
+      // As the real getActorInfo returns it (STUDIO-0074: the resume command carries it).
+      actorSource: req.actor.source ?? "session",
     };
   }
 
@@ -470,7 +472,8 @@ describe("agent cross-tenant route authorization", () => {
     );
 
     expect(res.status).toBe(200);
-    expect(mockAgentService.resume).toHaveBeenCalledWith(agentId);
+    // STUDIO-0074: the resume command carries the person who asks and how that person was signed in.
+    expect(mockAgentService.resume).toHaveBeenCalledWith(agentId, "user", { userId: "board-user", source: "local_implicit" });
     expect(mockLogActivity).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
       companyId,
       actorType: "user",
@@ -539,7 +542,8 @@ describe("agent cross-tenant route authorization", () => {
       resource: { type: "agent", companyId, agentId },
       scope: { requiresChangeGrant: true },
     }));
-    expect(mockAgentService.resume).toHaveBeenCalledWith(agentId);
+    // STUDIO-0074: an agent's resume names no person.
+    expect(mockAgentService.resume).toHaveBeenCalledWith(agentId, "user", undefined);
   });
 
   it.each([

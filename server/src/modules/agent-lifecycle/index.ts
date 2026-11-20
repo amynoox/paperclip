@@ -15,6 +15,8 @@ import { hasCompanyHoldMismatch, projectCompanyHolds } from "./adapters/company-
 import { createLifecycleWorker } from "./application/worker.js";
 import type { LifecycleDriver } from "./application/ports.js";
 
+export type { PauseResumeOperation, ResumeRequester } from "./adapters/postgres.js";
+import type { ResumeRequester } from "./adapters/postgres.js";
 export { applyAgentPolicyHoldsInTransaction, releaseAgentLifecycleLeaseOfHolderInTransaction, requestAgentLifecycleRecheckInTransaction } from "./adapters/postgres.js";
 export { companyHoldMismatch, fenceActiveCompanyAgentStopsInTransaction } from "./adapters/company-policy.js";
 
@@ -67,8 +69,9 @@ export function createAgentLifecycle(db: Db, effects: LifecycleEffects) {
   assertRootDatabase(db);
   const records = agentRecords(db, effects);
   const store = createLifecycleStore(db, effects);
-  async function change(id: string, command: "pause" | "resume" | "terminate" | "retry", reason?: string) {
-    const result = await store.change(id, command, { reason });
+  async function change(id: string, command: "pause" | "resume" | "terminate" | "retry", reason?: string,
+    requestedBy?: ResumeRequester) {
+    const result = await store.change(id, command, { reason, ...(requestedBy ? { requestedBy } : {}) });
     if (result) scheduleAgentLifecycle(db, id);
     return result ? records.getById(id) : null;
   }
@@ -112,7 +115,8 @@ export function createAgentLifecycle(db: Db, effects: LifecycleEffects) {
       return agent;
     },
     pauseAgent: (id: string, reason = "manual") => change(id, "pause", reason),
-    resumeAgent: (id: string, reason = "user") => change(id, "resume", reason),
+    // STUDIO-0074: `requestedBy` is the person who asks, kept on the operation for the continuation of cut runs.
+    resumeAgent: (id: string, reason = "user", requestedBy?: ResumeRequester) => change(id, "resume", reason, requestedBy),
     terminateAgent: (id: string) => change(id, "terminate"),
     retry: (id: string) => change(id, "retry"),
     clearError: records.clearError,
