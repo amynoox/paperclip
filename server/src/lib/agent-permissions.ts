@@ -1,12 +1,15 @@
 import { LOW_TRUST_REVIEW_PRESET, type PermissionKey } from "@paperclipai/shared";
 
-/** Direct grants for newly activated standard agents. Existing agents are not backfilled. */
+/**
+ * Direct grants for newly activated standard agents. Existing agents are not backfilled.
+ *
+ * STUDIO-0084: a new agent no longer receives the rights over other agents (`agents:configure`,
+ * `agents:suggest-changes`), over the company's skills (`skills:create`, `skills:suggest-changes`) and over another
+ * agent's checked-out work (`tasks:manage_active_checkouts`). The Board gives them case by case. What an agent does
+ * to itself, and what a manager does for its reports, does not come from these grants and stays.
+ */
 export const NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS = [
   "agents:read",
-  "agents:configure",
-  "agents:suggest-changes",
-  "skills:create",
-  "skills:suggest-changes",
   "tools:manage_connections",
   "tools:manage_profiles",
   "tools:view_audit",
@@ -16,7 +19,6 @@ export const NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS = [
   "inbox:manage",
   "tasks:assign",
   "tasks:assign_scope",
-  "tasks:manage_active_checkouts",
 ] as const satisfies readonly PermissionKey[];
 
 export function newStandardAgentGrantScope(

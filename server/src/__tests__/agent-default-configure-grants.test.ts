@@ -14,10 +14,6 @@ const support = await getEmbeddedPostgresTestSupport();
 const describeDatabase = support.supported ? describe : describe.skip;
 const expectedNewAgentGrantKeys: PermissionKey[] = ([
   "agents:read",
-  "agents:configure",
-  "agents:suggest-changes",
-  "skills:create",
-  "skills:suggest-changes",
   "tools:manage_connections",
   "tools:manage_profiles",
   "tools:view_audit",
@@ -27,7 +23,6 @@ const expectedNewAgentGrantKeys: PermissionKey[] = ([
   "inbox:manage",
   "tasks:assign",
   "tasks:assign_scope",
-  "tasks:manage_active_checkouts",
 ] satisfies PermissionKey[]).sort();
 
 describeDatabase("new agent configuration defaults", () => {
@@ -44,7 +39,7 @@ describeDatabase("new agent configuration defaults", () => {
     await cleanup?.();
   });
 
-  it("grants standard new agents direct peer configuration, but keeps restricted agents narrow", async () => {
+  it("grants standard new agents the standard rights without peer configuration, and keeps restricted agents narrow", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
@@ -114,6 +109,9 @@ describeDatabase("new agent configuration defaults", () => {
     for (const permissionKey of [
       "agents:create", "environments:manage", "tools:admin", "users:invite",
       "users:manage_permissions", "joins:approve",
+      // STUDIO-0084: no longer given to a new agent; the Board gives them case by case.
+      "agents:configure", "agents:suggest-changes", "skills:create", "skills:suggest-changes",
+      "tasks:manage_active_checkouts",
     ] as const) {
       expect(await accessService(db).hasPermission(companyId, "agent", standard.id, permissionKey)).toBe(false);
     }
@@ -124,7 +122,12 @@ describeDatabase("new agent configuration defaults", () => {
       resource: { type: "agent", agentId: peer.id, companyId },
       scope: { requiresChangeGrant: true },
     });
-    expect(decision).toMatchObject({ allowed: true, reason: "allow_direct_change" });
+    expect(decision).toMatchObject({ allowed: false, reason: "deny_no_grant" });
+    expect(await authorizationService(db).decide({
+      actor: { type: "agent", agentId: standard.id, companyId, source: "agent_key" },
+      action: "agent_config:update",
+      resource: { type: "agent", agentId: standard.id, companyId },
+    })).toMatchObject({ allowed: true, reason: "allow_self" });
 
     // A later ordinary self-update must not recreate a grant removed by an operator.
     await db.delete(principalPermissionGrants).where(eq(principalPermissionGrants.principalId, standard.id));
@@ -216,7 +219,7 @@ describeDatabase("new agent configuration defaults", () => {
     await db.delete(companies).where(eq(companies.id, companyId));
   });
 
-  it("keeps configuration access when invitation approval replaces a new agent's grants", async () => {
+  it("keeps the new-agent defaults when invitation approval replaces a new agent's grants", async () => {
     const companyId = randomUUID();
     await db.insert(companies).values({
       id: companyId,
