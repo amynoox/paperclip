@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { and, asc, eq, inArray } from "drizzle-orm";
+import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { activityLog, agents, agentWakeupRequests, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns,
-  issueComments, issueRecoveryActions, issueRelations, issueThreadInteractions, issues } from "@paperclipai/db";
+  instanceUserRoles, issueComments, issueRecoveryActions, issueRelations, issueThreadInteractions, issues } from "@paperclipai/db";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { startEmbeddedPostgresTestDatabase } from "../__tests__/helpers/embedded-postgres.js";
 import { projectCompanyHolds } from "../modules/agent-lifecycle/adapters/company-policy.js";
@@ -109,7 +109,9 @@ describe("the runs a pause cut, when the role resumes", () => {
     .orderBy(asc(activityLog.createdAt));
   const traceList = async (f: Task) => (await traces(f)).map(entry => entry.details?.reason ? `${entry.action}:${entry.details.reason}` : entry.action);
   const wakes = (f: Task) => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.companyId));
-  const retries = async (f: Task) => (await wakes(f)).filter(wake => wake.reason === "task_retry" && wake.payload?.issueId === f.issueId);
+  /** The requests this resume filed for the task (not the wake their dispatch writes). */
+  const retries = async (f: Task) => (await wakes(f)).filter(wake => wake.payload?.issueId === f.issueId
+    && wake.idempotencyKey?.startsWith("task-retry:pause-resume:"));
   const continuations = async (f: Task) => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, f.companyId)))
     .filter(run => run.contextSnapshot?.previousRunId === f.cut.id);
   async function expectContinued(f: Task, person = PERSON) {
@@ -168,7 +170,8 @@ describe("the runs a pause cut, when the role resumes", () => {
 
     it("a resume made with a person's board key, recorded as such", async () => {
       const f = await fixture();
-      const key = { userId: "board", source: "board_key" };
+      const key = { userId: `operator-${randomUUID()}`, source: "board_key" };
+      await db.insert(instanceUserRoles).values({ userId: key.userId, role: "instance_admin" });
       await roleResumes(f, key);
       await expectContinued(f, key);
     });
@@ -184,6 +187,8 @@ describe("the runs a pause cut, when the role resumes", () => {
       const f = await fixture();
       await roleResumes(f);
       await createLifecycleDriver(db, {} as never).onReady!(await state(f.agentId) as never);
+      // The role then ran the continuation to its end.
+      await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(and(eq(heartbeatRuns.agentId, f.agentId), eq(heartbeatRuns.status, "queued")));
       await idle(f);
       await createAgentLifecycle(db).pauseAgent(f.agentId);
       await work.process(f.agentId);
@@ -218,11 +223,15 @@ describe("the runs a pause cut, when the role resumes", () => {
       await idle(f);
       await createAgentLifecycle(db).pauseAgent(f.agentId);
       await work.process(f.agentId);
-      expect((await state(f.agentId)).lifecycleState).toBe("paused");
-      await busy(f);
+      // The new pause waits for the same proof before it completes.
+      expect((await state(f.agentId)).lifecycleState).toBe("pausing");
       const proven = new Date(Date.now() - 13 * HOUR);
       await db.update(heartbeatRuns).set({ finishedAt: proven }).where(eq(heartbeatRuns.id, f.cut.id));
       await db.update(environmentLeases).set({ releasedAt: proven }).where(eq(environmentLeases.heartbeatRunId, f.cut.id));
+      await db.execute(sql`update agents set lifecycle_operation = lifecycle_operation - 'retryAt' where id = ${f.agentId}`);
+      await work.process(f.agentId);
+      expect((await state(f.agentId)).lifecycleState).toBe("paused");
+      await busy(f);
       // The proof is there, but the role is paused again: nothing starts.
       await heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
       expect(await continuations(f)).toHaveLength(0);
@@ -314,6 +323,13 @@ describe("the runs a pause cut, when the role resumes", () => {
       // Nobody asked for this resume: the person of the earlier pause is not reused.
       await expectRefused(later, "resumed_without_a_person");
       expect(pauseLiftedOf((await state(f.agentId)).lifecycleOperation)).toMatchObject({ requestedBy: null });
+    });
+
+    it("a resume made with a key whose person may not change the task: the product's own check keeps the request", async () => {
+      const f = await fixture();
+      await roleResumes(f, { userId: `stranger-${randomUUID()}`, source: "board_key" });
+      expect(await continuations(f)).toHaveLength(0);
+      expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:retry_authority_denied`]);
     });
 
     it("a resume signed in by a source the Retry does not accept", async () => {
