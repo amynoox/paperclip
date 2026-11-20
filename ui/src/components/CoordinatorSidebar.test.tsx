@@ -14,7 +14,7 @@ import { queryKeys } from "@/lib/queryKeys";
 const fixture = vi.hoisted(() => ({ attention: vi.fn(), summary: vi.fn(), openNewIssue: vi.fn(), pathname: "/COO/issues", collapsed: false, userId: "reviewer", chats: [] as Array<{ isUnreadForMe: boolean }>,
   recentTasks: [] as Array<Record<string, unknown>>, projects: [] as Array<Record<string, unknown>>, projectTasks: vi.fn(), enableCases: false, agents: [] as Agent[],
   // What GET /plugins/ui-contributions answers: the declarations of the plugins that are ready, or a failure.
-  contributions: [] as unknown[], contributionsFail: false }));
+  contributions: [] as unknown[], contributionsFail: false, companyPrefix: "COO" as string | null }));
 vi.mock("@/hooks/useAgentChatNavigation", () => ({ useAgentChatNavigation: () => ({
   companyId: "company", userId: fixture.userId, agents: { data: fixture.agents }, chats: { data: fixture.chats }, session: { isSuccess: true },
 }) }));
@@ -34,7 +34,7 @@ vi.mock("@/lib/router", () => ({
   useLocation: () => ({ pathname: fixture.pathname, search: "" }),
   // The company on screen. This stand-in Link adds no prefix: a plugin entry carries its own (see the
   // company test file, which mounts the real router).
-  useActiveCompanyPrefix: () => "COO",
+  useActiveCompanyPrefix: () => fixture.companyPrefix,
   Link: ({ to, children, ...props }: { to: string; children: ReactNode }) => <a href={to} {...props}>{children}</a>,
   NavLink: ({ to, children, className, state: _state, end: _end, ...props }: {
     to: string; children: ReactNode; className?: string | ((state: { isActive: boolean }) => string); state?: unknown; end?: boolean;
@@ -57,7 +57,7 @@ let root: Root, container: HTMLDivElement, client: QueryClient;
 beforeEach(() => {
   vi.clearAllMocks(); localStorage.clear(); fixture.collapsed = false; fixture.userId = "reviewer"; fixture.pathname = "/COO/issues";
   fixture.chats = []; fixture.recentTasks = []; fixture.projects = []; fixture.enableCases = false; fixture.agents = [];
-  fixture.contributions = []; fixture.contributionsFail = false;
+  fixture.contributions = []; fixture.contributionsFail = false; fixture.companyPrefix = "COO";
   fixture.summary.mockResolvedValue(summary([pending("question"), pending("review")]));
   container = document.createElement("div"); document.body.appendChild(container); root = createRoot(container);
   client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -201,6 +201,9 @@ describe("Coordinator pinned pages", () => {
 // them. "Machines" is a page of the worker router plugin, declared exactly as below in its manifest (0.30.21 and
 // later); the left menu of the coordinator view mounted no plugin entry at all.
 describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
+  // The function is given the company on screen; without one it gives nothing (see the case below).
+  const build = (contributions: Parameters<typeof buildPluginMoreDestinations>[0], taken: Parameters<typeof buildPluginMoreDestinations>[1], companyPrefix: string | null = "COO") =>
+    buildPluginMoreDestinations(contributions, taken, companyPrefix);
   const slot = (patch: Record<string, unknown>) => ({ id: "slot", displayName: "Slot", exportName: "Slot", ...patch });
   const contribution = (pluginKey: string, slots: Array<Record<string, unknown>>) =>
     ({ pluginId: `id-${pluginKey}`, pluginKey, displayName: pluginKey, version: "1.0.0", uiEntryFile: "index.js", slots, launchers: [] }) as unknown as PluginUiContribution;
@@ -314,12 +317,12 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
       slot({ type: "page", id: "p2", displayName: "Other page", routePath: "fleet-other", order: 2 }),
       slot({ type: "page", id: "p1", displayName: "Fleet page", routePath: "fleet", order: 1 }),
     ]);
-    expect(buildPluginMoreDestinations([two], []).map(item => [item.label, item.to])).toEqual([["Fleet", "/fleet"]]);
+    expect(build([two], []).map(item => [item.label, item.to])).toEqual([["Fleet", "/fleet"]]);
   });
 
   it("gives one destination per plugin, sorted by name, and never a path a built-in page or another plugin uses", () => {
     const page = (routePath: string, label: string) => [slot({ type: "page", routePath }), slot({ type: "sidebar", displayName: label })];
-    const destinations = buildPluginMoreDestinations([
+    const destinations = build([
       contribution("z", page("zebra", "Zebra")),
       router,
       contribution("shadow-more", page("projects", "Fake projects")),
@@ -327,7 +330,7 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
       contribution("duplicate", page("machines", "Machines again")),
     ], [{ to: "/projects" }]);
     expect(destinations.map(item => [item.label, item.to])).toEqual([["Machines", "/machines"], ["Zebra", "/zebra"]]);
-    expect(buildPluginMoreDestinations(undefined, [])).toEqual([]);
+    expect(build(undefined, [])).toEqual([]);
   });
 
   // The server validates a manifest at install (packages/shared/src/validators/plugin.ts: a slot's displayName
@@ -338,7 +341,7 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
       [{ type: "page", id: "p", exportName: "P", ...page }, { type: "sidebar", id: "m", exportName: "M", ...menu }];
     const named = (pluginKey: string, displayName: unknown, slots: Array<Record<string, unknown>>) =>
       ({ ...contribution(pluginKey, slots), displayName }) as unknown as PluginUiContribution;
-    expect(buildPluginMoreDestinations([
+    expect(build([
       named("page-name", "Plugin A", pair({ routePath: "alpha", displayName: "Alpha page" }, {})),
       named("plugin-name", "Plugin B", pair({ routePath: "beta" }, { displayName: "   " })),
       named("no-name", undefined, pair({ routePath: "gamma" }, { displayName: null })),
@@ -355,9 +358,9 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
       null,
       undefined,
     ] as unknown as PluginUiContribution[];
-    expect(buildPluginMoreDestinations([...broken, router], []).map(item => [item.label, item.to])).toEqual([["Machines", "/machines"]]);
-    expect(buildPluginMoreDestinations(broken, [])).toEqual([]);
-    expect(buildPluginMoreDestinations({} as unknown as PluginUiContribution[], [])).toEqual([]);
+    expect(build([...broken, router], []).map(item => [item.label, item.to])).toEqual([["Machines", "/machines"]]);
+    expect(build(broken, [])).toEqual([]);
+    expect(build({} as unknown as PluginUiContribution[], [])).toEqual([]);
   });
 
   it("two plugins, one of them incomplete: the left menu renders, with the complete one behind More", async () => {
@@ -376,7 +379,7 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
 
   it("a route declared with leading slashes gives one clean path, compared with the taken ones after that", () => {
     const page = (routePath: string, label: string) => [slot({ type: "page", routePath }), slot({ type: "sidebar", displayName: label })];
-    expect(buildPluginMoreDestinations([
+    expect(build([
       contribution("slash", page("/machines", "Machines")),
       contribution("slashes", page("//fleet", "Fleet")),
       contribution("same-after", page("///machines", "Machines again")),
@@ -386,12 +389,33 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
     ], [{ to: "/projects" }]).map(item => [item.label, item.to])).toEqual([["Fleet", "/fleet"], ["Machines", "/machines"]]);
   });
 
+  it.each([null, "", "  "])("while the company on screen is not known (%j) there is no plugin entry and no plugin pin; they appear when it is", async (unknown) => {
+    fixture.contributions = [router];
+    fixture.companyPrefix = unknown;
+    localStorage.setItem(KEY, JSON.stringify(["/machines", "/projects"]));
+    await renderSidebar();
+    // The built-in pin is there; the plugin's is not shown, and is kept.
+    expect(pinnedPage("/projects")?.textContent).toBe("Projects");
+    expect(navigation().textContent).not.toContain("Machines");
+    await click("More workspace pages");
+    expect(moreLinks()).toEqual(["/search", "/dashboard", "/projects", "/routines", "/artifacts", "/agents/all", "/skills", "/apps", "/activity", "/settings"]);
+    expect(document.querySelector('a[href="/machines"]')).toBeNull();
+    expect(JSON.parse(localStorage.getItem(KEY)!)).toEqual(["/machines", "/projects"]);
+    // The company becomes known: the entry and the pin appear, with its prefix.
+    fixture.companyPrefix = "BAN";
+    await renderSidebar();
+    expect(moreLinks().at(-1)).toBe("/BAN/machines");
+    expect(navigation().querySelector('a[href="/BAN/machines"]')?.textContent).toBe("Machines");
+    expect(document.querySelector('a[href="/machines"]')).toBeNull();
+  });
+
   it("carries its link with the company prefix, and keeps a key that holds no company", () => {
-    const [machines] = buildPluginMoreDestinations([router], [], "ban");
+    const [machines] = build([router], [], "ban");
     expect(machines).toMatchObject({ label: "Machines", to: "/machines", href: "/BAN/machines" });
-    for (const none of [undefined, null, "", "  "]) expect(buildPluginMoreDestinations([router], [], none)[0]).not.toHaveProperty("href");
+    // Without a company there is no entry at all: its link could only be the bare path.
+    for (const none of [undefined, null, "", "  "]) expect(buildPluginMoreDestinations([router], [], none)).toEqual([]);
     // A route declared with a slash gives the same link.
-    expect(buildPluginMoreDestinations([contribution("slash", [slot({ type: "page", routePath: "/fleet" }), slot({ type: "sidebar", displayName: "Fleet" })])], [], "BAN")[0])
+    expect(build([contribution("slash", [slot({ type: "page", routePath: "/fleet" }), slot({ type: "sidebar", displayName: "Fleet" })])], [], "BAN")[0])
       .toMatchObject({ to: "/fleet", href: "/BAN/fleet" });
     // The pinned row: the same key, the prefixed link. A built-in destination has no link of its own.
     expect(buildPinnedNavigationItems(["/projects", "/machines"], [], [machines!, { to: "/projects", label: "Projects", icon: machines!.icon }])
@@ -407,7 +431,7 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
       // It has a menu entry, but nothing of the kind "page".
       slot({ type: "sidebar", displayName: "Menu entry" }),
     ]);
-    expect(buildPluginMoreDestinations([other], [])).toEqual([]);
+    expect(build([other], [])).toEqual([]);
   });
 });
 afterEach(async () => { await act(async () => root.unmount()); client.clear(); container.remove(); });

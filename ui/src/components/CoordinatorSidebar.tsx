@@ -62,7 +62,9 @@ const primaryDestinations = [{ to: "/chats" }, { to: "/issues" }, { to: "/decisi
  * The link. A plugin page is served at `/<company prefix>/<routePath>`, and the router's own prefixing only
  * knows the host's roots: it would take `/machines` for a company named MACHINES. So the entry carries its
  * link already prefixed (`href`), as the host does for Cases links, while its key stays `/<routePath>`: a pin
- * holds no company and is rendered with the prefix of the company on screen.
+ * holds no company and is rendered with the prefix of the company on screen. While that company is not known
+ * (a first render, a page outside any company) there is no plugin entry and no plugin pin at all: its link
+ * could only be the bare path.
  */
 export function buildPluginMoreDestinations(contributions: readonly PluginUiContribution[] | undefined, taken: readonly { to: string }[], companyPrefix?: string | null): MoreDestination[] {
   const used = new Set([...primaryDestinations, ...taken].map(item => item.to));
@@ -70,6 +72,7 @@ export function buildPluginMoreDestinations(contributions: readonly PluginUiCont
   const text = (value: unknown) => (typeof value === "string" ? value.trim() : "");
   const routeOf = (slot: { routePath?: unknown }) => text(slot.routePath).replace(/^\/+/, "");
   const prefix = text(companyPrefix) ? normalizeCompanyPrefix(text(companyPrefix)) : "";
+  if (!prefix) return [];
   const entries: MoreDestination[] = [];
   for (const contribution of Array.isArray(contributions) ? contributions : []) {
     const slots: PluginUiContribution["slots"] = Array.isArray(contribution?.slots) ? contribution.slots.filter(Boolean) : [];
@@ -81,7 +84,7 @@ export function buildPluginMoreDestinations(contributions: readonly PluginUiCont
     const to = `/${routeOf(page)}`;
     if (used.has(to)) continue;
     used.add(to);
-    entries.push({ label, to, icon: Puzzle, ...(prefix ? { href: `/${prefix}${to}` } : {}) });
+    entries.push({ label, to, icon: Puzzle, href: `/${prefix}${to}` });
   }
   return entries.sort((a, b) => a.label.localeCompare(b.label));
 }
