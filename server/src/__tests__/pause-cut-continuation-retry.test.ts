@@ -370,6 +370,13 @@ const support = await getEmbeddedPostgresTestSupport();
     const held = { companyId: f.companyId, issueId: f.issueId, runId: failed.id };
     // As it is, the task is held by the request that waits.
     expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(true);
+    // Once the role has run again on the task, that failed start is history: nothing is held for it.
+    const newer = randomUUID();
+    await db.insert(heartbeatRuns).values({ id: newer, companyId: f.companyId, agentId: f.agentId, status: "succeeded",
+      contextSnapshot: { issueId: f.issueId }, finishedAt: new Date() });
+    expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(false);
+    await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, newer));
+    expect(await keepPauseCutWorkAfterFailedStart(db, held)).toBe(true);
     await db.update(agentWakeupRequests).set({ status: "cancelled" }).where(eq(agentWakeupRequests.id, (await askedAgain(f))[0]!.wake.id));
     // The same run, had its adapter been invoked: nothing is filed.
     await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: failed.id, seq: 200_000,
