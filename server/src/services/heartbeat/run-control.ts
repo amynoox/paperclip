@@ -8,7 +8,7 @@ import { resumeDeferredChatWake } from "../durable-chat-wakeup.js";
 import { notifyEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { readNativeStopExecutionEvidence } from "./native-stop-evidence-read.js";
 import { readTaskRetryIntent, reconcileTaskChatRetryReceipts } from "../task-retry.js";
-import { PAUSE_RESUME_RETRY_KEY_PREFIX, pauseCutWorkRequestMayStart, recordPauseCutWorkContinued } from "../pause-resume-continuation.js";
+import { PAUSE_RESUME_RETRY_KEY_PREFIX, notePauseCutWorkStillWaiting, pauseCutWorkRequestMayStart, recordPauseCutWorkContinued } from "../pause-resume-continuation.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, readNativeLocalProcessStop, recordedLocalExecutionStopped } from "../native-local-process-stop.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { pendingCaseHandoffForRun, cancelCaseHandoffsForIssue, isCaseHandoffSourceReleased } from "./case-handoff-lifecycle.js";
@@ -868,6 +868,14 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         actorSource: intent.actorSource, continuationRunId: startedRunId }).catch(err =>
         logger.error({ err, companyId, issueId, requestId: wake.id, runId: startedRunId },
           "the run that continues work a pause cut started, but its record on the task could not be written"));
+    }
+    // STUDIO-0074: still kept after this look. Past thirty minutes of waiting for the stop proof, the task says so, once.
+    if (!startedRunId && wake.idempotencyKey?.startsWith(PAUSE_RESUME_RETRY_KEY_PREFIX)) {
+      await notePauseCutWorkStillWaiting(db, { companyId, agentId: wake.agentId, issueId, retryRequestId: wake.id,
+        idempotencyKey: wake.idempotencyKey, cutRunId: intent.sourceRunId, actorId: intent.actorId,
+        actorSource: intent.actorSource }).catch(err =>
+        logger.error({ err, companyId, issueId, requestId: wake.id },
+          "a request that continues work a pause cut still waits, but its note on the task could not be written"));
     }
   }
 

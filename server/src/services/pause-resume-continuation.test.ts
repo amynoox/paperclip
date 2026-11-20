@@ -55,6 +55,8 @@ describe("the runs a pause cut, when the role resumes", () => {
     group?: boolean;
     /** No process was ever recorded on the run. */
     noProcess?: boolean;
+    /** The environment of the cut run is not released yet: the resume follows the pause closely. */
+    leaseNotReleased?: boolean;
   };
   const pauseStop = (at: Date, holds: string[] = ["manual"]) => ({
     cancellation: { reason: "Cancelled due to agent pause", source: "control_plane", expected: true,
@@ -88,7 +90,8 @@ describe("the runs a pause cut, when the role resumes", () => {
     const provider = options.lease ?? "local";
     await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId: environment.id, heartbeatRunId: cutRunId, issueId,
       provider, ...(provider === "local" ? {} : { providerLeaseId: `${provider}://worker@mac-03:22/w/${cutRunId}`, cleanupStatus: "success" }),
-      status: "expired", leasePolicy: "ephemeral", releasedAt: new Date(finishedAt.getTime() + 70_000),
+      status: options.leaseNotReleased ? "active" : "expired", leasePolicy: "ephemeral",
+      releasedAt: options.leaseNotReleased ? null : new Date(finishedAt.getTime() + 70_000),
       metadata: { agentId: f.agentId, driver: provider } });
     await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, agentId: f.agentId, runId: cutRunId, seq: 1,
       eventType: "native.process_identity_recorded", stream: "system", level: "info", message: "identity" });
@@ -294,6 +297,80 @@ describe("the runs a pause cut, when the role resumes", () => {
   });
 
   describe("files the request and keeps it, and says when it starts", () => {
+    /** A program that is not the cut run's engine and keeps running until it is told to stop. */
+    function otherProgram(leadsItsGroup = false) {
+      const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore", detached: leadsItsGroup });
+      return { pid: child.pid!, stop: async () => { child.kill("SIGKILL"); await once(child, "exit"); } };
+    }
+    /** The deferred-receipt work looks at every kept request again (heartbeat/deferred-receipt-work.ts, about every 30 s). */
+    const keptRequestsAreLookedAtAgain = (f: { companyId: string }) => heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
+    const systemNotes = async (f: { issueId: string }) => (await db.select().from(issueComments).where(eq(issueComments.issueId, f.issueId)))
+      .filter(comment => comment.authorType === "system" && comment.body.includes("has not started again yet"));
+
+    // The number a cut run recorded can be given to another program later (the host restarted, or the numbers
+    // wrapped). A program born after the cut run ended is not its engine: the stop is proven.
+    it.each([["the process", false], ["the process and its group", true]] as const)(
+      "the recorded number now belongs to another program, born after the run ended (%s): the work starts", async (_what, group) => {
+        const f = await fixture();
+        const other = otherProgram(group);
+        try {
+          await db.update(heartbeatRuns).set({ processPid: other.pid, ...(group ? { processGroupId: other.pid } : {}) })
+            .where(eq(heartbeatRuns.id, f.cut.id));
+          await roleResumes(f);
+          await expectContinued(f);
+        } finally { await other.stop(); }
+      });
+
+    it("the recorded number belongs to a program born before the run ended: the request is kept, and starts once that program is gone", async () => {
+      const other = otherProgram();
+      try {
+        // The cut run ended after that program was born: it may be the run's own engine, still alive.
+        const f = await fixture({ finishedMinutesAgo: 0 });
+        await db.update(heartbeatRuns).set({ processPid: other.pid, finishedAt: new Date() }).where(eq(heartbeatRuns.id, f.cut.id));
+        await roleResumes(f);
+        await expectKept(f, "stop_not_proven", "process_running");
+        await keptRequestsAreLookedAtAgain(f);
+        expect(await continuations(f)).toHaveLength(0);
+        await other.stop();
+        await keptRequestsAreLookedAtAgain(f);
+        expect(await continuations(f)).toHaveLength(1);
+        expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:stop_not_proven`, PAUSE_CUT_WORK_CONTINUED]);
+      } finally { await other.stop().catch(() => undefined); }
+    });
+
+    // The resume follows the pause closely: the environment of the cut run is not released yet.
+    it("the local environment of the cut run is not released yet: the request is kept, and starts once it is", async () => {
+      const f = await fixture({ leaseNotReleased: true });
+      await roleResumes(f);
+      await expectKept(f, "stop_not_proven", "local_cleanup");
+      await db.update(environmentLeases).set({ status: "expired", releasedAt: new Date() }).where(eq(environmentLeases.heartbeatRunId, f.cut.id));
+      await keptRequestsAreLookedAtAgain(f);
+      const started = await continuations(f);
+      expect(started).toHaveLength(1);
+      expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:stop_not_proven`, PAUSE_CUT_WORK_CONTINUED]);
+    });
+
+    it("a request kept for more than thirty minutes writes one note on the task, which says what it waits for", async () => {
+      const f = await fixture({ leaseNotReleased: true });
+      await roleResumes(f);
+      await expectKept(f, "stop_not_proven", "local_cleanup");
+      // Before thirty minutes: nothing is said.
+      await keptRequestsAreLookedAtAgain(f);
+      expect(await systemNotes(f)).toHaveLength(0);
+      await db.update(agentWakeupRequests).set({ createdAt: new Date(Date.now() - 31 * 60_000) })
+        .where(and(eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      for (let look = 0; look < 3; look += 1) await keptRequestsAreLookedAtAgain(f);
+      const notes = await systemNotes(f);
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toContain(f.cut.id);
+      expect(notes[0]!.body).toContain("local_cleanup");
+      expect((await traceList(f)).filter(entry => entry === `${PAUSE_CUT_WORK_KEPT}:still_waiting_for_stop_proof`)).toHaveLength(1);
+      // It is still kept, and starts once the environment is released.
+      await db.update(environmentLeases).set({ status: "expired", releasedAt: new Date() }).where(eq(environmentLeases.heartbeatRunId, f.cut.id));
+      await keptRequestsAreLookedAtAgain(f);
+      expect(await continuations(f)).toHaveLength(1);
+    });
+
     // Not a form of production: a started run on which no process was ever recorded (a test bench whose engine never
     // reported its process). Nothing proves its stop, so nothing starts; the request is kept and the task says why.
     it("a started run with no recorded process: the request is kept, the wait names the missing proof", async () => {

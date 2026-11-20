@@ -309,6 +309,40 @@ export async function pauseCutWorkRequestMayStart(db: Db, input: {
   return false;
 }
 
+/** A kept request says so on its task once it has waited this long for the proof that the cut run stopped. */
+export const PAUSE_CUT_WORK_STILL_WAITING_AFTER_MS = 30 * 60_000;
+
+/**
+ * Asked where a kept Retry is looked at again (heartbeat/run-control.ts, resumeTaskRetry; the deferred-receipt work
+ * looks at every kept request about every thirty seconds): the request this file filed did not start, and the gate
+ * still waits for the proof that the cut run stopped. Past thirty minutes the task gets ONE note that says what is
+ * awaited, so that a continuation that does not come is not silent.
+ */
+export async function notePauseCutWorkStillWaiting(db: Db, input: {
+  companyId: string; agentId: string; issueId: string; retryRequestId: string; idempotencyKey: string | null;
+  cutRunId: string; actorId: string; actorSource: string; now?: Date;
+}) {
+  if (!input.idempotencyKey?.startsWith(PAUSE_RESUME_RETRY_KEY_PREFIX)) return false;
+  const [wake] = await db.select({ status: agentWakeupRequests.status, createdAt: agentWakeupRequests.createdAt,
+    payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
+    eq(agentWakeupRequests.companyId, input.companyId), eq(agentWakeupRequests.id, input.retryRequestId)));
+  const waitRecord = record(record(wake?.payload).executionWait);
+  const wait = waitRecord.reason;
+  if (wake?.status !== "deferred_issue_execution" || typeof wait !== "string" || !STOP_NOT_PROVEN_WAITS.has(wait)) return false;
+  if ((input.now ?? new Date()).getTime() - wake.createdAt.getTime() < PAUSE_CUT_WORK_STILL_WAITING_AFTER_MS) return false;
+  const readyOperationId = input.idempotencyKey.slice(PAUSE_RESUME_RETRY_KEY_PREFIX.length).split(":")[1] ?? null;
+  const first = await recordOnce(db, logActivity, { companyId: input.companyId, actorType: "system", actorId: PAUSE_RESUME_ACTOR_ID,
+    agentId: input.agentId, action: PAUSE_CUT_WORK_KEPT, entityType: "issue", entityId: input.issueId,
+    details: { interruptedRunId: input.cutRunId, readyOperationId, resumedByUserId: input.actorId, actorSource: input.actorSource,
+      retryRequestId: input.retryRequestId, reason: "still_waiting_for_stop_proof", wait } });
+  if (!first) return false;
+  const message = typeof waitRecord.message === "string" ? ` (${waitRecord.message})` : "";
+  await (await import("./issues.js")).issueService(db).addComment(input.issueId,
+    `The work a pause cut on this task has not started again yet. Paperclip has waited for more than 30 minutes for proof that the previous run \`${input.cutRunId}\` stopped: \`${wait}\`${message}. The request is kept and starts by itself once that is proven; nothing was lost. If it does not clear, inspect that run and its machine.`,
+    {}, { authorType: "system" });
+  return true;
+}
+
 /**
  * The run of a Retry this file filed has been created: say so on the task. Called where the Retry is dispatched
  * (heartbeat/run-control.ts, resumeTaskRetry), so a request that was kept and starts later is recorded too.
