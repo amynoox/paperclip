@@ -261,6 +261,9 @@ describe("the runs a pause cut, when the role resumes", () => {
       const f = await fixture({ taskStatus: "blocked" });
       await roleResumes(f);
       await expectRefused(f, "task_blocked");
+      // The ready hook called again for the same ready state writes no second entry.
+      await createLifecycleDriver(db, {} as never).onReady!(await state(f.agentId) as never);
+      await expectRefused(f, "task_blocked");
     });
 
     it("a task with an unresolved blocker", async () => {
