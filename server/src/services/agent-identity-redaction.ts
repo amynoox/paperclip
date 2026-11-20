@@ -1,5 +1,5 @@
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
-import { redactRegisteredSecretValues } from "./run-secret-redaction.js";
+import { maskBrokerAddresses, openBrokerAddressLength, redactRegisteredSecretValues } from "./run-secret-redaction.js";
 
 /** Keep private material in memory only; do not copy it into run snapshots. */
 export function createAgentIdentityRedactor(privateKeyPem?: string) {
@@ -21,7 +21,9 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
     chunk(stream: string, chunk: string): string {
       let text = (pending.get(stream) ?? "") + chunk;
       for (const value of values) text = text.split(value).join(REDACTED_EVENT_VALUE);
-      let held = 0;
+      // STUDIO-0085: a broker address is masked by its form; an ending that could begin one waits for the next chunk.
+      text = maskBrokerAddresses(text);
+      let held = openBrokerAddressLength(text);
       for (const value of values) {
         for (let size = Math.min(value.length - 1, text.length); size > held; size--) {
           if (text.endsWith(value.slice(0, size))) { held = size; break; }
@@ -35,6 +37,8 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
     finish(stream: string): string {
       const held = pending.get(stream);
       pending.delete(stream);
+      // STUDIO-0085: a broker address cut by the end of the output keeps its beginning; what follows /t/ is hidden.
+      if (held && openBrokerAddressLength(held) === held.length) return held.replace(/(\/t\/)[\w-]+$/, `$1${REDACTED_EVENT_VALUE}`);
       // Ed25519 PEM/PKCS#8 values begin with fixed structural bytes. Preserve
       // ordinary endings such as a dash; longer interrupted fragments stay hidden.
       return held ? (held.length < 8 ? held : REDACTED_EVENT_VALUE) : "";
