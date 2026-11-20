@@ -230,6 +230,19 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
     expect(document.querySelector('button[aria-label="Pin Machines"]')).not.toBeNull();
   });
 
+  it("with Cases enabled the plugin pages still come last, behind a separator of their own", async () => {
+    fixture.enableCases = true;
+    fixture.contributions = [router];
+    await renderSidebar();
+    await click("More workspace pages");
+    expect(moreLinks().slice(-3)).toEqual(["/settings", "/cases", "/machines"]);
+    const content = document.querySelector('[aria-label="More workspace pages"][data-slot="popover-content"]')!;
+    // Before Agents, before Cases, before the plugin pages.
+    expect(content.querySelectorAll('[role="separator"]')).toHaveLength(3);
+    const machinesRow = content.querySelector('a[href="/machines"]')!.closest("div")!.parentElement!;
+    expect(machinesRow.querySelector('[role="separator"]')).not.toBeNull();
+  });
+
   it.each([
     ["no plugin is installed", []],
     ["the plugin is not ready (the server lists ready plugins only)", []],
@@ -319,6 +332,8 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
       slot({ type: "companySettingsPage", routePath: "machines", displayName: "Settings page" }),
       slot({ type: "sidebarPanel", displayName: "Panel" }),
       slot({ type: "dashboardWidget", displayName: "Widget" }),
+      // It has a menu entry, but nothing of the kind "page".
+      slot({ type: "sidebar", displayName: "Menu entry" }),
     ]);
     expect(buildPluginMoreDestinations([other], [])).toEqual([]);
   });
