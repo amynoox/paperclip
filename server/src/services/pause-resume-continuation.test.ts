@@ -300,7 +300,10 @@ describe("the runs a pause cut, when the role resumes", () => {
     /** A program that is not the cut run's engine and keeps running until it is told to stop. */
     function otherProgram(leadsItsGroup = false) {
       const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 120000)"], { stdio: "ignore", detached: leadsItsGroup });
-      return { pid: child.pid!, stop: async () => { child.kill("SIGKILL"); await once(child, "exit"); } };
+      let exited = false;
+      const gone = once(child, "exit").then(() => { exited = true; });
+      // May be asked twice: the second time the program is already gone.
+      return { pid: child.pid!, stop: async () => { if (!exited) child.kill("SIGKILL"); await gone; } };
     }
     /** The deferred-receipt work looks at every kept request again (heartbeat/deferred-receipt-work.ts, about every 30 s). */
     const keptRequestsAreLookedAtAgain = (f: { companyId: string }) => heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
