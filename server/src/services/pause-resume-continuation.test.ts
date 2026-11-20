@@ -1,4 +1,6 @@
+import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { once } from "node:events";
 import { and, asc, eq, inArray, sql } from "drizzle-orm";
 import { activityLog, agents, agentWakeupRequests, companies, createDb, environmentLeases, heartbeatRunEvents, heartbeatRuns,
   instanceUserRoles, issueComments, issueRecoveryActions, issueRelations, issueThreadInteractions, issues } from "@paperclipai/db";
@@ -10,6 +12,8 @@ import { configureAgentLifecycle, createAgentLifecycle, createAgentLifecycleEffe
 import { createLifecycleDriver } from "./agent-lifecycle-driver.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { heartbeatService } from "./heartbeat.js";
+import { persistHeartbeatRunProcessMetadata } from "./heartbeat/run-lifecycle.js";
+import { recordedLocalExecutionStopped } from "./native-local-process-stop.js";
 import { environmentService } from "./environments.js";
 import { PAUSE_CUT_WORK_CONTINUED, PAUSE_CUT_WORK_KEPT, PAUSE_CUT_WORK_NOT_CONTINUED, PAUSE_CUT_WORK_REQUEST_FILED,
   continueRunsCutByPause, pauseLiftedOf } from "./pause-resume-continuation.js";
@@ -45,6 +49,12 @@ describe("the runs a pause cut, when the role resumes", () => {
     /** Replaces the pause's cancellation record. */
     resultJson?: Record<string, unknown>;
     errorCode?: string;
+    /** The stage the run had reached when the pause cut it (production: `settled`, or `dispatching`). */
+    stage?: string;
+    /** The process group is recorded too, as for a run over ssh. */
+    group?: boolean;
+    /** No process was ever recorded on the run. */
+    noProcess?: boolean;
   };
   const pauseStop = (at: Date, holds: string[] = ["manual"]) => ({
     cancellation: { reason: "Cancelled due to agent pause", source: "control_plane", expected: true,
@@ -64,9 +74,10 @@ describe("the runs a pause cut, when the role resumes", () => {
       assigneeAgentId: f.agentId });
     const [cut] = await db.insert(heartbeatRuns).values({ id: cutRunId, companyId: f.companyId, agentId: f.agentId,
       invocationSource: "automation", triggerDetail: "system",
-      status: "cancelled", runtimeMode: "legacy", executionStage: "settled", errorCode: options.errorCode ?? "agent_paused",
+      status: "cancelled", runtimeMode: "legacy", executionStage: options.stage ?? "settled", errorCode: options.errorCode ?? "agent_paused",
       error: "Cancelled due to agent pause", contextSnapshot: { issueId }, finishedAt,
-      ...(options.neverStarted ? {} : { processPid: GONE_PID, startedAt: new Date(finishedAt.getTime() - 356_000) }),
+      ...(options.neverStarted ? {} : { startedAt: new Date(finishedAt.getTime() - 356_000),
+        ...(options.noProcess ? {} : { processPid: GONE_PID, ...(options.group ? { processGroupId: GONE_PID } : {}) }) }),
       resultJson: options.resultJson ?? pauseStop(finishedAt, options.holds) }).returning();
     if (options.neverStarted) return { issueId, cut: cut!, hold: null };
     const [hold] = await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: issueId,
@@ -197,6 +208,46 @@ describe("the runs a pause cut, when the role resumes", () => {
       await expectContinued(f);
     });
 
+    // The eight runs a pause cut in production from 17 to 20 Nov 2026, as read in the database: all legacy, cancelled
+    // `agent_paused`, their lease expired and released. Seven ran for routed roles under a local lease: a process
+    // recorded, no process group, no acknowledged cancellation, the pause marker on four of them only, two cut while
+    // `dispatching`. One ran over ssh: process and group recorded, the cancellation acknowledged, no pause marker.
+    const withoutMarker = (extra: Record<string, unknown> = {}) => {
+      const { pauseStop: _marker, ...cancelled } = pauseStop(new Date());
+      return { ...cancelled, ...extra };
+    };
+    it.each<[string, CutOptions]>([
+      ["a routed role under a local lease, settled, without the pause marker", { resultJson: withoutMarker() }],
+      ["a routed role under a local lease, cut while dispatching, with the pause marker", { stage: "dispatching" }],
+      ["a routed role under a local lease, cut while dispatching, without the pause marker", { stage: "dispatching", resultJson: withoutMarker() }],
+      ["a role over ssh, process and group recorded, the cancellation acknowledged, without the pause marker",
+        { lease: "ssh", group: true, resultJson: withoutMarker({ executionCancellation: { state: "acknowledged" } }) }],
+    ])("a form production recorded: %s", async (_form, options) => {
+      const f = await fixture(options);
+      await roleResumes(f);
+      await expectContinued(f);
+    });
+
+    // A fresh attempt asks for more than a process that is gone: the stop recorded for the identity the spawn wrote
+    // (explicit-native-continuation.ts, `freshIntent`). On the form of production that record holds: the identity is
+    // written with the process, and a missing process group matches a missing one.
+    it("the recorded stop a fresh attempt asks for holds on the form of production", async () => {
+      const f = await fixture();
+      const child = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+      const pid = child.pid!;
+      await once(child, "exit");
+      await db.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, f.cut.id));
+      // The spawn's own writer: the process, no group, and the identity event, in one write.
+      await persistHeartbeatRunProcessMetadata(db, f.cut.id, { pid, processGroupId: null,
+        startedAt: new Date(Date.now() - 13 * HOUR).toISOString(), targetKind: "local" });
+      const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.cut.id));
+      expect(run).toMatchObject({ processPid: pid, processGroupId: null });
+      expect(await recordedLocalExecutionStopped(db, run!)).toBe(true);
+      // And the resume continues that run all the same.
+      await roleResumes(f);
+      await expectContinued(f);
+    });
+
     it("a resume made with a person's board key, recorded as such", async () => {
       const f = await fixture();
       const key = { userId: `operator-${randomUUID()}`, source: "board_key" };
@@ -243,6 +294,14 @@ describe("the runs a pause cut, when the role resumes", () => {
   });
 
   describe("files the request and keeps it, and says when it starts", () => {
+    // Not a form of production: a started run on which no process was ever recorded (a test bench whose engine never
+    // reported its process). Nothing proves its stop, so nothing starts; the request is kept and the task says why.
+    it("a started run with no recorded process: the request is kept, the wait names the missing proof", async () => {
+      const f = await fixture({ noProcess: true });
+      await roleResumes(f);
+      await expectKept(f, "stop_not_proven", "process_identity_missing");
+    });
+
     it("a run whose stop is not proven: nothing starts until the proof comes", async () => {
       const f = await fixture({ lease: "ssh", finishedMinutesAgo: 5 });
       await roleResumes(f);
