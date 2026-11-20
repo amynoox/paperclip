@@ -27,6 +27,12 @@ import { recoveryService } from "./recovery/service.js";
 import { enrichCaseWork } from "./case-work-summary.js";
 import { workflowService } from "./workflows.js";
 
+// STUDIO-0083: a block with a Board action now wakes the direct manager of the role, on a notice written for it. The
+// cases below state what else such a block does not wake and does not write; that wake and that notice are set aside.
+const wakesOtherThanTheManagerNotice = (wake: { mock: { calls: unknown[][] } }) =>
+  wake.mock.calls.filter((call) =>
+    (call[1] as { contextSnapshot?: Record<string, unknown> } | undefined)?.contextSnapshot?.boardRecoveryManagerWake !== true);
+
 describe("durable same-task case handoffs", () => {
   let temporary: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
   let db: ReturnType<typeof createDb>;
@@ -1053,7 +1059,7 @@ describe("durable same-task case handoffs", () => {
       expect((await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, receipt.handoffId)))[0])
         .toMatchObject({ state: "awaiting_completion", destinationKind: "done", completedAt: null });
       expect(await db.select().from(issues).where(eq(issues.companyId, f.companyId))).toHaveLength(1);
-      expect(enqueueWakeup).not.toHaveBeenCalled();
+      expect(wakesOtherThanTheManagerNotice(enqueueWakeup)).toEqual([]);
       expect(f.q.wakeup).toHaveBeenCalledTimes(1);
 
       // Existing task controls resolve the visible hold. The original intent
