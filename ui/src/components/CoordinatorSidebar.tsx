@@ -52,20 +52,28 @@ const primaryDestinations = [{ to: "/chats" }, { to: "/issues" }, { to: "/decisi
  * for the left menu (`type: "sidebar"`): the label is that entry's name, the link is the page's route. The
  * contributions list holds ready plugins only, so the entry appears and disappears with the plugin. A path
  * that a built-in page or another plugin already uses is skipped. The plugin's own code is not loaded here:
- * only its declaration is read.
+ * only its declaration is read. The server validates a manifest when a plugin is installed (a slot has a name,
+ * a route is one segment without a slash); this function still never throws on a declaration that lacks them,
+ * because an error here would take the whole left menu down: such an entry is named after the page or the
+ * plugin, or skipped.
  */
 export function buildPluginMoreDestinations(contributions: readonly PluginUiContribution[] | undefined, taken: readonly { to: string }[]): MoreDestination[] {
   const used = new Set([...primaryDestinations, ...taken].map(item => item.to));
   const first = <T extends { order?: number }>(slots: T[]) => [...slots].sort((a, b) => (a.order ?? Number.MAX_SAFE_INTEGER) - (b.order ?? Number.MAX_SAFE_INTEGER))[0];
+  const text = (value: unknown) => (typeof value === "string" ? value.trim() : "");
+  const routeOf = (slot: { routePath?: unknown }) => text(slot.routePath).replace(/^\/+/, "");
   const entries: MoreDestination[] = [];
-  for (const contribution of contributions ?? []) {
-    const page = first(contribution.slots.filter(slot => slot.type === "page" && slot.routePath));
-    const menu = first(contribution.slots.filter(slot => slot.type === "sidebar"));
+  for (const contribution of Array.isArray(contributions) ? contributions : []) {
+    const slots = (Array.isArray(contribution?.slots) ? contribution.slots : []).filter(Boolean);
+    const page = first(slots.filter(slot => slot.type === "page" && routeOf(slot)));
+    const menu = first(slots.filter(slot => slot.type === "sidebar"));
     if (!page || !menu) continue;
-    const to = `/${page.routePath}`;
+    const label = text(menu.displayName) || text(page.displayName) || text(contribution.displayName);
+    if (!label) continue;
+    const to = `/${routeOf(page)}`;
     if (used.has(to)) continue;
     used.add(to);
-    entries.push({ label: menu.displayName, to, icon: Puzzle });
+    entries.push({ label, to, icon: Puzzle });
   }
   return entries.sort((a, b) => a.label.localeCompare(b.label));
 }

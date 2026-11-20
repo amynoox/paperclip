@@ -201,7 +201,8 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
   const slot = (patch: Record<string, unknown>) => ({ id: "slot", displayName: "Slot", exportName: "Slot", ...patch });
   const contribution = (pluginKey: string, slots: Array<Record<string, unknown>>) =>
     ({ pluginId: `id-${pluginKey}`, pluginKey, displayName: pluginKey, version: "1.0.0", uiEntryFile: "index.js", slots, launchers: [] }) as unknown as PluginUiContribution;
-  const router = contribution("paperclip-worker-router", [
+  const router = contribution("amynoox.worker-router", [
+    slot({ type: "settingsPage", id: "settings", displayName: "Router Settings", exportName: "SettingsPage" }),
     slot({ type: "page", id: "machines", displayName: "Machines", exportName: "MachinesPage", routePath: "machines" }),
     slot({ type: "sidebar", id: "machines-menu", displayName: "Machines", exportName: "MachinesMenu" }),
   ]);
@@ -324,6 +325,62 @@ describe("Coordinator plugin pages in More (STUDIO-0081)", () => {
     ], [{ to: "/projects" }]);
     expect(destinations.map(item => [item.label, item.to])).toEqual([["Machines", "/machines"], ["Zebra", "/zebra"]]);
     expect(buildPluginMoreDestinations(undefined, [])).toEqual([]);
+  });
+
+  // The server validates a manifest at install (packages/shared/src/validators/plugin.ts: a slot's displayName
+  // is required, a routePath is one segment without a slash) and the route always returns `slots`. The left menu
+  // must still never fall on a declaration that lacks them.
+  it("a menu entry without a name takes the page's name, then the plugin's; with no name at all it is skipped", () => {
+    const pair = (page: Record<string, unknown>, menu: Record<string, unknown>) =>
+      [{ type: "page", id: "p", exportName: "P", ...page }, { type: "sidebar", id: "m", exportName: "M", ...menu }];
+    const named = (pluginKey: string, displayName: unknown, slots: Array<Record<string, unknown>>) =>
+      ({ ...contribution(pluginKey, slots), displayName }) as unknown as PluginUiContribution;
+    expect(buildPluginMoreDestinations([
+      named("page-name", "Plugin A", pair({ routePath: "alpha", displayName: "Alpha page" }, {})),
+      named("plugin-name", "Plugin B", pair({ routePath: "beta" }, { displayName: "   " })),
+      named("no-name", undefined, pair({ routePath: "gamma" }, { displayName: null })),
+      named("number-name", 7, pair({ routePath: "delta", displayName: 12 }, { displayName: {} })),
+      router,
+    ], []).map(item => [item.label, item.to])).toEqual([["Alpha page", "/alpha"], ["Machines", "/machines"], ["Plugin B", "/beta"]]);
+  });
+
+  it("a contribution without slots, or an empty one in the list, is skipped and the others are kept", () => {
+    const broken = [
+      { pluginId: "id-no-slots", pluginKey: "no-slots", displayName: "No slots", version: "1.0.0", uiEntryFile: "index.js", launchers: [] },
+      { pluginId: "id-null-slots", pluginKey: "null-slots", displayName: "Null slots", slots: null },
+      { pluginId: "id-odd-slots", pluginKey: "odd-slots", displayName: "Odd slots", slots: [null, undefined, slot({ type: "sidebar", displayName: "Odd" })] },
+      null,
+      undefined,
+    ] as unknown as PluginUiContribution[];
+    expect(buildPluginMoreDestinations([...broken, router], []).map(item => [item.label, item.to])).toEqual([["Machines", "/machines"]]);
+    expect(buildPluginMoreDestinations(broken, [])).toEqual([]);
+    expect(buildPluginMoreDestinations({} as unknown as PluginUiContribution[], [])).toEqual([]);
+  });
+
+  it("two plugins, one of them incomplete: the left menu renders, with the complete one behind More", async () => {
+    fixture.contributions = [
+      { pluginId: "id-broken", pluginKey: "broken", displayName: "Broken", version: "1.0.0", uiEntryFile: "index.js", launchers: [] } as unknown as PluginUiContribution,
+      contribution("nameless", [{ type: "page", id: "p", exportName: "P", routePath: "nameless" }, { type: "sidebar", id: "m", exportName: "M" }]),
+      router,
+    ];
+    await renderSidebar();
+    expect(container.querySelector('a[href="/chats"]')).not.toBeNull();
+    await click("More workspace pages");
+    // The nameless entry is named after its plugin; the one without slots gives nothing.
+    expect(moreLinks().slice(-2)).toEqual(["/machines", "/nameless"]);
+    expect(document.querySelector('[data-slot="popover-content"] a[href="/nameless"]')?.textContent).toBe("nameless");
+  });
+
+  it("a route declared with leading slashes gives one clean path, compared with the taken ones after that", () => {
+    const page = (routePath: string, label: string) => [slot({ type: "page", routePath }), slot({ type: "sidebar", displayName: label })];
+    expect(buildPluginMoreDestinations([
+      contribution("slash", page("/machines", "Machines")),
+      contribution("slashes", page("//fleet", "Fleet")),
+      contribution("same-after", page("///machines", "Machines again")),
+      contribution("taken-after", page("/projects", "Fake projects")),
+      contribution("only-slashes", page("//", "Nothing")),
+      contribution("blank", page("  ", "Blank")),
+    ], [{ to: "/projects" }]).map(item => [item.label, item.to])).toEqual([["Fleet", "/fleet"], ["Machines", "/machines"]]);
   });
 
   it("other kinds of slots are not destinations: only a page with a menu entry", () => {
