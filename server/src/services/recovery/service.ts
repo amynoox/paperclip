@@ -1275,9 +1275,15 @@ export function recoveryService(
           },
         });
         if (queued) woken += 1;
-      } catch {
+        // Not queued, without an error (the company is not active, wakes on demand are off): the same outcome.
+        else logger.warn({ companyId: input.companyId, agentId: input.agentId, issueId: issue.id, declaredWaitRunId: run.id },
+          "A task that waits on a declared wait was not started when its assignee's pause lifted: the wake was not queued");
+      } catch (error) {
         // A start refused now (a new pause, a budget still reached) loses nothing: the task is still a wait within
-        // its bound, the next resume starts it, and past the bound the normal path applies.
+        // its bound, the next resume starts it, and past the bound the normal path applies. The refusal is logged
+        // with the task and its reason, so that a start refused at the resume can be seen.
+        logger.warn({ err: error, companyId: input.companyId, agentId: input.agentId, issueId: issue.id, declaredWaitRunId: run.id },
+          "A task that waits on a declared wait was not started when its assignee's pause lifted: the wake was refused");
       }
     }
     return { issues: waiting.length, woken };

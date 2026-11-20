@@ -16,6 +16,7 @@ import { logger } from "../middleware/logger.js";
 import { and, eq, exists, inArray, isNull, not, or, sql } from "drizzle-orm";
 import { notifyExternalConversationSettlement } from "./external-conversation-settlement-notifications.js";
 import {
+  agents,
   agentTaskSessions,
   agentWakeupRequests,
   chatActions,
@@ -37,6 +38,7 @@ import { isSupersededConversationRun } from "./agent-conversations.js";
 import { hasRequiredWorkspaceRecovery } from "./workspace-restore-recovery-state.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
+import { isGovernancePauseStop } from "./governance-pause-stop.js";
 import { alias } from "drizzle-orm/pg-core";
 
 /** An operator records observed outcomes; this is not permission to blindly retry. */
@@ -859,6 +861,23 @@ export async function settleUnrecoverableExecutions(
             details: { recoveryActionId: action.id, outcome: "cancelled", supersedingRecoveryActionId: hold.id },
           });
           return;
+        }
+        // STUDIO-0076: a run a pause cut is not an unrecoverable execution while its role is paused. This
+        // settlement blocked its task about a minute after the cut (production: nine tasks, 18 Nov at 10:03 and
+        // 13:19, 20 Nov at 00:52; the runs of routed roles, whose cancellation is never acknowledged, are not
+        // conversation holds and reach this point). The block then made the resume's continuation of the cut run
+        // refuse the task. While the role is paused, whatever the hold, nothing is settled: the hold stays for the
+        // resume. After the pause, nothing is settled either while a person's request to continue waits for the
+        // task (the request the resume files, kept until the stop is proven). Otherwise today's path applies again.
+        if (isGovernancePauseStop(run)) {
+          const [owner] = await tx.select({ status: agents.status }).from(agents)
+            .where(and(eq(agents.companyId, run.companyId), eq(agents.id, run.agentId)));
+          if (owner?.status === "paused") return;
+          const [asked] = await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
+            eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"), eq(agentWakeupRequests.requestedByActorType, "user"),
+            sql`${agentWakeupRequests.payload}->>'issueId' = ${task.id}`)).limit(1);
+          if (asked) return;
         }
         // A legacy executor still holding its controller lease may be unwinding
         // a Stop and can prove that no adapter started. Let it settle first.
