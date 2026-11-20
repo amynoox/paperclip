@@ -1177,8 +1177,45 @@ export function heartbeatService(
         issue: issueRow, previousStatus: issueRow.status, latestRun: runRow, comment: input.comment,
       });
     },
+    onNotHanded: (input) => {
+      logger.warn(input, "relaunch loop guard: the issue is due to its role's manager and was not handed");
+      void getRun(input.freshRunId).then((freshRun) => freshRun && appendRunEvent(freshRun, {
+        eventType: "lifecycle", stream: "system", level: "warn",
+        message: input.reason === "still_held"
+          ? "Relaunch guard: the issue is due to the role's manager, but a run or a lease on the issue still holds it; the hand-over is asked again when a run on the issue ends"
+          : `Relaunch guard: the issue is due to the role's manager and was not handed (${input.reason})`,
+        payload: { reason: input.reason },
+      })).catch(() => undefined);
+    },
     onError: (error) => logger.error({ err: error }, "relaunch loop guard: the hand-over to the manager failed"),
   };
+  // The hand-overs another agent's run held, by issue: asked again at the end of each run on that issue. Kept in
+  // memory: after a restart the role goes on and the next fresh session makes the hand-over.
+  const heldRelaunchLoopHandovers = new Map<string, { companyId: string; agent: { id: string; name: string } }>();
+  async function relaunchLoopHandoverAtRunEnd(endedRun: { id: string; companyId: string; agentId: string; contextSnapshot: unknown }) {
+    try {
+      const snapshot = parseObject(endedRun.contextSnapshot);
+      const issueId = readNonEmptyString(snapshot.issueId);
+      if (!issueId) return;
+      const startedFreshByGuard = Boolean(snapshot[RELAUNCH_LOOP_GUARD_CONTEXT_KEY]);
+      const held = heldRelaunchLoopHandovers.get(issueId);
+      if (!startedFreshByGuard && !held) return;
+      // The role concerned: the one of the fresh run that ends, or the one whose hand-over is held.
+      let role = held;
+      if (startedFreshByGuard) {
+        const endedAgent = await getAgent(endedRun.agentId);
+        if (endedAgent) role = { companyId: endedRun.companyId, agent: { id: endedAgent.id, name: endedAgent.name } };
+      }
+      if (!role) return;
+      const outcome = await handOverAfterFreshSessionFailure(db, relaunchLoopHandoverDeps, {
+        companyId: role.companyId, agent: role.agent, issueId, heldBefore: Boolean(held), endedRunId: endedRun.id,
+      });
+      if (outcome === "held") heldRelaunchLoopHandovers.set(issueId, role);
+      else heldRelaunchLoopHandovers.delete(issueId);
+    } catch (error) {
+      logger.error({ err: error, runId: endedRun.id }, "relaunch loop guard: the hand-over at the end of the run failed");
+    }
+  }
 
   // The wake-queue module's plain snapshots hold only the fields the release
   // decision needs; escalation needs the full row, so this re-reads both by
@@ -3719,11 +3756,6 @@ export function heartbeatService(
           onProviderTraceFinalized: () => { providerTraceFinalized = true; },
           issueContext, onLog,
         }));
-        // STUDIO-0078: the run the relaunch guard started on a fresh session has ended. If it failed empty too, the
-        // issue goes to the role's direct manager (or, with no manager to receive it, to the Board).
-        if (context[RELAUNCH_LOOP_GUARD_CONTEXT_KEY]) {
-          await handOverAfterFreshSessionFailure(db, relaunchLoopHandoverDeps, { companyId: agent.companyId, agent, issueId });
-        }
       } catch (err) {
         await persistUsageCaptureFailure?.();
         if (err instanceof NativeStartupCleanupPendingError) {
@@ -3941,6 +3973,11 @@ export function heartbeatService(
       await instructionWorkingCopy?.nativeInstructionReservation?.release().catch(error => logger.warn({ runId: run.id, err: error }, "Managed warm session preparation cleanup failed"));
       if (managedAiRuntime) await managedAiRuntime.cleanup().catch(() => logger.warn({ runId: run.id }, "AI connection refresh or cleanup failed"));
       let latestRun = await getRun(run.id).catch(() => null);
+      // STUDIO-0078: the run the relaunch guard started on a fresh session has ended, by its normal end or by an
+      // error. If it failed empty too, the issue goes to the role's direct manager (or, with no manager to receive
+      // it, to the Board). A hand-over another agent's run held is asked again here, at the end of each run on the
+      // issue.
+      if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) await relaunchLoopHandoverAtRunEnd(latestRun);
       try {
         if (latestRun && isHeartbeatRunTerminalStatus(latestRun.status)) {
           await writeExecutionControl(db, DELIVERY_QUEUES.executionFinalization, tx => tx

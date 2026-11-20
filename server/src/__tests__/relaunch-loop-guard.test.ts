@@ -13,6 +13,7 @@ import {
   companies,
   companyMemberships,
   createDb,
+  heartbeatRunEvents,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -27,6 +28,7 @@ import {
   RELAUNCH_LOOP_FAILURE_THRESHOLD,
   RELAUNCH_LOOP_FRESH_SESSION_ACTIVITY_ACTION,
   RELAUNCH_LOOP_GUARD_CONTEXT_KEY,
+  RELAUNCH_LOOP_PASSING_FAILURE_CODES,
   RELAUNCH_LOOP_SHORT_RUN_MS,
   RELAUNCH_LOOP_TIMEOUT_ERROR_CODES,
   ROUTER_PRE_LAUNCH_FAILURE_CODES,
@@ -229,6 +231,21 @@ describe("relaunch loop guard: the decision", () => {
 });
 
 // Step three: the run on a fresh session failed the same way.
+describe("relaunch loop guard: passing failures of the provider or of the host", () => {
+  it("by its code, such a failure neither counts nor ends the series", () => {
+    expect([...RELAUNCH_LOOP_PASSING_FAILURE_CODES]).toEqual(["provider_quota", "codex_transient_upstream", "claude_transient_upstream", "process_lost"]);
+    for (const code of RELAUNCH_LOOP_PASSING_FAILURE_CODES) {
+      expect(classifyRelaunchLoopRun(sample(1, { errorCode: code }), false)).toBe("skipped");
+      // Three of them in a row, during an outage: the session is kept.
+      expect(decide([sample(1, { errorCode: code }), sample(2, { errorCode: code }), sample(3, { errorCode: code })])).toMatchObject({ action: "none" });
+      // Among the failures of a series it changes nothing: one before it, two after, three in all.
+      expect(decide([sample(1), sample(2, { errorCode: code }), sample(3), sample(4)])).toMatchObject({ action: "fresh_session", sessionId: "s1" });
+    }
+    // The code of TR-2069 is counted, whatever family the worker router declares for it.
+    expect(classifyRelaunchLoopRun(sample(1, { errorCode: ACK_UNCERTAIN }), false)).toBe("empty_failure");
+  });
+});
+
 describe("relaunch loop guard: the hand-over decision", () => {
   const hand = (runs: RelaunchLoopRunSample[], produced: string[] = []) =>
     evaluateRelaunchLoopHandover({ runs, runIdsThatProducedSomething: new Set(produced) });
@@ -267,6 +284,20 @@ describe("relaunch loop guard: the hand-over decision", () => {
     expect(hand([])).toEqual({ handover: false });
   });
 
+  it("a hand-over that was held stays due while the role only failed empty again; a run that did something ends it", () => {
+    const fresh = freshRun(9);
+    const again = sample(1, { sessionIdBefore: "s2" });
+    const held = (runs: RelaunchLoopRunSample[], produced: string[] = []) =>
+      evaluateRelaunchLoopHandover({ runs, runIdsThatProducedSomething: new Set(produced), heldBefore: true });
+    // Not held before: the role ran again, the matter is closed.
+    expect(hand([again, fresh])).toEqual({ handover: false });
+    expect(held([again, sample(5, { sessionIdBefore: "s2" }), fresh])).toEqual({ handover: true, freshRun: fresh });
+    expect(held([again, fresh], [again.id])).toEqual({ handover: false });
+    expect(held([sample(1, { status: "succeeded", errorCode: null }), fresh])).toEqual({ handover: false });
+    // A fresh run that failed on the provider's quota says nothing about the session: nothing is handed for it.
+    expect(hand([freshRun(1, { errorCode: "provider_quota" }), sample(5), sample(9), sample(13)])).toEqual({ handover: false });
+  });
+
   it("says in the note who failed, how many times, under which code, and what the manager may do", () => {
     const note = relaunchLoopHandoverNote({ agentName: "Dev Unity", failedRunCount: 3, code: ACK_UNCERTAIN });
     expect(note.title).toBe("Relaunch guard: handed to the manager");
@@ -290,14 +321,18 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
   let home: string;
 
   type Step =
-    | { kind: "fail"; code: string; session?: string; clearSession?: boolean; comment?: boolean; document?: boolean; productionActivity?: boolean; timedOut?: boolean;
+    | { kind: "fail"; code: string; during?: (runId: string) => Promise<void>; session?: string; clearSession?: boolean; comment?: boolean; document?: boolean; productionActivity?: boolean; timedOut?: boolean;
         /** What the engine did before its timeout, as the server records it. */
         engine?: "output_tokens" | "summary" | "narration" | "output" | "router_lines" | "host_lines" | "router_around_output" | "announcement_after_a_wait" }
-    | { kind: "ok"; session: string };
+    | { kind: "ok"; session: string }
+    | { kind: "throw" };
   // What each engine launch was asked to resume, in order, per issue.
   type Launch = { runId: string; agentId: string; resumed: string | null; resumedParams: Record<string, unknown> | null };
   const scripts = new Map<string, Step[]>();
   const launches = new Map<string, Launch[]>();
+  // The run of another agent on a ticket (the CTO, after the worker router's card) ends at once with nothing done,
+  // in the cases that say so; elsewhere it waits on the router, as an unscripted launch does.
+  let othersFailAtOnce = false;
 
   beforeAll(async () => {
     temporary = await startRecoveryPostgres("relaunch-loop-guard-");
@@ -312,8 +347,14 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
         const list = launches.get(issueId) ?? [];
         list.push({ runId: input.runId, agentId: input.agent.id, resumed: input.runtime.sessionId, resumedParams: input.runtime.sessionParams });
         launches.set(issueId, list);
-        // Unscripted launches wait on the router: such a run is outside every series.
-        const step: Step = scripts.get(issueId)?.shift() ?? { kind: "fail", code: WAIT };
+        const ofTheRole = input.agent.name === "Dev Unity";
+        if (!ofTheRole && othersFailAtOnce) {
+          return { exitCode: 1, signal: null, timedOut: false, errorCode: "adapter_failed", errorMessage: "engine failed (adapter_failed)" };
+        }
+        // Unscripted launches wait on the router: such a run is outside every series. The script is the role's.
+        const step: Step = (ofTheRole ? scripts.get(issueId)?.shift() : undefined) ?? { kind: "fail", code: WAIT };
+        // An error of the run itself, as a crash of the adapter: the server fails the run by its error branch.
+        if (step.kind === "throw") throw new Error("the adapter failed before any answer of the engine");
         if (step.kind === "ok") {
           await issueService(db).addComment(issueId, "Work done in this run.", { agentId: input.agent.id, runId: input.runId });
           return {
@@ -322,6 +363,7 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
           };
         }
         if (step.comment) await issueService(db).addComment(issueId, "Partial result before the failure.", { agentId: input.agent.id, runId: input.runId });
+        if (step.during) await step.during(input.runId);
         // The four entries production recorded under each failed run of TR-2069: none is the role's work.
         if (step.productionActivity) {
           for (const [action, actorType] of [["environment.lease_acquired", "agent"], ["environment.lease_released", "agent"],
@@ -378,6 +420,7 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
   type Fixture = { companyId: string; devId: string; ctoId: string; issueId: string };
 
   async function seed(): Promise<Fixture> {
+    othersFailAtOnce = false;
     const companyId = randomUUID(), devId = randomUUID(), ctoId = randomUUID(), issueId = randomUUID();
     const userId = `guard-user-${companyId}`;
     await db.insert(authUsers).values({ id: userId, name: "Board user", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
@@ -411,9 +454,44 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
 
   // One turn of the production cycle: the CTO's run on the ticket, its comment, and the Dev's run that
   // the comment wakes (`issue_commented`, asked by an agent). Returns the Dev's finished run.
-  async function turn(f: Fixture, step: Step, opts: { ctoRun?: boolean; cancelledRetry?: boolean } = {}) {
+  // A run waiting in the queue on the ticket, as the server writes it: the wake of another agent by a comment (the
+  // worker router's card wakes the CTO: a comment wake is the one the queue starts for an agent that is not the
+  // assignee), or the role's own retry of a failed run once its delay has passed.
+  async function queueARun(f: Fixture, agentId: string, retryOfRunId: string | null = null) {
+    const now = new Date();
+    const comment = retryOfRunId ? null : (await db.insert(issueComments).values({
+      companyId: f.companyId, issueId: f.issueId, authorType: "system", body: "The executor was interrupted. Keep the current reservation?",
+    }).returning())[0]!;
+    const reason = retryOfRunId ? "transient_failure_retry" : "issue_commented";
+    const context = retryOfRunId
+      ? { retryReason: "transient_failure", retryOfRunId }
+      : { commentId: comment!.id, wakeCommentId: comment!.id };
+    const [request] = await db.insert(agentWakeupRequests).values({
+      companyId: f.companyId, agentId, source: "automation", triggerDetail: "system", reason,
+      payload: { issueId: f.issueId, ...(retryOfRunId ? { retryOfRunId, retryReason: "transient_failure" } : { commentId: comment!.id }) },
+      status: "queued", requestedByActorType: "system",
+    }).returning();
+    const [queued] = await db.insert(heartbeatRuns).values({
+      companyId: f.companyId, agentId, invocationSource: "automation", triggerDetail: "system", status: "queued",
+      wakeupRequestId: request!.id, ...(retryOfRunId ? { retryOfRunId } : {}), createdAt: now, updatedAt: now,
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: reason, ...context },
+    }).returning();
+    await db.update(agentWakeupRequests).set({ runId: queued!.id }).where(eq(agentWakeupRequests.id, request!.id));
+    return queued!;
+  }
+  // `ctoRunAlive`: as production ran it. The worker router's card wakes the CTO as the role fails: a run of the CTO is
+  // in the queue on the ticket when the server decides what to do with the failure. It runs once the role's run is
+  // over, and has ended when the CTO answers the next time. `othersHeld`: the case holds another agent's run itself.
+  async function turn(f: Fixture, step: Step, opts: { ctoRun?: boolean; ctoRunAlive?: boolean; othersHeld?: boolean; cancelledRetry?: boolean } = {}) {
+    if (opts.ctoRunAlive) {
+      othersFailAtOnce = true;
+      if (step.kind === "fail") {
+        const during = step.during;
+        step = { ...step, during: async (runId) => { await queueARun(f, f.ctoId); await during?.(runId); } };
+      }
+    }
     scripts.get(f.issueId)!.push(step);
-    if (opts.ctoRun !== false) {
+    if (opts.ctoRun !== false && !opts.ctoRunAlive) {
       const now = new Date();
       await db.insert(heartbeatRuns).values({
         companyId: f.companyId, agentId: f.ctoId, invocationSource: "automation", triggerDetail: "system", status: "succeeded",
@@ -447,6 +525,11 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
         createdAt: now, finishedAt: now, updatedAt: now, sessionIdBefore: finished.sessionIdBefore,
         contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "transient_failure_retry", retryReason: "transient_failure" },
       });
+    }
+    if (opts.ctoRunAlive) {
+      // The CTO's run of the card: it starts now that the role's run is over, and ends.
+      await heartbeat.resumeQueuedRuns();
+      await heartbeat.drainActiveRunExecutions();
     }
     return finished;
   }
@@ -872,6 +955,21 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
     expect(notes[0]!.body).toContain("The last 3 runs");
   }, 180_000);
 
+  it("two failures, a passing failure of the provider, a failure: it neither counts nor ends the series", async () => {
+    const f = await seed();
+    await openSession(f);
+    await turn(f, fail(ACK_UNCERTAIN));
+    await turn(f, fail(ACK_UNCERTAIN));
+    const outage = await turn(f, fail("codex_transient_upstream"));
+    expect(outage).toMatchObject({ status: "failed", errorCode: "codex_transient_upstream" });
+    // After the outage the series still holds two: the run resumes the session.
+    await turn(f, fail(ACK_UNCERTAIN));
+    expect(await guardNotes(f)).toHaveLength(0);
+    await turn(f, { kind: "ok", session: "s2" });
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", "s1", null]);
+    expect(await guardNotes(f)).toHaveLength(1);
+  }, 180_000);
+
   it("two failures, then a run of the same role that leaves a comment: the series starts over", async () => {
     const f = await seed();
     await openSession(f);
@@ -1179,6 +1277,96 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
     expect(await boardActions(f)).toEqual([expect.objectContaining({ ownerType: "board", status: "active" })]);
   }, 300_000);
 
+  const sourceRunsOf = async (f: Fixture) => (await handovers(f)).map((row) => (row.details as Record<string, unknown>).sourceRunId);
+  const runsOf = (f: Fixture, agentId: string) => db.select().from(heartbeatRuns).where(and(
+    eq(heartbeatRuns.companyId, f.companyId), eq(heartbeatRuns.agentId, agentId), sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${f.issueId}`,
+  )).orderBy(asc(heartbeatRuns.createdAt));
+
+  it("TR-2069 as production ran it: a run of the CTO is in the queue at each failure and the role's own retry waits there too; the issue is handed at once", async () => {
+    const f = await seed();
+    await turn(f, fail("adapter_failed", { session: "s1" }), { ctoRunAlive: true });
+    for (let index = 0; index < 3; index += 1) await turn(f, fail(ACK_UNCERTAIN, { session: "s1" }), { ctoRunAlive: true });
+    let retryId = "";
+    const fresh = await turn(f, fail(ACK_UNCERTAIN, {
+      session: "s2", during: async (runId) => { retryId = (await queueARun(f, f.devId, runId)).id; },
+    }), { ctoRunAlive: true });
+    expect(fresh).toMatchObject({ status: "failed", errorCode: ACK_UNCERTAIN, sessionIdBefore: null });
+    expect(resumedOf(f)).toEqual([null, "s1", "s1", "s1", null]);
+    await expect.poll(async () => (await issueRow(f)).assigneeAgentId, { timeout: 30_000 }).toBe(f.ctoId);
+    expect(await issueRow(f)).toMatchObject({ status: "in_review", assigneeAgentId: f.ctoId });
+    expect(await sourceRunsOf(f)).toEqual([fresh.id]);
+    expect(await boardActions(f)).toHaveLength(0);
+    expect(await handoverNotes(f)).toHaveLength(1);
+    // The CTO's run of the last card was in the queue before the fresh run ended, and started only after the hand-over:
+    // it was alive on the ticket when the issue was handed.
+    const [handed] = await handovers(f);
+    const cardRuns = (await runsOf(f, f.ctoId)).filter((run) => run.createdAt <= fresh.finishedAt! && run.createdAt >= fresh.startedAt!);
+    expect(cardRuns).toHaveLength(1);
+    expect(cardRuns[0]!.startedAt!.getTime()).toBeGreaterThanOrEqual(handed!.createdAt.getTime());
+    // The role's retry never starts: the issue is no longer the role's.
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    await expect.poll(async () => (await devRuns(f)).find((row) => row.id === retryId)?.status, { timeout: 30_000 }).toBe("cancelled");
+    expect(devLaunches(f)).toHaveLength(5);
+    expect(await handovers(f)).toHaveLength(1);
+  }, 300_000);
+
+  it("the fresh run fails by an error of the run itself, not by the engine's answer: the issue is handed all the same", async () => {
+    const f = await seed();
+    await openSession(f);
+    for (let index = 0; index < 3; index += 1) await turn(f, fail(ACK_UNCERTAIN, { session: "s1" }));
+    const fresh = await turn(f, { kind: "throw" });
+    expect(fresh).toMatchObject({ status: "failed", sessionIdBefore: null });
+    expect(fresh.contextSnapshot).toMatchObject({ [RELAUNCH_LOOP_GUARD_CONTEXT_KEY]: { action: "fresh_session", droppedSessionId: "s1" } });
+    await expect.poll(async () => (await issueRow(f)).assigneeAgentId, { timeout: 30_000 }).toBe(f.ctoId);
+    expect(await issueRow(f)).toMatchObject({ status: "in_review", assigneeAgentId: f.ctoId });
+    expect(await sourceRunsOf(f)).toEqual([fresh.id]);
+    expect(await boardActions(f)).toHaveLength(0);
+  }, 240_000);
+
+  it("another agent's run holds the issue: nothing is handed, the fresh run says why, and the issue is handed at the end of the next run once that run is over", async () => {
+    const f = await seed();
+    const qaId = randomUUID();
+    await db.insert(agents).values({ id: qaId, companyId: f.companyId, name: "QA", adapterType, status: "idle", adapterConfig: {}, reportsTo: f.ctoId });
+    await openSession(f);
+    for (let index = 0; index < 3; index += 1) await turn(f, fail(ACK_UNCERTAIN, { session: "s1" }));
+    // A run of QA is alive on the ticket when the fresh run ends.
+    let qaRunId = "";
+    const fresh = await turn(f, fail(ACK_UNCERTAIN, {
+      session: "s2",
+      during: async () => {
+        const now = new Date();
+        const [row] = await db.insert(heartbeatRuns).values({
+          companyId: f.companyId, agentId: qaId, invocationSource: "automation", triggerDetail: "system", status: "running",
+          createdAt: now, startedAt: now, updatedAt: now, contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented" },
+        }).returning();
+        qaRunId = row!.id;
+      },
+    }));
+    expect(fresh).toMatchObject({ status: "failed", errorCode: ACK_UNCERTAIN, sessionIdBefore: null });
+    const saidHeld = async () => (await db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, fresh.id)))
+      .filter((event) => String(event.message).includes("a run or a lease on the issue still holds it"));
+    await expect.poll(async () => (await saidHeld()).length, { timeout: 30_000 }).toBe(1);
+    expect(await issueRow(f)).toMatchObject({ status: "in_progress", assigneeAgentId: f.devId });
+    expect(await handovers(f)).toHaveLength(0);
+    expect(await boardActions(f)).toHaveLength(0);
+    // QA's run is over. The CTO answers, the role is started once more and fails empty again: at the end of that run
+    // the hand-over is asked again and made, under the fresh run.
+    await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, qaRunId));
+    await turn(f, fail(ACK_UNCERTAIN, { session: "s2" }));
+    await expect.poll(async () => (await issueRow(f)).assigneeAgentId, { timeout: 30_000 }).toBe(f.ctoId);
+    expect(await issueRow(f)).toMatchObject({ status: "in_review", assigneeAgentId: f.ctoId });
+    expect(await sourceRunsOf(f)).toEqual([fresh.id]);
+    expect(await saidHeld()).toHaveLength(1);
+    expect(await guardNotes(f)).toHaveLength(1);
+    expect(devLaunches(f)).toHaveLength(6);
+    // Made once: the runs that end on the issue afterwards ask nothing more.
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.drainActiveRunExecutions();
+    expect(await handovers(f)).toHaveLength(1);
+    expect(await boardActions(f)).toHaveLength(0);
+  }, 360_000);
+
   // One answer of the CTO, as in production: its comment wakes the assignee of the ticket, whoever that is by then.
   // While the role is the assignee, that is one more run of the role, which fails as scripted.
   async function ctoAnswers(f: Fixture, session: string): Promise<"role ran" | "role not woken"> {
@@ -1188,12 +1376,13 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
       });
       return "role not woken";
     }
-    await turn(f, fail(ACK_UNCERTAIN, { session }));
+    await turn(f, fail(ACK_UNCERTAIN, { session }), { ctoRunAlive: true });
     return "role ran";
   }
 
   // The question asked after TR-2069: twenty-six `router_interactive_ack_uncertain` in a row in production. With the
-  // guard, twenty-six answers of the CTO start the role five times in all.
+  // guard, twenty-six answers of the CTO start the role five times in all. The CTO's run is alive on the ticket at
+  // each failure, the one on the fresh session included: the card's wake of the CTO is in the queue as the role fails.
   it("TR-2069 at length: twenty-six answers of the CTO start the role five times, then the issue is the CTO's and nothing loops", async () => {
     const f = await seed();
     await openSession(f);
@@ -1232,8 +1421,8 @@ describePostgres("relaunch loop guard on the real run path (TR-2069)", () => {
     const ask = () => handOverAfterFreshSessionFailure(db, { enqueueWakeup: async (agentId) => { woken.push(agentId); return null; } },
       { companyId: f.companyId, agent: { id: f.devId, name: "Dev Unity" }, issueId: f.issueId, exceptRunId: randomUUID() });
     expect(await ask()).toBe("handed");
-    // Asked again: the issue is the manager's, nothing more is handed.
-    expect(await ask()).toBe("left");
+    // Asked again: the issue is the manager's, nothing more is due.
+    expect(await ask()).toBe("none");
     expect(woken).toEqual([f.ctoId]);
     expect((await handovers(f)).map((row) => (row.details as Record<string, unknown>).sourceRunId)).toEqual([fresh!.id]);
     expect(await issueRow(f)).toMatchObject({ status: "in_review", assigneeAgentId: f.ctoId });

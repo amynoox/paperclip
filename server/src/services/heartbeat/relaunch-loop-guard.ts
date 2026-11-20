@@ -37,14 +37,25 @@
 //   the role (STUDIO-0083, manager-handover.ts), with a note that gives the
 //   code and the number of failures, and no Board action. The role is no
 //   longer the assignee, so nothing relaunches it on the issue until the
-//   manager gives it back. The hand-over is made when that run ends. It is
-//   not asked again at the start of the role's next run: a run that starts
-//   holds the issue, and an issue that holds a live run is not handed. If the
-//   server stops between the end of the fresh run and the hand-over, the role
+//   manager gives it back. The hand-over is made when that run ends, however
+//   it ended. The role's own retry still in the queue and the manager's own
+//   run on the issue (the worker router's card wakes it after each failure)
+//   do not hold the issue: with them it is handed at once. Another agent's
+//   live run, or a run of the role that has started, does: the hand-over is
+//   then logged, kept, and asked again at the end of each run on the issue
+//   until it is made or no longer due. It is
+//   never refused without a word. If the server stops in between, the role
 //   goes on, a new series forms on the session of the fresh run, and the
 //   hand-over is made at the end of the next fresh run. Where no manager can
 //   receive the issue (none, not invokable, or handed twice already), the
-//   issue is blocked with a Board action, as stranded work is today.
+//   issue is blocked with a Board action, as stranded work is today;
+// - a passing failure of the provider (quota, rate limit, an upstream outage,
+//   a process lost at a restart) is neither counted nor ends the series, by
+//   its code: three quick failures during an outage must not drop a sound
+//   session. The adapter's "transient" family is NOT used for this:
+//   production scheduled a transient retry after each failure of TR-2069,
+//   which the server does only for a failure it reads as transient, so the
+//   family would take the very failures the guard exists for out of the series.
 //
 // Reading the history at each start, with no counter of its own, is what makes
 // the guard survive a server restart or a cut in the middle of the gesture:
@@ -122,6 +133,16 @@ export const ROUTER_PRE_LAUNCH_FAILURE_CODES: readonly string[] = Object.freeze(
 // Lines the host writes into a run log itself, each through its own log call:
 // the worker router's notes (one a minute while it waits before a launch) and
 // Paperclip's own diagnostics. They are not the engine's output.
+// Passing failures of the provider or of the host, by their code (the codes the server itself reads as a quota or
+// an upstream failure, heartbeat/retries.ts readHeartbeatRunErrorFamily, and a process lost at a restart). They say
+// nothing about the session.
+export const RELAUNCH_LOOP_PASSING_FAILURE_CODES: readonly string[] = Object.freeze([
+  "provider_quota",
+  "codex_transient_upstream",
+  "claude_transient_upstream",
+  "process_lost",
+]);
+
 export const RUN_LOG_HOST_LINE_PREFIXES: readonly string[] = Object.freeze([
   "[paperclip-router] ",
   "[paperclip] ",
@@ -231,6 +252,7 @@ export function classifyRelaunchLoopRun(
   if (run.errorCode && ADAPTER_DECLARED_WAIT_ERROR_CODES.includes(run.errorCode)) return "skipped";
   if (run.errorCode && ROUTER_PRE_RESERVATION_REFUSAL_CODES.includes(run.errorCode)) return "skipped";
   if (run.errorCode && ROUTER_PRE_LAUNCH_FAILURE_CODES.includes(run.errorCode)) return "skipped";
+  if (run.errorCode && RELAUNCH_LOOP_PASSING_FAILURE_CODES.includes(run.errorCode)) return "skipped";
   if (run.engineNeverStarted) return "skipped";
   if (!run.finishedAt) return "other";
   if (run.finishedAt.getTime() - run.startedAt.getTime() >= RELAUNCH_LOOP_SHORT_RUN_MS) {
@@ -285,17 +307,20 @@ export type RelaunchLoopHandoverDecision =
  * the session is the one the guard started on a fresh session, and it is an
  * empty failure too. A run that only waited or was refused says nothing and
  * is passed over; any other run of the agent since then ends the matter.
+ * `heldBefore`: the hand-over was due and another agent's run held the issue. The role may have failed empty again
+ * meanwhile: such runs change nothing, the hand-over is still due under the fresh run.
  */
 export function evaluateRelaunchLoopHandover(input: {
   runs: readonly RelaunchLoopRunSample[];
   runIdsThatProducedSomething: ReadonlySet<string>;
+  heldBefore?: boolean;
 }): RelaunchLoopHandoverDecision {
   for (const run of input.runs) {
     const kind = classifyRelaunchLoopRun(run, input.runIdsThatProducedSomething.has(run.id));
     if (kind === "skipped") continue;
-    return kind === "empty_failure" && typeof run.guardFailedRunCount === "number"
-      ? { handover: true, freshRun: run }
-      : { handover: false };
+    if (kind !== "empty_failure") return { handover: false };
+    if (typeof run.guardFailedRunCount === "number") return { handover: true, freshRun: run };
+    if (!input.heldBefore) return { handover: false };
   }
   return { handover: false };
 }
@@ -591,10 +616,16 @@ export interface RelaunchLoopHandoverDeps {
   readRunLog?: RelaunchLoopRunLogReader;
   /** No manager can receive the issue: the caller blocks it with a Board action, as stranded work is today. */
   blockForBoard?: (input: { issueId: string; runId: string; comment: string }) => Promise<unknown>;
+  /** The hand-over was due and was not made: never without a word. */
+  onNotHanded?: (input: { issueId: string; freshRunId: string; reason: string }) => void;
   onError?: (error: unknown) => void;
 }
 
-export type RelaunchLoopHandoverOutcome = "none" | "handed" | "blocked_for_board" | "left";
+/**
+ * `held`: due, but a run or a lease on the issue still holds it; to ask again when a run on the issue ends.
+ * `left`: due, and not made for a reason that will not change by itself (the reason is given to `onNotHanded`).
+ */
+export type RelaunchLoopHandoverOutcome = "none" | "handed" | "blocked_for_board" | "held" | "left";
 
 const HANDOVER_REFUSALS_FOR_THE_BOARD: readonly string[] = Object.freeze(["no_manager", "manager_not_invokable", "handed_before"]);
 
@@ -607,7 +638,9 @@ const HANDOVER_REFUSALS_FOR_THE_BOARD: readonly string[] = Object.freeze(["no_ma
 export async function handOverAfterFreshSessionFailure(
   db: Db,
   deps: RelaunchLoopHandoverDeps,
-  input: { companyId: string; agent: { id: string; name: string }; issueId: string | null; exceptRunId?: string | null },
+  input: { companyId: string; agent: { id: string; name: string }; issueId: string | null; exceptRunId?: string | null; heldBefore?: boolean;
+    /** The run at whose end this is asked: its lease is released by that end. */
+    endedRunId?: string | null },
 ): Promise<RelaunchLoopHandoverOutcome> {
   if (!input.issueId) return "none";
   try {
@@ -622,7 +655,7 @@ export async function handOverAfterFreshSessionFailure(
       .filter((run) => classifyRelaunchLoopRun(run, false) === "empty_failure")
       .map((run) => run.id);
     const runIdsThatProducedSomething = await readRunIdsThatProducedSomething(db, { companyId: input.companyId, runIds: candidateIds });
-    const decision = evaluateRelaunchLoopHandover({ runs, runIdsThatProducedSomething });
+    const decision = evaluateRelaunchLoopHandover({ runs, runIdsThatProducedSomething, heldBefore: input.heldBefore });
     if (!decision.handover) return "none";
     const run = decision.freshRun;
     const said = { agentName: input.agent.name, failedRunCount: run.guardFailedRunCount ?? RELAUNCH_LOOP_FAILURE_THRESHOLD, code: run.errorCode };
@@ -633,13 +666,18 @@ export async function handOverAfterFreshSessionFailure(
       code: run.errorCode,
       sourceRun: { id: run.id, status: run.status, agentId: input.agent.id },
       note: relaunchLoopHandoverNote(said),
+      // The role's own retry in the queue and the manager's own run are the normal state after a failure.
+      doesNotHold: { queuedRunsOfTheRole: true, runsOfTheManager: true, leaseOfRunId: input.endedRunId ?? null },
     });
     if (result.handed) return "handed";
     if (HANDOVER_REFUSALS_FOR_THE_BOARD.includes(result.reason) && deps.blockForBoard) {
       await deps.blockForBoard({ issueId: input.issueId, runId: run.id, comment: relaunchLoopBoardBlockBody(said) });
       return "blocked_for_board";
     }
-    return "left";
+    // The same run asked twice, or an issue that left the role or its work meanwhile: nothing is due any more.
+    if (["run_already_handed", "assignee_changed", "issue_not_at_work", "issue_not_found"].includes(result.reason)) return "none";
+    deps.onNotHanded?.({ issueId: input.issueId, freshRunId: run.id, reason: result.reason });
+    return result.reason === "still_held" ? "held" : "left";
   } catch (error) {
     deps.onError?.(error);
     return "none";
