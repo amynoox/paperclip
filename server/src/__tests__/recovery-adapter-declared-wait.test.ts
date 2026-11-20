@@ -973,24 +973,43 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     } as any);
     const WAITED = [{ minutesAgo: 220, errorCode: WAIT }, { minutesAgo: 200, errorCode: WAIT, retry: true }];
 
-    it("neither blocks nor requeues the task during the pause, and the router's wake after the resume starts it", async () => {
+    // The real case replayed: wait, pause, sweep, resume.
+    it("neither blocks nor requeues the task during the pause, and the task starts alone at the resume", async () => {
       for (const status of ["todo", "in_progress"] as const) {
         const f = await seed(status, WAITED);
         await pause(f);
         await sweepTwice(f);
         await expectKept(f, status);
         await resume(f);
-        await sweepTwice(f);
-        await expectKept(f, status);
-        const host = routerHost();
-        try {
-          const woken = await host.issues.requestWakeup({ companyId: f.companyId, issueId: f.issueId,
-            reason: "worker_router_group_ready", idempotencyKey: `router-ready/${randomUUID()}` } as any);
-          expect(woken.queued).toBe(true);
-          await expect.poll(async () => (await runsOf(f)).find(run => run.id === woken.runId)?.status, { timeout: 30_000 }).toBe("succeeded");
-          expect((await issueOf(f.issueId)).status).toBe("done");
-        } finally { host.dispose(); }
+        await expectStartedOnceAndDone(f);
+        expect(await actionsOf(f.issueId)).toHaveLength(0);
       }
+    }, 240_000);
+
+    it("waits again in the same series when the router still has no machine at the resume, then starts on its wake", async () => {
+      const f = await seed("todo", WAITED);
+      modes.set(f.issueId, "wait");
+      await pause(f);
+      await sweepTwice(f);
+      await resume(f);
+      await expect.poll(async () => (await runsOf(f)).filter(run => !f.runIds.includes(run.id) && run.status === "failed").length,
+        { timeout: 30_000 }).toBe(1);
+      await sweepTwice(f);
+      // One more waiting run (it checked the task out), nothing requeued behind it, the same note, no board action.
+      expect((await issueOf(f.issueId)).status).toBe("in_progress");
+      expect((await runsOf(f)).length).toBe(f.runIds.length + 1);
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
+      expect(await waitNotes(f.issueId)).toHaveLength(1);
+      modes.delete(f.issueId);
+      const host = routerHost();
+      try {
+        const woken = await host.issues.requestWakeup({ companyId: f.companyId, issueId: f.issueId,
+          reason: "worker_router_group_ready", idempotencyKey: `router-ready/${randomUUID()}` } as any);
+        expect(woken.queued).toBe(true);
+        await expect.poll(async () => (await runsOf(f)).find(run => run.id === woken.runId)?.status, { timeout: 30_000 }).toBe("succeeded");
+        expect((await issueOf(f.issueId)).status).toBe("done");
+      } finally { host.dispose(); }
     }, 240_000);
 
     it("keeps the router's wake that arrives during the pause, and starts the task with it at the resume", async () => {
