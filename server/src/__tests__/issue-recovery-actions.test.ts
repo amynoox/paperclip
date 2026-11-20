@@ -173,6 +173,14 @@ if (!embeddedPostgresSupport.supported) {
   );
 }
 
+// STUDIO-0083: a block with a Board action now wakes the direct manager of the role, on a notice written for it. The
+// cases below state what else such a block does not wake and does not write; that wake and that notice are set aside.
+const wakesOtherThanTheManagerNotice = (wake: { mock: { calls: unknown[][] } }) =>
+  wake.mock.calls.filter((call) =>
+    (call[1] as { contextSnapshot?: Record<string, unknown> } | undefined)?.contextSnapshot?.boardRecoveryManagerWake !== true);
+const isNotTheManagerNotice = (row: { presentation?: unknown }) =>
+  (row.presentation as { title?: string } | null | undefined)?.title !== "Blocked for the Board: the manager is woken";
+
 describeEmbeddedPostgres("issue recovery actions", () => {
   let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
   let db: ReturnType<typeof createDb>;
@@ -678,7 +686,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       .where(and(eq(issues.companyId, companyId), eq(issues.originKind, "stranded_issue_recovery")));
     expect(recoveryIssues).toHaveLength(0);
     expect(updatedIssue?.assigneeAgentId).toBe(coderId);
-    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(wakesOtherThanTheManagerNotice(enqueueWakeup)).toEqual([]);
   });
 
   it.each(["done", "cancelled", "reassigned", "returned_to_todo"] as const)(
@@ -814,14 +822,14 @@ describeEmbeddedPostgres("issue recovery actions", () => {
     expect(await db.select().from(issueRecoveryActions)
       .where(eq(issueRecoveryActions.sourceIssueId, observed.id)))
       .toMatchObject([{ status: "active", previousOwnerAgentId: coderId }]);
-    expect(await db.select().from(issueComments)
-      .where(eq(issueComments.issueId, observed.id))).toHaveLength(1);
+    expect((await db.select().from(issueComments)
+      .where(eq(issueComments.issueId, observed.id))).filter(isNotTheManagerNotice)).toHaveLength(1);
     expect(await db.select().from(activityLog)
       .where(eq(activityLog.entityId, observed.id)))
       .toMatchObject([{ details: expect.objectContaining({ status: "blocked" }) }]);
     expect(await db.select().from(agentWakeupRequests)
       .where(eq(agentWakeupRequests.companyId, companyId))).toEqual([]);
-    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(wakesOtherThanTheManagerNotice(enqueueWakeup)).toEqual([]);
   });
 
   it.each(["awaiting_release", "pending_dispatch"] as const)("preserves an accepted %s agent transfer at both recovery boundaries", async state => {
@@ -898,7 +906,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
         }),
       ]);
       expect(result).toMatchObject({ id: observed!.id, status: "blocked" });
-      expect(await db.select().from(issueComments).where(eq(issueComments.issueId, observed!.id))).toHaveLength(1);
+      expect((await db.select().from(issueComments).where(eq(issueComments.issueId, observed!.id))).filter(isNotTheManagerNotice)).toHaveLength(1);
       expect(await db.select().from(activityLog).where(eq(activityLog.entityId, observed!.id))).toHaveLength(1);
     } finally {
       clearTimeout(timer);
@@ -1013,15 +1021,15 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       issue: (await issueService(db).getById(sourceIssue.id))!, previousStatus: "in_progress", latestRun: secondRun,
       recoveryCause: "configuration_incomplete",
     });
-    const notices = await db
-      .select({ metadata: issueComments.metadata })
+    const notices = (await db
+      .select({ metadata: issueComments.metadata, presentation: issueComments.presentation })
       .from(issueComments)
       .where(
         and(
           eq(issueComments.issueId, sourceIssue.id),
           eq(issueComments.authorType, "system"),
         ),
-      );
+      )).filter(isNotTheManagerNotice);
     expect(
       notices.filter((row) =>
         noticeMetadataReferencesRecoveryAction(row.metadata, actions[0]!.id),
@@ -1141,7 +1149,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
           preservesSourceAssignee: true,
         }),
       });
-      expect(enqueueWakeup).not.toHaveBeenCalled();
+      expect(wakesOtherThanTheManagerNotice(enqueueWakeup)).toEqual([]);
     },
   );
 
@@ -1731,7 +1739,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       cause: "configuration_incomplete",
       recoveryIssueId: null,
     });
-    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(wakesOtherThanTheManagerNotice(enqueueWakeup)).toEqual([]);
   });
 
   it("does not classify stale configuration failures from a non-assignee run", async () => {
@@ -1813,7 +1821,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       attemptCount: 2,
     });
     expect(actionRows[0]?.evidence).toMatchObject({ latestRunId: secondLatestRun.id });
-    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(wakesOtherThanTheManagerNotice(enqueueWakeup)).toEqual([]);
   });
 
   it("deduplicates workspace-incoherence recovery actions by the typed workspace fingerprint", async () => {
@@ -1924,7 +1932,7 @@ describeEmbeddedPostgres("issue recovery actions", () => {
       tone: "danger",
       title: "Workspace validation failed",
     });
-    expect(enqueueWakeup).not.toHaveBeenCalled();
+    expect(wakesOtherThanTheManagerNotice(enqueueWakeup)).toEqual([]);
   });
 
   it("keeps the source issue blocked when source-scoped wakeup is claimed synchronously", async () => {

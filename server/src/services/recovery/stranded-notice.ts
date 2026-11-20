@@ -22,6 +22,11 @@ export type StrandedRecoveryNoticeSeed = {
   title: string;
   tone: IssueCommentPresentation["tone"];
   nextAction?: string;
+  /**
+   * STUDIO-0083: set by the notice of a worker router refusal alone. It is how the escalation knows it was asked for
+   * by the refusal path, the only one that may hand the ticket to the role's manager instead of blocking it.
+   */
+  routerRefusalCode?: string;
 };
 
 export type StrandedRecoveryEscalationNotice = {
@@ -101,6 +106,7 @@ export function buildRouterRefusalRecoveryNoticeSeed(code: string): StrandedReco
     title: text.title,
     tone: "warning",
     ...(text.gesture ? { nextAction: text.gesture } : {}),
+    routerRefusalCode: code,
   };
 }
 
