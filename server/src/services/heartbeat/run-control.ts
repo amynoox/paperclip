@@ -8,7 +8,7 @@ import { resumeDeferredChatWake } from "../durable-chat-wakeup.js";
 import { notifyEnvironmentCleanup } from "../environment-cleanup-notifications.js";
 import { readNativeStopExecutionEvidence } from "./native-stop-evidence-read.js";
 import { readTaskRetryIntent, reconcileTaskChatRetryReceipts } from "../task-retry.js";
-import { PAUSE_RESUME_RETRY_KEY_PREFIX, recordPauseCutWorkContinued } from "../pause-resume-continuation.js";
+import { PAUSE_RESUME_RETRY_KEY_PREFIX, pauseCutWorkRequestMayStart, recordPauseCutWorkContinued } from "../pause-resume-continuation.js";
 import { PROCESS_IDENTITY_RECORDED, PROCESS_START_REQUESTED, readNativeLocalProcessStop, recordedLocalExecutionStopped } from "../native-local-process-stop.js";
 import { isHeartbeatRunTerminalStatus } from "./run-lifecycle.js";
 import { pendingCaseHandoffForRun, cancelCaseHandoffsForIssue, isCaseHandoffSourceReleased } from "./case-handoff-lifecycle.js";
@@ -848,6 +848,11 @@ export function createHeartbeatRunControl(db: Db, dependencies: HeartbeatRunCont
         intent.actorId !== wake.requestedByActorId) return;
     const issueId = readNonEmptyString(wake.payload?.issueId);
     if (!issueId) return;
+    // STUDIO-0074: a request filed at an agent's resume does not start a task its owner has blocked since, or that
+    // waits for a blocker. It stays kept.
+    if (!await pauseCutWorkRequestMayStart(db, { companyId, agentId: wake.agentId, issueId, retryRequestId: wake.id,
+      idempotencyKey: wake.idempotencyKey, cutRunId: intent.sourceRunId, actorId: intent.actorId,
+      actorSource: intent.actorSource })) return;
     const run = await enqueueWakeup(wake.agentId, { source: "on_demand", triggerDetail: "manual", reason: "task_retry",
       requestedByActorType: "user", requestedByActorId: intent.actorId, taskRetryRequestId: wake.id,
       payload: { issueId }, contextSnapshot: { issueId, triggeredBy: "board", actorId: intent.actorId,

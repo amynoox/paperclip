@@ -104,6 +104,30 @@ describe("the runs a pause cut, when the role resumes", () => {
     await work.process(f.agentId);
     expect((await state(f.agentId)).lifecycleState).toBe("ready");
   }
+  /** The delay of the pause's proof has passed for the cut run. */
+  async function proofArrives(f: { cut: { id: string } }) {
+    const proven = new Date(Date.now() - 13 * HOUR);
+    await db.update(heartbeatRuns).set({ finishedAt: proven }).where(eq(heartbeatRuns.id, f.cut.id));
+    await db.update(environmentLeases).set({ releasedAt: proven }).where(eq(environmentLeases.heartbeatRunId, f.cut.id));
+  }
+  /** A question card on the task that only a person may answer. */
+  const decisionPending = (f: { companyId: string; issueId: string }) => db.insert(issueThreadInteractions).values({
+    companyId: f.companyId, issueId: f.issueId, kind: "request_confirmation", continuationPolicy: "none", payload: {},
+    effectiveResolverPolicy: "human_only" } as never);
+  /** The role is paused again, through the lifecycle. */
+  async function pausedAgain(f: { companyId: string; agentId: string }) {
+    await idle(f);
+    await createAgentLifecycle(db).pauseAgent(f.agentId);
+    await work.process(f.agentId);
+    expect((await state(f.agentId)).lifecycleState).toBe("paused");
+    await busy(f);
+  }
+  /** The company's status changes and its policy is projected on the role. */
+  async function companyIs(f: { companyId: string; agentId: string }, status: "paused" | "active" | "archived") {
+    await db.update(companies).set({ status }).where(eq(companies.id, f.companyId));
+    await projectCompanyHolds(db, createAgentLifecycleEffects(), f.companyId);
+    await work.process(f.agentId);
+  }
   type Task = { companyId: string; agentId: string; issueId: string; cut: { id: string } };
   const traces = (f: Task) => db.select().from(activityLog).where(and(eq(activityLog.companyId, f.companyId),
     eq(activityLog.entityType, "issue"), eq(activityLog.entityId, f.issueId), inArray(activityLog.action, TRACES)))
@@ -278,6 +302,72 @@ describe("the runs a pause cut, when the role resumes", () => {
       await roleResumes(f);
       await expectKept(f, "waiting_for_person", "decision_pending");
     });
+
+    it("a kept request whose task its owner then blocks: nothing starts while it is blocked, and the task says so once", async () => {
+      const f = await fixture({ lease: "ssh", finishedMinutesAgo: 5 });
+      await roleResumes(f);
+      await expectKept(f, "stop_not_proven", "remote_cleanup");
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issueId));
+      await proofArrives(f);
+      await heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
+      await heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
+      expect(await continuations(f)).toHaveLength(0);
+      expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:stop_not_proven`, `${PAUSE_CUT_WORK_KEPT}:task_blocked`]);
+      // Its owner reopens the task: the kept request starts.
+      await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+      await heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
+      expect(await continuations(f)).toHaveLength(1);
+      expect((await traceList(f)).at(-1)).toBe(PAUSE_CUT_WORK_CONTINUED);
+    });
+
+    it("a kept request whose task then gets a blocker: nothing starts", async () => {
+      const f = await fixture({ lease: "ssh", finishedMinutesAgo: 5 });
+      await roleResumes(f);
+      await expectKept(f, "stop_not_proven", "remote_cleanup");
+      const blockerId = randomUUID();
+      await db.insert(issues).values({ id: blockerId, companyId: f.companyId, title: "Blocker", status: "todo" });
+      await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blockerId, relatedIssueId: f.issueId, type: "blocks" });
+      await proofArrives(f);
+      await heartbeatService(db).resumeExecutionWaitComments({ companyId: f.companyId });
+      expect(await continuations(f)).toHaveLength(0);
+      expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:stop_not_proven`,
+        `${PAUSE_CUT_WORK_KEPT}:blocked_by_dependency`]);
+    });
+
+    it("a kept request a person cancelled: the next resume does not file it again", async () => {
+      const f = await fixture();
+      await decisionPending(f);
+      await roleResumes(f);
+      await expectKept(f, "waiting_for_person", "decision_pending");
+      const [kept] = await retries(f);
+      await db.update(agentWakeupRequests).set({ status: "cancelled", error: "Cancelled by the board", finishedAt: new Date() })
+        .where(eq(agentWakeupRequests.id, kept!.id));
+      await pausedAgain(f);
+      await roleResumes(f);
+      expect(await retries(f)).toHaveLength(1);
+      expect(await continuations(f)).toHaveLength(0);
+      expect(await traceList(f)).toEqual([PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:waiting_for_person`]);
+    });
+
+    it("a request a pause cancelled is looked at by the resume of that pause only", async () => {
+      const f = await fixture();
+      await decisionPending(f);
+      await roleResumes(f);
+      await expectKept(f, "waiting_for_person", "decision_pending");
+      // A new pause cancels the kept request; nobody asks for its resume.
+      await pausedAgain(f);
+      expect(await retries(f)).toMatchObject([{ status: "cancelled" }]);
+      await roleResumes(f, null);
+      const afterSecond = [PAUSE_CUT_WORK_REQUEST_FILED, `${PAUSE_CUT_WORK_KEPT}:waiting_for_person`,
+        `${PAUSE_CUT_WORK_NOT_CONTINUED}:resumed_without_a_person`];
+      expect(await traceList(f)).toEqual(afterSecond);
+      // A third pause, resumed by a person: the request the second pause cancelled is not this pause's.
+      await pausedAgain(f);
+      await roleResumes(f);
+      expect(await traceList(f)).toEqual(afterSecond);
+      expect(await retries(f)).toHaveLength(1);
+      expect(await continuations(f)).toHaveLength(0);
+    });
   });
 
   describe("files nothing, and says why on the task", () => {
@@ -373,6 +463,49 @@ describe("the runs a pause cut, when the role resumes", () => {
       await work.process(f.agentId);
       expect((await state(f.agentId)).lifecycleState).toBe("ready");
       await expectRefused(f, "resumed_without_a_person");
+    });
+
+    it("a person's resume that left the role paused, then a pause on purpose: that person is not reused", async () => {
+      const f = await fixture();
+      // The role is held by its own pause and by the company's.
+      await companyIs(f, "paused");
+      expect(await state(f.agentId)).toMatchObject({ lifecycleState: "paused", lifecycleHolds: ["manual", "company_paused"] });
+      // A person resumes: recorded, but the company's pause keeps the role paused.
+      await createAgentLifecycle(db).resumeAgent(f.agentId, "user", PERSON);
+      expect(await state(f.agentId)).toMatchObject({ lifecycleState: "paused", lifecycleHolds: ["company_paused"],
+        lifecycleOperation: { resumeRequestedBy: PERSON } });
+      // Someone pauses the role again on purpose.
+      await createAgentLifecycle(db).pauseAgent(f.agentId);
+      expect((await state(f.agentId)).lifecycleOperation).not.toHaveProperty("resumeRequestedBy");
+      // The company resumes, then an agent's resume lifts the last hold.
+      await companyIs(f, "active");
+      expect((await state(f.agentId)).lifecycleState).toBe("paused");
+      await roleResumes(f, null);
+      await expectRefused(f, "resumed_without_a_person");
+    });
+
+    it("a resume that names nobody, and a hold a policy adds, also drop the person on record", async () => {
+      const byAgent = await fixture();
+      await companyIs(byAgent, "paused");
+      await createAgentLifecycle(db).resumeAgent(byAgent.agentId, "user", PERSON);
+      expect((await state(byAgent.agentId)).lifecycleOperation).toMatchObject({ resumeRequestedBy: PERSON });
+      // An agent's resume, while the company still holds the role, names nobody.
+      await createAgentLifecycle(db).resumeAgent(byAgent.agentId, "user", undefined);
+      expect((await state(byAgent.agentId)).lifecycleOperation).not.toHaveProperty("resumeRequestedBy");
+      await companyIs(byAgent, "active");
+      expect((await state(byAgent.agentId)).lifecycleState).toBe("ready");
+      await expectRefused(byAgent, "resumed_without_a_person");
+
+      const byPolicy = await fixture();
+      await companyIs(byPolicy, "paused");
+      await createAgentLifecycle(db).resumeAgent(byPolicy.agentId, "user", PERSON);
+      // The company is archived: its policy adds a hold to the paused role.
+      await companyIs(byPolicy, "archived");
+      expect(await state(byPolicy.agentId)).toMatchObject({ lifecycleState: "paused", lifecycleHolds: ["company_archived"] });
+      expect((await state(byPolicy.agentId)).lifecycleOperation).not.toHaveProperty("resumeRequestedBy");
+      await companyIs(byPolicy, "active");
+      expect((await state(byPolicy.agentId)).lifecycleState).toBe("ready");
+      await expectRefused(byPolicy, "resumed_without_a_person");
     });
 
     it("a resume made with a key whose person may not change the task: the product's own check keeps the request", async () => {

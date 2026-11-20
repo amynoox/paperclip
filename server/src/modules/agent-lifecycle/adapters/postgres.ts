@@ -147,16 +147,24 @@ async function changeLockedAgent(tx: Db, effects: LifecycleEffects, agent: Lifec
   if (command === "complete" && next === "paused" && !holds.length) next = "resuming";
   if (["complete", "reconcile"].includes(command) && next === "paused" && holds.length === 1 && holds[0] === "setup"
     && await effects.setupRequiresPreparation(tx, agent.companyId, agent.defaultEnvironmentId, agent)) next = "preparing";
-  // STUDIO-0074: a person's resume that does not change the state yet (the pause is still stopping runs, or another
-  // hold remains) still says who asked, on the operation of the pause in progress.
-  const resumeRequestedBy = command === "resume" && options.requestedBy ? options.requestedBy
-    : (agent.lifecycleOperation as PauseResumeOperation | null)?.resumeRequestedBy;
+  // STUDIO-0074: who asked to resume during this pause. The latest resume command decides: one that names nobody
+  // leaves nobody, it does not inherit an earlier requester. Any other command keeps the one on record.
+  const recordedRequester = (agent.lifecycleOperation as PauseResumeOperation | null)?.resumeRequestedBy;
+  const resumeRequestedBy = command === "resume" ? options.requestedBy : recordedRequester;
   if (next === agent.lifecycleState) {
+    // A person's resume that does not change the state yet (the pause is still stopping runs, or another hold
+    // remains) still says who asked, on the operation of the pause in progress.
     const requester = command === "resume" && options.requestedBy && agent.lifecycleOperation
       && ["pausing", "paused"].includes(agent.lifecycleState) ? options.requestedBy : null;
-    if (requester || JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) || agent.pauseReason !== (holds[0] ?? null)) {
+    // The earlier requester no longer stands once the agent is paused again on purpose, once a policy adds a hold,
+    // or once a resume names nobody: the runs would otherwise continue in that person's name against a later pause.
+    const holdAdded = holds.some(hold => !agent.lifecycleHolds.includes(hold));
+    const forget = !requester && recordedRequester !== undefined
+      && (command === "pause" || command === "resume" || (command === "reconcile" && holdAdded));
+    if (requester || forget || JSON.stringify(holds) !== JSON.stringify(agent.lifecycleHolds) || agent.pauseReason !== (holds[0] ?? null)) {
       const [updated] = await tx.update(agents).set({ lifecycleHolds: holds, pauseReason: holds[0] ?? null,
-        ...(requester ? { lifecycleOperation: sql`${agents.lifecycleOperation} || ${JSON.stringify({ resumeRequestedBy: requester })}::jsonb` } : {}),
+        ...(requester ? { lifecycleOperation: sql`${agents.lifecycleOperation} || ${JSON.stringify({ resumeRequestedBy: requester })}::jsonb` }
+          : forget ? { lifecycleOperation: sql`${agents.lifecycleOperation} - 'resumeRequestedBy'` } : {}),
       }).where(eq(agents.id, agent.id)).returning();
       return updated;
     }
