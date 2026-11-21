@@ -5,6 +5,8 @@ import { conversationEventCondition, conversationEventColumns } from "./conversa
 import { deriveTaskKey } from "./run-preparation.js";
 import { retryIdempotentDatabaseOperation } from "../../database-retry.js";
 import { isConversation } from "../agent-conversations.js";
+import { conversationCancelledRunKeepsSession } from "../cut-run-session.js";
+import { recordTaskSessionRemoved, taskSessionRemovedAfterRun } from "../task-session-removal.js";
 import fs from "node:fs/promises";
 import {
   and,
@@ -869,6 +871,10 @@ export function shouldResetTaskSessionForWake(
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
+  // STUDIO-0075: a continuation that would have gone on in the session of the run it continues.
+  const cutRunId = readNonEmptyString(contextSnapshot?.cutRunSessionNotKept);
+  if (contextSnapshot?.forceFreshSession === true && cutRunId)
+    return `a new conversation starts: the session of the cut run ${cutRunId} was not kept for this task (yet)`;
   if (contextSnapshot?.forceFreshSession === true)
     return "forceFreshSession was requested";
 
@@ -1684,14 +1690,37 @@ export function createHeartbeatRunState(db: Db) {
     sessionDisplayId: string | null;
     lastRunId: string | null;
     lastError: string | null;
+    /**
+     * STUDIO-0075: the write of a result that arrived after its run was settled. It is refused (null) when the
+     * task's session was last written by another run created at the same time as this one, or later. Read under the
+     * task's lock, which every session write takes: a later run cannot write between this check and this write.
+     */
+    lateResultOfRun?: { id: string; createdAt: Date };
   }) {
     return db.transaction(async (tx) => {
       const [issue] = await tx.select().from(issues).where(and(sql`${issues.id}::text = ${input.taskKey}`, eq(issues.companyId, input.companyId))).for("update");
       if (isConversation(issue)) {
         const [run] = input.lastRunId ? await tx.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, input.lastRunId)) : [];
-        if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return null;
+        // STUDIO-0075: a conversation keeps the session of a cancelled run (the owner's rule, cut-run-session.ts);
+        // only a run a person stopped is left aside, when the owner's switch is off. The product's own rule was that
+        // a conversation takes no session from a cancelled run. The generation rule is unchanged.
+        if ((run?.status === "cancelled" && !conversationCancelledRunKeepsSession(run))
+          || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return null;
       }
-    const existing = await tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId), eq(agentTaskSessions.adapterType, input.adapterType), eq(agentTaskSessions.taskKey, input.taskKey))).then((rows) => rows[0] ?? null);
+    // STUDIO-0075: a session removed on purpose after this run was created never comes back with its late result
+    // (a person's reset, the session of a cut run dropped by recovery, a guard that gave the session up). The
+    // removal left its mark under this same task lock (task-session-removal.ts).
+    if (input.lateResultOfRun && await taskSessionRemovedAfterRun(tx, { companyId: input.companyId, agentId: input.agentId,
+      taskKey: input.taskKey, adapterType: input.adapterType, runId: input.lateResultOfRun.id })) return null;
+    // STUDIO-0075: a late write also locks the session row itself. Every writer of that row then waits or is seen,
+    // whether or not it takes the task's lock, and whether or not the key names a task.
+    const existingQuery = tx.select().from(agentTaskSessions).where(and(eq(agentTaskSessions.companyId, input.companyId), eq(agentTaskSessions.agentId, input.agentId), eq(agentTaskSessions.adapterType, input.adapterType), eq(agentTaskSessions.taskKey, input.taskKey)));
+    const existing = await (input.lateResultOfRun ? existingQuery.for("update") : existingQuery).then((rows) => rows[0] ?? null);
+    if (existing?.lastRunId && input.lateResultOfRun && existing.lastRunId !== input.lateResultOfRun.id) {
+      const [writer] = await tx.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
+        .where(eq(heartbeatRuns.id, existing.lastRunId)).limit(1);
+      if (writer && writer.createdAt.getTime() >= input.lateResultOfRun.createdAt.getTime()) return null;
+    }
     if (existing) {
       return tx
         .update(agentTaskSessions)
@@ -1732,6 +1761,8 @@ export function createHeartbeatRunState(db: Db) {
       adapterType?: string | null;
       expectedRunId?: string;
       includeIssueAliases?: boolean;
+      /** STUDIO-0075: a late result's request to forget the session; same rule as `upsertTaskSession`. */
+      lateResultOfRun?: { id: string; createdAt: Date };
     },
   ) {
     const conditions = [
@@ -1776,10 +1807,33 @@ export function createHeartbeatRunState(db: Db) {
           if (run?.status === "cancelled" || run?.contextSnapshot?.conversationSessionGeneration !== issue.conversationSessionGeneration) return 0;
         }
       }
+      if (opts?.taskKey && opts.lateResultOfRun) {
+        const late = opts.lateResultOfRun;
+        await tx.select({ id: issues.id }).from(issues).where(and(sql`${issues.id}::text = ${opts.taskKey}`, eq(issues.companyId, companyId))).for("update");
+        const written = await tx.select({ lastRunId: agentTaskSessions.lastRunId }).from(agentTaskSessions).where(and(...conditions)).for("update");
+        for (const row of written) {
+          if (!row.lastRunId || row.lastRunId === late.id) continue;
+          const [writer] = await tx.select({ createdAt: heartbeatRuns.createdAt }).from(heartbeatRuns)
+            .where(eq(heartbeatRuns.id, row.lastRunId)).limit(1);
+          if (writer && writer.createdAt.getTime() >= late.createdAt.getTime()) return 0;
+        }
+      }
       const goals = await tx.select({ id: agentTaskSessions.id }).from(agentTaskSessions)
         .where(and(...conditions, sql`${agentTaskSessions.goalStatus} is not null`, sql`${agentTaskSessions.goalStatus} <> 'complete'`)).limit(1);
       if (goals.length) await notifyExternalConversationSettlement(tx, { companyId });
-      return tx.delete(agentTaskSessions).where(and(...conditions)).returning().then((rows) => rows.length);
+      if (opts?.lateResultOfRun) return tx.delete(agentTaskSessions).where(and(...conditions)).returning().then((rows) => rows.length);
+      // STUDIO-0075: a removal made on purpose leaves its mark, so that the late result of a run created before it
+      // does not put the session back. The task's row is locked first, as every session write does: a late write
+      // either sees the mark or is deleted with the rest.
+      const aliases = opts?.taskKey ? await tx.select({ id: issues.id, identifier: issues.identifier }).from(issues)
+        .where(and(eq(issues.companyId, companyId), or(sql`${issues.id}::text = ${opts.taskKey}`,
+          opts.includeIssueAliases ? eq(issues.identifier, opts.taskKey.toUpperCase()) : sql`false`))).for("update") : [];
+      const removed = await tx.delete(agentTaskSessions).where(and(...conditions)).returning();
+      const taskKeys = opts?.taskKey ? [...new Set([opts.taskKey, ...removed.map(row => row.taskKey),
+        ...aliases.flatMap(issue => opts.includeIssueAliases ? [issue.id, ...(issue.identifier ? [issue.identifier] : [])] : [issue.id])])] : null;
+      await recordTaskSessionRemoved(tx, { companyId, agentId, taskKeys, adapterType: opts?.adapterType ?? null,
+        reason: opts?.expectedRunId ? "cleared_by_run" : "cleared" });
+      return removed.length;
     });
   }
 

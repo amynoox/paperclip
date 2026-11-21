@@ -34,7 +34,8 @@ import { isConversation, settleConversationTurn } from "../agent-conversations.j
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../legacy-execution-recovery.js";
 import { isWorkspaceGitScanError } from "../workspace-git-operation-scheduler.js";
 import { and, eq, sql } from "drizzle-orm";
-import { heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
+import { KEEP_SESSION_AFTER_PERSON_STOP, isPersonStop } from "../cut-run-session.js";
+import { agentTaskSessions, heartbeatRuns, issues, nativeRunFinalizations } from "@paperclipai/db";
 import { HttpError } from "../../errors.js";
 import { logger } from "../../middleware/logger.js";
 import { normalizeResponsibleUserDenialCode } from "../responsible-user-denial-run-outcomes.js";
@@ -542,6 +543,64 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
       }
     }
 
+    /**
+     * STUDIO-0075: the session of a result that arrives after the run was already settled by another path (a pause
+     * or a stop cancelled it, recovery declared it lost). Such a result is not finalized, and its session used to be
+     * dropped with it: the task kept the PREVIOUS session and the next run opened a new conversation although the
+     * engine of this run had opened one (the worker router returns it in its failure result). The session the result
+     * names becomes the task's session, with the configuration fingerprint a finished run gets, and the run names it
+     * (`session_id_after`); a result that asks to forget the session is obeyed. Nothing is written when the result
+     * names no session, nor over the session of a later run of the same agent on the same task.
+     */
+    async function persistLateSessionState() {
+      if (!taskKey) return;
+      const namesSession = adapterResult.sessionParams !== undefined || adapterResult.sessionId !== undefined
+        || adapterResult.sessionDisplayId !== undefined;
+      const keeps = namesSession && Boolean(nextSessionState.params || nextSessionState.displayId);
+      if (!adapterResult.clearSession && !keeps) return;
+      if (nativeTaskSessionPublicationHandled(run.runnerProfileJson, {
+        runId: run.id, companyId: run.companyId, agentId: agent.id, taskKey, adapterType: agent.adapterType,
+      })) return;
+      // Not over the session of a run created at the same time or later: checked under the task's lock, with the
+      // write (run-state.ts). `left`: the task's session stays as it was (a later run wrote it, the task is a
+      // conversation that takes no session from a cancelled run, or there was nothing to forget).
+      const lateResultOfRun = { id: run.id, createdAt: run.createdAt };
+      // A run a person stopped leaves its session to the task only when the owner's switch says so
+      // (cut-run-session.ts). A pause, a lost link and a failure do not depend on it.
+      const [settled] = await db.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+        .from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id));
+      const leftByPersonStop = Boolean(settled && isPersonStop(settled) && !KEEP_SESSION_AFTER_PERSON_STOP);
+      const session: "kept" | "cleared" | "left" = leftByPersonStop ? "left" : adapterResult.clearSession
+        ? (await clearTaskSessions(agent.companyId, agent.id, { taskKey, adapterType: agent.adapterType, lateResultOfRun })) > 0
+          ? "cleared" : "left"
+        : (await upsertTaskSession({
+            companyId: agent.companyId, agentId: agent.id, adapterType: agent.adapterType, taskKey,
+            sessionParamsJson: attachPaperclipSessionMetadataToSessionParams(nextSessionState.params, configuredModel, sessionConfigMetadata),
+            sessionDisplayId: nextSessionState.displayId, lastRunId: run.id, lastError: runErrorMessage, lateResultOfRun,
+          })) ? "kept" : "left";
+      // The run says what its late result was and what became of its session: a session kept from a run whose stop
+      // was not proven (router_provider_stop_unverified) must be readable on the run, not only in the task's session.
+      // Whether the session this result names is the one the task now holds: `left` with `false` is a real loss.
+      const lateSessionId = nextSessionState.displayId ?? nextSessionState.legacySessionId ?? null;
+      const [held] = await db.select({ sessionDisplayId: agentTaskSessions.sessionDisplayId }).from(agentTaskSessions).where(and(
+        eq(agentTaskSessions.companyId, agent.companyId), eq(agentTaskSessions.agentId, agent.id),
+        eq(agentTaskSessions.adapterType, agent.adapterType), eq(agentTaskSessions.taskKey, taskKey))).limit(1);
+      const sameSessionAsTask = Boolean(namesSession && lateSessionId && held?.sessionDisplayId === lateSessionId);
+      const lateResult = { errorCode: adapterResult.errorCode ?? null, errorMessage: runErrorMessage ?? null, session, sameSessionAsTask };
+      await db.update(heartbeatRuns).set({
+        // Named on the run only when it is the session really kept for the task.
+        ...(session === "kept" ? { sessionIdAfter: nextSessionState.displayId ?? nextSessionState.legacySessionId } : {}),
+        resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ lateResult })}::jsonb`,
+      }).where(eq(heartbeatRuns.id, run.id));
+      await appendRunEvent(run, {
+        eventType: "run.late_result", stream: "system", level: "info",
+        message: session === "kept" ? "The result came after the run was settled; its session is kept for the task."
+          : session === "cleared" ? "The result came after the run was settled and asked to forget the session; the task's session is cleared."
+          : "The result came after the run was settled; the task's session is left as it was.",
+        payload: lateResult,
+      });
+    }
+
     let logSummary: {
       bytes: number | null;
       sha256?: string | null;
@@ -739,6 +798,16 @@ export function createHeartbeatRunCompletion(db: Db, dependencies: HeartbeatRunC
           },
           "skipping late run finalization because the run already left running state",
         );
+        // STUDIO-0075: the run is settled, but the session its result names is still the one to resume.
+        await persistLateSessionState().catch(async (err) => {
+          logger.error({ err, runId: run.id }, "the session of a late run result could not be kept for its task");
+          // Not only a line in the server's log: the run itself says its late session was not kept.
+          await appendRunEvent(run, {
+            eventType: "run.late_result", stream: "system", level: "error",
+            message: "The result came after the run was settled; its session could not be kept for the task.",
+            payload: { errorCode: adapterResult.errorCode ?? null, session: "failed", error: err instanceof Error ? err.message : String(err) },
+          }).catch(() => {});
+        });
         return;
       }
     }

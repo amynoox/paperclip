@@ -13,6 +13,7 @@ import { deliveredQueuedCommentIds } from "../queued-comment-delivery.js";
 import { hasAutomaticInteractionDeliveryHold, INTERACTION_DELIVERY_DENIED, recheckQueuedRunInteractions, withInteractionDeliveryOrigin } from "../agent-interaction-delivery.js";
 import { adapterWaitPayload, readAdapterTaskWait, deferAdapterRun } from "../adapter-task-admission.js";
 import { deferredWorkIntentWait } from "../work-intent-outbox.js";
+import { cancelledRunKeepsSession, conversationCancelledRunKeepsSession } from "../cut-run-session.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { createHeartbeatTimerPolicy } from "./timer-policy.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
@@ -113,6 +114,7 @@ import {
 import type { Db } from "@paperclipai/db";
 import {
   agents,
+  agentTaskSessions,
   caseHandoffs,
   cases,
   agentWakeupRequests,
@@ -5344,7 +5346,32 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           if (!explicitContinuation && (executionBlocker || (continuationBlocked && !verifiedConversationReset)) && !ownsReconstructionContinuation)
             return deferBlockedExecution(continuationHold());
           if (explicitContinuation) {
-            enrichedContextSnapshot.forceFreshSession = true;
+            // STUDIO-0075: a person's request on an interrupted run opens a new conversation, because what the run
+            // was doing when it broke is unknown. A run a pause cut is different: it was stopped on purpose, its stop
+            // is proven (the gate above), and its engine session is kept for the task. The request then continues in
+            // that session: the role goes on where it was, instead of starting again from a summary. The adapter still
+            // refuses to resume on another machine or in another folder, and the server on another configuration.
+            const [continued] = await tx.select({ status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+              .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, issue.companyId),
+                eq(heartbeatRuns.id, explicitContinuation.previousRunId)));
+            // Only the session really kept from that run: the task's session must have been written by it (its own
+            // end, or its late result). If its result never came, or the server restarted before it, the task still
+            // holds the session of an EARLIER run, which knows nothing of what the cut run did: a new conversation.
+            // The same holds for a run a person stopped, when the owner's switch is on, and on a conversation task
+            // for any cancelled run (cut-run-session.ts).
+            const keepsSession = Boolean(continued && (cancelledRunKeepsSession(continued)
+              || (isConversation(issue) && conversationCancelledRunKeepsSession(continued))));
+            const [kept] = keepsSession
+              ? await tx.select({ lastRunId: agentTaskSessions.lastRunId }).from(agentTaskSessions).where(and(
+                  eq(agentTaskSessions.companyId, issue.companyId), eq(agentTaskSessions.agentId, agentId),
+                  eq(agentTaskSessions.adapterType, agent.adapterType), eq(agentTaskSessions.taskKey, issue.id))).limit(1)
+              : [];
+            if (kept?.lastRunId !== explicitContinuation.previousRunId) {
+              enrichedContextSnapshot.forceFreshSession = true;
+              // The run could have gone on in the cut run's session, and that session is not the task's (its result
+              // has not come, or never will): the continuation's log says so, instead of a bare "fresh session".
+              if (keepsSession) enrichedContextSnapshot.cutRunSessionNotKept = explicitContinuation.previousRunId;
+            }
             enrichedContextSnapshot.previousRunId = explicitContinuation.previousRunId;
             enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
           }
