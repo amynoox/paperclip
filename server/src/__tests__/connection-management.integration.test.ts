@@ -64,7 +64,12 @@ describe("connection management with production default agents", () => {
   }, 90_000);
   afterAll(async () => { await lifecycle?.stop(); await server?.close(); providerFetch?.mockRestore(); vi.unstubAllEnvs(); vi.unstubAllGlobals(); });
 
-  async function fixture() {
+  // STUDIO-0084: a new standard agent no longer receives `agents:configure` by default. The cases below are about
+  // connection policy, not about that default: they give the key here, as the Board gives it case by case.
+  // - `configuresOtherAgents`: the agent acts on ANOTHER agent (an audience, a gateway or a chat endpoint for it);
+  // - `administersCompanyTools`: the agent administers the company's tools with no other agent in view (an AI
+  //   connection pool, a tool profile bound to a project, a client token of a gateway it created itself).
+  async function fixture(options: { configuresOtherAgents?: boolean; administersCompanyTools?: boolean } = {}) {
     const base = await server.fixture({ connectionScenario: "fresh" });
     const userId = base.responsibleUserId!;
     const access = accessService(server.db);
@@ -80,6 +85,10 @@ describe("connection management with production default agents", () => {
     const agent = await created.json();
     expect(agent, JSON.stringify(agent)).toHaveProperty("id");
     expect(created.status).toBe(201);
+    if (options.configuresOtherAgents || options.administersCompanyTools) {
+      await server.db.insert(principalPermissionGrants).values({ companyId: base.companyId, principalType: "agent", principalId: agent.id,
+        permissionKey: "agents:configure", scope: null }).onConflictDoNothing();
+    }
     await lifecycle.process(agent.id);
     await vi.waitFor(async () => expect((await agentService(server.db).getById(agent.id))?.status).toBe("idle"), { timeout: 10_000 });
     await server.db.update(heartbeatRuns).set({ agentId: agent.id }).where(eq(heartbeatRuns.id, base.runId));
@@ -552,7 +561,7 @@ describe("connection management with production default agents", () => {
   });
 
   it.each(["none", "other-agent", "other-agent-no-access", "other-agent-allow-policy", "other-agent-explicit-grant", "other-agent-caller-ask", "other-agent-new-rate", "other-agent-new-shared-rate", "other-agent-new-rate-target-block", "other-agent-caller-rate", "other-agent-shared-rate", "other-agent-credential", "other-agent-credential-none", "other-agent-caller-revoked", "private-status", "agent", "user", "cancelled", "project-block", "rate-limit", "agent-rate-approval", "authorized-policy-edit"] as const)("keeps delegated test policy and approval continuation bounded (%s)", async revocation => {
-    const f = await fixture();
+    const f = await fixture({ configuresOtherAgents: revocation.startsWith("other-agent") });
     let targetAgentId = f.agentId;
     if (revocation.startsWith("other-agent")) {
       const cookie = await server.humanSession(f.userId);
@@ -756,7 +765,7 @@ describe("connection management with production default agents", () => {
   });
 
   it("checks issue, routine, and gateway profile targets including retained bindings", async () => {
-    const f = await fixture();
+    const f = await fixture({ configuresOtherAgents: true });
     const other = (await server.db.select({ id: agents.id }).from(agents).where(eq(agents.companyId, f.companyId))).find(agent => agent.id !== f.agentId)!;
     const profile = await f.request("POST", `/companies/${f.companyId}/tools/profiles`, { profileKey: "target-checks", name: "Target checks", entries: [] });
     const gatewayProfile = await f.request("POST", `/companies/${f.companyId}/tools/profiles`, { profileKey: "gateway-target", name: "Gateway target", entries: [] });
@@ -1147,7 +1156,7 @@ describe("connection management with production default agents", () => {
 
   it.each(["linked", "invitation"] as const)("checks caller and target policy for delegated Slack %s sends", async recipient => {
     for (const mode of ["caller-block", "caller-ask", "caller-rate", "target-block", "target-rate", "shared-rate"] as const) {
-      const f = await fixture();
+      const f = await fixture({ configuresOtherAgents: true });
       const cookie = await server.humanSession(f.userId);
       const targetResponse = await fetch(`${server.apiUrl}/api/companies/${f.companyId}/agents`, {
         method: "POST", headers: { cookie, origin: server.apiUrl, "Content-Type": "application/json" },
@@ -1537,7 +1546,7 @@ describe("connection management with production default agents", () => {
   });
 
   it("keeps durable gateway client tokens bound to the issuer and responsible user", async () => {
-    const f = await fixture();
+    const f = await fixture({ administersCompanyTools: true });
     const profile = await f.request("POST", `/companies/${f.companyId}/tools/profiles`, { profileKey: "gateway-profile", name: "Gateway profile", entries: [] });
     expect(profile, JSON.stringify(profile)).toMatchObject({ status: 201 });
     const gateway = await f.request("POST", `/companies/${f.companyId}/tools/gateways`, { name: "Delegated gateway", slug: "delegated", profileId: profile.body.id });
@@ -1579,7 +1588,7 @@ describe("connection management with production default agents", () => {
   });
 
   it.each(["block", "ask", "ask-board", "ask-revoked", "ask-rate", "ask-new-rate", "ask-new-shared-rate", "ask-new-rate-target-block", "ask-token-revoked", "ask-token-deleted", "ask-token-scope", "ask-grant-revoked", "ask-one-connection", "ask-one-connection-recovery", "ask-one-connection-revoked", "rate", "shared-rate", "target-block", "credential"] as const)("intersects gateway issuer and target rules (%s)", async mode => {
-    const f = await fixture();
+    const f = await fixture({ configuresOtherAgents: true });
     const cookie = await server.humanSession(f.userId);
     const createdTarget = await fetch(`${server.apiUrl}/api/companies/${f.companyId}/agents`, { method: "POST", headers: { cookie, origin: server.apiUrl, "Content-Type": "application/json" },
       body: JSON.stringify({ name: "Gateway target", role: "engineer", adapterType: "paperclip_runner", adapterConfig: { provider: "codex" }, permissions: {}, runtimeConfig: { heartbeat: { enabled: false, wakeOnDemand: false } } }) });
@@ -1727,7 +1736,7 @@ describe("connection management with production default agents", () => {
   });
 
   it("requires access to saved and replacement gateway profiles and project bindings", async () => {
-    const f = await fixture();
+    const f = await fixture({ administersCompanyTools: true });
     const saved = await f.request("POST", `/companies/${f.companyId}/tools/profiles`, { profileKey: "saved-scope", name: "Saved scope", entries: [] });
     const replacement = await f.request("POST", `/companies/${f.companyId}/tools/profiles`, { profileKey: "replacement-scope", name: "Replacement scope", entries: [] });
     expect(saved.status).toBe(201);
@@ -1753,7 +1762,7 @@ describe("connection management with production default agents", () => {
   });
 
   it("saves an AI account with fixture verification under the user's ownership and agent attribution", async () => {
-    const f = await fixture();
+    const f = await fixture({ administersCompanyTools: true });
     provider = async url => {
       if (url === "https://api.openai.com/v1/models") return Response.json({ data: [] });
       throw new Error("Unexpected AI fixture request");
@@ -1820,7 +1829,7 @@ describe("connection management with production default agents", () => {
   });
 
   it("filters AI account and pool listings by the agent's resolved connection scope", async () => {
-    const f = await fixture();
+    const f = await fixture({ administersCompanyTools: true });
     provider = async url => {
       if (url === "https://api.openai.com/v1/models") return Response.json({ data: [] });
       throw new Error("Unexpected AI fixture request");
