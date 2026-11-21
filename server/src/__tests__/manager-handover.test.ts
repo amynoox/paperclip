@@ -515,12 +515,14 @@ describePostgres("a ticket the worker router refuses goes to the role's direct m
   }, 180_000);
 
   // A pause by the Board does not move the role's work to somebody else (at an install every role is paused).
-  it("a role the Board paused, whose latest run was refused, keeps its ticket: blocked as before, not handed", async () => {
+  // studio.25 assembly: with STUDIO-0076 under it, a pause never blocks a task of the role. The ticket of a paused role
+  // is left as it is until the pause lifts: neither blocked nor handed. (On STUDIO-0083 alone it was blocked.)
+  it("a role the Board paused, whose latest run was refused, keeps its ticket: left as it is while the pause lasts, not handed", async () => {
     const f = await seed("todo", [{ minutesAgo: 6, errorCode: ENDED }]);
     await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: new Date() }).where(eq(agents.id, f.agentId));
     await sweep(f);
-    expect(await issueOf(f.issueId)).toMatchObject({ status: "blocked", assigneeAgentId: f.agentId });
-    expect(await actionsOf(f.issueId)).toEqual([expect.objectContaining({ kind: "stranded_assigned_issue", status: "active", ownerType: "board" })]);
+    expect(await issueOf(f.issueId)).toMatchObject({ status: "todo", assigneeAgentId: f.agentId });
+    expect(await actionsOf(f.issueId)).toEqual([]);
     expect(await handoversOf(f.issueId)).toHaveLength(0);
     expect(await wakesOf(f.companyId, f.managerId, MANAGER_HANDOVER_WAKE_REASON)).toHaveLength(0);
     // The function itself refuses a paused role, whoever asks (the release of a refused run, for one).
