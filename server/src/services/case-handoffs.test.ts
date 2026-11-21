@@ -1038,8 +1038,10 @@ describe("durable same-task case handoffs", () => {
       const enqueueWakeup = vi.fn(async () => null);
       const recovery = recoveryService(db, { enqueueWakeup });
       if (mode === "sweep") {
+        // STUDIO-0076: a pause blocks no task of the paused role. The sweep leaves the task as it is (the product
+        // blocked it here); blocking it by the locked escalation, below, is unchanged.
         expect(await recovery.reconcileStrandedAssignedIssues())
-          .toMatchObject({ escalated: 1, issueIds: [f.first.taskId] });
+          .toMatchObject({ escalated: 0, skipped: 1, issueIds: [] });
       } else {
         expect(await recovery.escalateStrandedAssignedIssue({
           issue: observed!, previousStatus: "in_progress", latestRun: failedRun!,
@@ -1047,7 +1049,7 @@ describe("durable same-task case handoffs", () => {
         })).toMatchObject({ id: f.first.taskId, status: "blocked" });
       }
       expect((await db.select().from(issues).where(eq(issues.id, f.first.taskId)))[0])
-        .toMatchObject({ status: "blocked", assigneeAgentId: f.engineer, completedAt: null });
+        .toMatchObject({ status: mode === "sweep" ? "in_progress" : "blocked", assigneeAgentId: f.engineer, completedAt: null });
       expect((await db.select().from(cases).where(eq(cases.id, f.first.caseId)))[0])
         .toMatchObject({ status: "draft", completedAt: null });
       expect((await db.select().from(caseHandoffs).where(eq(caseHandoffs.id, receipt.handoffId)))[0])

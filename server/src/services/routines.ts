@@ -1993,17 +1993,30 @@ export function routineService(
         }
 
         // Keep the dispatch lock until the issue is linked to a queued heartbeat run.
-        await queueIssueAssignmentWakeup({
-          heartbeat,
-          issue: createdIssue,
-          reason: "issue_assigned",
-          mutation: "create",
-          contextSource: "routine.dispatch",
-          requestedByActorType: interactionActorAgentId ? "agent" : input.actor?.userId ? "user" : input.source === "schedule" ? "system" : undefined,
-          requestedByActorId: interactionActorAgentId ?? input.actor?.userId ?? null,
-          requestedByActorCompanyId: interactionActorCompanyId,
-          rethrowOnError: true,
-        });
+        try {
+          await queueIssueAssignmentWakeup({
+            heartbeat,
+            issue: createdIssue,
+            reason: "issue_assigned",
+            mutation: "create",
+            contextSource: "routine.dispatch",
+            requestedByActorType: interactionActorAgentId ? "agent" : input.actor?.userId ? "user" : input.source === "schedule" ? "system" : undefined,
+            requestedByActorId: interactionActorAgentId ?? input.actor?.userId ?? null,
+            requestedByActorCompanyId: interactionActorCompanyId,
+            rethrowOnError: true,
+          });
+        } catch (error) {
+          // STUDIO-0076: production, 18 Nov 2026. Five webhook requests of a routine failed while its assignee was
+          // paused ("Agent is not invokable in its current state"): the task just created was deleted, the request
+          // was settled `failed`, and nothing replayed it. A pause is not a failure of the request: the task is
+          // kept, and it starts when the pause lifts (the refused wake is replayed, or the sweep starts a task
+          // that never ran). Any other refusal keeps today's path.
+          const [assignee] = await txDb.select({ status: agents.status }).from(agents)
+            .where(and(eq(agents.companyId, createdIssue.companyId), eq(agents.id, assigneeAgentId)));
+          if (assignee?.status !== "paused") throw error;
+          logger.info({ routineId: input.routine.id, issueId: createdIssue.id, assigneeAgentId },
+            "Routine task created for a paused assignee; it starts when the pause lifts");
+        }
         const updated = await finalizeRun(createdRun.id, {
           status: "issue_created",
           linkedIssueId: createdIssue.id,

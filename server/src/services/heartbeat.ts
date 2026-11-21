@@ -4542,6 +4542,7 @@ export function heartbeatService(
     scheduleBoundedRetry,
 
     reconcileStrandedAssignedIssues,
+    wakeDeclaredWaitsAfterPause: recovery.wakeDeclaredWaitsAfterPause,
     recoverPendingSessionGoalActions,
     recoverActiveSessionGoals,
 

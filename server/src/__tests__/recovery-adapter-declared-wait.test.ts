@@ -6,6 +6,7 @@ import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
+  agentWakeupRequests,
   agents,
   authUsers,
   companies,
@@ -22,6 +23,8 @@ import { createPostgresRunDispatchAdapter } from "../modules/run-dispatch/adapte
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
+import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
+import { logger } from "../middleware/logger.js";
 import {
   ADAPTER_DECLARED_STOP_WAIT_MAX_MS,
   ADAPTER_DECLARED_WAIT_ERROR_CODES,
@@ -930,4 +933,434 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     await db.update(heartbeatRuns).set({ status: "succeeded", finishedAt: new Date() }).where(eq(heartbeatRuns.id, live.id));
     await heartbeat.drainActiveRunExecutions();
   }, 180_000);
+
+  // STUDIO-0076: production, 20 Nov 2026 (TR-2030, TR-2031). The executor's last run waited for a worker machine
+  // (`router_waiting_for_resources`, 19 Nov 21:17). The role was paused at 00:51:30 for an update; the sweep moved both
+  // tasks to `blocked` at 00:51:32 and 00:51:42 ("the original assignee is not invokable"). After the resume at 01:19:20
+  // nothing started them again (the router never serves a blocked task); a person clicked Retry at 01:51.
+  describe("a declared wait while the assignee is paused", () => {
+    type Seeded = Awaited<ReturnType<typeof seed>>;
+    /** The role is paused: by a person, by its company, or by its budget. */
+    const pause = (f: Seeded, hold: "manual" | "company_paused" | "budget" = "manual") => db.update(agents).set({
+      status: "paused", pauseReason: hold, pausedAt: new Date(), lifecycleState: "paused", lifecycleHolds: [hold],
+    }).where(eq(agents.id, f.agentId));
+    /** The role is resumed: it is invokable again, and the lifecycle driver's ready hook runs as the worker runs it. */
+    async function resume(f: Seeded) {
+      await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null, lifecycleState: "ready", lifecycleHolds: [] })
+        .where(eq(agents.id, f.agentId));
+      await readyStep(f);
+    }
+    /** The lifecycle driver's ready step alone, on the agent as it is. */
+    async function readyStep(f: Seeded) {
+      const [agent] = await db.select().from(agents).where(eq(agents.id, f.agentId));
+      await createLifecycleDriver(db, {} as never).onReady!(agent as never);
+    }
+    async function sweepTwice(f: Seeded) {
+      for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+    }
+    /** The task is as it was: same status, no new run, no board action, no comment but the note of the wait. */
+    async function expectKept(f: Seeded, status: string) {
+      expect((await issueOf(f.issueId)).status).toBe(status);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
+      expect(await waitNotes(f.issueId)).toHaveLength(1);
+    }
+    /** Nothing at all happened to the task: same status, no new run, no board action, no comment. */
+    async function expectUntouched(f: Seeded, status: string) {
+      expect((await issueOf(f.issueId)).status).toBe(status);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect(await commentsOf(f.issueId)).toHaveLength(0);
+    }
+    /** The normal path has the task again: a recovery run was started, or the task was blocked with its notice. */
+    async function expectTakenAgain(f: Seeded) {
+      const status = (await issueOf(f.issueId)).status;
+      const newRuns = (await runsOf(f)).filter(run => !f.runIds.includes(run.id));
+      expect(status === "blocked" || status === "done" || newRuns.length > 0,
+        JSON.stringify({ status, runs: (await runsOf(f)).map(run => [run.status, run.errorCode]) })).toBe(true);
+    }
+    async function expectBlockedAsToday(f: Seeded) {
+      expect((await issueOf(f.issueId)).status).toBe("blocked");
+      const [action] = await actionsOf(f.issueId);
+      expect(action).toMatchObject({ kind: "stranded_assigned_issue", status: "active" });
+      expect((await commentsOf(f.issueId)).some(row => row.body.includes("the original assignee is not invokable"))).toBe(true);
+    }
+    const routerHost = () => buildHostServices(db, "worker-router-test", "worker-router-test", {
+      forPlugin: () => ({ emit: vi.fn(), subscribe: vi.fn(), clear: vi.fn() }),
+    } as any);
+    const WAITED = [{ minutesAgo: 220, errorCode: WAIT }, { minutesAgo: 200, errorCode: WAIT, retry: true }];
+
+    // The real case replayed: wait, pause, sweep, resume.
+    it("neither blocks nor requeues the task during the pause, and the task starts alone at the resume", async () => {
+      for (const status of ["todo", "in_progress"] as const) {
+        const f = await seed(status, WAITED);
+        await pause(f);
+        await sweepTwice(f);
+        await expectKept(f, status);
+        await resume(f);
+        await expectStartedOnceAndDone(f);
+        expect(await actionsOf(f.issueId)).toHaveLength(0);
+      }
+    }, 240_000);
+
+    it("waits again in the same series when the router still has no machine at the resume, then starts on its wake", async () => {
+      const f = await seed("todo", WAITED);
+      modes.set(f.issueId, "wait");
+      await pause(f);
+      await sweepTwice(f);
+      await resume(f);
+      await expect.poll(async () => (await runsOf(f)).filter(run => !f.runIds.includes(run.id) && run.status === "failed").length,
+        { timeout: 30_000 }).toBe(1);
+      await sweepTwice(f);
+      // One more waiting run (it checked the task out), nothing requeued behind it, the same note, no board action.
+      expect((await issueOf(f.issueId)).status).toBe("in_progress");
+      expect((await runsOf(f)).length).toBe(f.runIds.length + 1);
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
+      expect(await waitNotes(f.issueId)).toHaveLength(1);
+      modes.delete(f.issueId);
+      const host = routerHost();
+      try {
+        const woken = await host.issues.requestWakeup({ companyId: f.companyId, issueId: f.issueId,
+          reason: "worker_router_group_ready", idempotencyKey: `router-ready/${randomUUID()}` } as any);
+        expect(woken.queued).toBe(true);
+        await expect.poll(async () => (await runsOf(f)).find(run => run.id === woken.runId)?.status, { timeout: 30_000 }).toBe("succeeded");
+        expect((await issueOf(f.issueId)).status).toBe("done");
+      } finally { host.dispose(); }
+    }, 240_000);
+
+    it("keeps the router's wake that arrives during the pause, and starts the task with it at the resume", async () => {
+      const f = await seed("todo", WAITED);
+      await pause(f);
+      await sweepTwice(f);
+      const host = routerHost();
+      try {
+        await expect(host.issues.requestWakeup({ companyId: f.companyId, issueId: f.issueId,
+          reason: "worker_router_group_ready", idempotencyKey: `router-ready/${randomUUID()}` } as any)).rejects.toThrow();
+      } finally { host.dispose(); }
+      const refused = await db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.agentId, f.agentId)));
+      expect(refused.map(wake => [wake.status, wake.reason])).toEqual([["skipped", "agent.not_invokable"]]);
+      await expectKept(f, "todo");
+      await resume(f);
+      await expect.poll(async () => (await runsOf(f)).length, { timeout: 30_000 }).toBe(3);
+      const started = (await runsOf(f)).find(run => !f.runIds.includes(run.id))!;
+      expect(started.contextSnapshot).toMatchObject({ issueId: f.issueId, wakeReason: "issue_wakes_missed_during_pause" });
+      await expect.poll(async () => (await runsOf(f)).find(run => run.id === started.id)?.status, { timeout: 30_000 }).toBe("succeeded");
+      expect((await issueOf(f.issueId)).status).toBe("done");
+    }, 240_000);
+
+    it("keeps the bound of the note: past it the task gets no note, and is still not blocked while the pause lasts", async () => {
+      const machine = ADAPTER_DECLARED_WAIT_MAX_MS / 60_000, stop = ADAPTER_DECLARED_STOP_WAIT_MAX_MS / 60_000;
+      const within = await seed("todo", [{ minutesAgo: machine - 30, errorCode: WAIT }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
+      const past = await seed("todo", [{ minutesAgo: machine + 12, errorCode: WAIT }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
+      const stopWithin = await seed("in_progress", [{ minutesAgo: stop - 20, errorCode: STOP }]);
+      const stopPast = await seed("todo", [{ minutesAgo: stop + 10, errorCode: STOP }, { minutesAgo: 8, errorCode: UNSETTLED, retry: true }]);
+      for (const f of [within, past, stopWithin, stopPast]) { await pause(f); await sweepTwice(f); }
+      await expectKept(within, "todo");
+      await expectKept(stopWithin, "in_progress");
+      await expectUntouched(past, "todo");
+      await expectUntouched(stopPast, "todo");
+      // The pause lifts: past its bound the normal path takes the task again (a recovery run, or its block).
+      for (const f of [past, stopPast]) {
+        await resume(f);
+        expect(await liftedWakes(f)).toHaveLength(0);
+        await sweepTwice(f);
+        await expectTakenAgain(f);
+      }
+    }, 240_000);
+
+    it("holds for a budget pause and a company pause too", async () => {
+      for (const hold of ["budget", "company_paused"] as const) {
+        const f = await seed("todo", WAITED);
+        await pause(f, hold);
+        await sweepTwice(f);
+        await expectKept(f, "todo");
+      }
+    }, 240_000);
+
+    it("covers a pause only: an assignee that cannot be invoked for another reason is blocked as today", async () => {
+      for (const status of ["terminated", "pending_approval"] as const) {
+        const f = await seed("todo", WAITED);
+        await db.update(agents).set({ status }).where(eq(agents.id, f.agentId));
+        await sweepTwice(f);
+        await expectBlockedAsToday(f);
+      }
+      // An assignee in `error` can still be invoked: its wait is kept by the rule for an invokable assignee, as today.
+      const inError = await seed("todo", WAITED);
+      await db.update(agents).set({ status: "error" }).where(eq(agents.id, inError.agentId));
+      await sweepTwice(inError);
+      await expectKept(inError, "todo");
+    }, 240_000);
+
+    // L7: TR-2072, TR-2073 (20 Nov, 00:51:46 and 00:51:47) and TR-1802, TR-1826 (18 Nov, 13:18:05 and 13:18:08, last
+    // run cancelled by the lifecycle's own stop: code `cancelled`, source `control_plane`, "Agent lifecycle stop
+    // requested") were blocked within seconds of a pause. A pause blocks no task of the role, whatever its last run.
+    const lifecycleStop = (marker: boolean) => ({
+      cancellation: { reason: "Agent lifecycle stop requested", source: "control_plane", expected: true, initiator: { type: "system" } },
+      ...(marker ? { pauseStop: { holds: ["company_paused"], companyPauseReason: "manual" } } : {}) });
+    const LAST_RUNS: Array<[string, PriorRun, Record<string, unknown> | null]> = [
+      ["a process lost", { minutesAgo: 10, errorCode: "process_lost" }, null],
+      ["an adapter failure", { minutesAgo: 10, errorCode: "adapter_failed" }, null],
+      ["a timeout", { minutesAgo: 10, errorCode: "timeout", status: "timed_out" }, null],
+      ["the lifecycle's stop, with the pause marker", { minutesAgo: 10, errorCode: "cancelled", status: "cancelled" }, lifecycleStop(true)],
+      ["the lifecycle's stop, without the pause marker", { minutesAgo: 10, errorCode: "cancelled", status: "cancelled" }, lifecycleStop(false)],
+    ];
+    it.each(LAST_RUNS)("blocks no task of a paused role, whatever its last run: %s", async (_name, run, resultJson) => {
+      for (const [status, hold] of [["todo", "manual"], ["in_progress", "company_paused"], ["in_progress", "budget"]] as const) {
+        const f = await seed(status, [run]);
+        if (resultJson) await db.update(heartbeatRuns).set({ resultJson, error: "Agent lifecycle stop requested" }).where(eq(heartbeatRuns.id, f.runIds[0]!));
+        await pause(f, hold);
+        await sweepTwice(f);
+        await expectUntouched(f, status);
+      }
+    }, 240_000);
+
+    it("takes the task again by the normal path once the pause lifts, when its last run failed", async () => {
+      for (const [, run] of LAST_RUNS.filter(([, , cancelled]) => !cancelled)) {
+        const f = await seed("in_progress", [run]);
+        await pause(f);
+        await sweepTwice(f);
+        await expectUntouched(f, "in_progress");
+        await resume(f);
+        await sweepTwice(f);
+        await expectTakenAgain(f);
+      }
+    }, 240_000);
+
+    // A run the pause itself cut is not a failure for the sweep: after the resume the sweep neither requeues nor
+    // blocks its task; at most the product's hold of a cut run appears (legacy_execution_requires_reconciliation).
+    // Starting the task again is the resume's own continuation of the runs a pause cut (STUDIO-0074), which is not
+    // in this patch: here the task is only kept from the block.
+    it("leaves to the resume's continuation a task whose last run the lifecycle's stop cut: the sweep does not block it", async () => {
+      for (const [, run, resultJson] of LAST_RUNS.filter(([, , cancelled]) => cancelled)) {
+        const f = await seed("in_progress", [run]);
+        await db.update(heartbeatRuns).set({ resultJson: resultJson!, error: "Agent lifecycle stop requested" }).where(eq(heartbeatRuns.id, f.runIds[0]!));
+        await pause(f);
+        await sweepTwice(f);
+        await expectUntouched(f, "in_progress");
+        await resume(f);
+        await sweepTwice(f);
+        expect((await issueOf(f.issueId)).status).toBe("in_progress");
+        expect((await runsOf(f)).map(row => row.id)).toEqual(f.runIds);
+        expect(await commentsOf(f.issueId)).toHaveLength(0);
+        expect((await actionsOf(f.issueId)).filter(action => action.cause !== "legacy_execution_requires_reconciliation")).toHaveLength(0);
+      }
+    }, 240_000);
+
+    // One role, three tasks, a long pause (the bench saw a task blocked during a long pause, 20 Nov at 07:25:58).
+    it("blocks none of the three tasks of one role during a long pause (last run succeeded, failed, cut), and takes the failed one again at its end", async () => {
+      const f = await seed("in_progress", [{ minutesAgo: 200, errorCode: "adapter_failed" }]);
+      /** Another task of the same role, with its last run. */
+      async function alsoHas(issueNumber: number, run: PriorRun, resultJson: Record<string, unknown> | null) {
+        const issueId = randomUUID();
+        const at = new Date(Date.now() - run.minutesAgo * 60_000);
+        const [row] = await db.insert(heartbeatRuns).values({ companyId: f.companyId, agentId: f.agentId, invocationSource: "assignment",
+          triggerDetail: "system", status: run.status ?? "failed", errorCode: run.errorCode, createdAt: at, startedAt: at,
+          updatedAt: new Date(at.getTime() + 7 * 60_000), finishedAt: new Date(at.getTime() + 7 * 60_000),
+          resultJson: resultJson ?? {}, contextSnapshot: { issueId, taskId: issueId, wakeReason: "issue_assigned" } }).returning();
+        await db.insert(issues).values({ id: issueId, companyId: f.companyId, title: "Another task of the role", status: "in_progress",
+          assigneeAgentId: f.agentId, issueNumber, checkoutRunId: row!.id, startedAt: new Date() });
+        return { ...f, issueId, runIds: [row!.id] };
+      }
+      const succeeded = await alsoHas(2, { minutesAgo: 190, errorCode: null, status: "succeeded" }, null);
+      const cut = await alsoHas(3, { minutesAgo: 185, errorCode: "cancelled", status: "cancelled" }, lifecycleStop(true));
+      await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: new Date(Date.now() - 3 * 60 * 60_000),
+        lifecycleState: "paused", lifecycleHolds: ["manual"] }).where(eq(agents.id, f.agentId));
+      for (let sweep = 0; sweep < 4; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      for (const task of [f, succeeded, cut]) {
+        expect((await issueOf(task.issueId)).status).toBe("in_progress");
+        expect(await actionsOf(task.issueId)).toHaveLength(0);
+        expect(await commentsOf(task.issueId)).toHaveLength(0);
+      }
+      expect((await runsOf(f)).length).toBe(3);
+      // The pause lifts: the task whose last run failed is taken again by the normal path; none carries the notice
+      // of an assignee that cannot be invoked.
+      await resume(f);
+      await sweepTwice(f);
+      await expectTakenAgain(f);
+      for (const task of [f, succeeded, cut])
+        expect((await commentsOf(task.issueId)).some(row => row.body.includes("the original assignee is not invokable"))).toBe(false);
+    }, 240_000);
+
+    it("leaves a paused review participant in review, with or without a run of its own", async () => {
+      for (const prior of [[], [{ minutesAgo: 10, errorCode: "process_lost" }]] as PriorRun[][]) {
+        const f = await seed("in_review", prior, { review: true });
+        await pause(f);
+        await sweepTwice(f);
+        await expectUntouched(f, "in_review");
+      }
+    }, 240_000);
+
+    it("does not serve a status the sweep never served: backlog, blocked", async () => {
+      for (const status of ["backlog", "blocked"] as const) {
+        const f = await seed(status, WAITED);
+        await pause(f);
+        await sweepTwice(f);
+        await expectUntouched(f, status);
+      }
+    }, 240_000);
+
+    // The router keeps its wake request and plays it again every two minutes, without limit, under the SAME
+    // idempotency key (router's contract, 20 Nov 2026). Refused during the pause, that same key must start a real run
+    // once the role can run again, even if the ready step never ran (a server stop at the resume).
+    it.each(["worker_router_group_ready", "worker_router_dispatch_settled"])(
+      "starts a real run when the router plays its wake again under the same key after the pause: %s", async (reason) => {
+        for (const hold of ["manual", "budget", "company_paused"] as const) {
+          const f = await seed("todo", WAITED);
+          await pause(f, hold);
+          if (hold === "company_paused") await companyIs(f, true);
+          const key = `router-ready/${f.issueId}/generation-1`;
+          const host = routerHost();
+          try {
+            // Refused during the pause, twice: the request stays in the router's queue.
+            for (let attempt = 0; attempt < 2; attempt += 1) await expect(host.issues.requestWakeup({ companyId: f.companyId, issueId: f.issueId,
+              reason, idempotencyKey: key } as any)).rejects.toThrow();
+            // The role can run again, and no ready step ran.
+            if (hold === "company_paused") await companyIs(f, false);
+            await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null, lifecycleState: "ready", lifecycleHolds: [] })
+              .where(eq(agents.id, f.agentId));
+            const woken = await host.issues.requestWakeup({ companyId: f.companyId, issueId: f.issueId, reason, idempotencyKey: key } as any);
+            expect(woken.queued).toBe(true);
+            await expect.poll(async () => (await runsOf(f)).find(run => run.id === woken.runId)?.status, { timeout: 30_000 }).toBe("succeeded");
+            expect((await issueOf(f.issueId)).status).toBe("done");
+            expect((await runsOf(f)).length).toBe(f.runIds.length + 1);
+          } finally { host.dispose(); }
+        }
+      }, 240_000);
+
+    // Point 2: the router's wake can be lost to the pause. The plugin's wake is refused before the queue, and written
+    // nowhere, while the agent's budget is reached or its company is paused; the resume then starts the task once.
+    const LIFTED = "issue_declared_wait_pause_lifted";
+    const wakesOf = (f: Seeded) => db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.companyId, f.companyId), eq(agentWakeupRequests.agentId, f.agentId)));
+    const liftedWakes = async (f: Seeded) => (await wakesOf(f)).filter(wake => wake.reason === LIFTED);
+    const companyIs = (f: Seeded, paused: boolean) => db.update(companies).set(paused
+      ? { status: "paused", pauseReason: "manual", pausedAt: new Date() }
+      : { status: "active", pauseReason: null, pausedAt: null }).where(eq(companies.id, f.companyId));
+    async function routerWakeRefusedBeforeTheQueue(f: Seeded) {
+      const host = routerHost();
+      try {
+        await expect(host.issues.requestWakeup({ companyId: f.companyId, issueId: f.issueId,
+          reason: "worker_router_group_ready", idempotencyKey: `router-ready/${randomUUID()}` } as any)).rejects.toThrow();
+      } finally { host.dispose(); }
+      expect(await wakesOf(f)).toHaveLength(0);
+    }
+    async function expectStartedOnceAndDone(f: Seeded) {
+      await expect.poll(async () => (await runsOf(f)).length, { timeout: 30_000 }).toBe(f.runIds.length + 1);
+      const started = (await runsOf(f)).find(run => !f.runIds.includes(run.id))!;
+      expect(started.contextSnapshot).toMatchObject({ issueId: f.issueId, wakeReason: LIFTED, declaredWaitRunId: f.runIds.at(-1) });
+      await expect.poll(async () => (await runsOf(f)).find(run => run.id === started.id)?.status, { timeout: 30_000 }).toBe("succeeded");
+      expect((await issueOf(f.issueId)).status).toBe("done");
+      expect(await liftedWakes(f)).toHaveLength(1);
+    }
+
+    it("starts the task once at the resume when the router's wake was lost to a budget pause or a company pause", async () => {
+      for (const kind of ["budget", "company"] as const) {
+        const f = await seed("todo", WAITED);
+        await pause(f, kind === "budget" ? "budget" : "company_paused");
+        if (kind === "company") await companyIs(f, true);
+        await sweepTwice(f);
+        await routerWakeRefusedBeforeTheQueue(f);
+        await expectKept(f, "todo");
+        if (kind === "company") await companyIs(f, false);
+        await resume(f);
+        await expectStartedOnceAndDone(f);
+        // A second resume starts nothing more.
+        await resume(f);
+        await heartbeat.drainActiveRunExecutions();
+        expect(await liftedWakes(f)).toHaveLength(1);
+        expect((await runsOf(f)).length).toBe(f.runIds.length + 1);
+      }
+    }, 240_000);
+
+    it("starts the task once, not twice, when the wake refused during the pause was kept and replayed", async () => {
+      const f = await seed("todo", WAITED);
+      await pause(f);
+      const host = routerHost();
+      try {
+        await expect(host.issues.requestWakeup({ companyId: f.companyId, issueId: f.issueId,
+          reason: "worker_router_group_ready", idempotencyKey: `router-ready/${randomUUID()}` } as any)).rejects.toThrow();
+      } finally { host.dispose(); }
+      await resume(f);
+      await expect.poll(async () => (await issueOf(f.issueId)).status, { timeout: 30_000 }).toBe("done");
+      await heartbeat.drainActiveRunExecutions();
+      expect(await liftedWakes(f)).toHaveLength(0);
+      expect((await runsOf(f)).length).toBe(f.runIds.length + 1);
+    }, 240_000);
+
+    it("starts nothing at the resume while a wake or a run of the agent is live for the task", async () => {
+      const wake = await seed("todo", WAITED);
+      const [live] = await db.insert(agentWakeupRequests).values({ companyId: wake.companyId, agentId: wake.agentId,
+        source: "automation", triggerDetail: "system", reason: "issue_assigned", status: "queued", payload: { issueId: wake.issueId } }).returning();
+      expect(await heartbeat.wakeDeclaredWaitsAfterPause({ companyId: wake.companyId, agentId: wake.agentId })).toEqual({ issues: 1, woken: 0 });
+      await db.delete(agentWakeupRequests).where(eq(agentWakeupRequests.id, live.id));
+      const run = await seed("in_progress", WAITED);
+      const [queued] = await db.insert(heartbeatRuns).values({ companyId: run.companyId, agentId: run.agentId,
+        invocationSource: "assignment", triggerDetail: "system", status: "queued",
+        contextSnapshot: { issueId: run.issueId, taskId: run.issueId } }).returning();
+      expect(await heartbeat.wakeDeclaredWaitsAfterPause({ companyId: run.companyId, agentId: run.agentId })).toEqual({ issues: 1, woken: 0 });
+      await db.delete(heartbeatRuns).where(eq(heartbeatRuns.id, queued.id));
+      // Without them, the same call starts each task.
+      for (const f of [wake, run]) {
+        expect(await heartbeat.wakeDeclaredWaitsAfterPause({ companyId: f.companyId, agentId: f.agentId })).toEqual({ issues: 1, woken: 1 });
+        await expect.poll(async () => (await issueOf(f.issueId)).status, { timeout: 30_000 }).toBe("done");
+      }
+      await heartbeat.drainActiveRunExecutions();
+    }, 240_000);
+
+    it("starts nothing at the resume for a wait past its bound, another failure, or a task not at work", async () => {
+      const machine = ADAPTER_DECLARED_WAIT_MAX_MS / 60_000;
+      const past = await seed("todo", [{ minutesAgo: machine + 12, errorCode: WAIT }, { minutesAgo: 10, errorCode: WAIT, retry: true }]);
+      const failed = await seed("todo", [{ minutesAgo: 40, errorCode: "process_lost" }]);
+      const blocked = await seed("blocked", WAITED);
+      const backlog = await seed("backlog", WAITED);
+      const review = await seed("in_review", WAITED, { review: true });
+      for (const f of [past, failed, blocked, backlog, review]) {
+        await pause(f);
+        await resume(f);
+        expect(await liftedWakes(f)).toHaveLength(0);
+        expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+      }
+      await heartbeat.drainActiveRunExecutions();
+    }, 240_000);
+
+    it("loses nothing when the start is refused at the resume: the next resume starts the task", async () => {
+      const f = await seed("todo", WAITED);
+      await pause(f, "company_paused");
+      await companyIs(f, true);
+      // The role is ready again while its company is still paused: the start is refused, and the resume does not fail.
+      const warned = vi.spyOn(logger, "warn");
+      await resume(f);
+      await heartbeat.drainActiveRunExecutions();
+      // The server's log says which task was not started, and on which waiting run.
+      expect(warned.mock.calls.some(([fields, message]) => (fields as Record<string, unknown>)?.issueId === f.issueId
+        && (fields as Record<string, unknown>)?.declaredWaitRunId === f.runIds.at(-1)
+        && String(message).includes("was not started when its assignee's pause lifted"))).toBe(true);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+      expect((await issueOf(f.issueId)).status).toBe("todo");
+      await companyIs(f, false);
+      await resume(f);
+      await expect.poll(async () => (await issueOf(f.issueId)).status, { timeout: 30_000 }).toBe("done");
+      expect((await runsOf(f)).length).toBe(f.runIds.length + 1);
+
+      // A new pause lands before the ready step: the queue refuses the start with an error. The step does not fail.
+      const again = await seed("todo", WAITED);
+      await pause(again);
+      await readyStep(again);
+      await heartbeat.drainActiveRunExecutions();
+      expect(warned.mock.calls.some(([fields, message]) => (fields as Record<string, unknown>)?.issueId === again.issueId
+        && (fields as Record<string, unknown>)?.err instanceof Error && String(message).includes("the wake was refused"))).toBe(true);
+      warned.mockRestore();
+      expect((await runsOf(again)).map(run => run.id).sort()).toEqual([...again.runIds].sort());
+      expect((await issueOf(again.issueId)).status).toBe("todo");
+      await resume(again);
+      await expect.poll(async () => (await issueOf(again.issueId)).status, { timeout: 30_000 }).toBe("done");
+      await heartbeat.drainActiveRunExecutions();
+      expect((await runsOf(again)).length).toBe(again.runIds.length + 1);
+    }, 240_000);
+  });
 });
