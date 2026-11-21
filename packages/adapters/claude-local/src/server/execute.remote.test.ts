@@ -797,7 +797,7 @@ describe("claude remote execution", () => {
         executionTransport: { remoteExecution: { host: "127.0.0.1", port: 2222, username: "fixture",
           remoteWorkspacePath: "/remote/workspace", remoteCwd: "/remote/workspace", privateKey: "PRIVATE KEY",
           knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA", strictHostKeyChecking: true } },
-        onLog: async (_stream, chunk) => { logs.push(chunk); },
+        onLog: async (_stream: string, chunk: string) => { logs.push(chunk); },
       } as never);
       const call = runChildProcess.mock.calls.filter(call => !call[2].includes("--version")).at(-1) as unknown as [string, string, string[]];
       return { args: call[2], logs: logs.join("") };
