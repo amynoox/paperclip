@@ -994,6 +994,8 @@ describe("residual recovery production matrix", () => {
       phase: "retryable_failure", nextAttemptAt: new Date(Date.now() - 1_000) });
     await start(); await quiet();
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id)))[0].phase).toBe("retryable_failure");
+    // STUDIO-0076: a pause blocks no task of the paused role (the product blocked it during the pause).
+    if (gate === "agent") expect((await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0].status).toBe("in_progress");
     const before = timeline.filter(event => Array.isArray(event) && event[0] === "finished" && event[1] === "native-process-sessions").length;
     if (gate === "agent") { await createAgentLifecycle(db).resumeAgent(f.agent.id); await lifecycleWorker.process(f.agent.id); }
     else await tree.releaseHold(f.companyId, f.issue.id, hold!.hold.id, { actor, reason: "Resume native recovery" });
@@ -1002,7 +1004,9 @@ describe("residual recovery production matrix", () => {
     while (timeline.filter(event => Array.isArray(event) && event[0] === "finished" && event[1] === "native-process-sessions").length <= before && performance.now() < deadline)
       await realDelay(5);
     expect(timeline.filter(event => Array.isArray(event) && event[0] === "finished" && event[1] === "native-process-sessions").length).toBeGreaterThan(before);
-    const expectedPhase = gate === "agent" ? "retryable_failure" : "terminal_failure";
+    // STUDIO-0076: the task was not blocked during the pause of its role, so the parked work is settled after the
+    // resume as it is after a released hold; the product left it parked behind the block of the pause.
+    const expectedPhase = "terminal_failure";
     expect((await db.select().from(nativeRunFinalizations).where(eq(nativeRunFinalizations.runId, run.id)))[0].phase).toBe(expectedPhase);
     if (gate === "agent") expect((await db.select().from(issues).where(eq(issues.id, f.issue.id)))[0].status).toBe("blocked");
     expect((await getRun(run.id)).errorCode).toBe("saved_native_failure");
