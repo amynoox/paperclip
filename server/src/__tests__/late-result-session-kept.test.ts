@@ -13,6 +13,7 @@ import { runningProcesses, type AdapterExecutionContext, type AdapterExecutionRe
 import { heartbeatService } from "../services/heartbeat.ts";
 import { environmentService } from "../services/environments.js";
 import { requestTaskRetry } from "../services/task-retry.js";
+import { readFreshWorkspaceReadiness } from "../services/fresh-workspace-continuation.js";
 import { markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
 import { createHeartbeatRunState } from "../services/heartbeat/run-state.js";
 import { TASK_SESSION_REMOVED } from "../services/task-session-removal.js";
@@ -366,6 +367,9 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(next.run.contextSnapshot).not.toHaveProperty("forceFreshSession");
     // The run works where the cut run worked: the product would have given this Retry a fresh isolated workspace,
     // another folder and another workspace mode, and refused the session for that.
+    expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.retry_workspace_reused", "pause_resume_task_workspace"]]);
+    // A run prepared twice (its start taken again) reads this again: same answer, and the task still says it once.
+    expect(await readFreshWorkspaceReadiness(db, next.run as never)).toBeNull();
     expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.retry_workspace_reused", "pause_resume_task_workspace"]]);
     expect(folderOf(next.run)).toBe(folderOf(cancelled));
     expect(folderOf(next.run)).not.toContain("isolated-workspace-attempts");
