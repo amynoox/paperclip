@@ -1841,8 +1841,8 @@ export function heartbeatService(
         now: scope.now,
         onDeferredDeadline: scope.onDeferredDeadline,
         wake: (agentId, request) => enqueueWakeup(agentId, request as Parameters<typeof enqueueWakeup>[1]),
-        invocationBlocked: async (agentId, issueId) =>
-          Boolean(await budgets.getInvocationBlock(scope.companyId, agentId, { issueId, projectId: null })),
+        invocationBlocked: async (agentId, issueId, projectId) =>
+          Boolean(await budgets.getInvocationBlock(scope.companyId, agentId, { issueId, projectId })),
       });
     } catch (err) {
       logger.warn({ err, issueId: scope.issueId }, "unanswered question pass failed; the next pass retries");
