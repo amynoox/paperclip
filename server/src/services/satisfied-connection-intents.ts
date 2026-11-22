@@ -16,7 +16,7 @@ import { createToolGatewayService } from "./tool-gateway.js";
 type Task = Pick<typeof issues.$inferSelect, "id" | "companyId" | "projectId" | "status" | "assigneeAgentId" | "assigneeUserId">;
 type Intent = Pick<typeof issueThreadInteractions.$inferSelect, "id" | "companyId" | "issueId" | "kind" | "status" | "payload" | "addresseeUserId"> & Partial<Pick<typeof issueThreadInteractions.$inferSelect, "sourceRunId">>;
 
-// STUDIO-0088 (lot 26, R13). Production, 22 Nov 2026: the roles' shared AI account lost its sign-in for three minutes.
+// STUDIO-0090 (lot 26, R13). Production, 22 Nov 2026: the roles' shared AI account lost its sign-in for three minutes.
 // Each task whose run failed on it got its own repair card, addressed to the responsible person. The person signed in
 // again and closed one card; the task of that card started again. TR-2419 did not: its card stayed pending, because
 // only the addressed person closes a card, one card at a time, and the reconciliation below left provider
@@ -140,7 +140,7 @@ async function findAvailableToolConnection(db: Db, task: Task, intent: Intent, p
     });
     return capability.allowed ? connection : null;
   }
-  // STUDIO-0088: the plain repair card of the AI account, only for the callers that ask for it.
+  // STUDIO-0090: the plain repair card of the AI account, only for the callers that ask for it.
   if (aiRepair && isPlainAiRepairPayload(payload)) return findAiRepairConnection(db, task, intent, payload, aiRepair);
   // Additional permissions, provider authentication and inbox setup still need
   // their governed completion paths. Aggregator cards also name an upstream app.
@@ -167,7 +167,7 @@ async function findAvailableToolConnection(db: Db, task: Task, intent: Intent, p
 }
 
 export async function findSatisfiedToolConnection(db: Db, task: Task, intent: Intent, policyRunId?: string | null, aiRepair?: AiRepairCheck) {
-  // STUDIO-0088: a task the account's failure blocked is read too, for its repair card only (findAiRepairConnection).
+  // STUDIO-0090: a task the account's failure blocked is read too, for its repair card only (findAiRepairConnection).
   if (!["in_progress", "in_review"].includes(task.status)) {
     if (!aiRepair || task.status !== "blocked") return null;
     const parsed = connectionIntentPayloadSchema.safeParse(intent.payload);

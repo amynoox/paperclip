@@ -20,7 +20,7 @@ import { issueRecoveryActionService } from "../services/issue-recovery-actions.j
 import { DELIVERY_QUEUES, subscribeDeliveryWork } from "../services/delivery-work-notifications.js";
 import { connectionIntentBoardRoutes } from "../routes/connection-intents.js";
 
-// STUDIO-0088: production, 22 Nov 2026. The roles' shared AI account lost its sign-in from 09:09 to 09:12 UTC. Each
+// STUDIO-0090: production, 22 Nov 2026. The roles' shared AI account lost its sign-in from 09:09 to 09:12 UTC. Each
 // task whose run failed on it got its own repair card. The owner signed in again and closed one card: that task
 // started again. TR-2419 did not: its card stayed pending until a person's comment, ten minutes later.
 let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;

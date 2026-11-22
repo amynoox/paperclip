@@ -955,7 +955,7 @@ export function aiConnectionService(db: Db) {
             );
       }
       if (loginSession) await notifyLoginSessionChanged(tx);
-      // STUDIO-0088: the repair cards that waited for this account are read again at once
+      // STUDIO-0090: the repair cards that waited for this account are read again at once
       // (satisfied-connection-intents.ts), also those of tasks its failure blocked.
       if (reconnect) await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       if (loginSession)

@@ -106,7 +106,7 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
       const recovery = await recoveries.getActiveForIssue(issue.companyId, issue.id, tx);
       if (!recovery || recovery.cause !== "configuration_incomplete" || recovery.evidence.latestRunId !== latest.id) return null;
       const actorId = loaded.interaction.resolvedByUserId ?? loaded.interaction.addresseeUserId!;
-      // STUDIO-0088: a card the system retired reopens the task in nobody's name.
+      // STUDIO-0090: a card the system retired reopens the task in nobody's name.
       const updated = await issueService(db).update(issue.id, {
         status: "in_progress", ...(bySystem ? {} : { actorUserId: actorId }), companyGuard: issue.companyId,
       }, tx, publications);
@@ -225,7 +225,7 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
       loaded.interaction = current.card;
       interaction = current.card;
     }
-    // STUDIO-0088: the repair card the system retired reopens the task the account's failure blocked, under the
+    // STUDIO-0090: the repair card the system retired reopens the task the account's failure blocked, under the
     // same guards as the card the person accepted.
     if ((interaction.status === "accepted" || retiredForAvailableConnection) && payload?.purpose === "ai" && loaded.issue.status === "blocked") {
       const restored = await restoreAiBlockedTask(loaded, retiredForAvailableConnection);
