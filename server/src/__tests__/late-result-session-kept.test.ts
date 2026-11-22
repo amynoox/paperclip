@@ -1,15 +1,20 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agentTaskSessions, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases,
-  heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  activityLog, agentTaskSessions, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases,
+  executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, workspaceOperations,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { runningProcesses, type AdapterExecutionContext, type AdapterExecutionResult } from "../adapters/index.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { environmentService } from "../services/environments.js";
+import { requestTaskRetry } from "../services/task-retry.js";
+import { pauseCutSourceLeftItsWorkspace, readFreshWorkspaceReadiness } from "../services/fresh-workspace-continuation.js";
 import { markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
 import { createHeartbeatRunState } from "../services/heartbeat/run-state.js";
 import { TASK_SESSION_REMOVED } from "../services/task-session-removal.js";
@@ -329,6 +334,246 @@ const support = await getEmbeddedPostgresTestSupport();
     });
     expect(await taskSession(f)).toMatchObject({ sessionDisplayId: other });
     expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left" } });
+  });
+
+  // The resume of a role files the Retry of the person who resumed it for each run its pause cut
+  // (pause-resume-continuation.ts; the key is the one that file writes). A Retry opens a new conversation; that one
+  // goes on in the session kept from the cut run. Production, 22 Nov 2026 (TR-2432): the run restarted by itself and
+  // its log said "forceFreshSession was requested".
+  const retryOf = async (f: Fixture, runId: string, key: string) => {
+    const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "responsible-user",
+      actorSource: "local_implicit", observedRunId: runId, idempotencyKey: key });
+    expect(receipt).toMatchObject({ accepted: true });
+    await heartbeat.resumeTaskRetry(f.companyId, receipt.requestId!);
+  };
+  const logOf = async (runId: string) => (await heartbeat.readLog(runId)).content;
+  /** What the product decided about the workspace of a Retry's run: the activity it wrote for that run. */
+  const workspaceChoiceOf = async (f: Fixture, runId: string) => (await db.select().from(activityLog).where(and(
+    eq(activityLog.companyId, f.companyId), eq(activityLog.entityId, f.issueId), eq(activityLog.runId, runId))))
+    .filter(entry => entry.action === "issue.fresh_workspace_selected" || entry.action === "issue.retry_workspace_reused")
+    .map(entry => [entry.action, entry.details?.mode]);
+  /** The folder a run worked in. */
+  const folderOf = (run: { contextSnapshot: Record<string, unknown> | null }) =>
+    String((run.contextSnapshot?.paperclipWorkspace as { cwd?: unknown } | undefined)?.cwd);
+  it("the resume of the role continues the run its pause cut: the run goes on in the session kept from it, in the task's own workspace", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", cut);
+    });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: cancelled.id });
+    await stopProven(f, cancelled.id);
+    const next = await nextExecution(f, () => retryOf(f, cancelled.id, `pause-resume:${cancelled.id}:${randomUUID()}`));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id, explicitUserContinuation: { previousRunId: cancelled.id } });
+    expect(next.run.contextSnapshot).not.toHaveProperty("forceFreshSession");
+    // The run works where the cut run worked: the product would have given this Retry a fresh isolated workspace,
+    // another folder and another workspace mode, and refused the session for that.
+    expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.retry_workspace_reused", "pause_resume_task_workspace"]]);
+    // A run prepared twice (its start taken again) reads this again: same answer, and the task still says it once.
+    expect(await readFreshWorkspaceReadiness(db, next.run as never)).toBeNull();
+    expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.retry_workspace_reused", "pause_resume_task_workspace"]]);
+    expect(folderOf(next.run)).toBe(folderOf(cancelled));
+    expect(folderOf(next.run)).not.toContain("isolated-workspace-attempts");
+    const log = await logOf(next.run.id);
+    expect(log).not.toContain("Skipping saved session resume");
+    expect(log).not.toContain("forceFreshSession was requested");
+    expect({ sessionId: next.sessionId, sessionParams: next.sessionParams }).toMatchObject({ sessionId: cut, sessionParams: paramsOf(cut) });
+    // Read several times at once, with the line not written yet: every reader has the same answer, and one line.
+    await db.delete(activityLog).where(and(eq(activityLog.runId, next.run.id), eq(activityLog.action, "issue.retry_workspace_reused")));
+    expect(await Promise.all(Array.from({ length: 8 }, () => readFreshWorkspaceReadiness(db, next.run as never))))
+      .toEqual(Array.from({ length: 8 }, () => null));
+    expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.retry_workspace_reused", "pause_resume_task_workspace"]]);
+    // The cut run is no longer seen to have left its workspace (the cleanup of a lease it took failed): the answer is
+    // the Retry's own choice again, a fresh isolated workspace, as before this patch.
+    await db.update(environmentLeases).set({ cleanupStatus: "failed" }).where(eq(environmentLeases.heartbeatRunId, cancelled.id));
+    expect(await readFreshWorkspaceReadiness(db, next.run as never)).toMatchObject({ mode: "fresh_isolated_workspace", sourceRunId: cancelled.id });
+  });
+
+  // What the server reads before it keeps the task's workspace for the run that continues a pause-cut run: each
+  // thing, one at a time, on the true rows of a cut run.
+  it("the task's workspace is kept only when the cut run is seen to have left it: each thing the server reads", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", cut);
+    });
+    await stopProven(f, cancelled.id);
+    const successorRunId = randomUUID();
+    const read = async (patch: Record<string, unknown> = {}) => pauseCutSourceLeftItsWorkspace(db, { companyId: f.companyId,
+      issueId: f.issueId, successorRunId, source: { ...(await reread(cancelled.id)), ...patch } as never });
+    expect(await read()).toBeNull();
+    // The cut run is not settled.
+    expect(await read({ status: "running" })).toBe("source_not_settled");
+    expect(await read({ finishedAt: null })).toBe("source_not_settled");
+    expect(await read({ controllerLeaseExpiresAt: new Date(Date.now() + 60_000) })).toBe("source_not_settled");
+    expect(await read({ controllerLeaseExpiresAt: new Date(Date.now() - 60_000) })).toBeNull();
+    // A repair of its workspace is due, by its result or by the cause of a hold on it.
+    expect(await read({ resultJson: { ...(cancelled.resultJson ?? {}), workspaceRestoreFailure: { reason: "restore failed" } } })).toBe("workspace_repair_required");
+    // The hold the product itself wrote on the cut run, or one written here when it wrote none.
+    const [written] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
+      eq(issueRecoveryActions.sourceIssueId, f.issueId), sql`${issueRecoveryActions.evidence}->>'runId' = ${cancelled.id}`));
+    const hold = written ?? (await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${cancelled.id}`,
+      status: "resolved", ownerType: "board", nextAction: "Review the cut run.", evidence: { runId: cancelled.id } }).returning())[0]!;
+    await db.update(issueRecoveryActions).set({ cause: "native_workspace_sync_out_unrecoverable" }).where(eq(issueRecoveryActions.id, hold.id));
+    expect(await read()).toBe("workspace_repair_required");
+    // A recovery generation is still at work on it.
+    await db.update(issueRecoveryActions).set({ cause: hold.cause,
+      evidence: { ...(hold.evidence as Record<string, unknown>), systemRecovery: { state: "scheduled" } } }).where(eq(issueRecoveryActions.id, hold.id));
+    expect(await read()).toBe("recovery_generation_unsettled");
+    await db.update(issueRecoveryActions).set({ cause: hold.cause, evidence: hold.evidence }).where(eq(issueRecoveryActions.id, hold.id));
+    expect(await read()).toBeNull();
+    // A lease it took is not released, or its cleanup failed or is still due: whatever the lease's provider.
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, cancelled.id));
+    for (const patch of [{ releasedAt: null }, { cleanupStatus: "failed" }, { status: "pending_cleanup" }, { status: "active" }]) {
+      await db.update(environmentLeases).set(patch).where(eq(environmentLeases.id, lease!.id));
+      expect(await read(), JSON.stringify(patch)).toBe("source_lease_not_released");
+      await db.update(environmentLeases).set({ releasedAt: lease!.releasedAt, cleanupStatus: lease!.cleanupStatus, status: lease!.status })
+        .where(eq(environmentLeases.id, lease!.id));
+    }
+    await db.update(environmentLeases).set({ provider: "ssh" }).where(eq(environmentLeases.id, lease!.id));
+    expect(await read()).toBeNull();
+    // The workspace the cut run used: its leases name it, and the task is bound to it.
+    const usedIds = [...new Set((await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, cancelled.id)))
+      .map(row => row.executionWorkspaceId).filter((id): id is string => Boolean(id)))];
+    const [task] = await db.select({ executionWorkspaceId: issues.executionWorkspaceId }).from(issues).where(eq(issues.id, f.issueId));
+    expect(usedIds).toEqual([task!.executionWorkspaceId]);
+    const usedId = usedIds[0]!;
+    const [used] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, usedId));
+    // Another run holds that workspace by a lease, or an operation runs on it.
+    const [other] = await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId: lease!.environmentId,
+      executionWorkspaceId: usedId, provider: "local", status: "active", leasePolicy: "ephemeral",
+      metadata: { agentId: f.agentId, driver: "local" } }).returning();
+    expect(await read()).toBe("lease_held");
+    await db.delete(environmentLeases).where(eq(environmentLeases.id, other!.id));
+    const [operation] = await db.insert(workspaceOperations).values({ companyId: f.companyId, issueId: f.issueId,
+      executionWorkspaceId: usedId, phase: "workspace_finalize", status: "running" }).returning();
+    expect(await read()).toBe("operation_running");
+    await db.delete(workspaceOperations).where(eq(workspaceOperations.id, operation!.id));
+    expect(await read()).toBeNull();
+    // The task is bound to another workspace than the one the cut run used, or to none.
+    const [elsewhere] = await db.insert(executionWorkspaces).values({ companyId: f.companyId, name: "Another folder",
+      cwd: path.join(FOLDER, "elsewhere"), mode: "shared_workspace", strategyType: "project_primary" }).returning();
+    await db.update(issues).set({ executionWorkspaceId: elsewhere!.id }).where(eq(issues.id, f.issueId));
+    expect(await read()).toBe("binding_not_source_workspace");
+    await db.update(issues).set({ executionWorkspaceId: null }).where(eq(issues.id, f.issueId));
+    expect(await read()).toBe("binding_not_source_workspace");
+    await db.update(issues).set({ executionWorkspaceId: usedId }).where(eq(issues.id, f.issueId));
+    expect(await read()).toBeNull();
+    // A project folder shared by tasks is not looked for on this server: it may be on a worker.
+    await db.update(executionWorkspaces).set({ sourceIssueId: null, mode: "shared_workspace", providerType: "local_fs", status: "active",
+      cwd: path.join(FOLDER, "does-not-exist-here") }).where(eq(executionWorkspaces.id, usedId));
+    expect(await read()).toBeNull();
+    // The task's own isolated local directory must still be there.
+    await db.update(executionWorkspaces).set({ sourceIssueId: f.issueId, mode: "isolated_workspace" }).where(eq(executionWorkspaces.id, usedId));
+    expect(await read()).toBe("directory_missing");
+    const real = await fs.mkdtemp(path.join((await import("node:os")).tmpdir(), "task-directory-"));
+    await db.update(executionWorkspaces).set({ cwd: real }).where(eq(executionWorkspaces.id, usedId));
+    expect(await read()).toBeNull();
+    // Its Git state must still be readable: a link to a repository that is no longer there is not.
+    await fs.writeFile(path.join(real, ".git"), "gitdir: /nowhere/that/exists\n");
+    expect(await read()).toBe("git_unreadable");
+    await fs.rm(path.join(real, ".git"), { force: true });
+    expect(await read()).toBeNull();
+    await db.update(executionWorkspaces).set({ sourceIssueId: used!.sourceIssueId, mode: used!.mode, providerType: used!.providerType,
+      status: used!.status, cwd: used!.cwd }).where(eq(executionWorkspaces.id, usedId));
+    await fs.rm(real, { recursive: true, force: true });
+  });
+
+  // The run is cut in the middle of a write. The resume starts in the same folder: nothing is reset, nothing is
+  // lost, and the role finds its work as it left it.
+  it("a run cut during a write: the resume starts in the same workspace, with the half-written work as it is", async () => {
+    const f = await seed();
+    let written = "";
+    const cancelled = await cutRun(f, async context => {
+      written = path.join(String((context.context.paperclipWorkspace as { cwd: string }).cwd), `half-written-${f.issueId}.txt`);
+      await fs.writeFile(written, "first half of the wor");
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", cut);
+    });
+    await stopProven(f, cancelled.id);
+    let found: { folder: string; content: string | null } | null = null;
+    turns.get(f.companyId)!.push(async context => {
+      const folder = String((context.context.paperclipWorkspace as { cwd: string }).cwd);
+      found = { folder, content: await fs.readFile(path.join(folder, path.basename(written)), "utf8").catch(() => null) };
+      return SUCCESS;
+    });
+    const next = await nextExecution(f, () => retryOf(f, cancelled.id, `pause-resume:${cancelled.id}:${randomUUID()}`));
+    expect(found).toEqual({ folder: path.dirname(written), content: "first half of the wor" });
+    expect(folderOf(next.run)).toBe(folderOf(cancelled));
+    expect(next).toMatchObject({ sessionId: cut });
+    await fs.rm(written, { force: true });
+  });
+
+  it("a Retry a person clicks on the run a pause cut still opens a new conversation", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", cut);
+    });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: cancelled.id });
+    await stopProven(f, cancelled.id);
+    const next = await nextExecution(f, () => retryOf(f, cancelled.id, randomUUID()));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id, forceFreshSession: true });
+    expect(next).toMatchObject({ sessionId: null });
+    // And its workspace is the product's choice for a Retry, unchanged: a fresh isolated one.
+    expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.fresh_workspace_selected", "fresh_isolated_workspace"]]);
+    expect(folderOf(next.run)).not.toBe(folderOf(cancelled));
+  });
+
+  // Only a run a PAUSE cut is continued in its own folder. A run that failed, or that something else cancelled, left
+  // its folder in a state nobody chose: its retry keeps the product's fresh workspace, even under the resume's key.
+  it.each<[string, Turn | "system" | "person"]>([
+    ["failed", async () => routerFailure("adapter_failed", cut)],
+    ["was cancelled by the system, not by a pause", "system"],
+    ["was stopped by a person, not by a pause", "person"],
+  ])("the retry of a run that %s keeps a fresh workspace: the folder it left is never reopened", async (_how, ending) => {
+    const f = await seed();
+    const ended = await cutRun(f, ending === "system" ? async context => {
+      await heartbeat.cancelRun(context.runId, "Cancelled by another path");
+      return routerFailure("router_cancelled", cut);
+    } : ending === "person" ? async context => {
+      await personStops(context.runId);
+      return routerFailure("router_cancelled", cut);
+    } : ending);
+    await stopProven(f, ended.id);
+    const next = await nextExecution(f, () => retryOf(f, ended.id, `pause-resume:${ended.id}:${randomUUID()}`));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: ended.id, taskRetryRequestId: expect.any(String), forceFreshSession: true });
+    expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.fresh_workspace_selected", "fresh_isolated_workspace"]]);
+    expect(folderOf(next.run)).not.toBe(folderOf(ended));
+    expect(folderOf(next.run)).toContain("isolated-workspace-attempts");
+    expect(next).toMatchObject({ sessionId: null });
+  });
+
+  it("the resume of the role, when the task's session was written by another run than the cut one: a new conversation", async () => {
+    const f = await seed();
+    // The cut run's result names no session: the task still holds the session of the run before it.
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", null);
+    });
+    expect((await taskSession(f))?.lastRunId).not.toBe(cancelled.id);
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
+    await stopProven(f, cancelled.id);
+    const next = await nextExecution(f, () => retryOf(f, cancelled.id, `pause-resume:${cancelled.id}:${randomUUID()}`));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id, forceFreshSession: true });
+    expect(next).toMatchObject({ sessionId: null });
+  });
+
+  it("the resume of the role, when nothing holds the task any more and its session is another run's: a new conversation", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", null);
+    });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
+    await stopProven(f, cancelled.id);
+    // The hold of the cut run was settled before the request is sent: the run that starts continues nothing.
+    await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "cancelled", resolvedAt: new Date() })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    const next = await nextExecution(f, () => retryOf(f, cancelled.id, `pause-resume:${cancelled.id}:${randomUUID()}`));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id, forceFreshSession: true });
+    expect(next).toMatchObject({ sessionId: null });
   });
 
   // A session removed on purpose always wins over a late result: the result of a run created before the removal
