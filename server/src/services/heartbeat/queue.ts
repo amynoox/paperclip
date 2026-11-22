@@ -1177,7 +1177,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         !(await verifyNonAssigneeAddresseeInteractionWake(db, { companyId: run.companyId,
           issueId, agentId: run.agentId, contextSnapshot: context })) &&
         // STUDIO-0086: a plugin's verified wake for a reason of the closed list.
-        !(await verifyPluginBlockedWake(db, { contextSnapshot: context, wakeupRequestId: run.wakeupRequestId })) &&
+        !(await verifyPluginBlockedWake(db, { contextSnapshot: context, wakeupRequestId: run.wakeupRequestId, runId: run.id })) &&
         // STUDIO-0087: a verified wake of a card, sent to the addressee's own task.
         !(await verifyOwnIssueInteractionWake(db, { companyId: run.companyId, issueId, agentId: run.agentId, contextSnapshot: context }))
       ) {

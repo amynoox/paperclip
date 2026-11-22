@@ -394,6 +394,104 @@ vi.setConfig({ testTimeout: 120_000 });
     expect(again[1]!.context).toMatchObject({ dependencyBlockedInteraction: true, pluginBlockedWake: { pluginId: f.pluginId, reason: LOAN_REQUESTED } });
   });
 
+  // The retry path is the one place where the requester is not read. It must not be a way in: a caller that could put
+  // the mark AND `retryOfRunId` in the context of its wake (an agent or a person through the wake API, another plugin,
+  // a routine, a direct call) is held, also when `retryOfRunId` names a true run of the router's plugin.
+  it("a forged retry is held at the admission, whoever asks: the mark and `retryOfRunId` in the context, naming a true run of the router's wake", async () => {
+    const f = await seed();
+    // A true wake of the router's plugin ran on the blocked issue: its run is what the forgeries name.
+    await f.services.issues.requestWakeup({ issueId: f.issueId, companyId: f.companyId, reason: LOAN_REQUESTED });
+    const [trueLaunch] = await started(f);
+    const forgedRetry = (actorType: string, actorId: string | null, patch: Record<string, unknown> = {}) => heartbeat.wakeup(f.agentId, {
+      source: "automation", triggerDetail: "system", reason: "transient_failure_retry",
+      payload: { issueId: f.issueId, retryOfRunId: trueLaunch!.runId, pluginBlockedWake: { pluginId: f.pluginId, reason: LOAN_REQUESTED } },
+      requestedByActorType: actorType as never, requestedByActorId: actorId,
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "transient_failure_retry", source: PLUGIN_BLOCKED_WAKE_CONTEXT_SOURCE,
+        pluginId: f.pluginId, pluginKey: f.pluginKey, pluginBlockedWake: { pluginId: f.pluginId, reason: LOAN_REQUESTED },
+        retryOfRunId: trueLaunch!.runId, ...patch },
+    }).catch(() => null);
+    const callers: Array<[string, string, string | null]> = [
+      ["an agent through the wake API", "agent", f.otherAgentId],
+      ["the assignee itself", "agent", f.agentId],
+      ["a person through the wake API", "user", "some-user"],
+      ["another plugin", "system", randomUUID()],
+      ["a routine", "system", "routine-scheduler"],
+      ["a direct call that names the router's plugin as its requester", "system", f.pluginId],
+      ["a direct call with no requester", "system", null],
+    ];
+    for (const [label, actorType, actorId] of callers) {
+      await forgedRetry(actorType, actorId);
+      // The same with the reason of the list kept as the wake's reason.
+      await forgedRetry(actorType, actorId, { wakeReason: LOAN_REQUESTED });
+      await heartbeat.resumeQueuedRuns();
+      await drainHeartbeatRunsToQuiescence(db, heartbeat);
+      expect(launchesOf(f.issueId), `${label}: ${await state(f)}`).toHaveLength(1);
+    }
+    // Only the router's true wake ran, once; the issue still waits.
+    expect((await runsOf(f)).filter((run) => ["queued", "running", "succeeded", "failed"].includes(run.status)).map((run) => run.id)).toEqual([trueLaunch!.runId]);
+    expect(await issueOf(f.issueId)).toMatchObject({ status: "blocked" });
+  });
+
+  it("a forged retry is held at the start of the run: admitted before the blocker with the mark and `retryOfRunId` in its context, it is cancelled for the blocker", async () => {
+    const f = await seed();
+    await f.services.issues.requestWakeup({ issueId: f.issueId, companyId: f.companyId, reason: LOAN_REQUESTED });
+    const [trueLaunch] = await started(f);
+    // The issue has no blocker for a moment; the assignee is kept at work on another issue.
+    await db.delete(issueRelations).where(eq(issueRelations.relatedIssueId, f.issueId));
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+    const busyIssueId = randomUUID();
+    await db.insert(issues).values({ id: busyIssueId, companyId: f.companyId, title: "Other work", status: "todo", priority: "medium", assigneeAgentId: f.agentId });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    answers.set(busyIssueId, [async () => { await gate; return SUCCESS; }]);
+    await heartbeat.wakeup(f.agentId, { source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId: busyIssueId, mutation: "update" }, requestedByActorType: "system", requestedByActorId: "test",
+      contextSnapshot: { issueId: busyIssueId, taskId: busyIssueId, source: "issue.update" } });
+    await vi.waitFor(() => expect(launchesOf(busyIssueId)).toHaveLength(1), { timeout: 30_000, interval: 100 });
+    // The forged wake is admitted (no blocker yet) and waits behind the run at work.
+    await heartbeat.wakeup(f.agentId, { source: "automation", triggerDetail: "system", reason: "transient_failure_retry",
+      payload: { issueId: f.issueId }, requestedByActorType: "agent", requestedByActorId: f.otherAgentId,
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "transient_failure_retry", source: PLUGIN_BLOCKED_WAKE_CONTEXT_SOURCE,
+        pluginBlockedWake: { pluginId: f.pluginId, reason: LOAN_REQUESTED }, retryOfRunId: trueLaunch!.runId } });
+    const queued = (await runsOf(f)).filter((run) => run.status === "queued");
+    expect(queued, await state(f)).toHaveLength(1);
+    expect(queued[0]!.retryOfRunId).toBeNull();
+    // The blocker comes back while it waits.
+    await db.insert(issueRelations).values({ companyId: f.companyId, issueId: f.blockerId, relatedIssueId: f.issueId, type: "blocks" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issueId));
+    release();
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(launchesOf(f.issueId), await state(f)).toHaveLength(1);
+    expect((await runsOf(f)).find((run) => run.id === queued[0]!.id)).toMatchObject({ status: "cancelled", errorCode: "issue_dependencies_blocked" });
+  });
+
+  it("the server's retry of a forged wake is not admitted: the run it retries was not asked for by the plugin's door", async () => {
+    const f = await seed();
+    // A forged wake, with the mark and the fixed source in its context, asked for by an agent while the issue has no
+    // blocker: it runs, as any wake on a ready issue, and fails on a lost link. The server schedules its own retry.
+    await db.delete(issueRelations).where(eq(issueRelations.relatedIssueId, f.issueId));
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+    answers.set(f.issueId, [async () => ({ exitCode: 1, signal: null, timedOut: false, errorCode: "router_provider_stop_unverified",
+      errorMessage: "router provider stop unverified" })]);
+    await wakeAs(f, { actorType: "agent", actorId: f.otherAgentId });
+    await started(f);
+    const [scheduled] = (await runsOf(f)).filter((run) => run.status === "scheduled_retry");
+    expect(scheduled, await state(f)).toBeDefined();
+    expect(scheduled!.contextSnapshot).toMatchObject({ pluginBlockedWake: { pluginId: f.pluginId, reason: LOAN_REQUESTED } });
+    expect(scheduled!.retryOfRunId).not.toBeNull();
+    // The blocker comes before the retry is due.
+    await db.insert(issueRelations).values({ companyId: f.companyId, issueId: f.blockerId, relatedIssueId: f.issueId, type: "blocks" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.issueId));
+    await db.update(heartbeatRuns).set({ scheduledRetryAt: new Date(Date.now() - 60_000) }).where(eq(heartbeatRuns.id, scheduled!.id));
+    await heartbeat.promoteDueScheduledRetries();
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    // The retry did not start on the blocked issue.
+    expect(launchesOf(f.issueId), await state(f)).toHaveLength(1);
+    expect(["queued", "running", "succeeded"]).not.toContain((await runsOf(f)).find((run) => run.id === scheduled!.id)!.status);
+  });
+
   it("the verification itself: the requester of the wake request, the plugin's state, the server's own retry", async () => {
     const f = await seed();
     const context = { issueId: f.issueId, wakeReason: LOAN_REQUESTED, pluginBlockedWake: { pluginId: f.pluginId, reason: LOAN_REQUESTED } };
@@ -411,18 +509,60 @@ vi.setConfig({ testTimeout: 120_000 });
     expect(await verifyPluginBlockedWake(db, { contextSnapshot: context, wakeupRequestId: byPlugin!.id })).toBe(true);
     expect(await verifyPluginBlockedWake(db, { contextSnapshot: context, wakeupRequestId: byAgent!.id })).toBe(false);
     expect(await verifyPluginBlockedWake(db, { contextSnapshot: context, wakeupRequestId: randomUUID() })).toBe(false);
-    // The server's own retry has no request of its own: the mark and the plugin's state decide.
-    const retry = { ...context, wakeReason: "transient_failure_retry", retryOfRunId: randomUUID() };
-    expect(await verifyPluginBlockedWake(db, { contextSnapshot: retry })).toBe(true);
+    // The request row is read in both parts: the system for ANOTHER id, and an agent whose id is the plugin's.
+    const row = async (requestedByActorType: string, requestedByActorId: string) => (await db.insert(agentWakeupRequests).values({ companyId: f.companyId,
+      agentId: f.agentId, source: "automation", triggerDetail: "system", reason: LOAN_REQUESTED, payload: {}, status: "queued",
+      requestedByActorType, requestedByActorId }).returning())[0]!;
+    expect(await verifyPluginBlockedWake(db, { contextSnapshot: context, wakeupRequestId: (await row("system", randomUUID())).id })).toBe(false);
+    expect(await verifyPluginBlockedWake(db, { contextSnapshot: context, wakeupRequestId: (await row("agent", f.pluginId)).id })).toBe(false);
+    // The server's own retry: a context that says so proves nothing. The run being judged must be, in the database,
+    // the server's retry of a run that carried the mark, back to the run the plugin's door asked for.
+    const run = async (values: Partial<typeof heartbeatRuns.$inferInsert>) => (await db.insert(heartbeatRuns).values({ companyId: f.companyId,
+      agentId: f.agentId, invocationSource: "automation", triggerDetail: "system", status: "failed", ...values }).returning())[0]!;
+    const asked = { ...context, source: PLUGIN_BLOCKED_WAKE_CONTEXT_SOURCE };
+    const origin = await run({ wakeupRequestId: byPlugin!.id, contextSnapshot: asked });
+    const retryContext = (of: string) => ({ ...asked, wakeReason: "transient_failure_retry", retryOfRunId: of });
+    const first = await run({ retryOfRunId: origin.id, contextSnapshot: retryContext(origin.id), status: "scheduled_retry" });
+    const second = await run({ retryOfRunId: first.id, contextSnapshot: retryContext(first.id), status: "scheduled_retry" });
+    const judged = (runId: string | null, contextSnapshot: Record<string, unknown>, patch: Record<string, unknown> = {}) =>
+      verifyPluginBlockedWake(db, { contextSnapshot, runId, ...patch });
+    expect(await judged(first.id, retryContext(origin.id))).toBe(true);
+    expect(await judged(second.id, retryContext(first.id))).toBe(true);
+    // No run to judge (the admission of a new wake): never, whoever asks, also when the context names a true run.
+    expect(await judged(null, retryContext(origin.id))).toBe(false);
+    expect(await judged(null, retryContext(origin.id), { requestedByActorType: "system", requestedByActorId: f.pluginId })).toBe(false);
+    expect(await judged(null, retryContext(randomUUID()))).toBe(false);
+    // The judged run is not a retry in the database, or not the retry the context names.
+    expect(await judged(origin.id, retryContext(origin.id))).toBe(false);
+    expect(await judged(first.id, retryContext(first.id))).toBe(false);
+    expect(await judged(randomUUID(), retryContext(origin.id))).toBe(false);
+    // The run it retries did not carry the mark of the plugin's door: another reason, another plugin, no fixed source,
+    // another issue, another agent, a request that is not the plugin's.
+    const retryOf = async (originValues: Partial<typeof heartbeatRuns.$inferInsert>) => {
+      const forgedOrigin = await run({ wakeupRequestId: byPlugin!.id, contextSnapshot: asked, ...originValues });
+      const retried = await run({ retryOfRunId: forgedOrigin.id, contextSnapshot: retryContext(forgedOrigin.id), status: "scheduled_retry" });
+      return judged(retried.id, retryContext(forgedOrigin.id));
+    };
+    expect(await retryOf({})).toBe(true);
+    expect(await retryOf({ contextSnapshot: { ...asked, pluginBlockedWake: { pluginId: f.pluginId, reason: LOAN_RETURNED } } })).toBe(false);
+    expect(await retryOf({ contextSnapshot: { ...asked, pluginBlockedWake: { pluginId: randomUUID(), reason: LOAN_REQUESTED } } })).toBe(false);
+    expect(await retryOf({ contextSnapshot: { ...asked, pluginBlockedWake: undefined } })).toBe(false);
+    expect(await retryOf({ contextSnapshot: { ...asked, source: "plugin.issue.requestWakeup" } })).toBe(false);
+    expect(await retryOf({ contextSnapshot: { ...asked, wakeReason: "issue_commented" } })).toBe(false);
+    expect(await retryOf({ contextSnapshot: { ...asked, issueId: f.blockerId } })).toBe(false);
+    expect(await retryOf({ agentId: f.otherAgentId })).toBe(false);
+    expect(await retryOf({ wakeupRequestId: byAgent!.id })).toBe(false);
+    expect(await retryOf({ wakeupRequestId: null })).toBe(false);
     await db.update(plugins).set({ status: "disabled" }).where(eq(plugins.id, f.pluginId));
-    expect(await verifyPluginBlockedWake(db, { contextSnapshot: retry })).toBe(false);
+    expect(await judged(first.id, retryContext(origin.id))).toBe(false);
     expect(await given()).toBe(false);
     // Ready again, under another key: it is no longer the router's plugin.
     await db.update(plugins).set({ status: "ready" }).where(eq(plugins.id, f.pluginId));
     expect(await given()).toBe(true);
+    expect(await judged(first.id, retryContext(origin.id))).toBe(true);
     await db.update(plugins).set({ pluginKey: `acme.renamed-${f.companyId}` }).where(eq(plugins.id, f.pluginId));
     expect(await given()).toBe(false);
-    expect(await verifyPluginBlockedWake(db, { contextSnapshot: retry })).toBe(false);
+    expect(await judged(first.id, retryContext(origin.id))).toBe(false);
     await db.update(plugins).set({ pluginKey: ROUTER_KEY }).where(eq(plugins.id, f.pluginId));
   });
 });

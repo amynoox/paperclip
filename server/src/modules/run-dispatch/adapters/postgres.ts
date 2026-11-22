@@ -657,7 +657,8 @@ export function createPostgresRunDispatchAdapter(
         issueId, agentId: input.agentId, context: input.contextSnapshot });
     // STUDIO-0086: a plugin's verified wake keeps its way through when the server retries its run.
     const pluginWakeAdmitted = readiness && !readiness.isDependencyReady
-      && await verifyPluginBlockedWake(db, { contextSnapshot: input.contextSnapshot, wakeupRequestId: input.wakeupRequestId });
+      && await verifyPluginBlockedWake(db, { contextSnapshot: input.contextSnapshot, wakeupRequestId: input.wakeupRequestId,
+        runId: input.runId });
     // STUDIO-0087: so does a verified wake of a card, sent to the addressee's own task.
     const cardWakeAdmitted = readiness && !readiness.isDependencyReady
       && await verifyOwnIssueInteractionWake(dbOrTx, { companyId: input.companyId, issueId, agentId: input.agentId,
