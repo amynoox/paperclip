@@ -12,7 +12,10 @@ export interface InteractionResolverKindGovernance {
 
 export type InteractionResolverGovernance = Partial<
   Record<IssueThreadInteractionKind, InteractionResolverKindGovernance>
->;
+> & {
+  /** STUDIO-0087: a question between roles left without an answer. */
+  unansweredAgentQuestion?: { enabled?: boolean; relaunchAfterMinutes?: number; managerAfterMinutes?: number };
+};
 
 export interface Company {
   id: string;

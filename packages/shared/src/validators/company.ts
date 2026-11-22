@@ -19,6 +19,13 @@ export const interactionResolverGovernanceSchema = z.object({
   request_confirmation: interactionResolverKindGovernanceSchema.optional(),
   request_checkbox_confirmation: interactionResolverKindGovernanceSchema.optional(),
   request_item_verdicts: interactionResolverKindGovernanceSchema.optional(),
+  // STUDIO-0087: the delays of a question between roles left without an answer (the addressee's relaunch, then
+  // the card to its manager); `enabled: false` switches both off for the company.
+  unansweredAgentQuestion: z.object({
+    enabled: z.boolean().optional(),
+    relaunchAfterMinutes: z.number().int().min(1).max(1440).optional(),
+    managerAfterMinutes: z.number().int().min(1).max(1440).optional(),
+  }).strict().optional(),
 }).strict().default({});
 
 export const createCompanySchema = z.object({
