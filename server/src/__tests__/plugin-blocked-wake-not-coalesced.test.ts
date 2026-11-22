@@ -59,6 +59,8 @@ vi.setConfig({ testTimeout: 120_000 });
   const launches: Launch[] = [];
   const answers = new Map<string, Array<() => Promise<Record<string, unknown>>>>();
   const SUCCESS = { exitCode: 0, signal: null, timedOut: false, resultJson: {} };
+  // The runs a case holds at work. A case that fails before it lets them go must not leave them hanging for the next.
+  const held: Array<() => void> = [];
 
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("plugin-blocked-wake-own-run-");
@@ -76,6 +78,7 @@ vi.setConfig({ testTimeout: 120_000 });
     });
   }, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS);
   afterEach(async () => {
+    for (const release of held.splice(0)) release();
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
     launches.length = 0;
     answers.clear();
@@ -144,6 +147,7 @@ vi.setConfig({ testTimeout: 120_000 });
   const gated = () => {
     let release!: () => void;
     const gate = new Promise<void>((resolve) => { release = resolve; });
+    held.push(release);
     return { release, answer: async () => { await gate; return SUCCESS; } };
   };
   /** The assignee is at work on another issue: what is admitted for the blocked issue waits its turn as a queued run. */
