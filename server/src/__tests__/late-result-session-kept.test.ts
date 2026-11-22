@@ -433,43 +433,50 @@ const support = await getEmbeddedPostgresTestSupport();
     }
     await db.update(environmentLeases).set({ provider: "ssh" }).where(eq(environmentLeases.id, lease!.id));
     expect(await read()).toBeNull();
-    // The task is bound to a workspace: a project folder, shared, not the task's own isolated directory.
-    const [shared] = await db.insert(executionWorkspaces).values({ companyId: f.companyId, name: "Project folder",
-      cwd: path.join(FOLDER, "does-not-exist-here"), mode: "shared_workspace", strategyType: "project_primary" }).returning();
-    await db.update(issues).set({ executionWorkspaceId: shared!.id }).where(eq(issues.id, f.issueId));
-    expect(await read()).toBeNull();
+    // The workspace the cut run used: its leases name it, and the task is bound to it.
+    const usedIds = [...new Set((await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, cancelled.id)))
+      .map(row => row.executionWorkspaceId).filter((id): id is string => Boolean(id)))];
+    const [task] = await db.select({ executionWorkspaceId: issues.executionWorkspaceId }).from(issues).where(eq(issues.id, f.issueId));
+    expect(usedIds).toEqual([task!.executionWorkspaceId]);
+    const usedId = usedIds[0]!;
+    const [used] = await db.select().from(executionWorkspaces).where(eq(executionWorkspaces.id, usedId));
     // Another run holds that workspace by a lease, or an operation runs on it.
     const [other] = await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId: lease!.environmentId,
-      executionWorkspaceId: shared!.id, provider: "local", status: "active", leasePolicy: "ephemeral",
+      executionWorkspaceId: usedId, provider: "local", status: "active", leasePolicy: "ephemeral",
       metadata: { agentId: f.agentId, driver: "local" } }).returning();
     expect(await read()).toBe("lease_held");
     await db.delete(environmentLeases).where(eq(environmentLeases.id, other!.id));
     const [operation] = await db.insert(workspaceOperations).values({ companyId: f.companyId, issueId: f.issueId,
-      executionWorkspaceId: shared!.id, phase: "workspace_finalize", status: "running" }).returning();
+      executionWorkspaceId: usedId, phase: "workspace_finalize", status: "running" }).returning();
     expect(await read()).toBe("operation_running");
     await db.delete(workspaceOperations).where(eq(workspaceOperations.id, operation!.id));
     expect(await read()).toBeNull();
-    // The cut run worked in another workspace than the one the task is bound to now.
+    // The task is bound to another workspace than the one the cut run used, or to none.
     const [elsewhere] = await db.insert(executionWorkspaces).values({ companyId: f.companyId, name: "Another folder",
       cwd: path.join(FOLDER, "elsewhere"), mode: "shared_workspace", strategyType: "project_primary" }).returning();
-    await db.update(environmentLeases).set({ executionWorkspaceId: elsewhere!.id }).where(eq(environmentLeases.id, lease!.id));
+    await db.update(issues).set({ executionWorkspaceId: elsewhere!.id }).where(eq(issues.id, f.issueId));
     expect(await read()).toBe("binding_not_source_workspace");
     await db.update(issues).set({ executionWorkspaceId: null }).where(eq(issues.id, f.issueId));
     expect(await read()).toBe("binding_not_source_workspace");
-    // The task's own isolated local directory, the one the cut run used: it must still be there.
-    const [own] = await db.insert(executionWorkspaces).values({ companyId: f.companyId, name: "Task directory", sourceIssueId: f.issueId,
-      cwd: path.join(FOLDER, "does-not-exist-here"), mode: "isolated_workspace", strategyType: "git_worktree", providerType: "local_fs" }).returning();
-    await db.update(issues).set({ executionWorkspaceId: own!.id }).where(eq(issues.id, f.issueId));
-    await db.update(environmentLeases).set({ executionWorkspaceId: own!.id }).where(eq(environmentLeases.id, lease!.id));
+    await db.update(issues).set({ executionWorkspaceId: usedId }).where(eq(issues.id, f.issueId));
+    expect(await read()).toBeNull();
+    // A project folder shared by tasks is not looked for on this server: it may be on a worker.
+    await db.update(executionWorkspaces).set({ sourceIssueId: null, mode: "shared_workspace", providerType: "local_fs", status: "active",
+      cwd: path.join(FOLDER, "does-not-exist-here") }).where(eq(executionWorkspaces.id, usedId));
+    expect(await read()).toBeNull();
+    // The task's own isolated local directory must still be there.
+    await db.update(executionWorkspaces).set({ sourceIssueId: f.issueId, mode: "isolated_workspace" }).where(eq(executionWorkspaces.id, usedId));
     expect(await read()).toBe("directory_missing");
     const real = await fs.mkdtemp(path.join((await import("node:os")).tmpdir(), "task-directory-"));
-    await db.update(executionWorkspaces).set({ cwd: real }).where(eq(executionWorkspaces.id, own!.id));
+    await db.update(executionWorkspaces).set({ cwd: real }).where(eq(executionWorkspaces.id, usedId));
     expect(await read()).toBeNull();
     // Its Git state must still be readable: a link to a repository that is no longer there is not.
     await fs.writeFile(path.join(real, ".git"), "gitdir: /nowhere/that/exists\n");
     expect(await read()).toBe("git_unreadable");
     await fs.rm(path.join(real, ".git"), { force: true });
     expect(await read()).toBeNull();
+    await db.update(executionWorkspaces).set({ sourceIssueId: used!.sourceIssueId, mode: used!.mode, providerType: used!.providerType,
+      status: used!.status, cwd: used!.cwd }).where(eq(executionWorkspaces.id, usedId));
     await fs.rm(real, { recursive: true, force: true });
   });
 
