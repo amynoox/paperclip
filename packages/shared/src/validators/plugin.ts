@@ -806,6 +806,7 @@ export const pluginManifestV1Schema = z.object({
   ).optional(),
   capabilities: z.array(z.enum(PLUGIN_CAPABILITIES)).min(1),
   agentLifecycle: z.literal(true).optional(),
+  blockedIssueWakeups: z.literal(true).optional(),
   workspaceProvider: z.object({
     finalizationVersion: z.literal(1).optional(),
     supportsMergeAncestry: z.boolean().optional(),

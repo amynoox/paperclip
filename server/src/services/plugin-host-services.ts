@@ -37,6 +37,7 @@ import type {
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, IssueRelationIssueSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import { PLUGIN_BLOCKED_WAKE_CONTEXT_SOURCE, pluginBlockedWakeMark } from "./plugin-blocked-wake.js";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
@@ -2430,7 +2431,9 @@ export function buildHostServices(
         }
         const relations = await issues.getRelationSummaries(issue.id);
         const unresolvedBlockers = relations.blockedBy.filter((blocker) => blocker.status !== "done");
-        if (unresolvedBlockers.length > 0) {
+        // STUDIO-0086: a reason of the closed list, from the plugin that holds the right, passes the blockers.
+        const blockedWake = pluginBlockedWakeMark({ pluginId, pluginKey, reason: params.reason, manifest: options.manifest });
+        if (unresolvedBlockers.length > 0 && !blockedWake) {
           throw new Error("Issue is blocked by unresolved blockers");
         }
         const budgetBlock = await budgets.getInvocationBlock(companyId, issue.assigneeAgentId, {
@@ -2440,7 +2443,8 @@ export function buildHostServices(
         if (budgetBlock) {
           throw new Error(budgetBlock.reason);
         }
-        const contextSource = params.contextSource ?? "plugin.issue.requestWakeup";
+        // STUDIO-0086: such a wake carries fixed data only; the plugin's own source text is not passed on.
+        const contextSource = blockedWake ? PLUGIN_BLOCKED_WAKE_CONTEXT_SOURCE : params.contextSource ?? "plugin.issue.requestWakeup";
         const run = await heartbeat.wakeup(issue.assigneeAgentId, {
           source: "assignment",
           triggerDetail: "system",
@@ -2462,6 +2466,7 @@ export function buildHostServices(
             source: contextSource,
             pluginId,
             pluginKey,
+            ...(blockedWake ? { pluginBlockedWake: blockedWake } : {}),
           },
         });
         await logPluginActivity({
@@ -2498,7 +2503,9 @@ export function buildHostServices(
           }
           const relations = await issues.getRelationSummaries(issue.id);
           const unresolvedBlockers = relations.blockedBy.filter((blocker) => blocker.status !== "done");
-          if (unresolvedBlockers.length > 0) {
+          // STUDIO-0086: as for the single wake.
+          const blockedWake = pluginBlockedWakeMark({ pluginId, pluginKey, reason: params.reason, manifest: options.manifest });
+          if (unresolvedBlockers.length > 0 && !blockedWake) {
             throw new Error("Issue is blocked by unresolved blockers");
           }
           const budgetBlock = await budgets.getInvocationBlock(companyId, issue.assigneeAgentId, {
@@ -2508,7 +2515,7 @@ export function buildHostServices(
           if (budgetBlock) {
             throw new Error(budgetBlock.reason);
           }
-          const contextSource = params.contextSource ?? "plugin.issue.requestWakeups";
+          const contextSource = blockedWake ? PLUGIN_BLOCKED_WAKE_CONTEXT_SOURCE : params.contextSource ?? "plugin.issue.requestWakeups";
           const run = await heartbeat.wakeup(issue.assigneeAgentId, {
             source: "assignment",
             triggerDetail: "system",
@@ -2530,6 +2537,7 @@ export function buildHostServices(
               source: contextSource,
               pluginId,
               pluginKey,
+              ...(blockedWake ? { pluginBlockedWake: blockedWake } : {}),
             },
           });
           await logPluginActivity({
