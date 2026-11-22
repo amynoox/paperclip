@@ -1,10 +1,11 @@
 import { randomUUID } from "node:crypto";
 import { and, eq } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { activityLog, agentWakeupRequests, agents, companies, createDb, heartbeatRuns, issueThreadInteractions, issues,
+import { activityLog, agentWakeupRequests, agents, companies, createDb, heartbeatRuns, issueThreadInteractions, issues, projects,
   EMBEDDED_POSTGRES_TEST_TIMEOUT_MS } from "@paperclipai/db";
 import { updateCompanySchema } from "@paperclipai/shared";
 import { startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
+import { addresseeWakeTarget, readOwnIssueInteractionWake } from "../services/addressee-wake-issue.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import {
@@ -306,8 +307,65 @@ describe("a question between roles left without an answer", () => {
       contextSnapshot: expect.objectContaining({ issueId: own, taskId: own, interactionId: card.id, interactionIssueId: f.issueId,
         wakeReason: "interaction_pending" }) })]);
     expect(await saidOf(f, UNANSWERED_QUESTION_RELAUNCHED_ACTION)).toEqual([expect.objectContaining({ interactionId: card.id, sent: true, wakeIssueId: own })]);
+    // The card was old when it was relaunched: the manager is asked no sooner after the relaunch than a card relaunched
+    // on time would have had (the second delay less the first), not at the next pass.
+    const deadlines: number[] = [];
+    expect(await pass(f, card, 71, wake, deadlines)).toBe("manager_not_due");
+    expect(deadlines).toEqual([after(card, 72).getTime()]);
+    expect(await cardsOf(f)).toHaveLength(1);
     expect(await pass(f, card, 72, wake)).toBe("manager_asked");
   });
+
+  // The two pieces together (STUDIO-0087 delivers a card's wake on a task of the addressee): the first wake is written
+  // with the route's own helper, and the relaunch goes through the real queue.
+  it("the same through the real queue: the relaunch of such a card starts a run of the addressee on its own task, for the card", async () => {
+    const f = await seed();
+    const own = await ownTaskOfAddressee(f);
+    const card = await ask(f);
+    const target = addresseeWakeTarget(f.issueId, own);
+    expect(target).toEqual({ issueId: own, context: { interactionIssueId: f.issueId } });
+    await firstWake(f, card, "completed", target.issueId);
+    await ran(f, card, "succeeded", {}, target.issueId);
+    const heartbeat = heartbeatService(db);
+    const wake = vi.fn((agentId: string, request: Parameters<typeof heartbeat.wakeup>[1]) => heartbeat.wakeup(agentId, request));
+    expect(await pass(f, card, 5, wake as never)).toBe("relaunched");
+    await new Promise(resolve => setTimeout(resolve, 500));
+    const relaunches = (await db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, f.companyId),
+      eq(agentWakeupRequests.agentId, f.addressee)))).filter(row => row.idempotencyKey === unansweredQuestionRelaunchKey(card.id));
+    expect(relaunches).toHaveLength(1);
+    expect(relaunches[0].reason).toBe(UNANSWERED_QUESTION_RELAUNCH_REASON);
+    expect(relaunches[0].payload).toMatchObject({ issueId: own, mutation: "interaction", interactionId: card.id, interactionIssueId: f.issueId });
+    expect(relaunches[0].status).not.toBe("skipped");
+    expect({ error: relaunches[0].error ?? "" }).not.toMatchObject({ error: expect.stringContaining("assignee changed") });
+    // The run the relaunch started is on the addressee's own task, and names the card and the card's task.
+    const started = (await db.select().from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, f.companyId),
+      eq(heartbeatRuns.agentId, f.addressee)))).filter(run => run.wakeupRequestId === relaunches[0].id);
+    expect(started).toHaveLength(1);
+    expect(started[0].contextSnapshot).toMatchObject({ issueId: own, interactionId: card.id, interactionIssueId: f.issueId,
+      wakeReason: "interaction_pending" });
+    // It is the run the other piece recognises as a card's wake on the addressee's own task.
+    expect(await readOwnIssueInteractionWake(db, { companyId: f.companyId, issueId: own, agentId: f.addressee,
+      contextSnapshot: started[0].contextSnapshot as Record<string, unknown> })).toMatchObject({ interactionId: card.id, cardIssueId: f.issueId });
+    await heartbeat.drainActiveRunExecutions?.();
+  });
+
+  it.each(["queued", "deferred_issue_execution", "claimed"])(
+    "a card whose wake, on the addressee's own task, is still %s: not read yet, no relaunch and no card to the manager", async status => {
+      const f = await seed();
+      const own = await ownTaskOfAddressee(f);
+      const card = await ask(f);
+      const first = await firstWake(f, card, status, own);
+      const wake = spy();
+      expect(await pass(f, card, 6, wake)).toBe("not_read_yet");
+      expect(await pass(f, card, 60, wake)).toBe("not_read_yet");
+      expect(wake).not.toHaveBeenCalled();
+      expect(await saidOf(f, UNANSWERED_QUESTION_RELAUNCHED_ACTION)).toHaveLength(0);
+      expect(await cardsOf(f)).toHaveLength(1);
+      await db.update(agentWakeupRequests).set({ status: "completed", finishedAt: after(card, 61) }).where(eq(agentWakeupRequests.id, first.id));
+      await ran(f, card, "succeeded", {}, own);
+      expect(await pass(f, card, 62, wake)).toBe("relaunched");
+      expect(wakesTo(wake, f.addressee)[0].payload).toMatchObject({ issueId: own, interactionId: card.id, interactionIssueId: f.issueId });
+    });
 
   it("a card whose wake went to a task the addressee no longer holds: the relaunch goes to the card's task", async () => {
     const f = await seed();
@@ -357,13 +415,26 @@ describe("a question between roles left without an answer", () => {
 
   it("the budget of the task's project is asked, not only the task's", async () => {
     const f = await seed();
+    const [project] = await db.insert(projects).values({ companyId: f.companyId, name: "The game" }).returning();
+    await db.update(issues).set({ projectId: project.id }).where(eq(issues.id, f.issueId));
     const card = await ask(f);
     await readAndDidNotAnswer(f, card);
     const blocked = vi.fn().mockResolvedValue(false);
-    await relaunchUnansweredAgentQuestions(db, { companyId: f.companyId, issueId: f.issueId, now: after(card, 5), wake: spy() as never,
+    const wake = spy();
+    await relaunchUnansweredAgentQuestions(db, { companyId: f.companyId, issueId: f.issueId, now: after(card, 5), wake: wake as never,
       invocationBlocked: blocked });
-    const [task] = await db.select({ projectId: issues.projectId }).from(issues).where(eq(issues.id, f.issueId));
-    expect(blocked).toHaveBeenCalledWith(f.addressee, f.issueId, task.projectId);
+    expect(blocked).toHaveBeenCalledWith(f.addressee, f.issueId, project.id);
+    expect(wakesTo(wake, f.addressee)).toHaveLength(1);
+    // A stop of that project's budget holds the addressee as a stop of its own does.
+    const g = await seed();
+    const [held] = await db.insert(projects).values({ companyId: g.companyId, name: "The game" }).returning();
+    await db.update(issues).set({ projectId: held.id }).where(eq(issues.id, g.issueId));
+    const heldCard = await ask(g);
+    await readAndDidNotAnswer(g, heldCard);
+    const heldWake = spy();
+    expect((await relaunchUnansweredAgentQuestions(db, { companyId: g.companyId, issueId: g.issueId, now: after(heldCard, 5), wake: heldWake as never,
+      invocationBlocked: async (_agentId, _issueId, projectId) => projectId === held.id }))[0]).toMatchObject({ outcome: "addressee_held" });
+    expect(heldWake).not.toHaveBeenCalled();
   });
 
   it("a card addressed to a person is left alone", async () => {
