@@ -1,4 +1,4 @@
-import { readWakeChatConversationId } from "../../run-dispatch/index.js";
+import { carriesPluginBlockedWake, readWakeChatConversationId } from "../../run-dispatch/index.js";
 import { isAdapterDeclaredWaitErrorCode, routerRefusalOutcome } from "../../../services/recovery/adapter-declared-wait.js";
 import { enrichPromotedWakeContext, wakeMustNotJoinActiveRun } from "../domain/context.js";
 import {
@@ -966,8 +966,10 @@ export function createAdmitWakeBehindIssueExecution(deps: {
       if (run) return { kind: "coalesced", run };
     }
 
+    // STUDIO-0093: a plugin's wake on a blocked issue waits as its own request, and no other wake joins it there.
+    const pluginBlockedWake = carriesPluginBlockedWake(input.contextSnapshot);
     const existingDeferred =
-      (interactionReceipt || input.allowRunCoalescing === false)
+      (interactionReceipt || pluginBlockedWake || input.allowRunCoalescing === false)
         ? null
         : await deps.reader.findExistingDeferredWake(scope, {
             companyId: input.companyId,
