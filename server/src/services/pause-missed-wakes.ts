@@ -138,6 +138,19 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
     let missed: Missed | null = issue.assigneeAgentId === input.agentId ? last : null;
     let interactionId: string | null = null;
     let interactionKind: string | null = null;
+    // STUDIO-0087: the lost wake of a card sent to this task, the agent's own, keeps its card while it waits.
+    let interactionIssueId: string | null = null;
+    if (missed?.interactionId) {
+      const [card] = await db.select({ kind: issueThreadInteractions.kind, issueId: issueThreadInteractions.issueId }).from(issueThreadInteractions).where(and(
+        eq(issueThreadInteractions.companyId, input.companyId),
+        eq(issueThreadInteractions.id, missed.interactionId),
+        eq(issueThreadInteractions.status, "pending"),
+        eq(issueThreadInteractions.addresseeAgentId, input.agentId),
+      )).limit(1);
+      if (card && card.issueId !== issueId) {
+        interactionId = missed.interactionId; interactionKind = card.kind; interactionIssueId = card.issueId;
+      }
+    }
     if (!missed) {
       // Not the agent's task: replay only the wake of a card still pending and addressed to the agent.
       const card = latestCard.get(issueId);
@@ -193,6 +206,7 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
           source: "agent.pause_lifted",
           missedWakeRequestId: missed.id,
           ...(interactionId ? { interactionId, interactionKind } : {}),
+          ...(interactionIssueId ? { interactionIssueId } : {}),
         },
       });
       woken += 1;

@@ -1,6 +1,7 @@
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { verifyPluginBlockedWake } from "../plugin-blocked-wake.js";
+import { verifyOwnIssueInteractionWake } from "../addressee-wake-issue.js";
 import { agentCommentHeldByDependencies, allUnresolvedBlockersCancelled, HELD_DEPENDENCY_COMMENT_IDS_KEY,
   HELD_DEPENDENCY_HANDOVER_AT_KEY, HELD_DEPENDENCY_OLDER_COUNT_KEY, HELD_DEPENDENCY_REASON_KEY, HELD_DEPENDENCY_TRACE_KEY,
   isDependencyHandoffWake, readCommentsToHandOver,
@@ -1176,7 +1177,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         !(await verifyNonAssigneeAddresseeInteractionWake(db, { companyId: run.companyId,
           issueId, agentId: run.agentId, contextSnapshot: context })) &&
         // STUDIO-0086: a plugin's verified wake for a reason of the closed list.
-        !(await verifyPluginBlockedWake(db, { contextSnapshot: context, wakeupRequestId: run.wakeupRequestId, runId: run.id }))
+        !(await verifyPluginBlockedWake(db, { contextSnapshot: context, wakeupRequestId: run.wakeupRequestId, runId: run.id })) &&
+        // STUDIO-0087: a verified wake of a card, sent to the addressee's own task.
+        !(await verifyOwnIssueInteractionWake(db, { companyId: run.companyId, issueId, agentId: run.agentId, contextSnapshot: context }))
       ) {
         const cancelled = await cancelQueuedRunForBlockedDependencies(
           run,
@@ -4763,7 +4766,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             )
             // STUDIO-0086: a plugin's verified wake for a reason of the closed list.
             || await verifyPluginBlockedWake(tx, { contextSnapshot: enrichedContextSnapshot,
-              requestedByActorType: opts.requestedByActorType, requestedByActorId: opts.requestedByActorId }));
+              requestedByActorType: opts.requestedByActorType, requestedByActorId: opts.requestedByActorId })
+            // STUDIO-0087: a verified wake of a card, sent to the addressee's own task.
+            || await verifyOwnIssueInteractionWake(tx, { companyId: issue.companyId, issueId: issue.id, agentId,
+              contextSnapshot: enrichedContextSnapshot }));
 
           if (blockedInteractionWake) {
             enrichedContextSnapshot.dependencyBlockedInteraction = true;

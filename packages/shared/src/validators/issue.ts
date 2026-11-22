@@ -2110,6 +2110,9 @@ const createIssueThreadInteractionCommon = {
   resolverPolicy: issueThreadInteractionResolverPolicySchema.optional(),
   addresseeAgentId: z.string().guid().nullable().optional(),
   addresseeUserId: z.string().trim().min(1).nullable().optional(),
+  // STUDIO-0087: the task of the addressee agent on which the card's wake is sent, instead of the card's own task.
+  // Not stored on the card: it only chooses where that wake goes (server: services/addressee-wake-issue.ts).
+  addresseeWakeIssueId: z.string().guid().nullable().optional(),
 };
 
 // Validate dual representations on creation, not when reading historical rows.
