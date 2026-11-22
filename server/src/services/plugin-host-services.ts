@@ -2431,8 +2431,8 @@ export function buildHostServices(
         }
         const relations = await issues.getRelationSummaries(issue.id);
         const unresolvedBlockers = relations.blockedBy.filter((blocker) => blocker.status !== "done");
-        // STUDIO-0086: a reason of the closed list, from a plugin that declares the capability, passes the blockers.
-        const blockedWake = pluginBlockedWakeMark({ pluginId, reason: params.reason, capabilities: options.manifest?.capabilities });
+        // STUDIO-0086: a reason of the closed list, from a plugin whose manifest declares it, passes the blockers.
+        const blockedWake = pluginBlockedWakeMark({ pluginId, reason: params.reason, manifest: options.manifest });
         if (unresolvedBlockers.length > 0 && !blockedWake) {
           throw new Error("Issue is blocked by unresolved blockers");
         }
@@ -2503,7 +2503,7 @@ export function buildHostServices(
           const relations = await issues.getRelationSummaries(issue.id);
           const unresolvedBlockers = relations.blockedBy.filter((blocker) => blocker.status !== "done");
           // STUDIO-0086: as for the single wake.
-          const blockedWake = pluginBlockedWakeMark({ pluginId, reason: params.reason, capabilities: options.manifest?.capabilities });
+          const blockedWake = pluginBlockedWakeMark({ pluginId, reason: params.reason, manifest: options.manifest });
           if (unresolvedBlockers.length > 0 && !blockedWake) {
             throw new Error("Issue is blocked by unresolved blockers");
           }

@@ -1,6 +1,6 @@
 // STUDIO-0086: a plugin's "verified" wake on an issue that still has unresolved blockers. A reason of the closed
-// list, from a plugin that declares `issues.wakeup.blocked`, starts the assignee's run on the blocked issue; every
-// other wake keeps today's refusal. The cases go through the plugin's door (plugin-host-services) and through the two
+// list, from a plugin whose manifest declares `blockedIssueWakeups`, starts the assignee's run on the blocked issue;
+// every other wake keeps today's refusal. The cases go through the plugin's door (plugin-host-services) and through the two
 // doors of the queue (admission and the start of the run), on real heartbeat runs with a stand-in adapter.
 import { randomUUID } from "node:crypto";
 import { and, asc, eq } from "drizzle-orm";
@@ -9,37 +9,58 @@ import {
   agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issueRelations,
   issues, plugins, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
 } from "@paperclipai/db";
-import { PLUGIN_BLOCKED_ISSUE_WAKE_REASONS, PLUGIN_CAPABILITIES, type PaperclipPluginManifestV1 } from "@paperclipai/shared";
+import { PLUGIN_BLOCKED_ISSUE_WAKE_REASONS, PLUGIN_CAPABILITIES, pluginManifestV1Schema, type PaperclipPluginManifestV1 } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
-import { PLUGIN_BLOCKED_ISSUE_WAKE_CAPABILITY, pluginBlockedWakeMark, verifyPluginBlockedWake } from "../services/plugin-blocked-wake.js";
+import { declaresBlockedIssueWakeups, pluginBlockedWakeMark, verifyPluginBlockedWake } from "../services/plugin-blocked-wake.js";
 import { readPluginBlockedWake } from "../modules/run-dispatch/domain/wake-context.js";
 
+const MACHINE_LENT = "worker_router_machine_lent";
 const LOAN_REQUESTED = "worker_router_loan_requested";
 const LOAN_RETURNED = "worker_router_loan_returned";
 const ORDINARY = "worker_router_group_ready";
 const REFUSED = "Issue is blocked by unresolved blockers";
 const adapterType = "codex_local";
 
-describe("a plugin's wake on a blocked issue: the list, the capability, the mark", () => {
-  it("the reasons are a closed list of two, and the capability is one a manifest may declare", () => {
-    expect([...PLUGIN_BLOCKED_ISSUE_WAKE_REASONS]).toEqual([LOAN_REQUESTED, LOAN_RETURNED]);
-    expect(PLUGIN_BLOCKED_ISSUE_WAKE_CAPABILITY).toBe("issues.wakeup.blocked");
-    expect(PLUGIN_CAPABILITIES).toContain("issues.wakeup.blocked");
-    expect(PLUGIN_CAPABILITIES).toContain("issues.wakeup");
+describe("a plugin's wake on a blocked issue: the list, the declaration, the mark", () => {
+  const baseManifest = { id: "studio.worker-router-fixture", apiVersion: 1, version: "0.1.0", displayName: "Fixture router",
+    description: "Fixture", author: "Tests", categories: ["connector"], capabilities: ["issues.wakeup"], entrypoints: { worker: "worker.js" } };
+
+  it("the reasons are a closed list of three, the router's own", () => {
+    expect([...PLUGIN_BLOCKED_ISSUE_WAKE_REASONS]).toEqual([MACHINE_LENT, LOAN_REQUESTED, LOAN_RETURNED]);
   });
 
-  it("the plugin's door writes the mark only for a listed reason and a plugin that declares the capability", () => {
-    const capable = ["issues.wakeup", "issues.wakeup.blocked"];
-    expect(pluginBlockedWakeMark({ pluginId: "p1", reason: LOAN_REQUESTED, capabilities: capable })).toEqual({ pluginId: "p1", reason: LOAN_REQUESTED });
-    expect(pluginBlockedWakeMark({ pluginId: "p1", reason: LOAN_RETURNED, capabilities: capable })).toEqual({ pluginId: "p1", reason: LOAN_RETURNED });
-    expect(pluginBlockedWakeMark({ pluginId: "p1", reason: ORDINARY, capabilities: capable })).toBeNull();
-    expect(pluginBlockedWakeMark({ pluginId: "p1", reason: undefined, capabilities: capable })).toBeNull();
-    expect(pluginBlockedWakeMark({ pluginId: "p1", reason: LOAN_REQUESTED, capabilities: ["issues.wakeup"] })).toBeNull();
-    expect(pluginBlockedWakeMark({ pluginId: "p1", reason: LOAN_REQUESTED, capabilities: undefined })).toBeNull();
+  it("the declaration is a manifest field and no new capability: a manifest with it is valid, and a host that does not know the field drops it", () => {
+    // No capability was added: a manifest that names one the host does not know is refused, and a plugin that
+    // declared it could not load on a server without this patch.
+    expect(PLUGIN_CAPABILITIES.filter((capability) => capability.startsWith("issues.wakeup"))).toEqual(["issues.wakeup"]);
+    expect(pluginManifestV1Schema.safeParse({ ...baseManifest, capabilities: ["issues.wakeup", "issues.wakeup.blocked"] }).success).toBe(false);
+    const declared = pluginManifestV1Schema.safeParse({ ...baseManifest, blockedIssueWakeups: true });
+    expect(declared.success).toBe(true);
+    expect(declared.success && declaresBlockedIssueWakeups(declared.data)).toBe(true);
+    // Only `true` declares it.
+    expect(pluginManifestV1Schema.safeParse({ ...baseManifest, blockedIssueWakeups: false }).success).toBe(false);
+    expect(declaresBlockedIssueWakeups({ blockedIssueWakeups: "yes" })).toBe(false);
+    expect(declaresBlockedIssueWakeups(baseManifest)).toBe(false);
+    expect(declaresBlockedIssueWakeups(null)).toBe(false);
+    // What a host without the field does with a manifest that has one it does not know: it drops it, the plugin loads.
+    const unknown = pluginManifestV1Schema.safeParse({ ...baseManifest, aFieldThisHostDoesNotKnow: true });
+    expect(unknown.success).toBe(true);
+    expect(unknown.success && "aFieldThisHostDoesNotKnow" in unknown.data).toBe(false);
+  });
+
+  it("the plugin's door writes the mark only for a listed reason and a plugin whose manifest declares it", () => {
+    const declared = { blockedIssueWakeups: true };
+    for (const reason of [MACHINE_LENT, LOAN_REQUESTED, LOAN_RETURNED]) {
+      expect(pluginBlockedWakeMark({ pluginId: "p1", reason, manifest: declared })).toEqual({ pluginId: "p1", reason });
+    }
+    expect(pluginBlockedWakeMark({ pluginId: "p1", reason: ORDINARY, manifest: declared })).toBeNull();
+    expect(pluginBlockedWakeMark({ pluginId: "p1", reason: undefined, manifest: declared })).toBeNull();
+    expect(pluginBlockedWakeMark({ pluginId: "p1", reason: LOAN_REQUESTED, manifest: {} })).toBeNull();
+    expect(pluginBlockedWakeMark({ pluginId: "p1", reason: LOAN_REQUESTED, manifest: undefined })).toBeNull();
   });
 
   it("the mark is read only with a listed reason that is the reason of the wake; a server retry keeps it", () => {
@@ -97,13 +118,13 @@ vi.setConfig({ testTimeout: 120_000 });
     await database?.cleanup();
   });
 
-  const manifest = (capabilities: string[]): PaperclipPluginManifestV1 => ({
+  const manifest = (declares: boolean): PaperclipPluginManifestV1 => ({
     id: "studio.worker-router-fixture", apiVersion: 1, version: "0.1.0", displayName: "Fixture router", description: "Fixture",
-    author: "Tests", categories: ["connector"], capabilities, entrypoints: { worker: "worker.js" },
+    author: "Tests", categories: ["connector"], capabilities: ["issues.wakeup"], entrypoints: { worker: "worker.js" },
+    ...(declares ? { blockedIssueWakeups: true } : {}),
   } as unknown as PaperclipPluginManifestV1);
-  const CAPABLE = ["issues.wakeup", "issues.wakeup.blocked"];
 
-  async function seed(options: { capabilities?: string[]; pluginStatus?: string; issueStatus?: string } = {}) {
+  async function seed(options: { declares?: boolean; pluginStatus?: string; issueStatus?: string } = {}) {
     const companyId = randomUUID(), agentId = randomUUID(), otherAgentId = randomUUID(), blockerId = randomUUID(), issueId = randomUUID();
     await db.insert(companies).values({ id: companyId, name: "Blocked wake", issuePrefix: `B${companyId.replaceAll("-", "").slice(0, 6).toUpperCase()}`,
       requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" });
@@ -124,7 +145,7 @@ vi.setConfig({ testTimeout: 120_000 });
     ]);
     await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: issueId, type: "blocks" });
     const pluginKey = `studio.worker-router-fixture.${companyId}`;
-    const declared = manifest(options.capabilities ?? CAPABLE);
+    const declared = manifest(options.declares ?? true);
     const [plugin] = await db.insert(plugins).values({ pluginKey, packageName: pluginKey, version: "0.1.0",
       status: (options.pluginStatus ?? "ready") as never, manifestJson: declared }).returning();
     const services = buildHostServices(db, plugin!.id, pluginKey, { forPlugin: () => ({ emit: async () => {}, subscribe: () => {} }) } as never,
@@ -166,7 +187,7 @@ vi.setConfig({ testTimeout: 120_000 });
     });
   };
 
-  it.each([LOAN_REQUESTED, LOAN_RETURNED])("the router's wake `%s` starts the assignee's run on the blocked issue, in the bounded mode", async (reason) => {
+  it.each([MACHINE_LENT, LOAN_REQUESTED, LOAN_RETURNED])("the router's wake `%s` starts the assignee's run on the blocked issue, in the bounded mode", async (reason) => {
     const f = await seed();
     await f.services.issues.requestWakeup({ issueId: f.issueId, companyId: f.companyId, reason });
     const [launch] = await started(f);
@@ -187,7 +208,7 @@ vi.setConfig({ testTimeout: 120_000 });
     expect(launch!.context).toMatchObject({ wakeReason: LOAN_REQUESTED, dependencyBlockedInteraction: true, pluginBlockedWake: { pluginId: f.pluginId, reason: LOAN_REQUESTED } });
   });
 
-  it("another reason is refused at the plugin's door, also for a plugin that declares the capability", async () => {
+  it("another reason is refused at the plugin's door, also for a plugin whose manifest declares it", async () => {
     const f = await seed();
     for (const reason of [ORDINARY, "plugin_issue_wakeup_requested", "mission_advance", undefined]) {
       await expect(f.services.issues.requestWakeup({ issueId: f.issueId, companyId: f.companyId, reason }), String(reason)).rejects.toThrow(REFUSED);
@@ -196,8 +217,8 @@ vi.setConfig({ testTimeout: 120_000 });
     await held(f);
   });
 
-  it("a plugin that does not declare the capability is refused at the plugin's door, also for a listed reason", async () => {
-    const f = await seed({ capabilities: ["issues.wakeup"] });
+  it("a plugin whose manifest does not declare it is refused at the plugin's door, also for a listed reason", async () => {
+    const f = await seed({ declares: false });
     for (const reason of PLUGIN_BLOCKED_ISSUE_WAKE_REASONS) {
       await expect(f.services.issues.requestWakeup({ issueId: f.issueId, companyId: f.companyId, reason })).rejects.toThrow(REFUSED);
       await expect(f.services.issues.requestWakeups({ issueIds: [f.issueId], companyId: f.companyId, reason })).rejects.toThrow(REFUSED);
@@ -205,7 +226,7 @@ vi.setConfig({ testTimeout: 120_000 });
     await held(f);
   });
 
-  it.each(["backlog", "done", "cancelled"])("an issue that is `%s` stays refused, with the listed reason and the capability", async (status) => {
+  it.each(["backlog", "done", "cancelled"])("an issue that is `%s` stays refused, with a listed reason and the declaration", async (status) => {
     const f = await seed({ issueStatus: status });
     await expect(f.services.issues.requestWakeup({ issueId: f.issueId, companyId: f.companyId, reason: LOAN_REQUESTED }))
       .rejects.toThrow(`Issue is not wakeable in status: ${status}`);
@@ -215,10 +236,10 @@ vi.setConfig({ testTimeout: 120_000 });
   });
 
   it("the doors of the queue do not trust the mark: the same wake written by another caller is held", async () => {
-    // The plugin on the server does not declare the capability.
-    const noCapability = await seed({ capabilities: ["issues.wakeup"] });
-    await wakeAs(noCapability);
-    await held(noCapability);
+    // The plugin on the server does not declare it.
+    const notDeclared = await seed({ declares: false });
+    await wakeAs(notDeclared);
+    await held(notDeclared);
     // The plugin is not ready.
     const notReady = await seed({ pluginStatus: "error" });
     await wakeAs(notReady);
@@ -286,10 +307,10 @@ vi.setConfig({ testTimeout: 120_000 });
     expect(launch!.context).toMatchObject({ wakeReason: LOAN_REQUESTED, dependencyBlockedInteraction: true, pluginBlockedWake: { pluginId: f.pluginId, reason: LOAN_REQUESTED } });
   });
 
-  it("at the start of the run: the plugin lost the capability meanwhile, and the queued run is cancelled for the blocker", async () => {
+  it("at the start of the run: the plugin no longer declares it, and the queued run is cancelled for the blocker", async () => {
     const f = await seed();
     const release = await queuedBehindAnotherRun(f);
-    await db.update(plugins).set({ manifestJson: manifest(["issues.wakeup"]) }).where(eq(plugins.id, f.pluginId));
+    await db.update(plugins).set({ manifestJson: manifest(false) }).where(eq(plugins.id, f.pluginId));
     release();
     await heartbeat.resumeQueuedRuns();
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
