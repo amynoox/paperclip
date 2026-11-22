@@ -25,7 +25,15 @@ export type PreDispatchCancellationSource = "stale_queued_run_gate" | "stale_exe
 // execution-start event, its adapter control has settled, and no remote lease was taken for it (a remote run keeps the
 // receipt or ssh-client rule of agent-execution-stop.ts). Production 15 Nov 2026: run 998a6dc0 (* Game Tester,
 // cancelled 07:25:29, no executionCancellation, conversationContinuation set, local lease) kept the pause in `pausing`.
-function stoppedBeforeProcessLaunchCondition(db: Db, options: { settledWithoutStopRequest?: boolean } = {}) {
+// STUDIO-0088: the same run with an `ssh` lease is accepted too, when that lease was released without a failed cleanup
+// (the lease rule of sshClientStopProvesPause, agent-execution-stop.ts). The ssh-client rule can never be met by a run
+// that recorded no ssh client, and the evidence above already says none was started: no process identity, no session,
+// no execution-start event. Any other remote lease keeps the refusal. Production 22 Nov 2026: the Infra Manager stayed
+// `pausing` on such a run until a Board gesture (tools/stop-proof-before-launch.py, the same conditions). Such a run must
+// have finished for as long as the ssh-client rule asks (SSH_CLIENT_STOP_PAUSE_PROOF_DELAY_MS, agent-execution-stop.ts).
+export const SETTLED_SSH_LEASE_STOP_MARK_DELAY_MS = 10 * 60_000;
+function stoppedBeforeProcessLaunchCondition(db: Db, options: { settledWithoutStopRequest?: boolean; at?: Date } = {}) {
+  const sshLeaseSettledBefore = new Date((options.at ?? new Date()).getTime() - SETTLED_SSH_LEASE_STOP_MARK_DELAY_MS).toISOString();
   const cancellation = sql`${heartbeatRuns.resultJson}->'executionCancellation'->>'state'`;
   return and(
     eq(heartbeatRuns.status, "cancelled"),
@@ -37,7 +45,11 @@ function stoppedBeforeProcessLaunchCondition(db: Db, options: { settledWithoutSt
     options.settledWithoutStopRequest
       ? sql`(${cancellation} = 'requested' or (${cancellation} is null and ${heartbeatRuns.executionStage} = 'settled'
           and not exists (select 1 from ${environmentLeases} where ${environmentLeases.companyId} = ${heartbeatRuns.companyId}
-            and ${environmentLeases.heartbeatRunId} = ${heartbeatRuns.id} and coalesce(${environmentLeases.provider}, 'local') <> 'local')))`
+            and ${environmentLeases.heartbeatRunId} = ${heartbeatRuns.id} and coalesce(${environmentLeases.provider}, 'local') <> 'local'
+            and not (${environmentLeases.provider} = 'ssh' and ${environmentLeases.releasedAt} is not null
+              and ${environmentLeases.status} in ('released', 'expired')
+              and coalesce(${environmentLeases.cleanupStatus}, '') <> 'failed'
+              and ${heartbeatRuns.finishedAt} < ${sshLeaseSettledBefore}::timestamptz))))`
       : sql`${cancellation} = 'requested'`,
     sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? ${PRE_DISPATCH_CANCELLATION_KEY}::text)`,
     notExists(db.select({ id: heartbeatRunEvents.id }).from(heartbeatRunEvents).where(and(
@@ -80,7 +92,7 @@ export async function markSettledStopsBeforeProcessLaunch(db: Db, agentIds: stri
     updatedAt: at,
   })
     .where(and(inArray(heartbeatRuns.agentId, agentIds), lt(heartbeatRuns.finishedAt, new Date(at.getTime() - SETTLED_STOP_MARK_DELAY_MS)),
-      stoppedBeforeProcessLaunchCondition(db, { settledWithoutStopRequest: true })))
+      stoppedBeforeProcessLaunchCondition(db, { settledWithoutStopRequest: true, at })))
     .returning({ id: heartbeatRuns.id });
   return rows.length;
 }

@@ -5,7 +5,10 @@ import { agents, companies, createDb, environmentLeases, heartbeatRunEvents, hea
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { agentExecutionsHaveStopped, SSH_CLIENT_STOP_PAUSE_PROOF_DELAY_MS } from "../services/agent-execution-stop.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
-import { markCancelledBeforeProcessLaunch, preDispatchCancellationResult, SETTLED_STOP_MARK_DELAY_MS } from "../services/pre-dispatch-cancellation.js";
+import {
+  markCancelledBeforeProcessLaunch, markSettledStopsBeforeProcessLaunch, preDispatchCancellationResult, SETTLED_SSH_LEASE_STOP_MARK_DELAY_MS,
+  SETTLED_STOP_MARK_DELAY_MS,
+} from "../services/pre-dispatch-cancellation.js";
 
 // STUDIO-0043: production, 14 Nov 2026. After a pause, three agents stayed
 // `pausing`: five runs had been cancelled by the server before their adapter
@@ -111,8 +114,12 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await agentExecutionsHaveStopped(db, [alive.agentId], { pauseStop: true })).toBe(false);
     const early = await cutSshRun({ minutesAgo: 5 });
     expect(await agentExecutionsHaveStopped(db, [early.agentId], { pauseStop: true })).toBe(false);
+    // A run that executed over ssh and recorded no ssh client. STUDIO-0088: what tells it from a run that launched
+    // nothing is its execution-start event; without one, the run is the case of STUDIO-0088 below.
     const noPid = await seed({ errorCode: "issue_reassigned", finishedAt: new Date(Date.now() - 15 * 60_000) });
     await sshLease(noPid);
+    await db.insert(heartbeatRunEvents).values({ companyId: noPid.companyId, runId: noPid.run.id, agentId: noPid.agentId, seq: 1,
+      eventType: "adapter.invoke", stream: "system", level: "info", message: "adapter.invoke" });
     expect(await agentExecutionsHaveStopped(db, [noPid.agentId], { pauseStop: true })).toBe(false);
     const plugin = await cutSshRun({ minutesAgo: 15 });
     await db.update(environmentLeases).set({ provider: "daytona" }).where(eq(environmentLeases.heartbeatRunId, plugin.run.id));
@@ -219,16 +226,114 @@ const support = await getEmbeddedPostgresTestSupport();
     const [marked] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id));
     expect(marked!.resultJson).toMatchObject({ preDispatchCancellation: { source: "stopped_before_process_launch", providerWorkStarted: false } });
 
-    // Not for a run whose adapter control had not settled, nor once an execution started, nor with a remote lease.
-    const remote = await seed({ finishedAt, resultJson: { conversationContinuation: "continue_conversation_v1" } });
-    await sshLease(remote);
-    expect(await agentExecutionsHaveStopped(db, [remote.agentId], { pauseStop: true })).toBe(false);
+    // Not for a run whose adapter control had not settled, nor once an execution started. (With a remote lease: the
+    // cases of STUDIO-0088 below.)
     const unsettled = await seed({ executionStage: "running", finishedAt, resultJson: { conversationContinuation: "continue_conversation_v1" } });
     expect(await agentExecutionsHaveStopped(db, [unsettled.agentId], { pauseStop: true })).toBe(false);
     const started = await seed({ finishedAt, resultJson: { conversationContinuation: "continue_conversation_v1" } });
     await db.insert(heartbeatRunEvents).values({ companyId: started.companyId, runId: started.run.id, agentId: started.agentId, seq: 1,
       eventType: "adapter.invoke", stream: "system", level: "info", message: "adapter.invoke" });
     expect(await agentExecutionsHaveStopped(db, [started.agentId], { pauseStop: true })).toBe(false);
+  });
+
+  // STUDIO-0088: production 22 Nov 2026, the Infra Manager. The same kind of run as STUDIO-0061's (cancelled without a
+  // stop request, settled, no process, no session, no execution-start event), but an ssh lease had been taken for it
+  // and released. The pause stayed `pausing` until a Board gesture wrote the stop proof by hand.
+  const settledWithoutStop = async (run: Partial<typeof heartbeatRuns.$inferInsert> = {}, minutesAgo = 15) => {
+    const finishedAt = new Date(Date.now() - minutesAgo * 60_000);
+    return seed({ errorCode: "legacy_disposition_repair_suppressed", startedAt: new Date(finishedAt.getTime() - 4_500), finishedAt,
+      resultJson: { conversationContinuation: "continue_conversation_v1" }, ...run });
+  };
+  const lease = (f: { companyId: string; agentId: string; run: typeof heartbeatRuns.$inferSelect }, values: Partial<typeof environmentLeases.$inferInsert> = {}) =>
+    db.insert(environmentLeases).values({ companyId: f.companyId, heartbeatRunId: f.run.id, provider: "ssh",
+      providerLeaseId: `ssh://worker@mac-03:22/w/${f.run.id}`, status: "expired", cleanupStatus: "success",
+      leasePolicy: "ephemeral", releasedAt: new Date(), metadata: { agentId: f.agentId, driver: "ssh" }, ...values });
+  const markerOf = async (f: { run: typeof heartbeatRuns.$inferSelect }) =>
+    ((await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, f.run.id)))[0]!.resultJson as Record<string, unknown> | null)?.preDispatchCancellation;
+
+  it("completes a pause held by a settled run that took an ssh lease, released it, and never started anything", async () => {
+    for (const status of ["expired", "released"]) {
+      const f = await settledWithoutStop();
+      await lease(f, { status });
+      await db.insert(heartbeatRunEvents).values({ companyId: f.companyId, runId: f.run.id, agentId: f.agentId, seq: 1,
+        eventType: "lifecycle", stream: "system", level: "info", message: "run cancelled" });
+      // Outside a pause nothing changes: the run is not proven stopped and no marker is written.
+      expect(await agentExecutionsHaveStopped(db, [f.agentId])).toBe(false);
+      expect(await markerOf(f)).toBeUndefined();
+      // The pause records the stop and completes; a termination now reads the same proof.
+      expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(true);
+      expect(await markerOf(f)).toMatchObject({ source: "stopped_before_process_launch", providerWorkStarted: false });
+    }
+    // Not before the delay of the ssh-client rule: the same run, finished five minutes ago, still waits.
+    expect(SETTLED_SSH_LEASE_STOP_MARK_DELAY_MS).toBe(SSH_CLIENT_STOP_PAUSE_PROOF_DELAY_MS);
+    const early = await settledWithoutStop({}, 5);
+    await lease(early);
+    expect(await agentExecutionsHaveStopped(db, [early.agentId], { pauseStop: true })).toBe(false);
+    expect(await markerOf(early)).toBeUndefined();
+    // A local lease keeps its own, shorter delay (STUDIO-0061).
+    const local = await settledWithoutStop({}, 5);
+    await lease(local, { provider: "local", providerLeaseId: null });
+    expect(await agentExecutionsHaveStopped(db, [local.agentId], { pauseStop: true })).toBe(true);
+    // Through the lifecycle worker, as in production: the role in `pausing` completes its pause.
+    const role = await settledWithoutStop();
+    await lease(role);
+    await db.update(agents).set({ status: "paused", lifecycleState: "pausing" }).where(eq(agents.id, role.agentId));
+    const [agent] = await db.select().from(agents).where(eq(agents.id, role.agentId));
+    expect(await createLifecycleDriver(db, {} as never).runHost(agent as never)).toBe("complete");
+  });
+
+  it("refuses it for an ssh run that recorded its ssh client, a session, or an execution-start event", async () => {
+    // A recorded ssh client that is still alive (this process): nothing is marked, the pause waits.
+    const withClient = await settledWithoutStop({ processPid: process.pid });
+    await lease(withClient);
+    expect(await agentExecutionsHaveStopped(db, [withClient.agentId], { pauseStop: true })).toBe(false);
+    expect(await markerOf(withClient)).toBeUndefined();
+    const withGroup = await settledWithoutStop({ processGroupId: 2_000_000_021 });
+    await lease(withGroup);
+    expect(await markSettledStopsBeforeProcessLaunch(db, [withGroup.agentId])).toBe(0);
+    const withSession = await settledWithoutStop({ sessionIdAfter: "session-3" });
+    await lease(withSession);
+    expect(await agentExecutionsHaveStopped(db, [withSession.agentId], { pauseStop: true })).toBe(false);
+    expect(await markerOf(withSession)).toBeUndefined();
+    for (const eventType of ["adapter.invoke", "session.started", "provider.event"]) {
+      const started = await settledWithoutStop();
+      await lease(started);
+      await db.insert(heartbeatRunEvents).values({ companyId: started.companyId, runId: started.run.id, agentId: started.agentId, seq: 1,
+        eventType, stream: "system", level: "info", message: eventType });
+      expect(await agentExecutionsHaveStopped(db, [started.agentId], { pauseStop: true })).toBe(false);
+      expect(await markerOf(started)).toBeUndefined();
+    }
+    // Its adapter control has not settled.
+    const unsettled = await settledWithoutStop({ executionStage: "running" });
+    await lease(unsettled);
+    expect(await markSettledStopsBeforeProcessLaunch(db, [unsettled.agentId])).toBe(0);
+  });
+
+  it("refuses it for a lease that is not ssh, not released, or whose cleanup failed", async () => {
+    const refused: Array<[string, Partial<typeof environmentLeases.$inferInsert>]> = [
+      ["another remote provider", { provider: "sandbox" }],
+      ["not released", { releasedAt: null, status: "active" }],
+      ["not released, marked expired", { releasedAt: null }],
+      ["released, still marked active", { status: "active" }],
+      ["released, cleanup pending", { status: "pending_cleanup" }],
+      ["cleanup failed", { cleanupStatus: "failed" }],
+    ];
+    for (const [label, values] of refused) {
+      const f = await settledWithoutStop();
+      await lease(f, values);
+      expect(await markSettledStopsBeforeProcessLaunch(db, [f.agentId]), label).toBe(0);
+      expect(await markerOf(f), label).toBeUndefined();
+      expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true }), label).toBe(false);
+    }
+    // Two leases, one of them refused: the run is refused.
+    const mixed = await settledWithoutStop();
+    await lease(mixed);
+    await lease(mixed, { cleanupStatus: "failed", providerLeaseId: `ssh://worker@mac-03:22/w/${mixed.run.id}-2` });
+    expect(await markSettledStopsBeforeProcessLaunch(db, [mixed.agentId])).toBe(0);
+    // A cleanup status never written (null) is not a failed cleanup.
+    const noCleanupStatus = await settledWithoutStop();
+    await lease(noCleanupStatus, { cleanupStatus: null });
+    expect(await markSettledStopsBeforeProcessLaunch(db, [noCleanupStatus.agentId])).toBe(1);
   });
 
   it("marks at pause time only the paused agent's cancelled runs without any process, session or execution event", async () => {
