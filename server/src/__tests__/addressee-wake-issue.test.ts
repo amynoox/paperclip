@@ -18,7 +18,8 @@ import { buildHostServices } from "../services/plugin-host-services.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import {
-  ADDRESSEE_WAKE_ON_BLOCKED_ISSUE_SETTING, addresseeWakeTarget, ownIssueInteractionNote, verifyOwnIssueInteractionWake,
+  ADDRESSEE_WAKE_ISSUE_REFUSED, ADDRESSEE_WAKE_ON_BLOCKED_ISSUE_SETTING, addresseeWakeTarget, ownIssueInteractionNote,
+  verifyOwnIssueInteractionWake,
 } from "../services/addressee-wake-issue.js";
 import { PAUSE_MISSED_WAKE_REASON } from "../services/pause-missed-wakes.js";
 
@@ -124,8 +125,10 @@ vi.setConfig({ testTimeout: 120_000 });
     await db.insert(agents).values([agent(hostId, "Super Dev Unity"), agent(guestId, "Game Tester", options.guestStatus), agent(thirdId, "Infra Manager")]);
     await db.insert(issues).values([
       { id: hostIssueId, companyId, identifier: `W${tag}-1`, title: "The host's task", status: "todo", priority: "medium", assigneeAgentId: hostId },
+      // STUDIO-0092: a card may name only a task in progress or in review. With `blocked`, the task stays in progress
+      // and has a blocker that is not done: the gate of the blockers reads the relation, not the status.
       { id: guestIssueId, companyId, identifier: `W${tag}-2`, title: "The guest's task", priority: "medium", assigneeAgentId: guestId,
-        status: options.guestIssueStatus ?? (options.blocked ? "blocked" : "todo") },
+        status: options.guestIssueStatus ?? "in_progress" },
       { id: blockerId, companyId, identifier: `W${tag}-3`, title: "What the guest's task waits on", status: "todo", priority: "medium", assigneeAgentId: thirdId },
     ]);
     if (options.blocked) await db.insert(issueRelations).values({ companyId, issueId: blockerId, relatedIssueId: guestIssueId, type: "blocks" });
@@ -212,37 +215,62 @@ vi.setConfig({ testTimeout: 120_000 });
     expect((await wokenFor(g, second.id, g.hostIssueId)).context.interactionIssueId).toBeUndefined();
   });
 
-  it("a task that is not the addressee's, a closed task, a task of another company: the card is refused and not created", async () => {
+  it("STUDIO-0092: a task that cannot be named is refused with ONE message, whatever the reason, and the card is not created", async () => {
     const f = await seed();
     const other = await seed();
     const service = issueThreadInteractionService(db);
     const create = (wakeIssueId: string, addressee: string | null = f.guestId) =>
       service.create({ id: f.hostIssueId, companyId: f.companyId }, cardBody(addressee, wakeIssueId) as never, { agentId: f.hostId });
-    // Assigned to another agent: the host's own task, and the third agent's.
+    const refused = { status: 422, message: ADDRESSEE_WAKE_ISSUE_REFUSED };
+    // Assigned to another agent (the host's own task, the third agent's), although IN PROGRESS: the status alone
+    // would accept them.
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.hostIssueId));
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.blockerId));
     for (const issueId of [f.hostIssueId, f.blockerId]) {
-      await expect(create(issueId)).rejects.toMatchObject({ status: 422, message: expect.stringContaining("assigned to the addressee agent") });
+      await expect(create(issueId), issueId).rejects.toMatchObject(refused);
     }
-    // Closed.
-    for (const status of ["done", "cancelled"]) {
-      await db.update(issues).set({ status }).where(eq(issues.id, f.guestIssueId));
-      await expect(create(f.guestIssueId)).rejects.toMatchObject({ status: 422, message: expect.stringContaining("not done or cancelled") });
-    }
-    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.guestIssueId));
-    // Another company's task, and one that does not exist.
+    // Another company's, in progress there and assigned to that company's guest; one that does not exist.
     for (const issueId of [other.guestIssueId, randomUUID()]) {
-      await expect(create(issueId)).rejects.toMatchObject({ status: 422, message: expect.stringContaining("same company") });
+      await expect(create(issueId), issueId).rejects.toMatchObject(refused);
     }
-    // The field needs an addressee agent.
-    await expect(create(f.guestIssueId, null)).rejects.toMatchObject({ status: 422, message: expect.stringContaining("requires addresseeAgentId") });
+    // Not at work: a card names only a task in progress or in review.
+    for (const status of ["todo", "backlog", "blocked", "done", "cancelled"]) {
+      await db.update(issues).set({ status }).where(eq(issues.id, f.guestIssueId));
+      await expect(create(f.guestIssueId), status).rejects.toMatchObject(refused);
+    }
+    // The message tells nothing of the task: it is the same text in every case, and it names no id, no status, no agent.
+    expect(ADDRESSEE_WAKE_ISSUE_REFUSED).not.toMatch(/[0-9a-f]{8}-/);
     // The same refusal through a plugin's entry.
-    await expect(postCard(f, f.blockerId)).rejects.toMatchObject({ status: 422 });
+    await db.update(issues).set({ status: "in_progress" }).where(eq(issues.id, f.guestIssueId));
+    await expect(postCard(f, f.blockerId)).rejects.toMatchObject(refused);
+    await expect(postCard(f, other.guestIssueId)).rejects.toMatchObject(refused);
+    await expect(postCard(f, randomUUID())).rejects.toMatchObject(refused);
+    // The field without an addressee agent is a mistake of the request, not of the task: its own message.
+    await expect(create(f.guestIssueId, null)).rejects.toMatchObject({ status: 422, message: expect.stringContaining("requires addresseeAgentId") });
     // No card was created, nobody was woken.
     expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.companyId, f.companyId))).toHaveLength(0);
     expect(await wakesOf(f)).toHaveLength(0);
     await held(f);
-    // A task that is `backlog` or `blocked` is accepted: only a closed one is refused.
-    await db.update(issues).set({ status: "backlog" }).where(eq(issues.id, f.guestIssueId));
-    await expect(create(f.guestIssueId)).resolves.toMatchObject({ status: "pending" });
+    // In progress and in review are accepted.
+    for (const status of ["in_progress", "in_review"]) {
+      await db.update(issues).set({ status }).where(eq(issues.id, f.guestIssueId));
+      await expect(create(f.guestIssueId), status).resolves.toMatchObject({ status: "pending" });
+    }
+  });
+
+  it("STUDIO-0092: a plugin that cannot read the named task is refused with the same message; a task it can read is accepted", async () => {
+    const f = await seed();
+    // The guest's task is private: the plugin, which creates the card, cannot read it.
+    await db.update(issues).set({ visibility: "private" }).where(eq(issues.id, f.guestIssueId));
+    await expect(postCard(f, f.guestIssueId)).rejects.toMatchObject({ status: 422, message: ADDRESSEE_WAKE_ISSUE_REFUSED });
+    expect(await db.select().from(issueThreadInteractions).where(eq(issueThreadInteractions.companyId, f.companyId))).toHaveLength(0);
+    expect(await wakesOf(f)).toHaveLength(0);
+    // Without the field, the same card on the host's task is created as before.
+    await expect(postCard(f)).resolves.toMatchObject({ status: "pending" });
+    // Open again: accepted, and the guest is woken on its task.
+    await db.update(issues).set({ visibility: "open" }).where(eq(issues.id, f.guestIssueId));
+    const card = await postCard(f, f.guestIssueId);
+    expect((await wokenFor(f, card.id)).context).toMatchObject({ issueId: f.guestIssueId, interactionIssueId: f.hostIssueId });
   });
 
   // The company's setting is OFF by default. Off, a card that names a blocked task of the addressee keeps today's gate:
@@ -259,7 +287,7 @@ vi.setConfig({ testTimeout: 120_000 });
     await held(f);
     expect(launchesOf(f.hostIssueId, f.guestId)).toHaveLength(0);
     expect(await cardOf(card.id)).toMatchObject({ status: "pending", issueId: f.hostIssueId, addresseeAgentId: f.guestId });
-    expect(await issueOf(f.guestIssueId)).toMatchObject({ status: "blocked", assigneeAgentId: f.guestId });
+    expect(await issueOf(f.guestIssueId)).toMatchObject({ assigneeAgentId: f.guestId });
     // The refused wake is recorded as any wake held for unresolved blockers, on the guest's task.
     const [wake] = (await wakesOf(f)).filter((row) => row.idempotencyKey === `interaction-pending:${card.id}`);
     expect(wake, await state(f)).toMatchObject({ status: "skipped", payload: expect.objectContaining({ issueId: f.guestIssueId }) });
@@ -308,7 +336,7 @@ vi.setConfig({ testTimeout: 120_000 });
       interactionIssueId: f.hostIssueId, dependencyBlockedInteraction: true, unresolvedBlockerIssueIds: [f.blockerId] });
     expect(String(launch.context.paperclipTaskMarkdown ?? "")).toContain(`interaction ${card.id} on issue ${f.hostIdentifier}`);
     expect(launchesOf(f.guestIssueId, f.guestId)).toHaveLength(1);
-    expect(await issueOf(f.guestIssueId)).toMatchObject({ status: "blocked", assigneeAgentId: f.guestId });
+    expect(await issueOf(f.guestIssueId)).toMatchObject({ status: "in_progress", assigneeAgentId: f.guestId });
     expect(await issueOf(f.blockerId)).toMatchObject({ status: "todo", assigneeAgentId: f.thirdId });
     expect(await db.select().from(issueRelations).where(and(eq(issueRelations.issueId, f.blockerId), eq(issueRelations.relatedIssueId, f.guestIssueId)))).toHaveLength(1);
     expect(launchesOf(f.blockerId)).toHaveLength(0);
