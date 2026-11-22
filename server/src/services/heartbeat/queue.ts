@@ -1,5 +1,6 @@
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
+import { verifyPluginBlockedWake } from "../plugin-blocked-wake.js";
 import { agentCommentHeldByDependencies, allUnresolvedBlockersCancelled, HELD_DEPENDENCY_COMMENT_IDS_KEY,
   HELD_DEPENDENCY_HANDOVER_AT_KEY, HELD_DEPENDENCY_OLDER_COUNT_KEY, HELD_DEPENDENCY_REASON_KEY, HELD_DEPENDENCY_TRACE_KEY,
   isDependencyHandoffWake, readCommentsToHandOver,
@@ -1173,7 +1174,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         // A named responder who does not own the task only answers its card;
         // the task's blockers gate the assignee, not that answer.
         !(await verifyNonAssigneeAddresseeInteractionWake(db, { companyId: run.companyId,
-          issueId, agentId: run.agentId, contextSnapshot: context }))
+          issueId, agentId: run.agentId, contextSnapshot: context })) &&
+        // STUDIO-0086: a plugin's verified wake for a reason of the closed list.
+        !(await verifyPluginBlockedWake(db, { contextSnapshot: context, wakeupRequestId: run.wakeupRequestId }))
       ) {
         const cancelled = await cancelQueuedRunForBlockedDependencies(
           run,
@@ -4750,14 +4753,17 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           const blockedInteractionWake =
             dependencyReadiness &&
             !dependencyReadiness.isDependencyReady &&
-            allowsDependencyBlockedWake(
+            (allowsDependencyBlockedWake(
               agentCommentHeld ? null : enrichedContextSnapshot,
               ISSUE_TREE_CONTROL_INTERACTION_WAKE_REASONS,
               await verifyBlockerStallWake(tx as unknown as Db, { companyId: issue.companyId, issueId: issue.id,
                 contextSnapshot: enrichedContextSnapshot, requestedByActorType: opts.requestedByActorType }),
               await isVerifiedDependencyInteractionResponse(tx, { companyId: issue.companyId,
                 issueId: issue.id, agentId, context: enrichedContextSnapshot }),
-            );
+            )
+            // STUDIO-0086: a plugin's verified wake for a reason of the closed list.
+            || await verifyPluginBlockedWake(tx, { contextSnapshot: enrichedContextSnapshot,
+              requestedByActorType: opts.requestedByActorType, requestedByActorId: opts.requestedByActorId }));
 
           if (blockedInteractionWake) {
             enrichedContextSnapshot.dependencyBlockedInteraction = true;

@@ -37,6 +37,7 @@ import type {
 } from "@paperclipai/plugin-sdk";
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, IssueRelationIssueSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
+import { pluginBlockedWakeMark } from "./plugin-blocked-wake.js";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
@@ -2430,7 +2431,9 @@ export function buildHostServices(
         }
         const relations = await issues.getRelationSummaries(issue.id);
         const unresolvedBlockers = relations.blockedBy.filter((blocker) => blocker.status !== "done");
-        if (unresolvedBlockers.length > 0) {
+        // STUDIO-0086: a reason of the closed list, from a plugin that declares the capability, passes the blockers.
+        const blockedWake = pluginBlockedWakeMark({ pluginId, reason: params.reason, capabilities: options.manifest?.capabilities });
+        if (unresolvedBlockers.length > 0 && !blockedWake) {
           throw new Error("Issue is blocked by unresolved blockers");
         }
         const budgetBlock = await budgets.getInvocationBlock(companyId, issue.assigneeAgentId, {
@@ -2462,6 +2465,7 @@ export function buildHostServices(
             source: contextSource,
             pluginId,
             pluginKey,
+            ...(blockedWake ? { pluginBlockedWake: blockedWake } : {}),
           },
         });
         await logPluginActivity({
@@ -2498,7 +2502,9 @@ export function buildHostServices(
           }
           const relations = await issues.getRelationSummaries(issue.id);
           const unresolvedBlockers = relations.blockedBy.filter((blocker) => blocker.status !== "done");
-          if (unresolvedBlockers.length > 0) {
+          // STUDIO-0086: as for the single wake.
+          const blockedWake = pluginBlockedWakeMark({ pluginId, reason: params.reason, capabilities: options.manifest?.capabilities });
+          if (unresolvedBlockers.length > 0 && !blockedWake) {
             throw new Error("Issue is blocked by unresolved blockers");
           }
           const budgetBlock = await budgets.getInvocationBlock(companyId, issue.assigneeAgentId, {
@@ -2530,6 +2536,7 @@ export function buildHostServices(
               source: contextSource,
               pluginId,
               pluginKey,
+              ...(blockedWake ? { pluginBlockedWake: blockedWake } : {}),
             },
           });
           await logPluginActivity({

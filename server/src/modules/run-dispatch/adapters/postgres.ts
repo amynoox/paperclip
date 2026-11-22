@@ -56,6 +56,7 @@ import { appendHeartbeatRunEvent } from "../../../services/heartbeat-run-events.
 import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js";
 import { issueService } from "../../../services/issues.js";
 import { verifyBlockerStallWake } from "../../../services/recovery/blocker-stall-wakeups.js";
+import { verifyPluginBlockedWake } from "../../../services/plugin-blocked-wake.js";
 import {
   issueTreeControlService,
   isVerifiedIssueTreeControlInteractionWake,
@@ -653,8 +654,11 @@ export function createPostgresRunDispatchAdapter(
       && input.contextSnapshot.dependencyBlockedInteraction === true
       && await isVerifiedDependencyInteractionResponse(dbOrTx, { companyId: input.companyId,
         issueId, agentId: input.agentId, context: input.contextSnapshot });
+    // STUDIO-0086: a plugin's verified wake keeps its way through when the server retries its run.
+    const pluginWakeAdmitted = readiness && !readiness.isDependencyReady
+      && await verifyPluginBlockedWake(db, { contextSnapshot: input.contextSnapshot, wakeupRequestId: input.wakeupRequestId });
     facts.dependenciesBlocked =
-      readiness && !readiness.isDependencyReady && !stallAdmitted && !responseAdmitted
+      readiness && !readiness.isDependencyReady && !stallAdmitted && !responseAdmitted && !pluginWakeAdmitted
         ? {
             unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
             unresolvedBlockerCount: readiness.unresolvedBlockerCount,

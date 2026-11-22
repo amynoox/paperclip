@@ -1392,6 +1392,9 @@ export const PLUGIN_CAPABILITIES = [
   "issue.relations.write",
   "issues.checkout",
   "issues.wakeup",
+  // STUDIO-0086: wake the assignee of an issue that still has unresolved blockers, for a reason of
+  // PLUGIN_BLOCKED_ISSUE_WAKE_REASONS only.
+  "issues.wakeup.blocked",
   "issue.comments.create",
   "issue.comments.create_human_attributed",
   "issue.interactions.create",
@@ -1455,6 +1458,16 @@ export const PLUGIN_CAPABILITIES = [
   "ui.action.register",
 ] as const;
 export type PluginCapability = (typeof PLUGIN_CAPABILITIES)[number];
+
+/**
+ * STUDIO-0086: the reasons for which a plugin holding `issues.wakeup.blocked` may wake the assignee of an issue that
+ * still has unresolved blockers. A closed list, owned by the worker router: the request to lend a machine to the
+ * maintenance of another issue, and the return of that machine. Any other reason keeps the ordinary refusal.
+ */
+export const PLUGIN_BLOCKED_ISSUE_WAKE_REASONS = [
+  "worker_router_loan_requested",
+  "worker_router_loan_returned",
+] as const;
 
 export const PLUGIN_DATABASE_NAMESPACE_MODES = ["schema"] as const;
 export type PluginDatabaseNamespaceMode = (typeof PLUGIN_DATABASE_NAMESPACE_MODES)[number];
