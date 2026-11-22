@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
+import fs from "node:fs/promises";
+import path from "node:path";
 import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agentTaskSessions, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases,
+  activityLog, agentTaskSessions, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases,
   heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -343,7 +345,15 @@ const support = await getEmbeddedPostgresTestSupport();
     await heartbeat.resumeTaskRetry(f.companyId, receipt.requestId!);
   };
   const logOf = async (runId: string) => (await heartbeat.readLog(runId)).content;
-  it("the resume of the role continues the run its pause cut: no new conversation is asked for", async () => {
+  /** What the product decided about the workspace of a Retry's run: the activity it wrote for that run. */
+  const workspaceChoiceOf = async (f: Fixture, runId: string) => (await db.select().from(activityLog).where(and(
+    eq(activityLog.companyId, f.companyId), eq(activityLog.entityId, f.issueId), eq(activityLog.runId, runId))))
+    .filter(entry => entry.action === "issue.fresh_workspace_selected" || entry.action === "issue.retry_workspace_reused")
+    .map(entry => [entry.action, entry.details?.mode]);
+  /** The folder a run worked in. */
+  const folderOf = (run: { contextSnapshot: Record<string, unknown> | null }) =>
+    String((run.contextSnapshot?.paperclipWorkspace as { cwd?: unknown } | undefined)?.cwd);
+  it("the resume of the role continues the run its pause cut: the run goes on in the session kept from it, in the task's own workspace", async () => {
     const f = await seed();
     const cancelled = await cutRun(f, async () => {
       await heartbeat.cancelActiveForAgent(f.agentId);
@@ -354,9 +364,40 @@ const support = await getEmbeddedPostgresTestSupport();
     const next = await nextExecution(f, () => retryOf(f, cancelled.id, `pause-resume:${cancelled.id}:${randomUUID()}`));
     expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id, explicitUserContinuation: { previousRunId: cancelled.id } });
     expect(next.run.contextSnapshot).not.toHaveProperty("forceFreshSession");
-    // No fresh session is asked for any more. (Whether the kept session is then resumed also depends on the
-    // workspace the Retry gets: the next piece.)
-    expect(await logOf(next.run.id)).not.toContain("forceFreshSession was requested");
+    // The run works where the cut run worked: the product would have given this Retry a fresh isolated workspace,
+    // another folder and another workspace mode, and refused the session for that.
+    expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.retry_workspace_reused", "pause_resume_task_workspace"]]);
+    expect(folderOf(next.run)).toBe(folderOf(cancelled));
+    expect(folderOf(next.run)).not.toContain("isolated-workspace-attempts");
+    const log = await logOf(next.run.id);
+    expect(log).not.toContain("Skipping saved session resume");
+    expect(log).not.toContain("forceFreshSession was requested");
+    expect({ sessionId: next.sessionId, sessionParams: next.sessionParams }).toMatchObject({ sessionId: cut, sessionParams: paramsOf(cut) });
+  });
+
+  // The run is cut in the middle of a write. The resume starts in the same folder: nothing is reset, nothing is
+  // lost, and the role finds its work as it left it.
+  it("a run cut during a write: the resume starts in the same workspace, with the half-written work as it is", async () => {
+    const f = await seed();
+    let written = "";
+    const cancelled = await cutRun(f, async context => {
+      written = path.join(String((context.context.paperclipWorkspace as { cwd: string }).cwd), `half-written-${f.issueId}.txt`);
+      await fs.writeFile(written, "first half of the wor");
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", cut);
+    });
+    await stopProven(f, cancelled.id);
+    let found: { folder: string; content: string | null } | null = null;
+    turns.get(f.companyId)!.push(async context => {
+      const folder = String((context.context.paperclipWorkspace as { cwd: string }).cwd);
+      found = { folder, content: await fs.readFile(path.join(folder, path.basename(written)), "utf8").catch(() => null) };
+      return SUCCESS;
+    });
+    const next = await nextExecution(f, () => retryOf(f, cancelled.id, `pause-resume:${cancelled.id}:${randomUUID()}`));
+    expect(found).toEqual({ folder: path.dirname(written), content: "first half of the wor" });
+    expect(folderOf(next.run)).toBe(folderOf(cancelled));
+    expect(next).toMatchObject({ sessionId: cut });
+    await fs.rm(written, { force: true });
   });
 
   it("a Retry a person clicks on the run a pause cut still opens a new conversation", async () => {
@@ -370,6 +411,9 @@ const support = await getEmbeddedPostgresTestSupport();
     const next = await nextExecution(f, () => retryOf(f, cancelled.id, randomUUID()));
     expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id, forceFreshSession: true });
     expect(next).toMatchObject({ sessionId: null });
+    // And its workspace is the product's choice for a Retry, unchanged: a fresh isolated one.
+    expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.fresh_workspace_selected", "fresh_isolated_workspace"]]);
+    expect(folderOf(next.run)).not.toBe(folderOf(cancelled));
   });
 
   it("the resume of the role, when the task's session was written by another run than the cut one: a new conversation", async () => {

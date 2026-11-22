@@ -7,6 +7,8 @@ import { persistActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
 import { readSystemRecovery } from "./system-recovery-state.js";
 import { readTaskRetryIntent } from "./task-retry.js";
+import { isGovernancePauseStop } from "./governance-pause-stop.js";
+import { PAUSE_RESUME_RETRY_KEY_PREFIX } from "./pause-resume-continuation.js";
 import { z } from "zod";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { hasPendingRunCleanup } from "./execution-blocker.js";
@@ -353,6 +355,25 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
         ${heartbeatRuns.issueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueId}`,
     )).limit(1);
     if (!source) throw new Error("Fresh retry source changed");
+    // STUDIO-0075: the Retry the resume of a role files for the run its pause cut (pause-resume-continuation.ts)
+    // continues that run where it was: in the task's own workspace, as a person's message after the pause already
+    // does. The pause stopped the run on purpose and its stop is proven before this run starts; a fresh isolated
+    // workspace changed the working folder and the workspace mode, so the session kept from the cut run was refused
+    // ("effective run configuration changed: adapter config, workspace config"; production, 22 Nov 2026).
+    if (intent.strategy !== "fresh_isolated_workspace" && wake.idempotencyKey?.startsWith(PAUSE_RESUME_RETRY_KEY_PREFIX)
+        && isGovernancePauseStop(source)) {
+      await db.transaction(async tx => {
+        const changed = await tx.update(agentWakeupRequests).set({
+          payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{taskRetry,strategy}', '"continue"'::jsonb)`,
+        }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.runId, run.id),
+          sql`${agentWakeupRequests.payload}#>>'{taskRetry,strategy}' = 'evaluate'`)).returning({ id: agentWakeupRequests.id });
+        if (changed.length) await persistActivity(tx as unknown as Db, { companyId: run.companyId,
+          actorType: "system", actorId: "task-recovery", action: "issue.retry_workspace_reused",
+          entityType: "issue", entityId: issueId, runId: run.id,
+          details: { mode: "pause_resume_task_workspace", retryIntentId: wake.id, sourceRunId: source.id } });
+      });
+      return null;
+    }
     if (intent.strategy !== "fresh_isolated_workspace") {
       const stoppedWorkspace = await stoppedNativeContinuationWorkspace(db, source, { runId: run.id, issueId, retryIntentId: wake.id });
       if (stoppedWorkspace) return stoppedWorkspace;
