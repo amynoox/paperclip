@@ -258,6 +258,17 @@ describe("a question between roles left without an answer", () => {
     expect(wakesTo(wake, f.addressee)).toHaveLength(1);
   });
 
+  it("a card that already waited a day is left alone: nothing is relaunched in bulk when the piece is put in service", async () => {
+    const f = await seed();
+    const card = await ask(f);
+    await readAndDidNotAnswer(f, card);
+    const wake = spy();
+    expect(await pass(f, card, 24 * 60 + 1, wake)).toBe("too_old");
+    expect(wake).not.toHaveBeenCalled();
+    expect(await cardsOf(f)).toHaveLength(1);
+    expect(await pass(f, card, 24 * 60, wake)).toBe("relaunched");
+  });
+
   it("a card addressed to a person is left alone", async () => {
     const f = await seed();
     const id = randomUUID();

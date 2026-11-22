@@ -17,7 +17,8 @@
 //   that cannot be addressed: nothing more, said once on the task;
 // - the card written to the manager is relaunched once like any other, and never gives a card to the manager above;
 // - when the question is no longer pending, the server withdraws ITS OWN card to the manager if that one still
-//   waits, so that nothing it wrote keeps the task waiting.
+//   waits, so that nothing it wrote keeps the task waiting;
+// - a card that already waited a day is left alone (a card open for long is told to the owner by another piece).
 // Never: an answer in someone's place, another's card closed, a card addressed to a person relaunched.
 //
 // Once-ness is read from what is stored, with no counter: the relaunch from its line of activity (written under the
@@ -44,6 +45,7 @@ export const UNANSWERED_QUESTION_MANAGER_ACTION = "issue.thread_interaction_mana
 export const UNANSWERED_QUESTION_MANAGER_KEY_PREFIX = "unanswered-question:";
 export const UNANSWERED_QUESTION_RELAUNCH_DEFAULT_MINUTES = 5;
 export const UNANSWERED_QUESTION_MANAGER_DEFAULT_MINUTES = 15;
+export const UNANSWERED_QUESTION_MAX_AGE_MS = 24 * 60 * 60_000;
 
 export const unansweredQuestionRelaunchKey = (interactionId: string) => `interaction-pending:${interactionId}:relance:1`;
 export const unansweredQuestionManagerKey = (interactionId: string) => `${UNANSWERED_QUESTION_MANAGER_KEY_PREFIX}${interactionId}:manager`;
@@ -60,7 +62,7 @@ export type UnansweredQuestionWake = (agentId: string, request: {
 }) => Promise<unknown>;
 
 export type UnansweredQuestionOutcome =
-  | "not_due" | "not_answerable" | "addressee_held" | "not_read_yet" | "relaunched" | "relaunch_not_sent"
+  | "not_due" | "too_old" | "not_answerable" | "addressee_held" | "not_read_yet" | "relaunched" | "relaunch_not_sent"
   | "manager_not_due" | "manager_asked" | "manager_not_asked" | "done" | "withdrawn";
 
 /** The company's delays, in milliseconds; null when the company switched the piece off. */
@@ -152,6 +154,9 @@ export async function relaunchUnansweredAgentQuestions(db: Db, input: {
       }
       const relaunchAt = card.createdAt.getTime() + settings.relaunchAfterMs;
       if (now.getTime() < relaunchAt) { input.onDeferredDeadline?.(relaunchAt); return "not_due"; }
+      // A card that already waited a day is not taken up: when this piece is put in service, the cards left for days
+      // are not all relaunched at once.
+      if (now.getTime() - card.createdAt.getTime() > UNANSWERED_QUESTION_MAX_AGE_MS) return "too_old";
       const managerDone = about !== null || Boolean((await db.select({ id: issueThreadInteractions.id }).from(issueThreadInteractions)
         .where(and(eq(issueThreadInteractions.companyId, input.companyId), eq(issueThreadInteractions.issueId, input.issueId),
           eq(issueThreadInteractions.idempotencyKey, unansweredQuestionManagerKey(card.id)))).limit(1))[0])
