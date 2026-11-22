@@ -123,7 +123,7 @@ describe("copyBackCodexAuth", () => {
     expect(result.logs.join("\n")).not.toContain("SENTINEL");
   });
 
-  // STUDIO-0089: the managed Codex home of a run holds `auth.json` as a LINK to the file the server issued for that run.
+  // STUDIO-0091: the managed Codex home of a run holds `auth.json` as a LINK to the file the server issued for that run.
   // Every credential below is FABRICATED by `subscriptionAuth` (made-up tokens, made-up account ids): no real login
   // file is read by these tests.
   async function managedHome(issuedAuth: string, link: "absolute" | "relative" | "chain" = "absolute") {

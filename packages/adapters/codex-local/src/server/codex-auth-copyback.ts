@@ -23,7 +23,7 @@ import {
 // destination) means "leave the host copy untouched". The predicate only ever
 // reads the two files and exits with a code; it never prints token bytes.
 
-// STUDIO-0089: the host credential may be a LINK. The managed Codex home of a run holds `auth.json` as a symlink to the
+// STUDIO-0091: the host credential may be a LINK. The managed Codex home of a run holds `auth.json` as a symlink to the
 // file the server issued for that run (codex-home.ts, SYMLINKED_SHARED_FILES), and the server reads that issued file
 // again when the run ends, to save a refreshed credential into the secret (server ai-connection-runtime.ts). Renaming
 // the staged copy onto the link replaced the LINK by a regular file and left the issued file as it was: the refreshed
@@ -127,7 +127,7 @@ export async function copyBackCodexAuth(input: CopyBackCodexAuthInput): Promise<
     throw error;
   }
 
-  // STUDIO-0089: the file the host credential really is, when `hostAuthPath` is a link to it.
+  // STUDIO-0091: the file the host credential really is, when `hostAuthPath` is a link to it.
   const hostTarget = await resolveCredentialLink(hostAuthPath);
   if (hostTarget.followedLink && !hostTarget.exists) {
     await log("[paperclip] Codex auth copy-back: the host credential is a link whose target no longer exists; nothing was written.");

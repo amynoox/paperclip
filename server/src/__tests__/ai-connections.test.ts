@@ -588,7 +588,7 @@ describe("managed AI connections", () => {
     } finally { release.resolve(); await Promise.allSettled([probing, refreshing]); lock?.mockRestore(); request.mockRestore(); }
   });
 
-  // STUDIO-0089: a run over ssh refreshed its login on the machine. Its copy is brought back by the adapter's copy-back,
+  // STUDIO-0091: a run over ssh refreshed its login on the machine. Its copy is brought back by the adapter's copy-back,
   // whose target is `auth.json` of the run's generated Codex home: a LINK to the file the server issued. The refreshed
   // credential must land in that issued file, so that the cleanup of the run saves it into the secret. Every
   // credential here is FABRICATED (made-up tokens and account): no real login file is read.
