@@ -38,6 +38,7 @@ import type {
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, IssueRelationIssueSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import { PLUGIN_BLOCKED_WAKE_CONTEXT_SOURCE, pluginBlockedWakeMark } from "./plugin-blocked-wake.js";
+import { addresseeWakeTarget } from "./addressee-wake-issue.js";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
@@ -2786,13 +2787,15 @@ export function buildHostServices(
               interaction.payload.toolAction !== undefined,
           })
         ) {
+          // STUDIO-0087: on the task of the addressee named at creation, when there is one.
+          const wakeTarget = addresseeWakeTarget(issue.id, (params.interaction as CreateIssueThreadInteraction).addresseeWakeIssueId);
           void heartbeat
             .wakeup(interaction.addresseeAgentId, {
               source: "automation",
               triggerDetail: "system",
               reason: "interaction_pending",
               payload: {
-                issueId: issue.id,
+                issueId: wakeTarget.issueId,
                 interactionId: interaction.id,
                 interactionKind: interaction.kind,
                 sourceCommentId: interaction.sourceCommentId ?? null,
@@ -2804,8 +2807,9 @@ export function buildHostServices(
               requestedByActorType: "system",
               requestedByActorId: pluginId,
               contextSnapshot: {
-                issueId: issue.id,
-                taskId: issue.id,
+                issueId: wakeTarget.issueId,
+                taskId: wakeTarget.issueId,
+                ...wakeTarget.context,
                 interactionId: interaction.id,
                 interactionKind: interaction.kind,
                 sourceCommentId: interaction.sourceCommentId ?? null,

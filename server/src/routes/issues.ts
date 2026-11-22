@@ -412,6 +412,7 @@ import {
   type IssueThreadInteractionResolverAudienceDecision,
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
+import { addresseeWakeTarget } from "../services/addressee-wake-issue.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
 import {
   crossIssueInfluenceLimitError,
@@ -18627,13 +18628,15 @@ export function issueRoutes(
             interaction.payload.toolAction !== undefined,
         })
       ) {
+        // STUDIO-0087: on the task of the addressee named at creation, when there is one.
+        const wakeTarget = addresseeWakeTarget(issue.id, req.body.addresseeWakeIssueId);
         void heartbeat
           .wakeup(interaction.addresseeAgentId, {
             source: "automation",
             triggerDetail: "system",
             reason: "interaction_pending",
             payload: {
-              issueId: issue.id,
+              issueId: wakeTarget.issueId,
               interactionId: interaction.id,
               interactionKind: interaction.kind,
               sourceCommentId: interaction.sourceCommentId ?? null,
@@ -18644,8 +18647,9 @@ export function issueRoutes(
             requestedByActorType: actor.actorType,
             requestedByActorId: actor.actorId,
             contextSnapshot: {
-              issueId: issue.id,
-              taskId: issue.id,
+              issueId: wakeTarget.issueId,
+              taskId: wakeTarget.issueId,
+              ...wakeTarget.context,
               interactionId: interaction.id,
               interactionKind: interaction.kind,
               sourceCommentId: interaction.sourceCommentId ?? null,
