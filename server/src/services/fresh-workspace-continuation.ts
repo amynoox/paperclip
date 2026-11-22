@@ -169,6 +169,50 @@ export async function retainedIssueWorkspaceForRetry(db: Db, input: {
   return { id: workspace.id, cwd: workspace.cwd };
 }
 
+/** STUDIO-0075: what the server reads before the run that continues a pause-cut run goes on in the task's own
+ * workspace. The reuse above asks for an isolated local directory owned by the task, and so refuses every project
+ * folder and every remote workspace, where the roles that work on a worker are: those conditions are not asked here.
+ * What is asked is what tells that the cut run left the workspace and that nothing else writes there: the source is
+ * settled, no repair or recovery generation is due on it, every lease it took is released with no failed cleanup, the
+ * task is bound to the workspace the source used, no other lease or running operation holds that workspace, and, for
+ * a local directory of the task, it is still there and its Git state can be read. The reason of a refusal, or null. */
+export async function pauseCutSourceLeftItsWorkspace(db: Db, input: {
+  companyId: string; issueId: string; successorRunId: string;
+  source: Pick<typeof heartbeatRuns.$inferSelect, "id" | "resultJson" | "status" | "finishedAt" | "controllerLeaseExpiresAt">;
+}): Promise<string | null> {
+  const { source } = input;
+  if (!terminalRunStatuses.includes(source.status) || !source.finishedAt || adapterExecutionControls.has(source.id) ||
+      (source.controllerLeaseExpiresAt && source.controllerLeaseExpiresAt > new Date())) return "source_not_settled";
+  const holds = await db.select({ cause: issueRecoveryActions.cause, evidence: issueRecoveryActions.evidence })
+    .from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, input.companyId),
+      eq(issueRecoveryActions.sourceIssueId, input.issueId), sql`${issueRecoveryActions.evidence}->>'runId' = ${source.id}`));
+  for (const hold of holds.length ? holds : [{ cause: null, evidence: null }]) {
+    if (!recoveryGenerationSettled(hold.evidence, source.id)) return "recovery_generation_unsettled";
+    if (sourceNeedsWorkspaceRepair(hold.cause, source.resultJson)) return "workspace_repair_required";
+  }
+  const leases = await db.select().from(environmentLeases).where(and(
+    eq(environmentLeases.companyId, input.companyId), eq(environmentLeases.heartbeatRunId, source.id)));
+  if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed" ||
+      ["active", "pending_cleanup"].includes(lease.status))) return "source_lease_not_released";
+  const used = new Set(leases.map(lease => lease.executionWorkspaceId).filter((id): id is string => Boolean(id)));
+  const [bound] = await db.select({ workspace: executionWorkspaces }).from(issues).innerJoin(executionWorkspaces, and(
+    eq(executionWorkspaces.companyId, issues.companyId), eq(executionWorkspaces.id, issues.executionWorkspaceId),
+  )).where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).limit(1);
+  const workspace = bound?.workspace;
+  if (used.size > 0 && (used.size !== 1 || !workspace || !used.has(workspace.id))) return "binding_not_source_workspace";
+  if (!workspace) return null;
+  const writer = await workspaceHasOtherWriter(db, { companyId: input.companyId, workspaceId: workspace.id,
+    successorRunId: input.successorRunId, stoppedSource: source });
+  if (writer) return writer;
+  if (isTaskOwnedLocalWorkspace(workspace, input.issueId)) {
+    const stat = await lstat(workspace.cwd!).catch(() => null);
+    const real = stat?.isDirectory() && !stat.isSymbolicLink() ? await realpath(workspace.cwd!).catch(() => null) : null;
+    if (!real) return "directory_missing";
+    if (!await readableOwnGitRoot(workspace, real)) return "git_unreadable";
+  }
+  return null;
+}
+
 /** This chooses a strategy, never establishes termination or effect safety.
  * Admission verifies those independently before it can persist this receipt. */
 export async function canSelectFreshWorkspace(input: {
@@ -360,17 +404,28 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
     // does. The pause stopped the run on purpose and its stop is proven before this run starts; a fresh isolated
     // workspace changed the working folder and the workspace mode, so the session kept from the cut run was refused
     // ("effective run configuration changed: adapter config, workspace config"; production, 22 Nov 2026).
+    // Only when the cut run is seen to have left its workspace (pauseCutSourceLeftItsWorkspace); otherwise the choice
+    // below stands, as for any Retry.
     if (intent.strategy !== "fresh_isolated_workspace" && wake.idempotencyKey?.startsWith(PAUSE_RESUME_RETRY_KEY_PREFIX)
         && isGovernancePauseStop(source)) {
-      // Said once per run on the task: this is read several times while a run is prepared.
-      const [said] = await db.select({ id: activityLog.id }).from(activityLog).where(and(
-        eq(activityLog.companyId, run.companyId), eq(activityLog.runId, run.id),
-        eq(activityLog.action, "issue.retry_workspace_reused"))).limit(1);
-      if (!said) await persistActivity(db, { companyId: run.companyId,
-        actorType: "system", actorId: "task-recovery", action: "issue.retry_workspace_reused",
-        entityType: "issue", entityId: issueId, runId: run.id,
-        details: { mode: "pause_resume_task_workspace", retryIntentId: wake.id, sourceRunId: source.id } });
-      return null;
+      const refusal = await pauseCutSourceLeftItsWorkspace(db, { companyId: run.companyId, issueId, successorRunId: run.id, source });
+      if (!refusal) {
+        // Said once per run on the task: this is read several times while a run is prepared, so the line is looked
+        // for and written under the lock of the Retry's own request.
+        await db.transaction(async tx => {
+          await tx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wake.id)).for("update");
+          const [said] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
+            eq(activityLog.companyId, run.companyId), eq(activityLog.runId, run.id),
+            eq(activityLog.action, "issue.retry_workspace_reused"))).limit(1);
+          if (!said) await persistActivity(tx as unknown as Db, { companyId: run.companyId,
+            actorType: "system", actorId: "task-recovery", action: "issue.retry_workspace_reused",
+            entityType: "issue", entityId: issueId, runId: run.id,
+            details: { mode: "pause_resume_task_workspace", retryIntentId: wake.id, sourceRunId: source.id } });
+        });
+        return null;
+      }
+      logger.info({ companyId: run.companyId, issueId, sourceRunId: source.id, successorRunId: run.id, reason: refusal },
+        "The run that continues a pause-cut run does not keep the task workspace; the Retry's own choice stands");
     }
     if (intent.strategy !== "fresh_isolated_workspace") {
       const stoppedWorkspace = await stoppedNativeContinuationWorkspace(db, source, { runId: run.id, issueId, retryIntentId: wake.id });

@@ -5,7 +5,8 @@ import { and, asc, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog, agentTaskSessions, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, environmentLeases,
-  heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issueComments, issueRecoveryActions, issues, workspaceOperations,
+  EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
@@ -13,7 +14,7 @@ import { runningProcesses, type AdapterExecutionContext, type AdapterExecutionRe
 import { heartbeatService } from "../services/heartbeat.ts";
 import { environmentService } from "../services/environments.js";
 import { requestTaskRetry } from "../services/task-retry.js";
-import { readFreshWorkspaceReadiness } from "../services/fresh-workspace-continuation.js";
+import { pauseCutSourceLeftItsWorkspace, readFreshWorkspaceReadiness } from "../services/fresh-workspace-continuation.js";
 import { markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
 import { createHeartbeatRunState } from "../services/heartbeat/run-state.js";
 import { TASK_SESSION_REMOVED } from "../services/task-session-removal.js";
@@ -377,6 +378,99 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(log).not.toContain("Skipping saved session resume");
     expect(log).not.toContain("forceFreshSession was requested");
     expect({ sessionId: next.sessionId, sessionParams: next.sessionParams }).toMatchObject({ sessionId: cut, sessionParams: paramsOf(cut) });
+    // Read several times at once, with the line not written yet: every reader has the same answer, and one line.
+    await db.delete(activityLog).where(and(eq(activityLog.runId, next.run.id), eq(activityLog.action, "issue.retry_workspace_reused")));
+    expect(await Promise.all(Array.from({ length: 8 }, () => readFreshWorkspaceReadiness(db, next.run as never))))
+      .toEqual(Array.from({ length: 8 }, () => null));
+    expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.retry_workspace_reused", "pause_resume_task_workspace"]]);
+    // The cut run is no longer seen to have left its workspace (the cleanup of a lease it took failed): the answer is
+    // the Retry's own choice again, a fresh isolated workspace, as before this patch.
+    await db.update(environmentLeases).set({ cleanupStatus: "failed" }).where(eq(environmentLeases.heartbeatRunId, cancelled.id));
+    expect(await readFreshWorkspaceReadiness(db, next.run as never)).toMatchObject({ mode: "fresh_isolated_workspace", sourceRunId: cancelled.id });
+  });
+
+  // What the server reads before it keeps the task's workspace for the run that continues a pause-cut run: each
+  // thing, one at a time, on the true rows of a cut run.
+  it("the task's workspace is kept only when the cut run is seen to have left it: each thing the server reads", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", cut);
+    });
+    await stopProven(f, cancelled.id);
+    const successorRunId = randomUUID();
+    const read = async (patch: Record<string, unknown> = {}) => pauseCutSourceLeftItsWorkspace(db, { companyId: f.companyId,
+      issueId: f.issueId, successorRunId, source: { ...(await reread(cancelled.id)), ...patch } as never });
+    expect(await read()).toBeNull();
+    // The cut run is not settled.
+    expect(await read({ status: "running" })).toBe("source_not_settled");
+    expect(await read({ finishedAt: null })).toBe("source_not_settled");
+    expect(await read({ controllerLeaseExpiresAt: new Date(Date.now() + 60_000) })).toBe("source_not_settled");
+    expect(await read({ controllerLeaseExpiresAt: new Date(Date.now() - 60_000) })).toBeNull();
+    // A repair of its workspace is due, by its result or by the cause of a hold on it.
+    expect(await read({ resultJson: { ...(cancelled.resultJson ?? {}), workspaceRestoreFailure: { reason: "restore failed" } } })).toBe("workspace_repair_required");
+    // The hold the product itself wrote on the cut run, or one written here when it wrote none.
+    const [written] = await db.select().from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, f.companyId),
+      eq(issueRecoveryActions.sourceIssueId, f.issueId), sql`${issueRecoveryActions.evidence}->>'runId' = ${cancelled.id}`));
+    const hold = written ?? (await db.insert(issueRecoveryActions).values({ companyId: f.companyId, sourceIssueId: f.issueId,
+      kind: "active_run_watchdog", cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${cancelled.id}`,
+      status: "resolved", ownerType: "board", nextAction: "Review the cut run.", evidence: { runId: cancelled.id } }).returning())[0]!;
+    await db.update(issueRecoveryActions).set({ cause: "native_workspace_sync_out_unrecoverable" }).where(eq(issueRecoveryActions.id, hold.id));
+    expect(await read()).toBe("workspace_repair_required");
+    // A recovery generation is still at work on it.
+    await db.update(issueRecoveryActions).set({ cause: hold.cause,
+      evidence: { ...(hold.evidence as Record<string, unknown>), systemRecovery: { state: "scheduled" } } }).where(eq(issueRecoveryActions.id, hold.id));
+    expect(await read()).toBe("recovery_generation_unsettled");
+    await db.update(issueRecoveryActions).set({ cause: hold.cause, evidence: hold.evidence }).where(eq(issueRecoveryActions.id, hold.id));
+    expect(await read()).toBeNull();
+    // A lease it took is not released, or its cleanup failed or is still due: whatever the lease's provider.
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, cancelled.id));
+    for (const patch of [{ releasedAt: null }, { cleanupStatus: "failed" }, { status: "pending_cleanup" }, { status: "active" }]) {
+      await db.update(environmentLeases).set(patch).where(eq(environmentLeases.id, lease!.id));
+      expect(await read(), JSON.stringify(patch)).toBe("source_lease_not_released");
+      await db.update(environmentLeases).set({ releasedAt: lease!.releasedAt, cleanupStatus: lease!.cleanupStatus, status: lease!.status })
+        .where(eq(environmentLeases.id, lease!.id));
+    }
+    await db.update(environmentLeases).set({ provider: "ssh" }).where(eq(environmentLeases.id, lease!.id));
+    expect(await read()).toBeNull();
+    // The task is bound to a workspace: a project folder, shared, not the task's own isolated directory.
+    const [shared] = await db.insert(executionWorkspaces).values({ companyId: f.companyId, name: "Project folder",
+      cwd: path.join(FOLDER, "does-not-exist-here"), mode: "shared_workspace", strategyType: "project_primary" }).returning();
+    await db.update(issues).set({ executionWorkspaceId: shared!.id }).where(eq(issues.id, f.issueId));
+    expect(await read()).toBeNull();
+    // Another run holds that workspace by a lease, or an operation runs on it.
+    const [other] = await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId: lease!.environmentId,
+      executionWorkspaceId: shared!.id, provider: "local", status: "active", leasePolicy: "ephemeral",
+      metadata: { agentId: f.agentId, driver: "local" } }).returning();
+    expect(await read()).toBe("lease_held");
+    await db.delete(environmentLeases).where(eq(environmentLeases.id, other!.id));
+    const [operation] = await db.insert(workspaceOperations).values({ companyId: f.companyId, issueId: f.issueId,
+      executionWorkspaceId: shared!.id, phase: "workspace_finalize", status: "running" }).returning();
+    expect(await read()).toBe("operation_running");
+    await db.delete(workspaceOperations).where(eq(workspaceOperations.id, operation!.id));
+    expect(await read()).toBeNull();
+    // The cut run worked in another workspace than the one the task is bound to now.
+    const [elsewhere] = await db.insert(executionWorkspaces).values({ companyId: f.companyId, name: "Another folder",
+      cwd: path.join(FOLDER, "elsewhere"), mode: "shared_workspace", strategyType: "project_primary" }).returning();
+    await db.update(environmentLeases).set({ executionWorkspaceId: elsewhere!.id }).where(eq(environmentLeases.id, lease!.id));
+    expect(await read()).toBe("binding_not_source_workspace");
+    await db.update(issues).set({ executionWorkspaceId: null }).where(eq(issues.id, f.issueId));
+    expect(await read()).toBe("binding_not_source_workspace");
+    // The task's own isolated local directory, the one the cut run used: it must still be there.
+    const [own] = await db.insert(executionWorkspaces).values({ companyId: f.companyId, name: "Task directory", sourceIssueId: f.issueId,
+      cwd: path.join(FOLDER, "does-not-exist-here"), mode: "isolated_workspace", strategyType: "git_worktree", providerType: "local_fs" }).returning();
+    await db.update(issues).set({ executionWorkspaceId: own!.id }).where(eq(issues.id, f.issueId));
+    await db.update(environmentLeases).set({ executionWorkspaceId: own!.id }).where(eq(environmentLeases.id, lease!.id));
+    expect(await read()).toBe("directory_missing");
+    const real = await fs.mkdtemp(path.join((await import("node:os")).tmpdir(), "task-directory-"));
+    await db.update(executionWorkspaces).set({ cwd: real }).where(eq(executionWorkspaces.id, own!.id));
+    expect(await read()).toBeNull();
+    // Its Git state must still be readable: a link to a repository that is no longer there is not.
+    await fs.writeFile(path.join(real, ".git"), "gitdir: /nowhere/that/exists\n");
+    expect(await read()).toBe("git_unreadable");
+    await fs.rm(path.join(real, ".git"), { force: true });
+    expect(await read()).toBeNull();
+    await fs.rm(real, { recursive: true, force: true });
   });
 
   // The run is cut in the middle of a write. The resume starts in the same folder: nothing is reset, nothing is
@@ -422,13 +516,17 @@ const support = await getEmbeddedPostgresTestSupport();
 
   // Only a run a PAUSE cut is continued in its own folder. A run that failed, or that something else cancelled, left
   // its folder in a state nobody chose: its retry keeps the product's fresh workspace, even under the resume's key.
-  it.each<[string, Turn | "system"]>([
+  it.each<[string, Turn | "system" | "person"]>([
     ["failed", async () => routerFailure("adapter_failed", cut)],
     ["was cancelled by the system, not by a pause", "system"],
+    ["was stopped by a person, not by a pause", "person"],
   ])("the retry of a run that %s keeps a fresh workspace: the folder it left is never reopened", async (_how, ending) => {
     const f = await seed();
     const ended = await cutRun(f, ending === "system" ? async context => {
       await heartbeat.cancelRun(context.runId, "Cancelled by another path");
+      return routerFailure("router_cancelled", cut);
+    } : ending === "person" ? async context => {
+      await personStops(context.runId);
       return routerFailure("router_cancelled", cut);
     } : ending);
     await stopProven(f, ended.id);
