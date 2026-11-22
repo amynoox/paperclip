@@ -10,6 +10,7 @@ import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.j
 import { runningProcesses, type AdapterExecutionContext, type AdapterExecutionResult } from "../adapters/index.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
 import { environmentService } from "../services/environments.js";
+import { requestTaskRetry } from "../services/task-retry.js";
 import { markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
 import { createHeartbeatRunState } from "../services/heartbeat/run-state.js";
 import { TASK_SESSION_REMOVED } from "../services/task-session-removal.js";
@@ -329,6 +330,60 @@ const support = await getEmbeddedPostgresTestSupport();
     });
     expect(await taskSession(f)).toMatchObject({ sessionDisplayId: other });
     expect(await lateResultOf(stopped.id)).toMatchObject({ record: { session: "left" } });
+  });
+
+  // The resume of a role files the Retry of the person who resumed it for each run its pause cut
+  // (pause-resume-continuation.ts; the key is the one that file writes). A Retry opens a new conversation; that one
+  // goes on in the session kept from the cut run. Production, 22 Nov 2026 (TR-2432): the run restarted by itself and
+  // its log said "forceFreshSession was requested".
+  const retryOf = async (f: Fixture, runId: string, key: string) => {
+    const receipt = await requestTaskRetry({ db, companyId: f.companyId, issueId: f.issueId, actorId: "responsible-user",
+      actorSource: "local_implicit", observedRunId: runId, idempotencyKey: key });
+    expect(receipt).toMatchObject({ accepted: true });
+    await heartbeat.resumeTaskRetry(f.companyId, receipt.requestId!);
+  };
+  const logOf = async (runId: string) => (await heartbeat.readLog(runId)).content;
+  it("the resume of the role continues the run its pause cut: the run goes on in the session kept from it", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", cut);
+    });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: cancelled.id });
+    await stopProven(f, cancelled.id);
+    const next = await nextExecution(f, () => retryOf(f, cancelled.id, `pause-resume:${cancelled.id}:${randomUUID()}`));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id, explicitUserContinuation: { previousRunId: cancelled.id } });
+    expect(next.run.contextSnapshot).not.toHaveProperty("forceFreshSession");
+    expect({ sessionId: next.sessionId, log: await logOf(next.run.id) }).toMatchObject({ sessionId: cut });
+    expect({ sessionId: next.sessionId, sessionParams: next.sessionParams }).toMatchObject({ sessionId: cut, sessionParams: paramsOf(cut) });
+  });
+
+  it("a Retry a person clicks on the run a pause cut still opens a new conversation", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", cut);
+    });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: cut, lastRunId: cancelled.id });
+    await stopProven(f, cancelled.id);
+    const next = await nextExecution(f, () => retryOf(f, cancelled.id, randomUUID()));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id, forceFreshSession: true });
+    expect(next).toMatchObject({ sessionId: null });
+  });
+
+  it("the resume of the role, when the task's session was written by another run than the cut one: a new conversation", async () => {
+    const f = await seed();
+    // The cut run's result names no session: the task still holds the session of the run before it.
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", null);
+    });
+    expect((await taskSession(f))?.lastRunId).not.toBe(cancelled.id);
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
+    await stopProven(f, cancelled.id);
+    const next = await nextExecution(f, () => retryOf(f, cancelled.id, `pause-resume:${cancelled.id}:${randomUUID()}`));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id, forceFreshSession: true });
+    expect(next).toMatchObject({ sessionId: null });
   });
 
   // A session removed on purpose always wins over a late result: the result of a run created before the removal

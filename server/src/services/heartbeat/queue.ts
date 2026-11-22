@@ -14,6 +14,7 @@ import { hasAutomaticInteractionDeliveryHold, INTERACTION_DELIVERY_DENIED, reche
 import { adapterWaitPayload, readAdapterTaskWait, deferAdapterRun } from "../adapter-task-admission.js";
 import { deferredWorkIntentWait } from "../work-intent-outbox.js";
 import { cancelledRunKeepsSession, conversationCancelledRunKeepsSession } from "../cut-run-session.js";
+import { PAUSE_RESUME_RETRY_KEY_PREFIX } from "../pause-resume-continuation.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { createHeartbeatTimerPolicy } from "./timer-policy.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
@@ -3051,7 +3052,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       if (retry.chatActionId ? !chatRetry :
           opts.requestedByActorType !== "user" || retry.actorId !== opts.requestedByActorId) return null;
       taskRetryActorId = retry.actorId;
-      enrichedContextSnapshot.forceFreshSession = true;
+      // STUDIO-0075: a Retry opens a new conversation, except the Retry the resume of a role files for the run its
+      // pause cut (pause-resume-continuation.ts): that one goes on in the session kept from the cut run, when the
+      // task's session was written by that very run. Production, 22 Nov 2026: the run started again by itself after
+      // the pause, on the same machine, and remade its conversation because this flag was set for every Retry.
+      // Whether the cut run keeps its session at all is decided with the continuation, further down.
+      const [keptByCutRun] = receipt.idempotencyKey?.startsWith(PAUSE_RESUME_RETRY_KEY_PREFIX) && issueId
+        ? await db.select({ lastRunId: agentTaskSessions.lastRunId }).from(agentTaskSessions)
+            .innerJoin(agents, and(eq(agents.id, agentTaskSessions.agentId), eq(agents.adapterType, agentTaskSessions.adapterType)))
+            .where(and(eq(agentTaskSessions.companyId, receipt.companyId), eq(agentTaskSessions.agentId, agentId),
+              eq(agentTaskSessions.taskKey, issueId))).limit(1)
+        : [];
+      if (keptByCutRun?.lastRunId !== retry.sourceRunId) enrichedContextSnapshot.forceFreshSession = true;
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;
       enrichedContextSnapshot.taskRetryRequestId = receipt.id;
       if (retry.boardMessageOrigin) enrichedContextSnapshot.boardMessageRetry = true;
