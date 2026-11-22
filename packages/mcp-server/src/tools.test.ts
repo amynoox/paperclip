@@ -255,6 +255,38 @@ describe("paperclip MCP tools", () => {
     });
   });
 
+  // STUDIO-0087: each of the four tools that create a card carries the addressee agent and the task of that agent
+  // on which it is woken. Before, a tool dropped both fields without a word.
+  const ADDRESSEE = "44444444-4444-4444-8444-444444444444";
+  const ADDRESSEE_TASK = "55555555-5555-4555-8555-555555555555";
+  const cardTools: Array<[string, string, Record<string, unknown>]> = [
+    ["paperclipSuggestTasks", "suggest_tasks", { version: 1, tasks: [{ clientKey: "task-1", title: "One" }] }],
+    ["paperclipAskUserQuestions", "ask_user_questions", { version: 1, questions: [{ id: "scope", prompt: "Which scope?", selectionMode: "single",
+      options: [{ id: "phase-1", label: "Phase 1" }] }] }],
+    ["paperclipRequestConfirmation", "request_confirmation", { version: 1, prompt: "Is the build you tested the one of this morning?" }],
+    ["paperclipRequestCheckboxConfirmation", "request_checkbox_confirmation", { version: 1, prompt: "Which files?",
+      options: [{ id: "file-a", label: "File A" }, { id: "file-b", label: "File B" }] }],
+  ];
+  it.each(cardTools)("%s sends the addressee agent and its wake task to the route, and nothing of the two when they are not given", async (name, kind, payload) => {
+    const fetchMock = vi.fn().mockImplementation(async () => mockJsonResponse({ id: "interaction-1", kind }));
+    vi.stubGlobal("fetch", fetchMock);
+    const tool = getTool(name);
+    await tool.execute({ issueId: "PAP-1135", addresseeAgentId: ADDRESSEE, addresseeWakeIssueId: ADDRESSEE_TASK, payload });
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(String(url)).toBe("http://localhost:3100/api/issues/PAP-1135/interactions");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toMatchObject({ kind, addresseeAgentId: ADDRESSEE, addresseeWakeIssueId: ADDRESSEE_TASK });
+    // Without them, the request is the one of before: neither key is sent.
+    await tool.execute({ issueId: "PAP-1135", payload });
+    const before = JSON.parse(String((fetchMock.mock.calls[1] as [string, RequestInit])[1].body));
+    expect(before).not.toHaveProperty("addresseeAgentId");
+    expect(before).not.toHaveProperty("addresseeWakeIssueId");
+    // A value that is not an id never leaves the tool.
+    const refused = await tool.execute({ issueId: "PAP-1135", addresseeAgentId: ADDRESSEE, addresseeWakeIssueId: "TR-2466", payload });
+    expect(JSON.stringify(refused)).toContain("addresseeWakeIssueId");
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
   it("creates request_confirmation interactions with plan target payloads", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       mockJsonResponse({ id: "interaction-1", kind: "request_confirmation" }),

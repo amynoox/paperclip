@@ -14,6 +14,9 @@ const interactionResolverKindGovernanceSchema = z.object({
 }).strict();
 
 export const interactionResolverGovernanceSchema = z.object({
+  // STUDIO-0087: OFF unless `enabled: true`. When on, a card that wakes its addressee on a task of its own
+  // (addresseeWakeIssueId) also passes the unresolved blockers of that task. No install turns it on.
+  addresseeWakeOnBlockedIssue: z.object({ enabled: z.boolean().optional() }).strict().optional(),
   suggest_tasks: interactionResolverKindGovernanceSchema.optional(),
   ask_user_questions: interactionResolverKindGovernanceSchema.optional(),
   request_confirmation: interactionResolverKindGovernanceSchema.optional(),

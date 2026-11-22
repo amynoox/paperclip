@@ -199,6 +199,28 @@ export function allowsDependencyBlockedWake(
   return allowsIssueInteractionWake(contextSnapshot, interactionWakeReasons) || verifiedBlockerStall || verifiedInteractionResponse;
 }
 
+/**
+ * STUDIO-0086: the mark of a plugin's wake let through on an issue with unresolved blockers,
+ * `pluginBlockedWake: { pluginId, reason }`, read when its reason is one of the closed list and is the reason of the
+ * wake. A retry the server creates keeps the context but not the wake reason (`serverRetry`). The mark alone admits
+ * nothing: the caller verifies the requester and the plugin against server state (services/plugin-blocked-wake.ts).
+ */
+export const PLUGIN_BLOCKED_WAKE_KEY = "pluginBlockedWake";
+
+export function readPluginBlockedWake(
+  contextSnapshot: unknown,
+  allowedReasons: readonly string[],
+): { pluginId: string; reason: string; serverRetry: boolean } | null {
+  const context = parseObject(contextSnapshot);
+  const mark = parseObject(context[PLUGIN_BLOCKED_WAKE_KEY]);
+  const pluginId = readNonEmptyString(mark.pluginId);
+  const reason = readNonEmptyString(mark.reason);
+  if (!pluginId || !reason || !allowedReasons.includes(reason)) return null;
+  const serverRetry = readNonEmptyString(context.retryOfRunId) !== null;
+  if (!serverRetry && readNonEmptyString(context.wakeReason) !== reason) return null;
+  return { pluginId, reason, serverRetry };
+}
+
 export function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown): boolean {
   const context = parseObject(contextSnapshot);
   const interactionId = readNonEmptyString(context.interactionId);

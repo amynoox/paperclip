@@ -1,4 +1,5 @@
 import { notifyLoginSessionChanged } from "./login-cleanup-notifications.js";
+import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
 import type { ConnectionManagementContext } from "./connection-management.js";
 import { WORKSPACE_RESTORE_LOCK_TIMEOUT_CODE } from "@paperclipai/adapter-utils/workspace-restore-merge";
 import { withAccountHomeSecretMutationLock } from "@paperclipai/adapter-codex-local/server";
@@ -954,6 +955,9 @@ export function aiConnectionService(db: Db) {
             );
       }
       if (loginSession) await notifyLoginSessionChanged(tx);
+      // STUDIO-0090: the repair cards that waited for this account are read again at once
+      // (satisfied-connection-intents.ts), also those of tasks its failure blocked.
+      if (reconnect) await notifyDeliveryWork(tx, DELIVERY_QUEUES.connection);
       if (loginSession)
         await tx
           .update(adapterAuthSessions)
