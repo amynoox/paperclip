@@ -362,20 +362,14 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
     // ("effective run configuration changed: adapter config, workspace config"; production, 22 Nov 2026).
     if (intent.strategy !== "fresh_isolated_workspace" && wake.idempotencyKey?.startsWith(PAUSE_RESUME_RETRY_KEY_PREFIX)
         && isGovernancePauseStop(source)) {
-      await db.transaction(async tx => {
-        await tx.update(agentWakeupRequests).set({
-          payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{taskRetry,strategy}', '"continue"'::jsonb)`,
-        }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.runId, run.id),
-          sql`${agentWakeupRequests.payload}#>>'{taskRetry,strategy}' = 'evaluate'`));
-        // Said once per run on the task: this is read several times while a run is prepared.
-        const [said] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
-          eq(activityLog.companyId, run.companyId), eq(activityLog.runId, run.id),
-          eq(activityLog.action, "issue.retry_workspace_reused"))).limit(1);
-        if (!said) await persistActivity(tx as unknown as Db, { companyId: run.companyId,
-          actorType: "system", actorId: "task-recovery", action: "issue.retry_workspace_reused",
-          entityType: "issue", entityId: issueId, runId: run.id,
-          details: { mode: "pause_resume_task_workspace", retryIntentId: wake.id, sourceRunId: source.id } });
-      });
+      // Said once per run on the task: this is read several times while a run is prepared.
+      const [said] = await db.select({ id: activityLog.id }).from(activityLog).where(and(
+        eq(activityLog.companyId, run.companyId), eq(activityLog.runId, run.id),
+        eq(activityLog.action, "issue.retry_workspace_reused"))).limit(1);
+      if (!said) await persistActivity(db, { companyId: run.companyId,
+        actorType: "system", actorId: "task-recovery", action: "issue.retry_workspace_reused",
+        entityType: "issue", entityId: issueId, runId: run.id,
+        details: { mode: "pause_resume_task_workspace", retryIntentId: wake.id, sourceRunId: source.id } });
       return null;
     }
     if (intent.strategy !== "fresh_isolated_workspace") {

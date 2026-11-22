@@ -3056,14 +3056,16 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       // pause cut (pause-resume-continuation.ts): that one goes on in the session kept from the cut run, when the
       // task's session was written by that very run. Production, 22 Nov 2026: the run started again by itself after
       // the pause, on the same machine, and remade its conversation because this flag was set for every Retry.
-      // Whether the cut run keeps its session at all is decided with the continuation, further down.
+      // Only a run that keeps its session (a pause cut it): a run that failed opens a new conversation as before.
       const [keptByCutRun] = receipt.idempotencyKey?.startsWith(PAUSE_RESUME_RETRY_KEY_PREFIX) && issueId
-        ? await db.select({ lastRunId: agentTaskSessions.lastRunId }).from(agentTaskSessions)
+        ? await db.select({ lastRunId: agentTaskSessions.lastRunId, status: heartbeatRuns.status, resultJson: heartbeatRuns.resultJson })
+            .from(agentTaskSessions)
             .innerJoin(agents, and(eq(agents.id, agentTaskSessions.agentId), eq(agents.adapterType, agentTaskSessions.adapterType)))
+            .innerJoin(heartbeatRuns, eq(heartbeatRuns.id, agentTaskSessions.lastRunId))
             .where(and(eq(agentTaskSessions.companyId, receipt.companyId), eq(agentTaskSessions.agentId, agentId),
               eq(agentTaskSessions.taskKey, issueId))).limit(1)
         : [];
-      if (keptByCutRun?.lastRunId !== retry.sourceRunId) enrichedContextSnapshot.forceFreshSession = true;
+      if (keptByCutRun?.lastRunId !== retry.sourceRunId || !cancelledRunKeepsSession(keptByCutRun)) enrichedContextSnapshot.forceFreshSession = true;
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;
       enrichedContextSnapshot.taskRetryRequestId = receipt.id;
       if (retry.boardMessageOrigin) enrichedContextSnapshot.boardMessageRetry = true;

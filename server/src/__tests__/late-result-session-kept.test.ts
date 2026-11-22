@@ -416,6 +416,26 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(folderOf(next.run)).not.toBe(folderOf(cancelled));
   });
 
+  // Only a run a PAUSE cut is continued in its own folder. A run that failed, or that something else cancelled, left
+  // its folder in a state nobody chose: its retry keeps the product's fresh workspace, even under the resume's key.
+  it.each<[string, Turn | "system"]>([
+    ["failed", async () => routerFailure("adapter_failed", cut)],
+    ["was cancelled by the system, not by a pause", "system"],
+  ])("the retry of a run that %s keeps a fresh workspace: the folder it left is never reopened", async (_how, ending) => {
+    const f = await seed();
+    const ended = await cutRun(f, ending === "system" ? async context => {
+      await heartbeat.cancelRun(context.runId, "Cancelled by another path");
+      return routerFailure("router_cancelled", cut);
+    } : ending);
+    await stopProven(f, ended.id);
+    const next = await nextExecution(f, () => retryOf(f, ended.id, `pause-resume:${ended.id}:${randomUUID()}`));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: ended.id, taskRetryRequestId: expect.any(String), forceFreshSession: true });
+    expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.fresh_workspace_selected", "fresh_isolated_workspace"]]);
+    expect(folderOf(next.run)).not.toBe(folderOf(ended));
+    expect(folderOf(next.run)).toContain("isolated-workspace-attempts");
+    expect(next).toMatchObject({ sessionId: null });
+  });
+
   it("the resume of the role, when the task's session was written by another run than the cut one: a new conversation", async () => {
     const f = await seed();
     // The cut run's result names no session: the task still holds the session of the run before it.
