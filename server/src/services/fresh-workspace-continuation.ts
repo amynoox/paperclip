@@ -1,7 +1,7 @@
 import { lstat, realpath } from "node:fs/promises";
 import path from "node:path";
 import { and, eq, inArray, isNull, ne, or, sql } from "drizzle-orm";
-import { agentWakeupRequests, environmentLeases, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, workspaceOperations, type Db } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, environmentLeases, executionWorkspaces, heartbeatRunEvents, heartbeatRuns, issues, issueRecoveryActions, nativeRunFinalizations, nativeRunResults, workspaceOperations, type Db } from "@paperclipai/db";
 import { verifiedWorkspaceRepairReceipt } from "./workspace-recovery-receipt.js";
 import { persistActivity } from "./activity-log.js";
 import { logger } from "../middleware/logger.js";
@@ -363,11 +363,15 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
     if (intent.strategy !== "fresh_isolated_workspace" && wake.idempotencyKey?.startsWith(PAUSE_RESUME_RETRY_KEY_PREFIX)
         && isGovernancePauseStop(source)) {
       await db.transaction(async tx => {
-        const changed = await tx.update(agentWakeupRequests).set({
+        await tx.update(agentWakeupRequests).set({
           payload: sql`jsonb_set(${agentWakeupRequests.payload}, '{taskRetry,strategy}', '"continue"'::jsonb)`,
         }).where(and(eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.runId, run.id),
-          sql`${agentWakeupRequests.payload}#>>'{taskRetry,strategy}' = 'evaluate'`)).returning({ id: agentWakeupRequests.id });
-        if (changed.length) await persistActivity(tx as unknown as Db, { companyId: run.companyId,
+          sql`${agentWakeupRequests.payload}#>>'{taskRetry,strategy}' = 'evaluate'`));
+        // Said once per run on the task: this is read several times while a run is prepared.
+        const [said] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
+          eq(activityLog.companyId, run.companyId), eq(activityLog.runId, run.id),
+          eq(activityLog.action, "issue.retry_workspace_reused"))).limit(1);
+        if (!said) await persistActivity(tx as unknown as Db, { companyId: run.companyId,
           actorType: "system", actorId: "task-recovery", action: "issue.retry_workspace_reused",
           entityType: "issue", entityId: issueId, runId: run.id,
           details: { mode: "pause_resume_task_workspace", retryIntentId: wake.id, sourceRunId: source.id } });
