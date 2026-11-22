@@ -387,6 +387,22 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(next).toMatchObject({ sessionId: null });
   });
 
+  it("the resume of the role, when nothing holds the task any more and its session is another run's: a new conversation", async () => {
+    const f = await seed();
+    const cancelled = await cutRun(f, async () => {
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return routerFailure("router_cancelled", null);
+    });
+    expect(await taskSession(f)).toMatchObject({ sessionDisplayId: first });
+    await stopProven(f, cancelled.id);
+    // The hold of the cut run was settled before the request is sent: the run that starts continues nothing.
+    await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "cancelled", resolvedAt: new Date() })
+      .where(eq(issueRecoveryActions.sourceIssueId, f.issueId));
+    const next = await nextExecution(f, () => retryOf(f, cancelled.id, `pause-resume:${cancelled.id}:${randomUUID()}`));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id, forceFreshSession: true });
+    expect(next).toMatchObject({ sessionId: null });
+  });
+
   // A session removed on purpose always wins over a late result: the result of a run created before the removal
   // never puts the session back. The removal leaves a mark the late write reads (task-session-removal.ts).
   type Removal = (f: Fixture, cutRunId: string) => Promise<unknown>;
