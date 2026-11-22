@@ -5,6 +5,7 @@ import type { PaperclipTurnContext } from "@paperclipai/adapter-utils/server-uti
 import { parseObject } from "../../adapters/utils.js";
 import { isConversation } from "../agent-conversations.js";
 import { chatCompletionInstruction } from "../chat-completion-delivery.js";
+import { ownIssueInteractionNote } from "../addressee-wake-issue.js";
 import { getConversationConfirmationContext } from "../conversation-confirmation-context.js";
 import { buildExecutionContinuation } from "../execution-continuation.js";
 import { getIssueContinuationSummaryDocument } from "../issue-continuation-summary.js";
@@ -318,23 +319,27 @@ export async function prepareHeartbeatTaskContext(db: Db, input: HeartbeatTaskCo
   if (workflowCase) context.paperclipCase = workflowCase;
   else delete context.paperclipCase;
   const assignmentPrefix = liveVoiceTaskPrefix + caseExecutionMarkdown(workflowCase);
-  let taskMarkdown = assignmentPrefix + buildPaperclipTaskMarkdown({ ...taskMarkdownInput, taskPlan }) + chatCompletionInstruction(context);
+  // STUDIO-0087: a run woken on its own task for a card of another task reads which card, and where.
+  const cardNote = issueRef
+    ? await ownIssueInteractionNote(db, { companyId: agent.companyId, issueId: issueRef.id, agentId: agent.id, contextSnapshot: context })
+    : "";
+  let taskMarkdown = assignmentPrefix + buildPaperclipTaskMarkdown({ ...taskMarkdownInput, taskPlan }) + chatCompletionInstruction(context) + cardNote;
   let taskMarkdownAssignment = assignmentPrefix + buildPaperclipTaskMarkdown({
     ...taskMarkdownInput,
     taskPlan,
     includeWakeComments: false,
-  }) + chatCompletionInstruction(context);
+  }) + chatCompletionInstruction(context) + cardNote;
   const taskMarkdownCompact = assignmentPrefix + buildPaperclipTaskMarkdown({
     ...taskMarkdownInput,
     taskPlan,
     includeDescription: false,
-  }) + chatCompletionInstruction(context);
+  }) + chatCompletionInstruction(context) + cardNote;
   const taskMarkdownAssignmentCompact = assignmentPrefix + buildPaperclipTaskMarkdown({
     ...taskMarkdownInput,
     taskPlan,
     includeDescription: false,
     includeWakeComments: false,
-  }) + chatCompletionInstruction(context);
+  }) + chatCompletionInstruction(context) + cardNote;
   if (issueRef) {
     context.paperclipIssue = {
       id: issueRef.id,

@@ -715,6 +715,12 @@ export interface PaperclipPluginManifestV1 {
   capabilities: PluginCapability[];
   /** Required participant in agent preparation, stop, resume, and cleanup. */
   agentLifecycle?: true;
+  /**
+   * STUDIO-0086: this plugin may wake the assignee of an issue that still has unresolved blockers, for a reason of
+   * PLUGIN_BLOCKED_ISSUE_WAKE_REASONS only (it still needs `issues.wakeup`). A field, not a capability: a host that
+   * does not know it drops it and loads the plugin as before, where an unknown capability fails the manifest.
+   */
+  blockedIssueWakeups?: true;
   /** Own project storage and durable workspace operations as one contract. */
   workspaceProvider?: {
     /** Supports bounded run completion separately from removal-safety inspection. */

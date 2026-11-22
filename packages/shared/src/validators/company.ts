@@ -14,11 +14,21 @@ const interactionResolverKindGovernanceSchema = z.object({
 }).strict();
 
 export const interactionResolverGovernanceSchema = z.object({
+  // STUDIO-0087: OFF unless `enabled: true`. When on, a card that wakes its addressee on a task of its own
+  // (addresseeWakeIssueId) also passes the unresolved blockers of that task. No install turns it on.
+  addresseeWakeOnBlockedIssue: z.object({ enabled: z.boolean().optional() }).strict().optional(),
   suggest_tasks: interactionResolverKindGovernanceSchema.optional(),
   ask_user_questions: interactionResolverKindGovernanceSchema.optional(),
   request_confirmation: interactionResolverKindGovernanceSchema.optional(),
   request_checkbox_confirmation: interactionResolverKindGovernanceSchema.optional(),
   request_item_verdicts: interactionResolverKindGovernanceSchema.optional(),
+  // STUDIO-0089: the delays of a question between roles left without an answer (the addressee's relaunch, then
+  // the card to its manager); `enabled: false` switches both off for the company.
+  unansweredAgentQuestion: z.object({
+    enabled: z.boolean().optional(),
+    relaunchAfterMinutes: z.number().int().min(1).max(1440).optional(),
+    managerAfterMinutes: z.number().int().min(1).max(1440).optional(),
+  }).strict().optional(),
 }).strict().default({});
 
 export const createCompanySchema = z.object({

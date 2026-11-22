@@ -146,8 +146,18 @@ const addCommentToolSchema = z.object({
   issueId: issueIdSchema,
 }).merge(addIssueCommentSchema);
 
+// STUDIO-0087: a card created by a tool may name the agent it is addressed to and the task of that agent on which it
+// is woken (addresseeWakeIssueId). The tools only carry the two fields: the route checks them (same company, the task
+// is assigned to the addressee, not done nor cancelled) and refuses the card otherwise. Before this, a tool dropped
+// both fields without a word, and a card created by a tool could not be addressed to an agent at all.
+const interactionAddresseeToolFields = {
+  addresseeAgentId: z.string().guid().nullable().optional(),
+  addresseeWakeIssueId: z.string().guid().nullable().optional(),
+};
+
 const createSuggestTasksToolSchema = z.object({
   issueId: issueIdSchema,
+  ...interactionAddresseeToolFields,
   idempotencyKey: z.string().trim().max(255).nullable().optional(),
   sourceCommentId: z.string().guid().nullable().optional(),
   sourceRunId: z.string().guid().nullable().optional(),
@@ -159,6 +169,7 @@ const createSuggestTasksToolSchema = z.object({
 
 const createAskUserQuestionsToolSchema = z.object({
   issueId: issueIdSchema,
+  ...interactionAddresseeToolFields,
   idempotencyKey: z.string().trim().max(255).nullable().optional(),
   sourceCommentId: z.string().guid().nullable().optional(),
   sourceRunId: z.string().guid().nullable().optional(),
@@ -170,6 +181,7 @@ const createAskUserQuestionsToolSchema = z.object({
 
 const createRequestConfirmationToolSchema = z.object({
   issueId: issueIdSchema,
+  ...interactionAddresseeToolFields,
   idempotencyKey: z.string().trim().max(255).nullable().optional(),
   sourceCommentId: z.string().guid().nullable().optional(),
   sourceRunId: z.string().guid().nullable().optional(),
@@ -181,6 +193,7 @@ const createRequestConfirmationToolSchema = z.object({
 
 const createRequestCheckboxConfirmationToolSchema = z.object({
   issueId: issueIdSchema,
+  ...interactionAddresseeToolFields,
   idempotencyKey: z.string().trim().max(255).nullable().optional(),
   sourceCommentId: z.string().guid().nullable().optional(),
   sourceRunId: z.string().guid().nullable().optional(),
