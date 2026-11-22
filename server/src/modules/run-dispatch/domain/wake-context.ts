@@ -221,6 +221,15 @@ export function readPluginBlockedWake(
   return { pluginId, reason, serverRetry };
 }
 
+/**
+ * STUDIO-0093: whether a wake context carries a plugin's blocked-issue mark, whatever its wake reason is by now. Such a
+ * wake never merges with another wake: merged, it loses its reason or its requester, and with them its way past the
+ * blockers (`readPluginBlockedWake`, services/plugin-blocked-wake.ts).
+ */
+export function carriesPluginBlockedWake(contextSnapshot: unknown): boolean {
+  return readNonEmptyString(parseObject(parseObject(contextSnapshot)[PLUGIN_BLOCKED_WAKE_KEY]).pluginId) !== null;
+}
+
 export function isResolvedInteractionContinuationWakeContext(contextSnapshot: unknown): boolean {
   const context = parseObject(contextSnapshot);
   const interactionId = readNonEmptyString(context.interactionId);
