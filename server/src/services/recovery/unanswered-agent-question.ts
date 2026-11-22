@@ -81,7 +81,7 @@ export function readUnansweredQuestionSettings(governance: unknown): { relaunchA
 }
 
 function titleOf(card: typeof issueThreadInteractions.$inferSelect) {
-  const payload = (card.payload ?? {}) as Record<string, unknown>;
+  const payload = (card.payload ?? {}) as unknown as Record<string, unknown>;
   const questions = Array.isArray(payload.questions) ? payload.questions as Array<Record<string, unknown>> : [];
   const text = [card.title, payload.title, payload.prompt, questions[0]?.prompt]
     .find((value): value is string => typeof value === "string" && value.trim().length > 0);
@@ -164,7 +164,7 @@ export async function relaunchUnansweredAgentQuestions(db: Db, input: {
       const relaunchDone = await said(card, UNANSWERED_QUESTION_RELAUNCHED_ACTION);
       if (relaunchDone && managerDone) return "done";
       // The same attention rule as the wake of the card's creation: an agent that may not answer is not woken.
-      const payload = (card.payload ?? {}) as Record<string, unknown>;
+      const payload = (card.payload ?? {}) as unknown as Record<string, unknown>;
       if (!issueThreadInteractionAttentionAgentAllowed({ agentId: addresseeAgentId, interaction: card as never,
         governedAction: card.kind === "request_confirmation" && payload.toolAction !== undefined })) return "not_answerable";
       const [addressee] = await db.select().from(agents)
