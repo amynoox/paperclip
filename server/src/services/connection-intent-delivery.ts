@@ -82,7 +82,7 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
   async function restoreAiBlockedTask(loaded: {
     issue: typeof issues.$inferSelect;
     interaction: typeof issueThreadInteractions.$inferSelect;
-  }) {
+  }, bySystem = false) {
     const publications: ActivityPublication[] = [];
     const restored = await db.transaction(async (tx) => {
       const [issue] = await tx.select().from(issues).where(and(
@@ -106,16 +106,17 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
       const recovery = await recoveries.getActiveForIssue(issue.companyId, issue.id, tx);
       if (!recovery || recovery.cause !== "configuration_incomplete" || recovery.evidence.latestRunId !== latest.id) return null;
       const actorId = loaded.interaction.resolvedByUserId ?? loaded.interaction.addresseeUserId!;
+      // STUDIO-0090: a card the system retired reopens the task in nobody's name.
       const updated = await issueService(db).update(issue.id, {
-        status: "in_progress", actorUserId: actorId, companyGuard: issue.companyId,
+        status: "in_progress", ...(bySystem ? {} : { actorUserId: actorId }), companyGuard: issue.companyId,
       }, tx, publications);
       await recoveries.resolveActiveForIssue({ companyId: issue.companyId, sourceIssueId: issue.id,
-        actionId: recovery.id, status: "resolved", outcome: "restored", resolutionNote: "AI connection restored by the responsible user." }, tx);
+        actionId: recovery.id, status: "resolved", outcome: "restored", resolutionNote: bySystem ? "AI connection available again." : "AI connection restored by the responsible user." }, tx);
       return updated;
     });
     for (const publication of publications) publishActivity(publication);
-    if (restored) await logActivity(db, { companyId: restored.companyId, actorType: "user",
-      actorId: loaded.interaction.resolvedByUserId ?? loaded.interaction.addresseeUserId!,
+    if (restored) await logActivity(db, { companyId: restored.companyId, actorType: bySystem ? "system" : "user",
+      actorId: bySystem ? "connection-reconciliation" : loaded.interaction.resolvedByUserId ?? loaded.interaction.addresseeUserId!,
       action: "issue.updated", entityType: "issue", entityId: restored.id,
       details: { status: restored.status, _previous: { status: "blocked" }, source: "ai_connection_restored", interactionId: loaded.interaction.id } });
     return restored;
@@ -202,7 +203,7 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
           eq(issueThreadInteractions.id, interactionId), eq(issueThreadInteractions.companyId, claimed.companyId),
           eq(issueThreadInteractions.issueId, loaded.issue.id))).for("update");
         if (!task || !card || card.status !== "expired" || card.result?.outcome !== "expired") return null;
-        const ready = await findSatisfiedToolConnection(tx as unknown as Db, task, { ...card, status: "pending" });
+        const ready = await findSatisfiedToolConnection(tx as unknown as Db, task, { ...card, status: "pending" }, undefined, "retired");
         if (!ready) return null;
         if (ready.id !== (card.result as { connectionId: string }).connectionId) {
           const previousConnectionId = (card.result as { connectionId: string }).connectionId;
@@ -224,8 +225,10 @@ export function connectionIntentDeliveryService(db: Db, heartbeat: Pick<Heartbea
       loaded.interaction = current.card;
       interaction = current.card;
     }
-    if (interaction.status === "accepted" && payload?.purpose === "ai" && loaded.issue.status === "blocked") {
-      const restored = await restoreAiBlockedTask(loaded);
+    // STUDIO-0090: the repair card the system retired reopens the task the account's failure blocked, under the
+    // same guards as the card the person accepted.
+    if ((interaction.status === "accepted" || retiredForAvailableConnection) && payload?.purpose === "ai" && loaded.issue.status === "blocked") {
+      const restored = await restoreAiBlockedTask(loaded, retiredForAvailableConnection);
       if (!restored) return;
       loaded.issue = restored;
     }

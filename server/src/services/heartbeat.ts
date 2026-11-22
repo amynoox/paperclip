@@ -513,6 +513,7 @@ import {
 } from "./recovery/stranded-notice.js";
 
 import { reconcileHeldCommentHandover as reconcileHeldCommentHandoverForIssue } from "./recovery/held-comment-handover-backstop.js";
+import { relaunchUnansweredAgentQuestions as relaunchUnansweredAgentQuestionsForIssue } from "./recovery/unanswered-agent-question.js";
 import { recoveryService } from "./recovery/service.js";
 import {
   createRunDispatch,
@@ -1824,6 +1825,27 @@ export function heartbeatService(
       });
     } catch (err) {
       logger.warn({ err, issueId: scope.issueId }, "held comment hand-over backstop failed; the next pass retries");
+      return null;
+    }
+  }
+
+  // STUDIO-0089: a question between roles left without an answer (recovery/unanswered-agent-question.ts). Run by the
+  // same two recovery queues, for one issue; never fails their pass.
+  async function relaunchUnansweredAgentQuestions(scope: {
+    companyId: string; issueId: string; now?: Date; onDeferredDeadline?: (at: number) => void;
+  }) {
+    try {
+      return await relaunchUnansweredAgentQuestionsForIssue(db, {
+        companyId: scope.companyId,
+        issueId: scope.issueId,
+        now: scope.now,
+        onDeferredDeadline: scope.onDeferredDeadline,
+        wake: (agentId, request) => enqueueWakeup(agentId, request as Parameters<typeof enqueueWakeup>[1]),
+        invocationBlocked: async (agentId, issueId) =>
+          Boolean(await budgets.getInvocationBlock(scope.companyId, agentId, { issueId, projectId: null })),
+      });
+    } catch (err) {
+      logger.warn({ err, issueId: scope.issueId }, "unanswered question pass failed; the next pass retries");
       return null;
     }
   }
@@ -4573,12 +4595,14 @@ export function heartbeatService(
       registerIssueRecoveryWork(db, coordinator, {
         stranded: async scope => {
           await reconcileHeldCommentHandover(scope);
+          await relaunchUnansweredAgentQuestions(scope);
           return reconcileStrandedAssignedIssues({ ...scope, skipExternalConversationSettlement: true, skipRelatedRecovery: true });
         },
         orphanBlockers: recovery.reconcileUnassignedBlockingIssues,
         recoveryActions: recovery.reconcileActiveRecoveryActions,
         dependencies: async scope => {
           await reconcileHeldCommentHandover(scope);
+          await relaunchUnansweredAgentQuestions(scope);
           return reconcileResolvedDependencyWakes(scope);
         },
         locks: sweepStaleIssueLocks,

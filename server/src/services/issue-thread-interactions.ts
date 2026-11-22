@@ -117,6 +117,7 @@ import {
 } from "@paperclipai/shared";
 import { z } from "zod";
 import { conflict, forbidden, notFound, unprocessable } from "../errors.js";
+import { assertAddresseeWakeIssue } from "./addressee-wake-issue.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { authorizationService } from "./authorization.js";
 import { isCloudManagedInstance } from "./cloud-instance.js";
@@ -3839,6 +3840,12 @@ export function issueThreadInteractionService(
             },
           );
         }
+      }
+
+      // STUDIO-0087: the wake of the card may be sent to a task of the addressee agent itself.
+      if (normalizedData.addresseeWakeIssueId) {
+        await assertAddresseeWakeIssue(db, { companyId: issue.companyId, addresseeAgentId: normalizedData.addresseeAgentId,
+          addresseeWakeIssueId: normalizedData.addresseeWakeIssueId });
       }
 
       if (normalizedData.idempotencyKey) {

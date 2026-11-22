@@ -1456,6 +1456,21 @@ export const PLUGIN_CAPABILITIES = [
 ] as const;
 export type PluginCapability = (typeof PLUGIN_CAPABILITIES)[number];
 
+/**
+ * STUDIO-0086: the one right of the worker router's plugin to wake the assignee of an issue that still has
+ * unresolved blockers. Two closed lists, here and nowhere else:
+ * - the plugins that hold the right, by their key (the manifest id, re-read in the database): the worker router;
+ * - the reasons (the router's contract of 22 Nov 2026): a machine lent to the maintenance of an issue, the request
+ *   to lend a machine, and the return of that machine.
+ * Any other plugin, and any other reason, keeps the ordinary refusal.
+ */
+export const PLUGIN_BLOCKED_ISSUE_WAKE_PLUGIN_KEYS = ["amynoox.worker-router"] as const;
+export const PLUGIN_BLOCKED_ISSUE_WAKE_REASONS = [
+  "worker_router_machine_lent",
+  "worker_router_loan_requested",
+  "worker_router_loan_returned",
+] as const;
+
 export const PLUGIN_DATABASE_NAMESPACE_MODES = ["schema"] as const;
 export type PluginDatabaseNamespaceMode = (typeof PLUGIN_DATABASE_NAMESPACE_MODES)[number];
 
