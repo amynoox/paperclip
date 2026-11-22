@@ -13,7 +13,7 @@ export interface InteractionResolverKindGovernance {
 export type InteractionResolverGovernance = Partial<
   Record<IssueThreadInteractionKind, InteractionResolverKindGovernance>
 > & {
-  /** STUDIO-0091: a question between roles left without an answer. */
+  /** STUDIO-0089: a question between roles left without an answer. */
   unansweredAgentQuestion?: { enabled?: boolean; relaunchAfterMinutes?: number; managerAfterMinutes?: number };
 };
 

@@ -12,7 +12,7 @@ import {
   readUnansweredQuestionSettings, relaunchUnansweredAgentQuestions, unansweredQuestionManagerKey, unansweredQuestionRelaunchKey,
 } from "../services/recovery/unanswered-agent-question.js";
 
-// STUDIO-0091: production, 22 Nov 2026, TR-2394. A card addressed to the CTO; the CTO was woken once, its run
+// STUDIO-0089: production, 22 Nov 2026, TR-2394. A card addressed to the CTO; the CTO was woken once, its run
 // succeeded, it did not answer, and nothing woke it again: the card waited for hours.
 describe("a question between roles left without an answer", () => {
   let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;

@@ -19,7 +19,7 @@ export const interactionResolverGovernanceSchema = z.object({
   request_confirmation: interactionResolverKindGovernanceSchema.optional(),
   request_checkbox_confirmation: interactionResolverKindGovernanceSchema.optional(),
   request_item_verdicts: interactionResolverKindGovernanceSchema.optional(),
-  // STUDIO-0091: the delays of a question between roles left without an answer (the addressee's relaunch, then
+  // STUDIO-0089: the delays of a question between roles left without an answer (the addressee's relaunch, then
   // the card to its manager); `enabled: false` switches both off for the company.
   unansweredAgentQuestion: z.object({
     enabled: z.boolean().optional(),
