@@ -27,7 +27,7 @@ let database: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>>;
 let db: ReturnType<typeof createDb>;
 let home: string;
 let service: ReturnType<typeof aiConnectionService>;
-const binding = { provider: "anthropic", method: "api_key", mode: "responsible_user" } as const;
+const binding = { provider: "openai", method: "api_key", mode: "responsible_user" } as const;
 
 beforeAll(async () => {
   home = await realpath(await mkdtemp(path.join(os.tmpdir(), "paperclip-ai-repair-")));
@@ -52,12 +52,12 @@ describe("the repair card of an AI account that works again", () => {
     });
     return { companyId, owner, wakeup, roles: [] as string[], account: null as null | Awaited<ReturnType<typeof service.save>> };
   }
-  const accountInput = (s: Scene) => ({ provider: "anthropic" as const, method: "api_key" as const, ownership: "personal" as const,
+  const accountInput = (s: Scene) => ({ provider: "openai" as const, method: "api_key" as const, ownership: "personal" as const,
     name: "Roles account", apiKey: "fixture", agentIds: s.roles, allAgents: false });
   /** A role on the account, with its task. */
   async function role(s: Scene, name: string, status = "in_progress") {
     const agentId = randomUUID(), issueId = randomUUID();
-    await db.insert(agents).values({ id: agentId, companyId: s.companyId, name, adapterType: "claude_local", runtimeConfig: { aiConnection: binding } });
+    await db.insert(agents).values({ id: agentId, companyId: s.companyId, name, adapterType: "codex_local", runtimeConfig: { aiConnection: binding } });
     await db.insert(issues).values({ id: issueId, companyId: s.companyId, title: `Task of ${name}`, status, assigneeAgentId: agentId });
     s.roles.push(agentId);
     return { agentId, issueId };
@@ -71,7 +71,7 @@ describe("the repair card of an AI account that works again", () => {
   async function refusedByProvider(s: Scene, r: Role, extraContext: Record<string, unknown> = {}) {
     const runId = randomUUID();
     const runtime = await prepareManagedAiRuntime(db, { companyId: s.companyId, agentId: r.agentId, responsibleUserId: s.owner,
-      adapterType: "claude_local", binding, config: {} });
+      adapterType: "codex_local", binding, config: {} });
     await db.insert(heartbeatRuns).values({ id: runId, companyId: s.companyId, agentId: r.agentId, status: "failed", errorCode: "refresh_token_reused",
       responsibleUserId: s.owner, finishedAt: new Date(),
       contextSnapshot: { issueId: r.issueId, aiConnection: { ...runtime.attribution, identity: runtime.identity }, ...extraContext } });
@@ -89,11 +89,11 @@ describe("the repair card of an AI account that works again", () => {
   }
   async function cardOf(s: Scene, runId: string) {
     const asked = await connectionIntentService(db).requestForRunAuthFailure(runId);
-    expect(asked).toMatchObject({ state: "needs_user_action", service: "anthropic" });
+    expect(asked).toMatchObject({ state: "needs_user_action", service: "openai" });
     return asked!.interactionId!;
   }
   /** The owner signs in again: the product's own reconnection of the same account. */
-  const reconnect = (s: Scene) => service.save(s.companyId, s.owner, { ...accountInput(s), connectionId: s.account!.connectionId }, "fixture-key-2");
+  const reconnect = (s: Scene) => service.save(s.companyId, s.owner, { ...accountInput(s), connectionId: s.account!.connectionId }, "fixture-key-1");
   /** The owner closes one card, by the real route. */
   async function closeCard(s: Scene, cardId: string) {
     const app = express();
@@ -204,7 +204,7 @@ describe("the repair card of an AI account that works again", () => {
       agentId: r.agentId, status: "running", responsibleUserId: s.owner, contextSnapshot: { issueId: r.issueId }, createdAt: new Date(Date.now() + 1000) }); } },
     { label: "the task was given to another role", prepare: async (s: Scene, r: Role) => {
       const other = randomUUID();
-      await db.insert(agents).values({ id: other, companyId: s.companyId, name: "Other role", adapterType: "claude_local" });
+      await db.insert(agents).values({ id: other, companyId: s.companyId, name: "Other role", adapterType: "codex_local" });
       await db.update(issues).set({ assigneeAgentId: other }).where(eq(issues.id, r.issueId)); } },
     { label: "the task is held by a person", prepare: async (s: Scene, r: Role) => {
       await db.update(issues).set({ assigneeUserId: s.owner }).where(eq(issues.id, r.issueId)); } },
