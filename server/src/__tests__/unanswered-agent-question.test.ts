@@ -307,6 +307,21 @@ describe("a question between roles left without an answer", () => {
     expect(wake).not.toHaveBeenCalled();
   });
 
+  it("a manager that cannot be addressed is given no card: said once on the task", async () => {
+    const f = await seed();
+    const card = await ask(f);
+    await readAndDidNotAnswer(f, card);
+    await db.update(agents).set({ status: "pending_approval" }).where(eq(agents.id, f.manager));
+    const wake = spy();
+    expect(await pass(f, card, 5, wake)).toBe("relaunched");
+    expect(await pass(f, card, 15, wake)).toBe("manager_not_asked");
+    expect(await pass(f, card, 16, wake)).toBe("done");
+    expect(wakesTo(wake, f.manager)).toHaveLength(0);
+    expect(await cardsOf(f)).toHaveLength(1);
+    expect(await saidOf(f, UNANSWERED_QUESTION_MANAGER_ACTION)).toEqual([expect.objectContaining({ interactionId: card.id, asked: false,
+      reason: "manager_not_addressable" })]);
+  });
+
   it("an addressee without a manager: the relaunch, then nothing more, said once", async () => {
     const f = await seed({ manager: false });
     const card = await ask(f);
