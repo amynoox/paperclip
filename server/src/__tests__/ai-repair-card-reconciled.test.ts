@@ -177,6 +177,8 @@ describe("the repair card of an AI account that works again", () => {
     for (let index = 0; index < 3; index += 1) await sweep(s);
     expect((await card(failed.card)).status).toBe("pending");
     expect(s.wakeup).not.toHaveBeenCalled();
+    // Still pending, it holds a continuation as any pending card does, though the account answers.
+    expect(await connectionContinuationPendingResponse(db, await task(r.issueId), s.owner, null)).toBe("interaction");
     // The same account, put back in service after the failure: retired.
     await healthyWithoutReconnection(s, new Date(run.finishedAt!.getTime() + 60_000));
     await sweep(s);
@@ -209,6 +211,12 @@ describe("the repair card of an AI account that works again", () => {
     { label: "the task is done", prepare: async (s: Scene, r: Role) => { await db.update(issues).set({ status: "done" }).where(eq(issues.id, r.issueId)); } },
     { label: "the person addressed left the company", prepare: async (s: Scene) => { await db.update(companyMemberships).set({ status: "inactive" })
       .where(and(eq(companyMemberships.companyId, s.companyId), eq(companyMemberships.principalId, s.owner))); } },
+    { label: "the person addressed is now only a viewer", prepare: async (s: Scene) => { await db.update(companyMemberships).set({ membershipRole: "viewer" })
+      .where(and(eq(companyMemberships.companyId, s.companyId), eq(companyMemberships.principalId, s.owner))); } },
+    { label: "the card's run did not fail on the account", prepare: async (s: Scene, r: Role) => { await db.update(heartbeatRuns).set({ errorCode: "process_lost" })
+      .where(and(eq(heartbeatRuns.companyId, s.companyId), eq(heartbeatRuns.agentId, r.agentId))); } },
+    { label: "the card's run did not fail", prepare: async (s: Scene, r: Role) => { await db.update(heartbeatRuns).set({ status: "succeeded", errorCode: null })
+      .where(and(eq(heartbeatRuns.companyId, s.companyId), eq(heartbeatRuns.agentId, r.agentId))); } },
   ])("after the reconnection, the card is left alone when $label", async ({ prepare }) => {
     const s = await scene();
     const r = await role(s, "CTO");
@@ -235,7 +243,8 @@ describe("the repair card of an AI account that works again", () => {
 
   it.each([
     { label: "an agent's setup card", extra: { agentSetup: true } },
-    { label: "an access request", extra: { accessRequest: { connectionId: randomUUID(), connectionName: "Account", tools: [] } } },
+    { label: "an access request", extra: { accessRequest: { connectionId: randomUUID(), connectionName: "Account",
+      tools: [{ catalogEntryId: randomUUID(), toolName: "read", versionHash: "v1", permission: "allowed" }] } } },
     { label: "a card through an upstream app", extra: { upstreamService: { slug: "upstream", name: "Upstream" } } },
   ])("$label of the same account is not touched", async ({ extra }) => {
     const s = await scene();
