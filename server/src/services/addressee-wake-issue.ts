@@ -27,7 +27,26 @@ function readNonEmptyString(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value : null;
 }
 
-/** The three checks of the creation field, and a fourth: it needs an addressee agent. Throws 422. */
+/**
+ * STUDIO-0092: ONE refusal for every reason the named task cannot be used. Three different messages told a caller
+ * whether a task it cannot see exists in the company, whose it is, and whether it is open.
+ */
+export const ADDRESSEE_WAKE_ISSUE_REFUSED =
+  "addresseeWakeIssueId cannot be used for this card: name a task in progress or in review that is assigned to the addressee agent and that you can comment";
+
+/** The refusal itself, for the entries that check the creator's access before the card is created. */
+export function refuseAddresseeWakeIssue(): never {
+  throw unprocessable(ADDRESSEE_WAKE_ISSUE_REFUSED);
+}
+
+/** STUDIO-0092: the addressee is woken only on a task it is at work on: `todo`, `backlog` and `blocked` are refused. */
+const ADDRESSEE_WAKE_ISSUE_STATUSES = ["in_progress", "in_review"];
+
+/**
+ * The checks of the creation field on the named task and the addressee: same company, assigned to the addressee
+ * agent, in progress or in review; and the field needs an addressee agent. Throws 422, with one message for the task.
+ * The creator's own access to the named task is checked by each entry (the route, a plugin's createInteraction).
+ */
 export async function assertAddresseeWakeIssue(db: Pick<Db, "select">, input: {
   companyId: string;
   addresseeAgentId: string | null | undefined;
@@ -37,14 +56,9 @@ export async function assertAddresseeWakeIssue(db: Pick<Db, "select">, input: {
   const [wakeIssue] = await db
     .select({ companyId: issues.companyId, assigneeAgentId: issues.assigneeAgentId, status: issues.status })
     .from(issues).where(eq(issues.id, input.addresseeWakeIssueId)).limit(1);
-  if (!wakeIssue || wakeIssue.companyId !== input.companyId) {
-    throw unprocessable("addresseeWakeIssueId must reference an issue of the same company");
-  }
-  if (wakeIssue.assigneeAgentId !== input.addresseeAgentId) {
-    throw unprocessable("addresseeWakeIssueId must reference an issue assigned to the addressee agent");
-  }
-  if (wakeIssue.status === "done" || wakeIssue.status === "cancelled") {
-    throw unprocessable("addresseeWakeIssueId must reference an issue that is not done or cancelled");
+  if (!wakeIssue || wakeIssue.companyId !== input.companyId || wakeIssue.assigneeAgentId !== input.addresseeAgentId
+      || !ADDRESSEE_WAKE_ISSUE_STATUSES.includes(wakeIssue.status)) {
+    refuseAddresseeWakeIssue();
   }
 }
 

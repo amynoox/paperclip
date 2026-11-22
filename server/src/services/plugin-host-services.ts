@@ -38,7 +38,7 @@ import type {
 import type { CreateIssueThreadInteraction, InviteJoinType, IssueDocumentSummary, IssueRelationIssueSummary, PermissionKey, PrincipalType } from "@paperclipai/shared";
 import { pluginOperationIssueOriginKind } from "@paperclipai/shared";
 import { PLUGIN_BLOCKED_WAKE_CONTEXT_SOURCE, pluginBlockedWakeMark } from "./plugin-blocked-wake.js";
-import { addresseeWakeTarget } from "./addressee-wake-issue.js";
+import { addresseeWakeTarget, refuseAddresseeWakeIssue } from "./addressee-wake-issue.js";
 import { companyService } from "./companies.js";
 import { agentService } from "./agents.js";
 import { projectService } from "./projects.js";
@@ -2752,6 +2752,13 @@ export function buildHostServices(
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
         const issue = requireInCompany("Issue", await issues.getById(params.issueId), companyId);
+        // STUDIO-0092: the plugin must be able to read the task it names for the wake; otherwise the same refusal as
+        // for any task that cannot be used.
+        const namedWakeIssueId = (params.interaction as CreateIssueThreadInteraction).addresseeWakeIssueId;
+        if (namedWakeIssueId && namedWakeIssueId !== issue.id) {
+          const named = await issues.getById(namedWakeIssueId);
+          if (!inCompany(named, companyId) || !(await pluginCanReadIssue(named))) refuseAddresseeWakeIssue();
+        }
         const interaction = await issueThreadInteractionService(db).create(issue, params.interaction as CreateIssueThreadInteraction, {
           agentId: params.authorAgentId ?? null,
         });
