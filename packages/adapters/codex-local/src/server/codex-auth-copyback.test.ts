@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, lstat, mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -121,6 +121,102 @@ describe("copyBackCodexAuth", () => {
     expect(result.leftoverEntries).toEqual([]);
     // Never leak token bytes in log output.
     expect(result.logs.join("\n")).not.toContain("SENTINEL");
+  });
+
+  // STUDIO-0091: the managed Codex home of a run holds `auth.json` as a LINK to the file the server issued for that run.
+  // Every credential below is FABRICATED by `subscriptionAuth` (made-up tokens, made-up account ids): no real login
+  // file is read by these tests.
+  async function managedHome(issuedAuth: string, link: "absolute" | "relative" | "chain" = "absolute") {
+    const root = await makeHostDir();
+    const issuedDir = path.join(root, "issued", "provider");
+    const generatedHome = path.join(root, "generated-home");
+    await mkdir(issuedDir, { recursive: true });
+    await mkdir(generatedHome, { recursive: true });
+    const issuedAuthPath = path.join(issuedDir, "auth.json");
+    await writeFile(issuedAuthPath, issuedAuth, { mode: 0o600 });
+    const homeAuthPath = path.join(generatedHome, "auth.json");
+    if (link === "absolute") await symlink(issuedAuthPath, homeAuthPath);
+    if (link === "relative") await symlink(path.join("..", "issued", "provider", "auth.json"), homeAuthPath);
+    if (link === "chain") {
+      const middle = path.join(root, "middle-auth.json");
+      await symlink(issuedAuthPath, middle);
+      await symlink(middle, homeAuthPath);
+    }
+    return { root, issuedDir, issuedAuthPath, generatedHome, homeAuthPath };
+  }
+  async function copyBackThroughLink(home: Awaited<ReturnType<typeof managedHome>>, sandboxAuth: string) {
+    const logs: string[] = [];
+    const outcome = await copyBackCodexAuth({ readSandboxAuth: async () => Buffer.from(sandboxAuth, "utf8"), hostAuthPath: home.homeAuthPath,
+      log: (line) => { logs.push(line); } });
+    return { outcome, logs };
+  }
+
+  it.each(["absolute", "relative", "chain"] as const)("installs a strictly-newer fabricated credential INTO the file a managed home's link points at (%s link), and keeps the link", async (link) => {
+    const issued = subscriptionAuth({ accountId: "acct-fabricated", lastRefresh: OLDER, marker: "issued-older-SENTINEL" });
+    const refreshed = subscriptionAuth({ accountId: "acct-fabricated", lastRefresh: NEWER, marker: "refreshed-newer-SENTINEL" });
+    const home = await managedHome(issued, link);
+    const linkBefore = await readlink(home.homeAuthPath);
+
+    const result = await copyBackThroughLink(home, refreshed);
+
+    expect(result.outcome).toBe("copied");
+    // The file the server issued, and reads again at the end of the run, holds the refreshed credential.
+    expect(await readFile(home.issuedAuthPath, "utf8")).toBe(refreshed);
+    expect((await lstat(home.issuedAuthPath)).isSymbolicLink()).toBe(false);
+    expect((await lstat(home.issuedAuthPath)).mode & 0o777).toBe(0o600);
+    // The home still holds a link, the same one: it was not replaced by a regular file.
+    expect((await lstat(home.homeAuthPath)).isSymbolicLink()).toBe(true);
+    expect(await readlink(home.homeAuthPath)).toBe(linkBefore);
+    // No staged copy is left, in the issued folder or in the home.
+    expect(await readdir(home.issuedDir)).toEqual(["auth.json"]);
+    expect(await readdir(home.generatedHome)).toEqual(["auth.json"]);
+    expect(result.logs.join("\n")).not.toContain("SENTINEL");
+  });
+
+  it("through a link, keeps the issued file when the fabricated sandbox copy is not strictly newer or is another account's", async () => {
+    const issued = subscriptionAuth({ accountId: "acct-fabricated", lastRefresh: NEWER, marker: "issued-newer-SENTINEL" });
+    for (const sandbox of [
+      subscriptionAuth({ accountId: "acct-fabricated", lastRefresh: OLDER, marker: "sandbox-older-SENTINEL" }),
+      subscriptionAuth({ accountId: "acct-fabricated", lastRefresh: NEWER, marker: "sandbox-equal-SENTINEL" }),
+      subscriptionAuth({ accountId: "acct-other-fabricated", lastRefresh: "2026-07-09T03:00:00Z", marker: "sandbox-other-SENTINEL" }),
+      apiKeyAuth("fabricated-SENTINEL"),
+    ]) {
+      const home = await managedHome(issued);
+      const result = await copyBackThroughLink(home, sandbox);
+      expect(result.outcome).toBe("kept-host");
+      expect(await readFile(home.issuedAuthPath, "utf8")).toBe(issued);
+      expect((await lstat(home.homeAuthPath)).isSymbolicLink()).toBe(true);
+      expect(await readdir(home.issuedDir)).toEqual(["auth.json"]);
+      expect(result.logs.join("\n")).not.toContain("SENTINEL");
+    }
+  });
+
+  it("writes nothing when the link's target no longer exists: no file is created in a folder the server removed", async () => {
+    const issued = subscriptionAuth({ accountId: "acct-fabricated", lastRefresh: OLDER, marker: "issued-older-SENTINEL" });
+    const refreshed = subscriptionAuth({ accountId: "acct-fabricated", lastRefresh: NEWER, marker: "refreshed-newer-SENTINEL" });
+    const home = await managedHome(issued);
+    await rm(path.join(home.root, "issued"), { recursive: true, force: true });
+
+    const result = await copyBackThroughLink(home, refreshed);
+
+    expect(result.outcome).toBe("kept-host");
+    await expect(stat(path.join(home.root, "issued"))).rejects.toMatchObject({ code: "ENOENT" });
+    expect((await lstat(home.homeAuthPath)).isSymbolicLink()).toBe(true);
+    expect(await readdir(home.generatedHome)).toEqual(["auth.json"]);
+    expect(result.logs.join("\n")).toContain("no longer exists");
+    expect(result.logs.join("\n")).not.toContain("SENTINEL");
+  });
+
+  it("fails loud on a loop of links and writes nothing", async () => {
+    const root = await makeHostDir();
+    const first = path.join(root, "auth.json");
+    const second = path.join(root, "other-auth.json");
+    await symlink(second, first);
+    await symlink(first, second);
+    const refreshed = subscriptionAuth({ accountId: "acct-fabricated", lastRefresh: NEWER, marker: "refreshed-newer-SENTINEL" });
+    await expect(copyBackCodexAuth({ readSandboxAuth: async () => Buffer.from(refreshed, "utf8"), hostAuthPath: first, log: () => undefined }))
+      .rejects.toThrow("too many credential links");
+    expect((await readdir(root)).sort()).toEqual(["auth.json", "other-auth.json"]);
   });
 
   it("keeps the host auth when the sandbox copy is not strictly newer", async () => {
