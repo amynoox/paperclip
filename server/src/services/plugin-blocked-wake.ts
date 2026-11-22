@@ -24,7 +24,7 @@
 // load on a server without this patch (a roll-back of the server would stop it). An unknown field is dropped.
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agentWakeupRequests, plugins } from "@paperclipai/db";
+import { agentWakeupRequests, heartbeatRuns, plugins } from "@paperclipai/db";
 import { PLUGIN_BLOCKED_ISSUE_WAKE_PLUGIN_KEYS, PLUGIN_BLOCKED_ISSUE_WAKE_REASONS } from "@paperclipai/shared";
 import { readPluginBlockedWake } from "../modules/run-dispatch/domain/wake-context.js";
 
@@ -57,25 +57,76 @@ export function pluginBlockedWakeMark(input: {
   return { pluginId: input.pluginId, reason: input.reason };
 }
 
+/** Who asked for a wake: read from its request row. Only the plugin's door asks as the system for that plugin. */
+async function requestedByThePlugin(db: Pick<Db, "select">, wakeupRequestId: string | null, pluginId: string): Promise<boolean> {
+  if (!wakeupRequestId) return false;
+  const [requester] = await db.select({ type: agentWakeupRequests.requestedByActorType, id: agentWakeupRequests.requestedByActorId })
+    .from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeupRequestId)).limit(1);
+  return requester?.type === "system" && requester.id === pluginId;
+}
+
+/**
+ * The retry path. A context that says "I am a retry" proves nothing: anyone who could write a context could write
+ * that. What proves it is the server's own state: the run being judged is a row whose `retry_of_run_id` the server
+ * wrote, the run it retries carried the same mark (same plugin, same reason, the fixed source the plugin's door
+ * writes) for the same agent and the same issue, and so on back to the run the plugin's door asked for, whose wake
+ * request names the plugin. No run to judge (the admission of a new wake): no retry path.
+ */
+async function serverRetryOfThePluginWake(db: Pick<Db, "select">, input: {
+  runId: string | null | undefined;
+  contextSnapshot: Record<string, unknown> | null | undefined;
+  mark: { pluginId: string; reason: string };
+}): Promise<boolean> {
+  if (!input.runId) return false;
+  const context = input.contextSnapshot ?? {};
+  const seen = new Set<string>();
+  let judgedId = input.runId;
+  // The server's retries of one run are bounded; the count only guards this loop.
+  for (let hop = 0; hop < 50; hop += 1) {
+    if (seen.has(judgedId)) return false;
+    seen.add(judgedId);
+    const [judged] = await db.select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId, retryOfRunId: heartbeatRuns.retryOfRunId })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, judgedId)).limit(1);
+    if (!judged?.retryOfRunId) return false;
+    if (hop === 0 && context.retryOfRunId !== judged.retryOfRunId) return false;
+    const [retried] = await db.select({ companyId: heartbeatRuns.companyId, agentId: heartbeatRuns.agentId, retryOfRunId: heartbeatRuns.retryOfRunId,
+      wakeupRequestId: heartbeatRuns.wakeupRequestId, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns).where(eq(heartbeatRuns.id, judged.retryOfRunId)).limit(1);
+    if (!retried || retried.companyId !== judged.companyId || retried.agentId !== judged.agentId) return false;
+    const retriedContext = (retried.contextSnapshot ?? {}) as Record<string, unknown>;
+    const retriedMark = (retriedContext.pluginBlockedWake ?? {}) as Record<string, unknown>;
+    if (retriedMark.pluginId !== input.mark.pluginId || retriedMark.reason !== input.mark.reason) return false;
+    if (retriedContext.source !== PLUGIN_BLOCKED_WAKE_CONTEXT_SOURCE || retriedContext.issueId !== context.issueId) return false;
+    if (!retried.retryOfRunId) {
+      return retriedContext.wakeReason === input.mark.reason && requestedByThePlugin(db, retried.wakeupRequestId, input.mark.pluginId);
+    }
+    judgedId = judged.retryOfRunId;
+  }
+  return false;
+}
+
 /**
  * Whether a wake may run although its issue has unresolved blockers, as a plugin's verified wake. The requester is
- * the one of the wake request (given, or read by its id); a retry the server itself creates (a resource wait) keeps
- * the context but has no request of its own, and is admitted on the mark and the plugin's state.
+ * the one of the wake request (given at the admission, or read by its id). A retry the server itself creates (a lost
+ * link, a resource wait) keeps the context and has a request of the server's own: it is admitted only when the
+ * database says it is the server's retry of the plugin's wake (serverRetryOfThePluginWake); `runId` is the run being
+ * judged, when there is one.
  */
 export async function verifyPluginBlockedWake(db: Pick<Db, "select">, input: {
   contextSnapshot: Record<string, unknown> | null | undefined;
   requestedByActorType?: string | null;
   requestedByActorId?: string | null;
   wakeupRequestId?: string | null;
+  runId?: string | null;
 }): Promise<boolean> {
   const mark = readPluginBlockedWake(input.contextSnapshot, PLUGIN_BLOCKED_ISSUE_WAKE_REASONS);
   if (!mark) return false;
-  if (!mark.serverRetry) {
-    const requester = input.wakeupRequestId
-      ? await db.select({ type: agentWakeupRequests.requestedByActorType, id: agentWakeupRequests.requestedByActorId })
-        .from(agentWakeupRequests).where(eq(agentWakeupRequests.id, input.wakeupRequestId)).then((rows) => rows[0] ?? null)
-      : { type: input.requestedByActorType ?? null, id: input.requestedByActorId ?? null };
-    if (requester?.type !== "system" || requester.id !== mark.pluginId) return false;
+  if (mark.serverRetry) {
+    if (!(await serverRetryOfThePluginWake(db, { runId: input.runId, contextSnapshot: input.contextSnapshot, mark }))) return false;
+  } else if (input.wakeupRequestId) {
+    if (!(await requestedByThePlugin(db, input.wakeupRequestId, mark.pluginId))) return false;
+  } else if (input.requestedByActorType !== "system" || input.requestedByActorId !== mark.pluginId) {
+    return false;
   }
   const [plugin] = await db.select({ status: plugins.status, pluginKey: plugins.pluginKey, manifest: plugins.manifestJson }).from(plugins)
     .where(and(eq(plugins.id, mark.pluginId))).limit(1);
