@@ -1,4 +1,4 @@
-import { mkdir, open, rename, rm } from "node:fs/promises";
+import { lstat, mkdir, open, readlink, rename, rm } from "node:fs/promises";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { withDirectoryMergeLock } from "@paperclipai/adapter-utils/workspace-restore-merge";
@@ -22,6 +22,35 @@ import {
 // source) means "install the sandbox copy onto the host" and exit 20 (keep
 // destination) means "leave the host copy untouched". The predicate only ever
 // reads the two files and exits with a code; it never prints token bytes.
+
+// STUDIO-0091: the host credential may be a LINK. The managed Codex home of a run holds `auth.json` as a symlink to the
+// file the server issued for that run (codex-home.ts, SYMLINKED_SHARED_FILES), and the server reads that issued file
+// again when the run ends, to save a refreshed credential into the secret (server ai-connection-runtime.ts). Renaming
+// the staged copy onto the link replaced the LINK by a regular file and left the issued file as it was: the refreshed
+// credential of a run over ssh never reached the secret, and every later run started with a refresh token already
+// used (`refresh_token_reused`). The copy-back now follows the link to the file it points at, and stages, decides and
+// renames there, as Codex itself does (openai/codex 0.170.0, login/src/auth/storage_file.rs: "Symlinks retain their
+// target"). A link whose target no longer exists is left alone: nothing is created in a folder the server removed.
+const MAX_CREDENTIAL_LINKS = 40;
+
+async function resolveCredentialLink(filePath: string): Promise<{ path: string; followedLink: boolean; exists: boolean }> {
+  let current = filePath;
+  let followedLink = false;
+  for (let hop = 0; hop < MAX_CREDENTIAL_LINKS; hop += 1) {
+    let stats;
+    try {
+      stats = await lstat(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code === "ENOENT") return { path: current, followedLink, exists: false };
+      throw error;
+    }
+    if (!stats.isSymbolicLink()) return { path: current, followedLink, exists: true };
+    const target = await readlink(current);
+    current = path.isAbsolute(target) ? target : path.join(path.dirname(current), target);
+    followedLink = true;
+  }
+  throw new Error("codex auth copy-back: too many credential links");
+}
 
 /** Outcome of a copy-back attempt. No token material is ever surfaced. */
 export type CopyBackCodexAuthOutcome = "copied" | "kept-host";
@@ -98,7 +127,14 @@ export async function copyBackCodexAuth(input: CopyBackCodexAuthInput): Promise<
     throw error;
   }
 
-  const hostDir = path.dirname(hostAuthPath);
+  // STUDIO-0091: the file the host credential really is, when `hostAuthPath` is a link to it.
+  const hostTarget = await resolveCredentialLink(hostAuthPath);
+  if (hostTarget.followedLink && !hostTarget.exists) {
+    await log("[paperclip] Codex auth copy-back: the host credential is a link whose target no longer exists; nothing was written.");
+    return "kept-host";
+  }
+  const hostTargetPath = hostTarget.path;
+  const hostDir = path.dirname(hostTargetPath);
   await mkdir(hostDir, { recursive: true });
   const hostOutcome = await withDirectoryMergeLock(
     hostDir,
@@ -114,12 +150,12 @@ export async function copyBackCodexAuth(input: CopyBackCodexAuthInput): Promise<
         await handle.writeFile(sandboxAuthBytes);
         await handle.close();
 
-        const decision = await decideCodexAuthMerge(stagedTempPath, hostAuthPath, {
+        const decision = await decideCodexAuthMerge(stagedTempPath, hostTargetPath, {
           errorLabel: "codex auth copy-back",
         });
         if (decision === USE_SOURCE_EXIT) {
           // Atomic same-directory swap; rename preserves the temp's 0600 mode.
-          await rename(stagedTempPath, hostAuthPath);
+          await rename(stagedTempPath, hostTargetPath);
           await log(
             "[paperclip] Codex auth copy-back: sandbox credential is strictly newer for the same subscription identity; installed to the host at mode 0600.",
           );

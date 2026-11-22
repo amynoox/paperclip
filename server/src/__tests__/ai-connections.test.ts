@@ -588,6 +588,41 @@ describe("managed AI connections", () => {
     } finally { release.resolve(); await Promise.allSettled([probing, refreshing]); lock?.mockRestore(); request.mockRestore(); }
   });
 
+  // STUDIO-0091: a run over ssh refreshed its login on the machine. Its copy is brought back by the adapter's copy-back,
+  // whose target is `auth.json` of the run's generated Codex home: a LINK to the file the server issued. The refreshed
+  // credential must land in that issued file, so that the cleanup of the run saves it into the secret. Every
+  // credential here is FABRICATED (made-up tokens and account): no real login file is read.
+  it("saves into the secret the fabricated credential a run over ssh refreshed, brought back through the managed home's link", async () => {
+    const owner = "ssh-run-refresh-fabricated";
+    await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
+    const auth = (hour: string) => JSON.stringify({ tokens: { account_id: owner, id_token: "fabricated-identity", access_token: `fabricated-access-${hour}`,
+      refresh_token: `fabricated-refresh-${hour}` }, last_refresh: `2026-09-10T${hour}:00:00Z` });
+    await service.save(companyId, owner, { provider: "openai", method: "subscription", ownership: "personal", name: owner, loginSessionId: "fixture", agentIds: [], allAgents: true }, auth("10"));
+    const [row] = await service.quotaAccounts(companyId, owner);
+    expect(await service.credential(row)).toBe(auth("10"));
+    const generatedHome = await mkdtemp(path.join(home, "generated-codex-home-"));
+    const outcomes: string[] = [];
+    await withManagedAiProbe(db, { companyId, agentId, responsibleUserId: owner, adapterType: "codex_local",
+      binding: { provider: "openai", method: "subscription", mode: "responsible_user" }, config: {} }, async runtime => {
+      const issuedAuthPath = path.join(String(runtime.config.env.CODEX_HOME), "auth.json");
+      expect(await readFile(issuedAuthPath, "utf8")).toBe(auth("10"));
+      // The generated home of the run: `auth.json` is a link to the issued file, as seedManagedCodexHome makes it.
+      const homeAuthPath = path.join(generatedHome, "auth.json");
+      await fs.symlink(issuedAuthPath, homeAuthPath);
+      // The engine refreshed on the machine; the adapter brings its copy back onto the home's `auth.json`.
+      outcomes.push(await codexAdapter.copyBackCodexAuth({ readSandboxAuth: async () => Buffer.from(auth("11"), "utf8"), hostAuthPath: homeAuthPath, log: () => undefined }));
+      expect((await fs.lstat(homeAuthPath)).isSymbolicLink()).toBe(true);
+      expect(await readFile(issuedAuthPath, "utf8")).toBe(auth("11"));
+    });
+    expect(outcomes).toEqual(["copied"]);
+    // The cleanup of the run saved the refreshed credential: the next run starts with it.
+    expect(await service.credential(row)).toBe(auth("11"));
+    await withManagedAiProbe(db, { companyId, agentId, responsibleUserId: owner, adapterType: "codex_local",
+      binding: { provider: "openai", method: "subscription", mode: "responsible_user" }, config: {} }, async runtime => {
+      expect(await readFile(path.join(String(runtime.config.env.CODEX_HOME), "auth.json"), "utf8")).toBe(auth("11"));
+    });
+  });
+
   it("persists native Codex setup's refreshed selected login without changing existing agents", async () => {
     const owner = "native-codex-setup-refresh";
     await db.insert(companyMemberships).values({ companyId, principalId: owner, principalType: "user", status: "active", membershipRole: "member" });
