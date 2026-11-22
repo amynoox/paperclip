@@ -1,4 +1,4 @@
-// STUDIO-0087 (lot 26, R2): a question one role asks another, left without an answer, is taken up by the server.
+// STUDIO-0091 (lot 26, R2): a question one role asks another, left without an answer, is taken up by the server.
 //
 // The facts. Production, 22 Nov 2026. TR-2394: a card addressed to the CTO; the CTO was woken once, at the card's
 // creation, its run succeeded, and it did not answer; nothing woke it again and the card waited for hours. A card
