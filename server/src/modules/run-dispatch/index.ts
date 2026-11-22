@@ -36,6 +36,8 @@ export {
   allowsIssueInteractionWake,
   allowsDependencyBlockedWake,
   isResolvedInteractionContinuationWakeContext,
+  carriesPluginBlockedWake,
+  PLUGIN_BLOCKED_WAKE_KEY,
 } from "./domain/wake-context.js";
 export type {
   RetryReasonKind,

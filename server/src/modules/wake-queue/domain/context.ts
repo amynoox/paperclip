@@ -4,7 +4,7 @@
 // shape; this file holds only the small pieces that are specific to
 // building the release half's promoted-run snapshot.
 
-import { extractWakeCommentIds, WAKE_COMMENT_IDS_KEY, wakeChatConversationsConflict } from "../../run-dispatch/index.js";
+import { carriesPluginBlockedWake, extractWakeCommentIds, WAKE_COMMENT_IDS_KEY, wakeChatConversationsConflict } from "../../run-dispatch/index.js";
 import { parseObject, readNonEmptyString } from "./values.js";
 
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
@@ -86,7 +86,9 @@ export function wakeMustNotJoinActiveRun(
   return hasRetainedExternalChatRetry(activeRunContext) || interactionReceipt || Boolean(parseObject(activeRunContext).interactionId) ||
     Boolean(readNonEmptyString(parseObject(activeRunContext).contextCompactionRequestId)) ||
     Boolean(readNonEmptyString(wakeContext.contextCompactionRequestId)) ||
-    wakeChatConversationsConflict(activeRunContext, wakeContext);
+    wakeChatConversationsConflict(activeRunContext, wakeContext) ||
+    // STUDIO-0093: a plugin's wake on a blocked issue keeps its own run, in either arrival order.
+    carriesPluginBlockedWake(activeRunContext) || carriesPluginBlockedWake(wakeContext);
 }
 
 export function hasRetainedExternalChatRetry(context: unknown): boolean {

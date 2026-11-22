@@ -55,7 +55,7 @@ import {
   queuedCommentIdsFromRunContext,
   withQueuedCommentIdsInWakePayload,
 } from "../../../services/issue-queued-comment-queue.js";
-import { CHAT_CONVERSATION_ID_KEY, extractWakeCommentIds, verifyAddresseeInteractionWake } from "../../run-dispatch/index.js";
+import { CHAT_CONVERSATION_ID_KEY, PLUGIN_BLOCKED_WAKE_KEY, extractWakeCommentIds, verifyAddresseeInteractionWake } from "../../run-dispatch/index.js";
 import { hasInteractionContinuationWakeContext } from "../domain/context.js";
 import { decidePreDrain, type PreDrainFacts } from "../domain/policy.js";
 import {
@@ -962,6 +962,8 @@ export function createWakeAdmissionReader(): WakeAdmissionReader {
             // wake instead of starting another one behind the receipt.
             sql`${agentWakeupRequests.payload} ->> 'interactionId' is null`,
             sql`${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text ->> 'interactionId' is null`,
+            // STUDIO-0093: nor does a plugin's waiting wake on a blocked issue; a later wake joins an ordinary one.
+            sql`${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text -> ${PLUGIN_BLOCKED_WAKE_KEY}::text ->> 'pluginId' is null`,
             ...(chatConversationId
               ? [
                   sql`coalesce(${agentWakeupRequests.payload} -> ${DEFERRED_WAKE_CONTEXT_KEY}::text ->> ${CHAT_CONVERSATION_ID_KEY}::text, ${chatConversationId}) = ${chatConversationId}`,

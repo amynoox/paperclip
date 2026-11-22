@@ -192,7 +192,7 @@ import {
   WORKSPACE_WORKTREE_REQUIRES_PROJECT_REMEDIATION,
 } from "../execution-workspace-policy.js";
 import { readContinuationAttempt } from "../recovery/index.js";
-import { addresseeWakePassesRecoveryHold, allowsDependencyBlockedWake, verifyAddresseeInteractionWake, verifyNonAssigneeAddresseeInteractionWake, requeueAdoptedCommentsForAssignee, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
+import { addresseeWakePassesRecoveryHold, allowsDependencyBlockedWake, carriesPluginBlockedWake, verifyAddresseeInteractionWake, verifyNonAssigneeAddresseeInteractionWake, requeueAdoptedCommentsForAssignee, wakeChatConversationsConflict } from "../../modules/run-dispatch/index.js";
 import { withAgentStartLock } from "../agent-start-lock.js";
 import {
   evaluateAgentInvokability,
@@ -2484,7 +2484,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
           sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
         ), sql`${agentWakeupRequests.payload}->>'mutation' = 'interaction'`,
-        dependencyResolvedWakePayloadSql),
+        dependencyResolvedWakePayloadSql,
+        // STUDIO-0093: a plugin's wake on a blocked issue that waited behind a run cancelled before it started (for
+        // the blocker, at the start gate) has no owner run left to promote it.
+        sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,pluginBlockedWake,pluginId}' is not null`),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         or(
           sql`NOT EXISTS (SELECT 1 FROM heartbeat_runs live_issue_run
@@ -2507,6 +2510,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         await verifyAddresseeInteractionWake(db, { companyId: wake.companyId, issueId: String(wake.payload?.issueId),
           agentId: wake.agentId, contextSnapshot: parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]) });
       if (!dependencyWake && !pendingAddresseeWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
+          !carriesPluginBlockedWake(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]) &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
       const requeuedFromRunId = readNonEmptyString(parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]).requeuedFromRunId);
       if (requeuedFromRunId && wake.idempotencyKey === `stale-addressee-requeue:${requeuedFromRunId}`) {
@@ -5445,7 +5449,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               : null;
           // External input owns an exact authorized source batch. Board input
           // must retain its separate receipt, including during normal resume.
-          const canCoalesceComments = !durableRequest && !isConversation(issue) && opts.allowRunCoalescing !== false;
+          // STUDIO-0093: nor does a plugin's wake on a blocked issue take in the comments that wait for the issue.
+          const canCoalesceComments = !durableRequest && !isConversation(issue) && opts.allowRunCoalescing !== false &&
+            !carriesPluginBlockedWake(enrichedContextSnapshot);
           // A resumed receipt already passed admission under this issue lock.
           // Consume it with its successor even when chat keeps other messages
           // in separate turns, or finalization will deliver it a second time.
