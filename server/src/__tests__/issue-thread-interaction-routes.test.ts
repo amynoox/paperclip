@@ -903,6 +903,64 @@ describe("issue thread interaction routes", () => {
         contextSnapshot: expect.objectContaining({ wakeReason: "interaction_pending" }),
       }),
     );
+    // STUDIO-0087: without the creation field, the wake stays on the card's task and names no other task.
+    const [, wake] = mockHeartbeatService.wakeup.mock.calls.at(-1)!;
+    expect(wake.contextSnapshot).toMatchObject({ issueId: ISSUE_ID, taskId: ISSUE_ID });
+    expect(wake.contextSnapshot).not.toHaveProperty("interactionIssueId");
+  });
+
+  it("STUDIO-0087: wakes the addressed agent on the task named by addresseeWakeIssueId, and keeps the card's task in the context", async () => {
+    mockInteractionService.create.mockResolvedValueOnce({
+      id: "interaction-own-task",
+      companyId: "company-1",
+      issueId: ISSUE_ID,
+      kind: "ask_user_questions",
+      status: "pending",
+      continuationPolicy: "wake_assignee",
+      addresseeAgentId: ASSIGNEE_AGENT_ID,
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "anyone",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: null,
+      payload: { version: 1, questions: [] },
+      result: null,
+      createdAt: "2026-07-25T12:00:00.000Z",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/interactions`)
+      .send({
+        kind: "ask_user_questions",
+        addresseeAgentId: ASSIGNEE_AGENT_ID,
+        addresseeWakeIssueId: OTHER_ISSUE_ID,
+        payload: {
+          version: 1,
+          questions: [{
+            id: "scope",
+            prompt: "Which scope?",
+            selectionMode: "single",
+            options: [{ id: "phase-1", label: "Phase 1" }],
+          }],
+        },
+      });
+
+    expect(res.status).toBe(201);
+    // The service receives the field: its three checks are there (services/issue-thread-interactions.ts).
+    expect(mockInteractionService.create).toHaveBeenCalledWith(expect.anything(),
+      expect.objectContaining({ addresseeWakeIssueId: OTHER_ISSUE_ID }), expect.anything());
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "interaction_pending",
+        idempotencyKey: "interaction-pending:interaction-own-task",
+        payload: expect.objectContaining({ issueId: OTHER_ISSUE_ID, interactionId: "interaction-own-task" }),
+        contextSnapshot: expect.objectContaining({ issueId: OTHER_ISSUE_ID, taskId: OTHER_ISSUE_ID,
+          interactionId: "interaction-own-task", interactionIssueId: ISSUE_ID, wakeReason: "interaction_pending" }),
+      }),
+    );
   });
 
   it("does not route agent attention for a human-only interaction", async () => {

@@ -57,6 +57,7 @@ import { emitAgentTaskRun } from "../../../services/agent-task-run-telemetry.js"
 import { issueService } from "../../../services/issues.js";
 import { verifyBlockerStallWake } from "../../../services/recovery/blocker-stall-wakeups.js";
 import { verifyPluginBlockedWake } from "../../../services/plugin-blocked-wake.js";
+import { verifyOwnIssueInteractionWake } from "../../../services/addressee-wake-issue.js";
 import {
   issueTreeControlService,
   isVerifiedIssueTreeControlInteractionWake,
@@ -657,8 +658,12 @@ export function createPostgresRunDispatchAdapter(
     // STUDIO-0086: a plugin's verified wake keeps its way through when the server retries its run.
     const pluginWakeAdmitted = readiness && !readiness.isDependencyReady
       && await verifyPluginBlockedWake(db, { contextSnapshot: input.contextSnapshot, wakeupRequestId: input.wakeupRequestId });
+    // STUDIO-0087: so does a verified wake of a card, sent to the addressee's own task.
+    const cardWakeAdmitted = readiness && !readiness.isDependencyReady
+      && await verifyOwnIssueInteractionWake(dbOrTx, { companyId: input.companyId, issueId, agentId: input.agentId,
+        contextSnapshot: input.contextSnapshot });
     facts.dependenciesBlocked =
-      readiness && !readiness.isDependencyReady && !stallAdmitted && !responseAdmitted && !pluginWakeAdmitted
+      readiness && !readiness.isDependencyReady && !stallAdmitted && !responseAdmitted && !pluginWakeAdmitted && !cardWakeAdmitted
         ? {
             unresolvedBlockerIssueIds: readiness.unresolvedBlockerIssueIds,
             unresolvedBlockerCount: readiness.unresolvedBlockerCount,
