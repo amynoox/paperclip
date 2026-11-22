@@ -963,6 +963,55 @@ describe("issue thread interaction routes", () => {
     );
   });
 
+  // STUDIO-0087: the request of each of the four MCP tools that create a card (packages/mcp-server/src/tools.ts), as
+  // the tool sends it: the addressee is woken on the task the tool named.
+  it.each([
+    ["suggest_tasks", "wake_assignee", { version: 1, tasks: [{ clientKey: "task-1", title: "One" }] }],
+    ["ask_user_questions", "wake_assignee", { version: 1, questions: [{ id: "scope", prompt: "Which scope?", selectionMode: "single",
+      options: [{ id: "phase-1", label: "Phase 1" }] }] }],
+    ["request_confirmation", "none", { version: 1, prompt: "Is the build you tested the one of this morning?" }],
+    ["request_checkbox_confirmation", "wake_assignee", { version: 1, prompt: "Which files?",
+      options: [{ id: "file-a", label: "File A" }, { id: "file-b", label: "File B" }] }],
+  ])("STUDIO-0087: a %s card created as its MCP tool creates it wakes the addressee on the named task", async (kind, continuationPolicy, payload) => {
+    mockInteractionService.create.mockResolvedValueOnce({
+      id: `interaction-tool-${kind}`,
+      companyId: "company-1",
+      issueId: ISSUE_ID,
+      kind,
+      status: "pending",
+      continuationPolicy,
+      addresseeAgentId: ASSIGNEE_AGENT_ID,
+      requestedResolverPolicy: "anyone",
+      effectiveResolverPolicy: "anyone",
+      idempotencyKey: null,
+      sourceCommentId: null,
+      sourceRunId: null,
+      payload,
+      result: null,
+      createdAt: "2026-07-25T12:00:00.000Z",
+      updatedAt: "2026-07-25T12:00:00.000Z",
+    });
+    const app = await createApp();
+
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/interactions`)
+      .send({ kind, continuationPolicy, addresseeAgentId: ASSIGNEE_AGENT_ID, addresseeWakeIssueId: OTHER_ISSUE_ID, payload });
+
+    expect(res.status).toBe(201);
+    expect(mockInteractionService.create).toHaveBeenCalledWith(expect.anything(),
+      expect.objectContaining({ kind, addresseeAgentId: ASSIGNEE_AGENT_ID, addresseeWakeIssueId: OTHER_ISSUE_ID }), expect.anything());
+    expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+      ASSIGNEE_AGENT_ID,
+      expect.objectContaining({
+        reason: "interaction_pending",
+        idempotencyKey: `interaction-pending:interaction-tool-${kind}`,
+        payload: expect.objectContaining({ issueId: OTHER_ISSUE_ID }),
+        contextSnapshot: expect.objectContaining({ issueId: OTHER_ISSUE_ID, taskId: OTHER_ISSUE_ID, interactionIssueId: ISSUE_ID,
+          wakeReason: "interaction_pending" }),
+      }),
+    );
+  });
+
   it("does not route agent attention for a human-only interaction", async () => {
     mockInteractionService.create.mockResolvedValueOnce({
       id: "interaction-human-attention",
