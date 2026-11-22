@@ -1012,6 +1012,58 @@ describe("issue thread interaction routes", () => {
     );
   });
 
+  // STUDIO-0092: the creator of the card must be allowed to comment the task it names; otherwise ONE refusal, the card
+  // is not created and nobody is woken.
+  it.each([
+    ["the creator may not comment the named task", "denied"],
+    ["the named task does not exist", "missing"],
+    ["the named task is another company's", "other_company"],
+  ])("STUDIO-0092: %s: refused with the one message, no card, no wake", async (_label, how) => {
+    mockIssueService.getById.mockImplementation(async (id: string) => {
+      if (id !== OTHER_ISSUE_ID) return createIssue();
+      if (how === "missing") return null;
+      return { ...createIssue(), id: OTHER_ISSUE_ID, companyId: how === "other_company" ? "company-2" : "company-1" };
+    });
+    mockAccessDecide.mockImplementation(async (input: { action?: string; resource?: { issueId?: string } }) => ({
+      allowed: !(how === "denied" && input.action === "issue:comment" && input.resource?.issueId === OTHER_ISSUE_ID),
+      action: input.action, reason: "test", explanation: "test",
+    }));
+    const app = await createApp();
+
+    const res = await request(app)
+      .post(`/api/issues/${ISSUE_ID}/interactions`)
+      .send({ kind: "request_confirmation", addresseeAgentId: ASSIGNEE_AGENT_ID, addresseeWakeIssueId: OTHER_ISSUE_ID,
+        payload: { version: 1, prompt: "Is the build you tested the one of this morning?" } });
+
+    expect(res.status).toBe(422);
+    expect(res.body.error).toBe("addresseeWakeIssueId cannot be used for this card: name a task in progress or in review that is assigned to the addressee agent and that you can comment");
+    expect(mockInteractionService.create).not.toHaveBeenCalled();
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+    if (how === "denied") {
+      expect(mockAccessDecide).toHaveBeenCalledWith(expect.objectContaining({ action: "issue:comment",
+        resource: expect.objectContaining({ issueId: OTHER_ISSUE_ID }) }));
+    }
+  });
+
+  it("STUDIO-0092: the creator's right to comment is asked for the NAMED task, and a card that names its own task asks nothing more", async () => {
+    mockIssueService.getById.mockImplementation(async (id: string) => ({ ...createIssue(), id: id === OTHER_ISSUE_ID ? OTHER_ISSUE_ID : ISSUE_ID }));
+    mockInteractionService.create.mockResolvedValue({ id: "interaction-access", companyId: "company-1", issueId: ISSUE_ID, kind: "request_confirmation",
+      status: "pending", continuationPolicy: "none", addresseeAgentId: ASSIGNEE_AGENT_ID, requestedResolverPolicy: "anyone", effectiveResolverPolicy: "anyone",
+      idempotencyKey: null, sourceCommentId: null, sourceRunId: null, payload: { version: 1, prompt: "Confirm." }, result: null,
+      createdAt: "2026-07-25T12:00:00.000Z", updatedAt: "2026-07-25T12:00:00.000Z" });
+    const app = await createApp();
+    const post = (addresseeWakeIssueId: string) => request(app).post(`/api/issues/${ISSUE_ID}/interactions`)
+      .send({ kind: "request_confirmation", addresseeAgentId: ASSIGNEE_AGENT_ID, addresseeWakeIssueId, payload: { version: 1, prompt: "Confirm." } });
+    const commentAsked = (issueId: string) => mockAccessDecide.mock.calls.filter(([input]) =>
+      (input as { action?: string }).action === "issue:comment" && (input as { resource?: { issueId?: string } }).resource?.issueId === issueId).length;
+
+    expect((await post(OTHER_ISSUE_ID)).status).toBe(201);
+    expect(commentAsked(OTHER_ISSUE_ID)).toBe(1);
+    const before = commentAsked(ISSUE_ID);
+    expect((await post(ISSUE_ID)).status).toBe(201);
+    expect(commentAsked(ISSUE_ID)).toBe(before);
+  });
+
   it("does not route agent attention for a human-only interaction", async () => {
     mockInteractionService.create.mockResolvedValueOnce({
       id: "interaction-human-attention",

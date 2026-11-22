@@ -412,7 +412,7 @@ import {
   type IssueThreadInteractionResolverAudienceDecision,
   type IssueThreadInteractionResolverRestriction,
 } from "../services/issue-thread-interaction-resolution.js";
-import { addresseeWakeTarget } from "../services/addressee-wake-issue.js";
+import { addresseeWakeTarget, refuseAddresseeWakeIssue } from "../services/addressee-wake-issue.js";
 import { resolveSelectedSuggestedTasks } from "../services/issue-thread-interactions.js";
 import {
   crossIssueInfluenceLimitError,
@@ -18566,6 +18566,16 @@ export function issueRoutes(
         throw unprocessable(
           "payload.secretProposal is server-owned metadata and cannot be supplied when creating an interaction",
         );
+      }
+
+      // STUDIO-0092: the creator of the card must be allowed to comment the task it names for the wake, the right that
+      // waking a task's assignee has always asked for. A task it cannot comment, or cannot see, is refused with the
+      // same message as any other task that cannot be used.
+      if (req.body.addresseeWakeIssueId && req.body.addresseeWakeIssueId !== issue.id) {
+        const named = await svc.getById(req.body.addresseeWakeIssueId);
+        if (!named || named.companyId !== issue.companyId || !(await decideIssueAccess(req, named, "issue:comment")).allowed) {
+          refuseAddresseeWakeIssue();
+        }
       }
 
       // Plan-document confirmation targets are validated authoritatively inside
