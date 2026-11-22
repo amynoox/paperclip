@@ -10,14 +10,17 @@
 // `cancelled`. Without the field nothing changes. The field is not stored on the card: it lives in the wake request
 // and in the run's context (`interactionId`, `interactionIssueId` = the card's task).
 //
-// On its own task the addressee is the assignee, so the wake follows the ordinary path. One gate would still stop it:
-// unresolved blockers on that task. A card's wake passes it, in the bounded mode of a blocked task, when the server's
-// own state says so (verifyOwnIssueInteractionWake): the context alone never qualifies. It lifts no blocker and
-// changes no status. The server does not know which task of the addressee is "the right one" for the work in common:
+// On its own task the addressee is the assignee, so the wake follows the ordinary path. One gate still stops it:
+// unresolved blockers on that task. By default that gate stays as it is: the wake is held as any wake on a blocked
+// task, and the card stays pending. A COMPANY SETTING, OFF unless set (ADDRESSEE_WAKE_ON_BLOCKED_ISSUE_SETTING, in
+// the company's interactionResolverGovernance), lets a card's wake pass it, in the bounded mode of a blocked task,
+// when the server's own state says so (verifyOwnIssueInteractionWake): the context alone never qualifies. Without
+// the setting, any role could pull another role onto a blocked task by a card. It lifts no blocker and changes no
+// status. The server does not know which task of the addressee is "the right one" for the work in common:
 // it only checks that the named task is the addressee's.
 import { and, eq } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { issueThreadInteractions, issues } from "@paperclipai/db";
+import { companies, issueThreadInteractions, issues } from "@paperclipai/db";
 import { unprocessable } from "../errors.js";
 
 function readNonEmptyString(value: unknown): string | null {
@@ -96,12 +99,29 @@ export async function readOwnIssueInteractionWake(db: Pick<Db, "select">, input:
   return own ? { interactionId, cardIssueId, cardIssueIdentifier: card.cardIssueIdentifier } : null;
 }
 
-/** The gate of unresolved blockers: true for a verified wake of a card on the agent's own task. */
+/**
+ * The company's switch for the gate below: `interactionResolverGovernance.addresseeWakeOnBlockedIssue.enabled`. OFF
+ * unless it is exactly `true`; no install sets it.
+ */
+export const ADDRESSEE_WAKE_ON_BLOCKED_ISSUE_SETTING = "addresseeWakeOnBlockedIssue";
+
+async function blockedIssueWakeEnabled(db: Pick<Db, "select">, companyId: string): Promise<boolean> {
+  const [company] = await db.select({ governance: companies.interactionResolverGovernance }).from(companies)
+    .where(eq(companies.id, companyId)).limit(1);
+  const setting = (company?.governance as Record<string, unknown> | null | undefined)?.[ADDRESSEE_WAKE_ON_BLOCKED_ISSUE_SETTING];
+  return (setting as { enabled?: unknown } | null | undefined)?.enabled === true;
+}
+
+/**
+ * The gate of unresolved blockers: true for a verified wake of a card on the agent's own task, and only when the
+ * company's setting is on. Off (the default), the wake keeps today's gate.
+ */
 export async function verifyOwnIssueInteractionWake(
   db: Pick<Db, "select">,
   input: Parameters<typeof readOwnIssueInteractionWake>[1],
 ): Promise<boolean> {
-  return (await readOwnIssueInteractionWake(db, input)) !== null;
+  if ((await readOwnIssueInteractionWake(db, input)) === null) return false;
+  return blockedIssueWakeEnabled(db, input.companyId);
 }
 
 /**

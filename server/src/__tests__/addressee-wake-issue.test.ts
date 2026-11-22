@@ -9,7 +9,7 @@ import {
   agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issueRelations,
   issueThreadInteractions, issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
 } from "@paperclipai/db";
-import { createIssueThreadInteractionSchema } from "@paperclipai/shared";
+import { createIssueThreadInteractionSchema, interactionResolverGovernanceSchema } from "@paperclipai/shared";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
@@ -17,7 +17,9 @@ import { heartbeatService } from "../services/heartbeat.js";
 import { buildHostServices } from "../services/plugin-host-services.js";
 import { issueThreadInteractionService } from "../services/issue-thread-interactions.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
-import { addresseeWakeTarget, ownIssueInteractionNote, verifyOwnIssueInteractionWake } from "../services/addressee-wake-issue.js";
+import {
+  ADDRESSEE_WAKE_ON_BLOCKED_ISSUE_SETTING, addresseeWakeTarget, ownIssueInteractionNote, verifyOwnIssueInteractionWake,
+} from "../services/addressee-wake-issue.js";
 import { PAUSE_MISSED_WAKE_REASON } from "../services/pause-missed-wakes.js";
 
 const adapterType = "codex_local";
@@ -44,6 +46,18 @@ describe("the task a card's wake goes to", () => {
     const unknown = createIssueThreadInteractionSchema.safeParse({ ...card, aFieldThisServerDoesNotKnow: randomUUID() });
     expect(unknown.success).toBe(true);
     expect(unknown.success && "aFieldThisServerDoesNotKnow" in unknown.data).toBe(false);
+  });
+});
+
+describe("the company setting that lets a card's wake pass the blockers of the addressee's task", () => {
+  it("lives in the company's interactionResolverGovernance, is a boolean, and is absent by default", () => {
+    expect(ADDRESSEE_WAKE_ON_BLOCKED_ISSUE_SETTING).toBe("addresseeWakeOnBlockedIssue");
+    expect(interactionResolverGovernanceSchema.parse(undefined)).toEqual({});
+    expect(interactionResolverGovernanceSchema.parse({ addresseeWakeOnBlockedIssue: { enabled: true } }))
+      .toEqual({ addresseeWakeOnBlockedIssue: { enabled: true } });
+    expect(interactionResolverGovernanceSchema.safeParse({ addresseeWakeOnBlockedIssue: { enabled: false } }).success).toBe(true);
+    expect(interactionResolverGovernanceSchema.safeParse({ addresseeWakeOnBlockedIssue: { enabled: "yes" } }).success).toBe(false);
+    expect(interactionResolverGovernanceSchema.safeParse({ addresseeWakeOnBlockedIssue: { enabled: true, other: 1 } }).success).toBe(false);
   });
 });
 
@@ -91,12 +105,16 @@ vi.setConfig({ testTimeout: 120_000 });
   });
 
   // The host and the guest each have a task of their own. With `blocked`, the guest's task waits on a third task.
-  async function seed(options: { blocked?: boolean; guestStatus?: string; guestIssueStatus?: string } = {}) {
+  // `blockedIssueWake` is the company's setting: a real company has NONE (off). The fixture turns it ON unless a case
+  // says otherwise, because most cases below prove what happens once the Board has turned it on.
+  async function seed(options: { blocked?: boolean; guestStatus?: string; guestIssueStatus?: string; blockedIssueWake?: unknown } = {}) {
     const companyId = randomUUID(), hostId = randomUUID(), guestId = randomUUID(), thirdId = randomUUID();
     const hostIssueId = randomUUID(), guestIssueId = randomUUID(), blockerId = randomUUID();
     const tag = companyId.replaceAll("-", "").slice(0, 6).toUpperCase();
+    const setting = "blockedIssueWake" in options ? options.blockedIssueWake : { enabled: true };
     await db.insert(companies).values({ id: companyId, name: "Work in common", issuePrefix: `W${tag}`,
-      requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user" });
+      requireBoardApprovalForNewAgents: false, defaultResponsibleUserId: "responsible-user",
+      interactionResolverGovernance: (setting === undefined ? {} : { [ADDRESSEE_WAKE_ON_BLOCKED_ISSUE_SETTING]: setting }) as never });
     await db.insert(authUsers).values({ id: "responsible-user", name: "Fixture user", email: "responsible-user@example.test",
       createdAt: new Date(), updatedAt: new Date() }).onConflictDoNothing();
     await db.insert(companyMemberships).values({ companyId, principalType: "user", principalId: "responsible-user",
@@ -227,7 +245,62 @@ vi.setConfig({ testTimeout: 120_000 });
     await expect(create(f.guestIssueId)).resolves.toMatchObject({ status: "pending" });
   });
 
-  it("the addressee's task waits on a blocker: the card still wakes it there, in the bounded mode; no blocker is lifted, no status changes", async () => {
+  // The company's setting is OFF by default. Off, a card that names a blocked task of the addressee keeps today's gate:
+  // the wake is held as any wake on a blocked task and the card stays pending.
+  it.each([
+    ["no setting at all, the state of a company after an install", undefined],
+    ["the setting set to false", { enabled: false }],
+    ["a value that is not exactly true", { enabled: "true" }],
+    ["an empty setting", {}],
+  ])("setting OFF (%s): the wake on the addressee's blocked task is refused as today, the card stays pending", async (_label, setting) => {
+    const f = await seed({ blocked: true, blockedIssueWake: setting });
+    const card = await postCard(f, f.guestIssueId);
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await held(f);
+    expect(launchesOf(f.hostIssueId, f.guestId)).toHaveLength(0);
+    expect(await cardOf(card.id)).toMatchObject({ status: "pending", issueId: f.hostIssueId, addresseeAgentId: f.guestId });
+    expect(await issueOf(f.guestIssueId)).toMatchObject({ status: "blocked", assigneeAgentId: f.guestId });
+    // The refused wake is recorded as any wake held for unresolved blockers, on the guest's task.
+    const [wake] = (await wakesOf(f)).filter((row) => row.idempotencyKey === `interaction-pending:${card.id}`);
+    expect(wake, await state(f)).toMatchObject({ status: "skipped", payload: expect.objectContaining({ issueId: f.guestIssueId }) });
+    expect(String(wake!.reason ?? "") + String(wake!.error ?? "")).toContain("issue_dependencies_blocked");
+    // The verification itself says no, although every part of the card is true.
+    expect(await verifyOwnIssueInteractionWake(db, { companyId: f.companyId, issueId: f.guestIssueId, agentId: f.guestId,
+      contextSnapshot: { wakeReason: "interaction_pending", interactionId: card.id, interactionIssueId: f.hostIssueId } })).toBe(false);
+  });
+
+  it("setting OFF: on a task that is NOT blocked, the card still wakes the addressee on its own task, with its line", async () => {
+    const f = await seed({ blockedIssueWake: undefined });
+    const card = await postCard(f, f.guestIssueId);
+    const launch = await wokenFor(f, card.id);
+    expect(launch.context).toMatchObject({ issueId: f.guestIssueId, wakeReason: "interaction_pending", interactionId: card.id, interactionIssueId: f.hostIssueId });
+    expect(String(launch.context.paperclipTaskMarkdown ?? "")).toContain(`interaction ${card.id} on issue ${f.hostIdentifier}`);
+  });
+
+  it("setting OFF, at the start of the run: a wake admitted before a blocker came is cancelled for the blocker", async () => {
+    const f = await seed({ blockedIssueWake: undefined });
+    const busyIssueId = randomUUID();
+    await db.insert(issues).values({ id: busyIssueId, companyId: f.companyId, title: "Other work of the guest", status: "todo", priority: "medium", assigneeAgentId: f.guestId });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    answers.set(busyIssueId, [async () => { await gate; return SUCCESS; }]);
+    await heartbeat.wakeup(f.guestId, { source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId: busyIssueId, mutation: "update" }, requestedByActorType: "system", requestedByActorId: "test",
+      contextSnapshot: { issueId: busyIssueId, taskId: busyIssueId, source: "issue.update" } });
+    await vi.waitFor(() => expect(launchesOf(busyIssueId)).toHaveLength(1), { timeout: 30_000, interval: 100 });
+    const card = await postCard(f, f.guestIssueId);
+    await vi.waitFor(async () => expect((await runsOf(f, f.guestIssueId)).map((run) => run.status), await state(f)).toEqual(["queued"]), { timeout: 30_000, interval: 100 });
+    await db.insert(issueRelations).values({ companyId: f.companyId, issueId: f.blockerId, relatedIssueId: f.guestIssueId, type: "blocks" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.guestIssueId));
+    release();
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    expect(launchesOf(f.guestIssueId), await state(f)).toHaveLength(0);
+    expect((await runsOf(f, f.guestIssueId)).map((run) => [run.status, run.errorCode])).toEqual([["cancelled", "issue_dependencies_blocked"]]);
+    expect(await cardOf(card.id)).toMatchObject({ status: "pending" });
+  });
+
+  it("setting ON: the addressee's task waits on a blocker, the card still wakes it there, in the bounded mode; no blocker is lifted, no status changes", async () => {
     const f = await seed({ blocked: true });
     const card = await postCard(f, f.guestIssueId);
     const launch = await wokenFor(f, card.id);
@@ -399,6 +472,18 @@ vi.setConfig({ testTimeout: 120_000 });
     const verify = (patch: Record<string, unknown> = {}, who: { issueId?: string; agentId?: string; companyId?: string } = {}) =>
       verifyOwnIssueInteractionWake(db, { companyId: who.companyId ?? f.companyId, issueId: who.issueId ?? f.guestIssueId,
         agentId: who.agentId ?? f.guestId, contextSnapshot: { ...context, ...patch } });
+    expect(await verify()).toBe(true);
+    // The company's setting is read each time: turned off, the same wake no longer passes; turned on again, it does.
+    const governance = (value: unknown) => db.update(companies).set({ interactionResolverGovernance: value as never }).where(eq(companies.id, f.companyId));
+    for (const off of [{}, { [ADDRESSEE_WAKE_ON_BLOCKED_ISSUE_SETTING]: { enabled: false } }, { [ADDRESSEE_WAKE_ON_BLOCKED_ISSUE_SETTING]: { enabled: 1 } },
+      { [ADDRESSEE_WAKE_ON_BLOCKED_ISSUE_SETTING]: true }, { unansweredAgentQuestion: { enabled: true } }]) {
+      await governance(off);
+      expect(await verify(), JSON.stringify(off)).toBe(false);
+    }
+    // What the run reads does not depend on the setting.
+    expect(await ownIssueInteractionNote(db, { companyId: f.companyId, issueId: f.guestIssueId, agentId: f.guestId, contextSnapshot: context }))
+      .toContain(`interaction ${card.id} on issue ${f.hostIdentifier}`);
+    await governance({ [ADDRESSEE_WAKE_ON_BLOCKED_ISSUE_SETTING]: { enabled: true } });
     expect(await verify()).toBe(true);
     // A retry the server creates keeps the context and takes its own wake reason.
     expect(await verify({ wakeReason: "transient_failure_retry", retryOfRunId: randomUUID() })).toBe(true);
