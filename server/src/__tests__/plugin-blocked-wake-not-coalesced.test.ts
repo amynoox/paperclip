@@ -243,7 +243,11 @@ vi.setConfig({ testTimeout: 120_000 });
     await vi.waitFor(async () => expect((await runsOf(f)).map((run) => run.errorCode), await state(f)).toEqual(["issue_dependencies_blocked"]),
       { timeout: 30_000, interval: 100 });
     expect(launchesOf(f.issueId), await state(f)).toHaveLength(0);
-    await heartbeat.resumeQueuedRuns();
+    // The pass runs turn after turn on a server; one turn may come before the cancelled run has released the issue.
+    await vi.waitFor(async () => {
+      await heartbeat.resumeQueuedRuns();
+      expect(launchesOf(f.issueId).length, await state(f)).toBeGreaterThanOrEqual(1);
+    }, { timeout: 30_000, interval: 500 });
     await settled(f, 1);
     expect(story(f), await state(f)).toEqual([[LOAN_REQUESTED, true, true]]);
     expect((await runsOf(f)).map((run) => [run.status, run.errorCode]), await state(f)).toEqual([
