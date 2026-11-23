@@ -130,7 +130,7 @@ export interface HeartbeatRetryDependencies {
     run: HeartbeatRun | null;
   }>;
   setWakeupStatus: (wakeupRequestId: string | null | undefined, status: string, patch?: Partial<typeof agentWakeupRequests.$inferInsert>) => Promise<void>;
-  releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">) => Promise<unknown>;
+  releaseIssueExecutionAndPromote: (run: Pick<HeartbeatRun, "id" | "companyId">, options?: { suppressImmediateRecovery?: boolean }) => Promise<unknown>;
   finalizeAgentStatus: (
     agentId: string,
     outcome: "succeeded" | "interrupted" | "failed" | "cancelled" | "timed_out",
@@ -1827,10 +1827,12 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
   // STUDIO-0095: a scheduled retry the gate cancels (a disposition repair superseded by a wake that waits behind it,
   // for example) never ran, so no end of run promotes the wakes that waited behind it. Production, 22 Nov 2026,
   // TR-2562: the retry was cancelled as superseded by a card's wake, and that wake stayed deferred with no run left
-  // on the issue. The same release as at the end of a run: holds, pauses and operator stops still apply.
+  // on the issue. The same release as at the end of a run: holds, pauses and operator stops still apply. It only
+  // promotes what waited: the gate refused the retry for the task's state, so the release starts no recovery of
+  // its own when nothing waited.
   async function promoteBehindSuppressedRetries(runs: Array<{ id: string; companyId: string }>) {
     for (const run of runs) {
-      await releaseIssueExecutionAndPromote(run).catch(err =>
+      await releaseIssueExecutionAndPromote(run, { suppressImmediateRecovery: true }).catch(err =>
         logger.warn({ err, runId: run.id }, "failed to promote the wakes that waited behind a suppressed scheduled retry"));
     }
   }
