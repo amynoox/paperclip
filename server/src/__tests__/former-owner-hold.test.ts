@@ -216,6 +216,26 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await getExecutionBlocker(db, companyOf.companyId, companyOf.issueId)).toBeNull();
   });
 
+  // TR-149, read in service on 23 Nov 2026: the same hold after a cut run, on a task that waits in backlog.
+  it("a task in backlog that carries a former assignee's hold is free, and starts when a person takes it out of backlog", async () => {
+    const f = await seed({ task: { status: "backlog" } });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
+    expect((await listExecutionHolds(db, f.companyId, [f.issueId], () => null)).size).toBe(0);
+    // A person takes the task out of backlog: the wake the issue update route sends for that change.
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, f.issueId));
+    await heartbeat.wakeup(f.manager, { source: "automation", triggerDetail: "system", reason: "issue_status_changed",
+      payload: { issueId: f.issueId, mutation: "update" }, requestedByActorType: "user", requestedByActorId: "responsible-user",
+      contextSnapshot: { issueId: f.issueId, source: "issue.status_change" } });
+    expect(await heldWakes(f)).toEqual([]);
+    await managerStarts(f);
+  });
+
+  it("a task in backlog whose cut run is the assignee's OWN stays held: that run's outcome is its agent's to settle", async () => {
+    const f = await seed({ assignee: "cto", task: { status: "backlog" } });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ recoveryActionId: f.actionId,
+      cause: "legacy_execution_requires_reconciliation", runId: f.ctoRunId });
+  });
+
   it("is released as well when a person now owns the task", async () => {
     const f = await seed({ task: { assigneeAgentId: null, assigneeUserId: "responsible-user" } });
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
