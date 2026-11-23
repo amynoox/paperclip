@@ -1,4 +1,5 @@
 import { preserveAgentInteractionPermissions } from "../../../lib/agent-interaction-permissions.js";
+import { withLiveSteeringDefault } from "../../../lib/agent-live-steering.js";
 import type { LifecycleEffects } from "./effects.js";
 import { randomUUID } from "node:crypto";
 import { and, eq, sql } from "drizzle-orm";
@@ -44,6 +45,8 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
         const createdStatus=status === "pending_approval" ? "pending_approval" : status === "terminated" ? "terminated" : "paused";
         const values: typeof agents.$inferInsert = {
           ...prepared,
+          // STUDIO-0096: a new agent is steerable unless its creation says otherwise (lib/agent-live-steering.ts).
+          adapterConfig: withLiveSteeringDefault(prepared.adapterType, prepared.adapterConfig),
           ...(setup ? { permissions: preserveAgentInteractionPermissions(setup.permissions, prepared.permissions) } : {}),
           createdByUserId: setup?.createdByUserId ?? options?.createdByUserId ?? null,
           lifecycleState,
@@ -127,6 +130,11 @@ export function agentRecords(db: Db, effects: LifecycleEffects) {
         const existing = await agentRecordQueries(txDb).getById(id);
         if (!existing || existing.status !== "pending_approval") return null;
         const patch = await effects.prepareHireApproval(txDb, existing, approvedPayload);
+        // STUDIO-0096: the approval ends the creation, and its payload may replace the configuration written when
+        // the hire was asked for: the same default, on the configuration the agent will have.
+        const approvedConfig = patch.adapterConfig ?? existing.adapterConfig;
+        const steerable = withLiveSteeringDefault(patch.adapterType ?? existing.adapterType, approvedConfig);
+        if (steerable !== approvedConfig) patch.adapterConfig = steerable;
         const [company] = await tx.select({ status: companies.status }).from(companies).where(eq(companies.id, existing.companyId));
         const holds = existing.lifecycleHolds.filter(hold => hold !== "company_paused" && hold !== "company_archived");
         if (company?.status === "paused") holds.push("company_paused");

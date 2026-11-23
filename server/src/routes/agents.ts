@@ -1,3 +1,4 @@
+import { withLiveSteeringCarriedOver } from "../lib/agent-live-steering.js";
 import { assertLoginEnvironmentTarget } from "../services/login-environment.js";
 import { assertProviderApiPlacementPolicy, managedCursorApiDefaultEnabled, resolveProviderApiPlacement } from "../services/native-runtime/provider-api-placement.js";
 import { isObjectJournalBusyError } from "../services/object-byte-journal.js";
@@ -5682,6 +5683,8 @@ export function agentRoutes(
             rawEffectiveAdapterConfig = { ...rawEffectiveAdapterConfig, [key]: existingAdapterConfig[key] };
           }
         }
+        // STUDIO-0096: nor does a change of engine drop live steering (lib/agent-live-steering.ts).
+        rawEffectiveAdapterConfig = withLiveSteeringCarriedOver(requestedAdapterType, existingAdapterConfig, rawEffectiveAdapterConfig);
         rawEffectiveAdapterConfig = preserveInstructionsBundleConfig(
           existingAdapterConfig,
           rawEffectiveAdapterConfig,
