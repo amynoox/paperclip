@@ -107,19 +107,23 @@ describe("card addressed to a paused agent", () => {
     expect(wake.idempotencyKey).toBe(`pause-missed:${f.quality}:${f.issueId}:${refused[0].id}`);
   });
 
-  it("accepts a card from a person, whose refused wake leaves no row, and still replays it with the card on resume", async () => {
+  // STUDIO-0099: a person's wake on a task, refused by the pause, now leaves its row as an agent's does (it left none:
+  // the card was then replayed from the card itself, with no refused wake to name).
+  it("accepts a card from a person, records the refused wake as skipped, and replays it with the card on resume", async () => {
     const f = await seed();
     const created = await issueThreadInteractionService(db).create({ id: f.issueId, companyId: f.companyId }, card(f.quality),
       { userId: "board" });
     expect(created).toMatchObject({ status: "pending", addresseeAgentId: f.quality });
     await routeWake(f, created.id, f.quality, { type: "user", id: "board" });
-    expect(await wakesOf(f, f.quality)).toHaveLength(0);
+    const refused = await wakesOf(f, f.quality);
+    expect(refused).toEqual([expect.objectContaining({ status: "skipped", reason: "agent.not_invokable", requestedByActorType: "user",
+      payload: expect.objectContaining({ interactionId: created.id }) })]);
 
     await resume(f.quality);
     await resume(f.quality);
     const wake = await expectDelivered(f, f.quality);
-    expect(wake.payload).toMatchObject({ issueId: f.issueId, interactionId: created.id, missedWakeRequestId: null });
-    expect(wake.idempotencyKey).toBe(`pause-missed:${f.quality}:${f.issueId}:${created.id}`);
+    expect(wake.payload).toMatchObject({ issueId: f.issueId, interactionId: created.id, missedWakeRequestId: refused[0].id });
+    expect(wake.idempotencyKey).toBe(`pause-missed:${f.quality}:${f.issueId}:${refused[0].id}`);
   });
 
   it("accepts a plugin-created card for a paused addressee and wakes it with the card on resume", async () => {
