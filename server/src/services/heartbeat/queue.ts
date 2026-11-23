@@ -70,7 +70,7 @@ import {
   undeliveredLegacyUserCommentIds,
 } from "../explicit-native-continuation.js";
 import { canRetryStoppedRun } from "../cancelled-native-startup.js";
-import { getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.js";
+import { formerOwnerLegacyHoldReleasedCondition, getExecutionBlocker, hasPendingRunCleanup } from "../execution-blocker.js";
 import { nativeManualAdmissionHoldsExecution } from "../native-runtime/native-runner-ownership.js";
 import { taskChatRetrySourceCleanupPending } from "../chat-channels/task-retry-authority.js";
 import { validateNativeWorkspaceReconstruction } from "../native-runtime/native-workspace-reconstruction.js";
@@ -2336,21 +2336,30 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         eq(agentWakeupRequests.status, "deferred_issue_execution"), isNull(agentWakeupRequests.runId),
         sql`${agentWakeupRequests.payload}->'adapterInteractionWait' is null`,
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
-        sql`${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'execution_recovery'`,
         // STUDIO-0051: also a wake held behind a hold that the Board reconciled
         // without a continuation because the task waits on a person: no
         // continuation run will adopt it, so it is re-admitted here once the
         // blocker is gone. Only that path: behind a dependency-blocked
         // reconciliation (STUDIO-0048) admission would refuse it while a blocker
         // is open and consume it; workspace repair and containment keep theirs.
-        sql`(jsonb_typeof(${agentWakeupRequests.payload}->'executionWait'->'recoveryActionId') = 'null'
-          or exists (select 1 from issue_recovery_actions reconciled_hold
-            where reconciled_hold.company_id = ${agentWakeupRequests.companyId}
-              and reconciled_hold.id::text = ${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId'
-              and reconciled_hold.status = 'resolved'
-              and reconciled_hold.evidence ? 'executionReconciliation'
-              and reconciled_hold.evidence->>'continuationDelivery' in ('not_requested', 'satisfied')
-              and reconciled_hold.evidence->>'awaitingResponseReconciliation' = 'true'))`,
+        // STUDIO-0100: and a wake held behind the hold of a FORMER assignee's cut run, which no longer holds the
+        // task's new assignee (execution-blocker.ts): whatever the wait says (a person's message refused because the
+        // stopped run is not the assignee's waits as `source_unavailable`), nothing else would ever start it.
+        sql`((${agentWakeupRequests.payload}->'executionWait'->>'reason' = 'execution_recovery'
+          and (jsonb_typeof(${agentWakeupRequests.payload}->'executionWait'->'recoveryActionId') = 'null'
+            or exists (select 1 from issue_recovery_actions reconciled_hold
+              where reconciled_hold.company_id = ${agentWakeupRequests.companyId}
+                and reconciled_hold.id::text = ${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId'
+                and reconciled_hold.status = 'resolved'
+                and reconciled_hold.evidence ? 'executionReconciliation'
+                and reconciled_hold.evidence->>'continuationDelivery' in ('not_requested', 'satisfied')
+                and reconciled_hold.evidence->>'awaitingResponseReconciliation' = 'true')))
+          or exists (select 1 from issue_recovery_actions former_hold
+            where former_hold.company_id = ${agentWakeupRequests.companyId}
+              and former_hold.id::text = ${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId'
+              and ${formerOwnerLegacyHoldReleasedCondition({ companyId: sql.raw("former_hold.company_id"),
+                sourceIssueId: sql.raw("former_hold.source_issue_id"), cause: sql.raw("former_hold.cause"),
+                status: sql.raw("former_hold.status"), evidence: sql.raw("former_hold.evidence") })}))`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'stale-addressee-requeue:%'`,
         // Unique whatever the status: a second row with the same key can never be inserted.
@@ -3656,6 +3665,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           error: invokability.message,
         }, { status: agent.status, reason: invokability.reason });
         waitSaved = wait.waitSaved === true;
+      } else if (invokability.reason === "paused" && issueId && isUuidLike(issueId) && !receiptRequest) {
+        // STUDIO-0099: a wake a PERSON asked for on a task, refused because the agent is paused, left no row at all
+        // (production, 23 Nov 2026: three tasks the Board put to work during a pause; nothing was replayed at the
+        // resume, because there was nothing to replay). It now leaves the same refused row as a wake of the system
+        // or of an agent, which the resume replays once per task (pause-missed-wakes.ts). The caller is answered as
+        // before: the refusal, not a saved wait.
+        // Never for a wake that carries a durable receipt (a message of a chat channel, above all): the row would
+        // carry the receipt's id and be read as that receipt's refusal, and its delivery would be settled as failed
+        // instead of being tried again until the resume, as its own path does on this refusal.
+        await writeSkippedRequest("agent.not_invokable", {
+          error: invokability.message,
+        }, { status: agent.status, reason: invokability.reason });
       }
       const details = { status: agent.status, reason: invokability.reason,
         invalidOrgChain: invokability.invalidOrgChain, ...invokability.details };
