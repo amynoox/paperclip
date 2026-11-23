@@ -1,5 +1,5 @@
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
-import { maskBrokerAddresses, openBrokerAddressLength, redactRegisteredSecretValues } from "./run-secret-redaction.js";
+import { maskBrokerAddresses, maskOpenBrokerToken, openBrokerAddressLength, redactRegisteredSecretValues } from "./run-secret-redaction.js";
 
 /** Keep private material in memory only; do not copy it into run snapshots. */
 export function createAgentIdentityRedactor(privateKeyPem?: string) {
@@ -38,7 +38,7 @@ export function createAgentIdentityRedactor(privateKeyPem?: string) {
       const held = pending.get(stream);
       pending.delete(stream);
       // STUDIO-0085: a broker address cut by the end of the output keeps its beginning; what follows /t/ is hidden.
-      if (held && openBrokerAddressLength(held) === held.length) return held.replace(/(\/t\/)[\w-]+$/, `$1${REDACTED_EVENT_VALUE}`);
+      if (held && openBrokerAddressLength(held) === held.length) return maskOpenBrokerToken(held);
       // Ed25519 PEM/PKCS#8 values begin with fixed structural bytes. Preserve
       // ordinary endings such as a dash; longer interrupted fragments stay hidden.
       return held ? (held.length < 8 ? held : REDACTED_EVENT_VALUE) : "";

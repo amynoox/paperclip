@@ -1,6 +1,8 @@
 // STUDIO-0085: the local address of a KitWright broker carries the broker's access token in its path. The Codex MCP
 // client prints the whole address in the error of a failed tool call, and that error reached run logs in clear.
 // These cases use made-up values of the same form: http://127.0.0.1:<port>/p/<8 characters>/t/<32 characters>/.
+// STUDIO-0098: the token is recognised by its PATH, /p/<pin>/t/<32 characters>, under any address and however its
+// slashes are written; the cases of that patch are at the end of the file.
 import { describe, expect, it, vi } from "vitest";
 import type { Db } from "@paperclipai/db";
 import { REDACTED_EVENT_VALUE } from "../redaction.js";
@@ -120,23 +122,17 @@ describe("the address of a KitWright broker, when a run's output is written", ()
     expect(interrupted.chunk("stdout", `x ${key.slice(0, 40)}`) + interrupted.finish("stdout")).toBe(`x ${REDACTED_EVENT_VALUE}`);
   });
 
-  it("leaves an address the engine already masked, and addresses that are not a broker's, as they are", () => {
+  it("leaves a token the engine already masked, a token of another length and another path as they are", () => {
     const untouched = [
       // What the Claude engine writes: the token is already replaced.
       `error sending request for url (http://127.0.0.1:52431/p/a1b2c3d4/t/redacted/mcp)`,
       `${HEAD}${REDACTED_EVENT_VALUE}/mcp`,
-      // Another host, another scheme.
-      `http://127.0.0.2:52431/p/a1b2c3d4/t/${TOKEN}/`,
-      `http://localhost:52431/p/a1b2c3d4/t/${TOKEN}/`,
-      `http://10.0.0.5:52431/p/a1b2c3d4/t/${TOKEN}/`,
-      `https://127.0.0.1:52431/p/a1b2c3d4/t/${TOKEN}/`,
-      // Other lengths: the token, the first segment, the port.
+      // Another length of the token.
       `${HEAD}${TOKEN.slice(1)}/`,
       `${HEAD}${TOKEN}0/`,
-      `http://127.0.0.1:52431/p/a1b2c3d/t/${TOKEN}/`,
-      `http://127.0.0.1:52431/p/a1b2c3d4e/t/${TOKEN}/`,
-      `http://127.0.0.1:524310/p/a1b2c3d4/t/${TOKEN}/`,
-      `http://127.0.0.1/p/a1b2c3d4/t/${TOKEN}/`,
+      // No pin, or a pin longer than 64 characters.
+      `http://127.0.0.1:52431/p//t/${TOKEN}/`,
+      `http://127.0.0.1:52431/p/${"a".repeat(65)}/t/${TOKEN}/`,
       // Another path.
       `http://127.0.0.1:52431/q/a1b2c3d4/t/${TOKEN}/`,
       `http://127.0.0.1:52431/p/a1b2c3d4/s/${TOKEN}/`,
@@ -234,11 +230,14 @@ describe("the address of a KitWright broker, when a run is read", () => {
   it("only a page of a run log is shortened, and only before an address that is not closed", async () => {
     const reads = registry();
     const open = `x ${HEAD}${TOKEN.slice(0, 10)}`;
+    // STUDIO-0098: what is held is the path that carries the token; the scheme, the host and the port before it are
+    // ordinary text and stay in the page.
+    const kept = "x http://127.0.0.1:52431";
     expect(await reads.redactForRun("company-1", "run-1", { runId: "run-1", store: "local_file", logRef: "r.ndjson", content: open, nextOffset: 500 }))
-      .toEqual({ runId: "run-1", store: "local_file", logRef: "r.ndjson", content: "x ", nextOffset: 500 - (open.length - 2) });
+      .toEqual({ runId: "run-1", store: "local_file", logRef: "r.ndjson", content: kept, nextOffset: 500 - (open.length - kept.length) });
     // The last page of a log has no next offset: the reader computes it from what it received.
     expect(await reads.redactForRun("company-1", "run-1", { runId: "run-1", store: "local_file", logRef: "r.ndjson", content: open }))
-      .toEqual({ runId: "run-1", store: "local_file", logRef: "r.ndjson", content: "x " });
+      .toEqual({ runId: "run-1", store: "local_file", logRef: "r.ndjson", content: kept });
     // A page that ends on a closed address, or on ordinary text, keeps its size.
     const closed = { runId: "run-1", store: "local_file", logRef: "r.ndjson", content: `x ${ADDRESS}mcp) y`, nextOffset: 500 };
     expect(await reads.redactForRun("company-1", "run-1", closed)).toEqual({ ...closed, content: maskedPage(closed.content) });
@@ -284,4 +283,127 @@ describe("the address of a KitWright broker, when a run is read", () => {
     expect(offset).toBe(file.length);
     expect(redaction / pages).toBeLessThan(50);
   }, 120_000);
+});
+
+// STUDIO-0098. Production, 23 Nov 2026 (TR-2598): the token of a KitWright address is the Unity project's own, and it
+// is durable. The first form let it through as soon as the address was not exactly http://127.0.0.1:<port>/p/<8>/t/.
+// Made-up values, each of a form the first mask left in clear.
+describe("the token of a KitWright address, whatever the address and however its slashes are written", () => {
+  const PATH = `/p/a1b2c3d4/t/${TOKEN}/`;
+  const forms: Array<[string, string]> = [
+    ["a host name", `http://localhost:52431${PATH}mcp`],
+    ["another address", `http://10.0.0.5:52431${PATH}mcp`],
+    ["https", `https://127.0.0.1:52431${PATH}mcp`],
+    ["a web socket", `ws://127.0.0.1:52431${PATH}mcp`],
+    ["the IPv6 loopback", `http://[::1]:52431${PATH}mcp`],
+    ["no port", `http://127.0.0.1${PATH}mcp`],
+    ["a pin of one character", `http://127.0.0.1:52431/p/7/t/${TOKEN}/mcp`],
+    ["a pin of four digits", `http://127.0.0.1:52431/p/1234/t/${TOKEN}/mcp`],
+    ["a pin of 64 characters", `http://127.0.0.1:52431/p/${"a1b2".repeat(16)}/t/${TOKEN}/mcp`],
+    ["the path alone", `${PATH}mcp`],
+    ["slashes escaped as in a JSON text", `http:\\/\\/127.0.0.1:52431${PATH.replaceAll("/", "\\/")}mcp`],
+    ["slashes escaped twice (a JSON text quoted in another)", `http:\\\\\\/\\\\\\/127.0.0.1:52431${PATH.replaceAll("/", "\\\\\\/")}mcp`],
+    ["percent-encoded", `http%3A%2F%2F127.0.0.1%3A52431${PATH.replaceAll("/", "%2F")}mcp`],
+    ["percent-encoded in lower case", `http%3a%2f%2f127.0.0.1%3a52431${PATH.replaceAll("/", "%2f")}mcp`],
+    ["a token in upper case", `http://127.0.0.1:52431/p/a1b2c3d4/t/${TOKEN.toUpperCase()}/mcp`],
+  ];
+  const hidden = (text: string) => !text.toLowerCase().includes(TOKEN.slice(0, 6)) && !text.toLowerCase().includes(TOKEN.slice(-6));
+  const transportError = (address: string) => `tool call failed: transport error: error sending request for url (${address}): connection closed`;
+
+  it("masks it when a run's output is written: in one chunk, in the events and in the result", () => {
+    for (const [name, address] of forms) {
+      const line = `${JSON.stringify({ type: "item.completed", item: { type: "mcp_tool_call", status: "failed", error: { message: transportError(address) } } })}\n`;
+      const redactor = createAgentIdentityRedactor();
+      const written = redactor.chunk("stdout", line) + redactor.finish("stdout");
+      expect(hidden(written), name).toBe(true);
+      // Only the token is replaced: the line keeps everything else, and stays the JSON it was.
+      expect(written.length, name).toBe(line.length - TOKEN.length + REDACTED_EVENT_VALUE.length);
+      expect(JSON.parse(written).item.status, name).toBe("failed");
+      expect(hidden(JSON.stringify(redactor.redact({ message: transportError(address), payload: { tries: [address] } }))), name).toBe(true);
+    }
+  });
+
+  it("masks it when the text is cut between two chunks, at every position, for every form", () => {
+    for (const [name, address] of forms) {
+      const text = `${transportError(address)} then again ${address}\n`;
+      const whole = createAgentIdentityRedactor();
+      const expected = whole.chunk("stdout", text) + whole.finish("stdout");
+      expect(hidden(expected), name).toBe(true);
+      for (let cut = 1; cut < text.length; cut += 1) {
+        const redactor = createAgentIdentityRedactor();
+        const written = redactor.chunk("stdout", text.slice(0, cut)) + redactor.chunk("stdout", text.slice(cut)) + redactor.finish("stdout");
+        expect(written, `${name}, cut at ${cut}`).toBe(expected);
+      }
+    }
+  });
+
+  it("a text interrupted by the end of the output never gives a part of the token, for every form", () => {
+    for (const [name, address] of forms) {
+      const line = transportError(address);
+      const tokenStart = line.toLowerCase().indexOf(TOKEN);
+      for (let cut = 1; cut <= tokenStart + TOKEN.length; cut += 1) {
+        const redactor = createAgentIdentityRedactor();
+        const written = redactor.chunk("stdout", line.slice(0, cut)) + redactor.finish("stdout");
+        expect(written, `${name}, ended at ${cut}`).toBe(cut <= tokenStart ? line.slice(0, cut) : `${line.slice(0, tokenStart)}${REDACTED_EVENT_VALUE}`);
+      }
+    }
+  });
+
+  it("masks it when a run is read: the run, its events, a page of its log, the comments of its task", async () => {
+    const reads = registry();
+    for (const [name, address] of forms) {
+      const run = { id: "run-1", status: "failed", error: transportError(address), stdoutExcerpt: address, resultJson: { stderr: address } };
+      expect(hidden(JSON.stringify(await reads.redactForRun("company-1", "run-1", run))), name).toBe(true);
+      expect(hidden(JSON.stringify(await reads.redactForRuns("company-1", [run]))), name).toBe(true);
+      expect(hidden(JSON.stringify(await reads.redactForIssue("company-1", "issue-1", { comments: [{ body: `seen: ${address}` }] }))), name).toBe(true);
+      const content = logFile([transportError(address)]).toString("utf8");
+      const page = await reads.redactForRun("company-1", "run-1", { runId: "run-1", store: "local_file", logRef: "run-1.ndjson", content });
+      expect(hidden(page.content), name).toBe(true);
+      // In a page the mask keeps the length of the token: the reader's offsets stay exact.
+      expect(Buffer.byteLength(page.content), name).toBe(Buffer.byteLength(content));
+    }
+  });
+
+  it("no page of a log gives a part of the token when the text is cut between two pages, at every position, for every form", async () => {
+    for (const [name, address] of forms) {
+      const file = logFile(["start\n", `${transportError(address)}\n`, "end\n"]);
+      const whole = (await readByPages(file, () => 256_000)).join("");
+      expect(hidden(whole), name).toBe(true);
+      const tokenAt = file.toString("utf8").toLowerCase().indexOf(TOKEN);
+      for (let cut = tokenAt - 130; cut <= tokenAt + TOKEN.length + 2; cut += 1) {
+        const pages = await readByPages(file, (index) => (index === 0 ? cut : 256_000));
+        expect(pages.join(""), `${name}, first page of ${cut} bytes`).toBe(whole);
+        for (const page of pages) expect(hidden(page), `${name}, first page of ${cut} bytes`).toBe(true);
+      }
+    }
+  });
+
+  it("a reader always advances, also with pages shorter than the path of a token", async () => {
+    const file = logFile([`${transportError(forms[0]![1])}\n`]);
+    for (const size of [1, 2, 3, 7, 16, 40]) {
+      const pages = await readByPages(file, () => size);
+      expect(Buffer.byteLength(pages.join("")), `pages of ${size} bytes`).toBe(file.length);
+    }
+  });
+
+  it("leaves ordinary paths and addresses as they are", () => {
+    const untouched = [
+      "http://127.0.0.1:3100/api/issues/TR-2598",
+      "/Users/studio/Projects/TheRanchers/Assets/p/Scenes/t/Solo.unity",
+      "C:\\Users\\studio\\p\\a1b2c3d4\\t\\notes.txt",
+      // 31 characters, then something that is not a character of a token.
+      `/p/a1b2c3d4/t/${TOKEN.slice(0, 31)}/mcp`,
+      `/p/a1b2c3d4/t/${TOKEN}0`,
+      `/q/a1b2c3d4/t/${TOKEN}`,
+      `/p/a1b2c3d4/s/${TOKEN}`,
+      `/p/a1b2c3d4/${TOKEN}`,
+      `p/a1b2c3d4/t/${TOKEN}`,
+      `/p/a1b2 c3d4/t/${TOKEN}`,
+    ];
+    for (const text of untouched) {
+      const redactor = createAgentIdentityRedactor();
+      expect(redactor.chunk("stdout", text) + redactor.finish("stdout"), text).toBe(text);
+      expect(redactRegisteredSecretValues(text, []), text).toBe(text);
+    }
+  });
 });
