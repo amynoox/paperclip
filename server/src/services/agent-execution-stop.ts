@@ -6,6 +6,7 @@ import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { isPreDispatchCancellation, markSettledStopsBeforeProcessLaunch, PRE_DISPATCH_CANCELLATION_KEY } from "./pre-dispatch-cancellation.js";
+import { hasEngineStopProof } from "./provider-stop-proof.js";
 
 // STUDIO-0068: the stop proof reads every run the agents ever had. Production, 18 Nov 2026: with whole rows
 // (result_json, usage_json, context_snapshot...) the runs of one long-lived role were 864 MB compressed in the
@@ -125,8 +126,13 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], opt
     // no process ran and no remote command was sent on its lease.
     const cancelledBeforeDispatch = isPreDispatchCancellation(run);
     if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
+      // STUDIO-0097: a pause also concludes on the proof of the engine's verified stop, handed by the adapter that
+      // drove it (provider-stop-proof.ts), without the delay of the ssh client rule: every lease is released (above).
+      // Without that proof the ssh client rule still concludes the pause, as before: the link's absence then proves
+      // nothing of the engine, and the run is marked when the pause concludes (agent-lifecycle-driver.ts).
       if (run.status === "cancelled" && !cancelledBeforeDispatch && !runLeases.every(hasRemoteTerminationReceipt) &&
-          !(options.pauseStop && await sshClientStopProvesPause(run, runLeases, now))) return false;
+          !(options.pauseStop && (await sshClientStopProvesPause(run, runLeases, now)
+            || await hasEngineStopProof(db, run.companyId, run.id)))) return false;
       continue;
     }
     let processAlive = Boolean(run.processPid && !absent(run.processPid));

@@ -291,6 +291,9 @@ export interface AdapterExecutionContext {
   /** Host-owned collection after the final provider invocation is confirmed stopped,
    * before remote workspace restore or disposal. Never call on an unverified timeout. */
   onProviderStopped?: () => Promise<void>;
+  /** STUDIO-0097: host-owned record of the proof a prepared interactive process hands with its stop callback
+   * (the engine's verified stop). The host checks it; it never throws and grants nothing by itself. */
+  onProviderStopProof?: (proof: unknown) => Promise<void>;
   /** Server-owned, actor-attributed snapshot also rendered by legacy wake prompts. */
   executionContinuation?: ExecutionContinuationEnvelope | null;
   runId: string;

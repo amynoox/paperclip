@@ -1401,7 +1401,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       try {
         const processStopped = providerStop.beginInvocation();
         const processOptions = {
-          onProcessStopped: () => { processStopped(); interactiveInvocationPending = false; releaseOrphanedBridge?.(); },
+          // STUDIO-0097: the proof a prepared interactive process hands with the stop goes on to the host as it is.
+          onProcessStopped: (proof?: unknown) => { processStopped(); interactiveInvocationPending = false; releaseOrphanedBridge?.();
+            return proof === undefined ? undefined : ctx.onProviderStopProof?.(proof); },
           cwd,
           env,
           stdin: prompt,

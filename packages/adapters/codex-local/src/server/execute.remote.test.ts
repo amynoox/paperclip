@@ -751,6 +751,68 @@ describe("codex remote execution", () => {
     expect(restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
   });
 
+  // STUDIO-0097: a prepared run that is cancelled hands the proof of its engine's stop with the stop callback; the
+  // adapter passes it on to the host as it is, before the process returns.
+  it("passes the proof a cancelled prepared run hands with the stop callback on to the host", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const bridgeStop = vi.fn(async () => {});
+    startAdapterExecutionTargetPaperclipBridge.mockResolvedValueOnce({
+      env: {
+        PAPERCLIP_API_URL: "http://127.0.0.1:4310",
+        PAPERCLIP_API_KEY: "bridge-token",
+        PAPERCLIP_API_BRIDGE_MODE: "queue_v1",
+      },
+      stop: bridgeStop,
+    });
+    const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-codex-remote-proof-"));
+    cleanupDirs.push(rootDir);
+    const workspaceDir = path.join(rootDir, "workspace");
+    const codexHomeDir = path.join(rootDir, "codex-home");
+    await mkdir(workspaceDir, { recursive: true });
+    await mkdir(codexHomeDir, { recursive: true });
+    await writeFile(path.join(codexHomeDir, "auth.json"), "{}", "utf8");
+    const controller = new AbortController();
+    const proof = { schema: "paperclip.provider-stop-proof.v1", runId: "run-ssh-prepared-proof", providerPid: 4321 };
+    const order: string[] = [];
+    const onProviderStopProof = vi.fn(async (value: unknown) => {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      order.push(`host:${JSON.stringify(value)}`);
+    });
+    const codexPreparedProcess = vi.fn(async (prepared: { options: { onProcessStopped?: (proof?: unknown) => void | Promise<void> } }) => {
+      controller.abort(new Error("operator cancel"));
+      await prepared.options.onProcessStopped?.(proof);
+      order.push("process returns");
+      throw new Error("router_cancelled");
+    });
+
+    await expect(execute({
+      runId: "run-ssh-prepared-proof",
+      agent: { id: "agent-1", companyId: "company-1", name: "CodexCoder", adapterType: "codex_local", adapterConfig: {} },
+      runtime: { sessionId: null, sessionParams: null, sessionDisplayId: null, taskKey: null },
+      config: { engine: "cli", command: "codex", experimentalLiveSteering: true, env: { CODEX_HOME: codexHomeDir } },
+      context: { paperclipWorkspace: { cwd: workspaceDir, source: "project_primary" } },
+      executionTransport: {
+        remoteExecution: {
+          host: "127.0.0.1",
+          port: 2222,
+          username: "fixture",
+          remoteWorkspacePath: "/remote/workspace",
+          remoteCwd: "/remote/workspace",
+          privateKey: "PRIVATE KEY",
+          knownHosts: "[127.0.0.1]:2222 ssh-ed25519 AAAA",
+          strictHostKeyChecking: true,
+        },
+      },
+      registerInteractiveControl: () => () => {},
+      codexPreparedProcess,
+      onProviderStopProof,
+      signal: controller.signal,
+      onLog: async () => {},
+    })).rejects.toThrow(/router_cancelled/);
+
+    expect(order).toEqual([`host:${JSON.stringify(proof)}`, "process returns"]);
+  });
+
   // STUDIO-0075: the session the worker router returns for a cut run carries the folder of the task on the machine and
   // the machine's ssh identity. The existing rule decides whether the next run resumes it; these cases pin that rule on
   // that shape, and that the run's log says why a saved session is not resumed.

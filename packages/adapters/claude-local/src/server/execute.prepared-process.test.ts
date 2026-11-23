@@ -193,6 +193,37 @@ describe("claude prepared interactive process", () => {
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
   });
 
+  // STUDIO-0097: the proof a prepared interactive process hands with its stop goes on to the host as it is, before
+  // the process returns; a stop that carries none calls nothing.
+  it("passes the proof handed with the stop callback on to the host, and nothing when the stop carries none", async () => {
+    const proof = { schema: "paperclip.provider-stop-proof.v1", runId: RUN, providerPid: 4321 };
+    const order: string[] = [];
+    const onProviderStopProof = vi.fn(async (value: unknown) => {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      order.push(`host:${JSON.stringify(value)}`);
+    });
+    const withProof = vi.fn(async (prepared: ClaudePreparedProcessInput) => {
+      await prepared.options.onProcessStopped?.(proof);
+      order.push("process returns");
+      return processResult();
+    });
+    const result = await execute({ ...await context({ hook: withProof }), onProviderStopProof });
+    expect(result.exitCode).toBe(0);
+    expect(order).toEqual([`host:${JSON.stringify(proof)}`, "process returns"]);
+    // The stop is proven as before: the bridge is stopped and the workspace restored.
+    expect(bridgeStop).toHaveBeenCalledTimes(1);
+    expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
+    const without = vi.fn(async (prepared: ClaudePreparedProcessInput) => {
+      prepared.options.onProcessStopped?.();
+      return processResult();
+    });
+    await execute({ ...await context({ hook: without }), onProviderStopProof });
+    expect(onProviderStopProof).toHaveBeenCalledTimes(1);
+    // A host that has no such callback is left alone.
+    await execute(await context({ hook: withProof }));
+    expect(onProviderStopProof).toHaveBeenCalledTimes(1);
+  });
+
   it("keeps the bridge and the remote workspace when the hook fails with an unknown provider state", async () => {
     const hook = vi.fn(async () => { throw new Error("SSH lost; provider status unknown"); });
     await expect(execute(await context({ hook }))).rejects.toThrow(/provider status unknown/);

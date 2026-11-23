@@ -11,6 +11,7 @@ import { hasVerifiedWorkspaceRepair } from "./workspace-recovery-receipt.js";
 import { readMigratedLegacyWorkspaceSource } from "./legacy-workspace-recovery-migration.js";
 import { isGovernancePauseStop } from "./governance-pause-stop.js";
 import { sshClientStopProvesPause } from "./agent-execution-stop.js";
+import { hasEngineStopProof } from "./provider-stop-proof.js";
 import { readNativeWorkspaceSyncReference } from "./native-runtime/native-workspace-sync.js";
 import { preserveNativeFailedWorkspace, preserveTaskRemoteWorkspaceWriter } from "./native-runtime/native-failed-workspace-recovery.js";
 import { createHash } from "node:crypto";
@@ -508,8 +509,10 @@ export async function admitExplicitNativeContinuation(input: {
       // accepted on the proof the pause itself accepts to complete (sshClientStopProvesPause), once the agent has
       // left `pausing`: its pause concluded that all its executions stopped. Any other stop keeps the receipt.
       if (!leases.every(lease => hasRemoteTerminationReceipt(lease) || hasRecoveredCleanupStopReceipt(lease))
+          // STUDIO-0097: or on the proof of the engine's verified stop, as the pause itself does.
           && !(isGovernancePauseStop(run) && agent.lifecycleState !== "pausing"
-            && await sshClientStopProvesPause(run, leases, new Date()))) return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
+            && (await sshClientStopProvesPause(run, leases, new Date())
+              || await hasEngineStopProof(db, companyId, run.id)))) return blocked("remote_cleanup", "Waiting for the previous environment to stop. Your message will start automatically.");
       if (run.runtimeMode === "native" && !input.dryRun && !leases.every(lease => completeTerminatedRemoteNativeSessionCleanup({
         companyId, runId: run.id, remoteCleanupScope: remoteLeaseCleanupScope(lease)!,
       }))) return null;

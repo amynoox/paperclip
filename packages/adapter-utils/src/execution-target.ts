@@ -294,8 +294,10 @@ export interface AdapterExecutionTargetProcessOptions {
   onRuntimeProgress?: RuntimeStatusSink;
   onSpawn?: (meta: { pid: number; processGroupId: number | null; startedAt: string }) => Promise<void>;
   /** Trusted invocation observation, not a turn completion callback. Called only
-   * after local child close or a remotely observed exit, including nonzero exits. */
-  onProcessStopped?: () => void;
+   * after local child close or a remotely observed exit, including nonzero exits.
+   * STUDIO-0097: a prepared interactive process may hand the proof of the engine's verified stop as its one
+   * argument (`paperclip.provider-stop-proof.v1`); the adapter passes it on to the host (`onProviderStopProof`). */
+  onProcessStopped?: (proof?: unknown) => void | Promise<void>;
   terminalResultCleanup?: TerminalResultCleanupOptions;
   /**
    * Sandbox-only: factory from the Paperclip bridge handle that streams the
