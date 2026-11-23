@@ -143,6 +143,8 @@ export function executionBlockerPredicate() {
       or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
         sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
     )),
+    // STUDIO-0100: a former assignee's hold does not hold the task's new assignee.
+    sql`not ${formerOwnerLegacyHoldReleasedPredicate()}`,
   );
 }
 
@@ -284,6 +286,57 @@ export function restoreHoldReleasedForCurrentOwnerPredicate() {
       join ${workspaceOperations} op on op.id::text = saved.id
       where op.company_id = ${issueRecoveryActions.companyId} and op.phase <> 'workspace_recovery')`,
   )}), false)`;
+}
+
+/**
+ * STUDIO-0100: the hold a FORMER assignee's cut legacy run left on a task does not hold the task's new assignee.
+ *
+ * Production, 23 Nov 2026, TR-165: the task was reassigned on 22 Nov; the former assignee's legacy run was cancelled
+ * ("Cancelled before issue reassignment") and its reconciliation action was settled as no longer current, with
+ * `automaticRecovery.replay = "blocked"`. Such an action still holds every execution of the task (the predicate
+ * above). For the new assignee nothing could lift it: a person's message was refused because the stopped run is not
+ * the assignee's (explicit-native-continuation.ts, `source_unavailable`), and the Board's reconciliation was refused
+ * for the same reason (execution-recovery-resolution.ts). Every wake of the new assignee waited for ever.
+ *
+ * Released, for the task's CURRENT assignee only, when all of this holds:
+ * - the hold is a legacy reconciliation hold with no folder to repair (no workspace restore failure or recovery, no
+ *   system recovery, on the action or on the run);
+ * - its run is a legacy run that ended (cancelled, failed, timed out, interrupted) and released every lease it took;
+ * - the run's agent is no longer the task's assignee, nor the participant a pending review waits on.
+ * A run whose process is still alive holds the task through the ownership blocker, which this does not change. What
+ * the former assignee's run did before it was cut stays unverified: the run is still there to inspect.
+ *
+ * The same condition serves a recovery action read under another name (the deferred-wake sweep).
+ */
+export function formerOwnerLegacyHoldReleasedCondition(action: { companyId: SQL; sourceIssueId: SQL; cause: SQL; evidence: SQL }) {
+  // JSON reads are NULL for other holds. Callers negate this, so it must be strictly true or false.
+  return sql`coalesce((
+    ${action.cause} = 'legacy_execution_requires_reconciliation'
+    and not (${action.evidence} ?| array['workspaceRestoreFailure', 'workspaceRestoreRecovery', 'systemRecovery'])
+    and exists (select 1 from ${heartbeatRuns} stopped
+      join ${issues} task on task.company_id = stopped.company_id and task.id = ${action.sourceIssueId}
+      where stopped.company_id = ${action.companyId}
+        and stopped.id::text = coalesce(${action.evidence}->>'runId', ${action.evidence}->>'sourceRunId')
+        and stopped.runtime_mode = 'legacy'
+        and stopped.status in ('failed', 'timed_out', 'interrupted', 'cancelled')
+        and stopped.finished_at is not null
+        and not (coalesce(stopped.result_json, '{}'::jsonb) ?| array['workspaceRestoreFailure', 'workspaceRestoreRecovery'])
+        and task.assignee_agent_id is not null
+        and task.assignee_agent_id <> stopped.agent_id
+        and not coalesce(task.status = 'in_review'
+          and task.execution_state->>'status' = 'pending'
+          and task.execution_state->'currentParticipant'->>'type' = 'agent'
+          and task.execution_state->'currentParticipant'->>'agentId' = stopped.agent_id::text, false)
+        and not exists (select 1 from ${environmentLeases} held
+          where held.company_id = stopped.company_id and held.heartbeat_run_id = stopped.id
+            and (held.released_at is null or held.status in ('active', 'pending_cleanup') or held.cleanup_status = 'failed')))
+  ), false)`;
+}
+
+export function formerOwnerLegacyHoldReleasedPredicate() {
+  return formerOwnerLegacyHoldReleasedCondition({ companyId: sql`${issueRecoveryActions.companyId}`,
+    sourceIssueId: sql`${issueRecoveryActions.sourceIssueId}`, cause: sql`${issueRecoveryActions.cause}`,
+    evidence: sql`${issueRecoveryActions.evidence}` });
 }
 
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: { conversationResetCommentId?: string | null }): Promise<ExecutionBlocker | null> {
