@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray, isNull, sql } from "drizzle-orm";
-import { agents, environmentLeases, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
+import { agents, environmentLeases, environments, heartbeatRunEvents, heartbeatRuns, type Db } from "@paperclipai/db";
 import { logger } from "../middleware/logger.js";
 import { logActivity } from "./activity-log.js";
 import { isGovernancePauseStop } from "./governance-pause-stop.js";
@@ -177,8 +177,15 @@ export async function markEngineStopsUnprovenAtPause(db: Db, agent: { id: string
       sql`not (coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) ? ${ENGINE_STOP_UNPROVEN_KEY})`));
     for (const run of cut) {
       if (!await pauseCutEngineStopUnproven(db, { companyId: agent.companyId, runId: run.id })) continue;
-      const leases = await db.select({ provider: environmentLeases.provider, environmentId: environmentLeases.environmentId })
-        .from(environmentLeases).where(and(eq(environmentLeases.companyId, agent.companyId), eq(environmentLeases.heartbeatRunId, run.id)));
+      // Where the engine ran: the environment of each lease the run held (for a run steered through a link of its own,
+      // the role's own environment), by its id, its name and its driver. Never an address: the environment's own
+      // settings hold it, for who may read them.
+      const leases = await db.select({ id: environmentLeases.id, provider: environmentLeases.provider,
+        environmentId: environmentLeases.environmentId, environmentName: environments.name, environmentDriver: environments.driver })
+        .from(environmentLeases).leftJoin(environments, eq(environments.id, environmentLeases.environmentId))
+        .where(and(eq(environmentLeases.companyId, agent.companyId), eq(environmentLeases.heartbeatRunId, run.id)));
+      const ran = new Map(leases.filter(lease => lease.environmentId).map(lease => [lease.environmentId!,
+        { id: lease.environmentId!, name: lease.environmentName ?? null, driver: lease.environmentDriver ?? null }]));
       const markedAt = new Date().toISOString();
       const [first] = await db.update(heartbeatRuns).set({
         resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
@@ -192,7 +199,7 @@ export async function markEngineStopsUnprovenAtPause(db: Db, agent: { id: string
         action: PAUSE_CUT_ENGINE_STOP_UNPROVEN, entityType: run.issueId ? "issue" : "agent", entityId: run.issueId ?? agent.id,
         details: { interruptedRunId: run.id, reason: ENGINE_STOP_UNPROVEN_REASON,
           leaseProviders: [...new Set(leases.map(lease => lease.provider).filter(Boolean))],
-          environmentIds: [...new Set(leases.map(lease => lease.environmentId).filter(Boolean))] } });
+          environmentIds: [...ran.keys()], environments: [...ran.values()], leaseIds: leases.map(lease => lease.id) } });
       logger.warn({ companyId: agent.companyId, agentId: agent.id, runId: run.id, issueId: run.issueId },
         "A pause cut a steered run and no proof of its engine's stop was handed: the run is marked, and the run that continues its work starts in a new conversation and a new folder");
     }

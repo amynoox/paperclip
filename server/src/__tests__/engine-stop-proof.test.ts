@@ -272,7 +272,13 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatchObject({ actorType: "system", agentId: f.agentId, entityType: "issue", entityId: f.issueId,
       details: { interruptedRunId: cancelled.id, reason: "no_engine_stop_proof", leaseProviders: ["ssh"] } });
-    expect((lines[0]!.details as { environmentIds: unknown[] }).environmentIds).toHaveLength(1);
+    // Where the engine ran: the environment the run's lease names, by its id, its name and its driver, and the lease.
+    const environment = await environmentService(db).ensureLocalEnvironment(f.companyId);
+    const [lease] = await db.select().from(environmentLeases).where(eq(environmentLeases.heartbeatRunId, cancelled.id));
+    expect(lines[0]!.details).toMatchObject({ environmentIds: [environment.id],
+      environments: [{ id: environment.id, name: environment.name, driver: environment.driver }], leaseIds: [lease!.id] });
+    // Nothing of the lease's own address is written.
+    expect(JSON.stringify(lines[0]!.details)).not.toContain("mac-03");
     // Concluded again (the worker's next tick, another pause later): nothing is said twice.
     expect(await pauseConcludes(f, 12)).toBe("complete");
     expect(await markEngineStopsUnprovenAtPause(db, { id: f.agentId, companyId: f.companyId }, new Date(0))).toBe(0);
@@ -306,6 +312,31 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id });
     expect(next.run.contextSnapshot).not.toHaveProperty("forceFreshSession");
     expect({ sessionId: next.sessionId, sessionParams: next.sessionParams }).toMatchObject({ sessionId: cut, sessionParams: paramsOf(cut) });
+    expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.retry_workspace_reused", "pause_resume_task_workspace", null]]);
+    expect(folderOf(next.run)).toBe(folderOf(cancelled));
+  });
+
+  // A steered run cut early has often recorded no session (production, 23 Nov 2026: a role paused in the middle of
+  // its first turn). Nothing here counts on one: the pause concludes on the proof, and the resume has none to resume.
+  it("a cut run that recorded no session, the proof handed: the pause concludes at once and the resume starts a conversation in the same folder", async () => {
+    const f = await seed(true);
+    turns.get(f.companyId)!.push(async context => {
+      await context.onSpawn?.({ pid: LINK_PID, processGroupId: null, startedAt: new Date().toISOString() });
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      await handsProof()(context);
+      return { exitCode: 1, signal: null, timedOut: false, errorCode: "router_cancelled", errorMessage: "router cancelled" };
+    });
+    await assignmentWake(f);
+    const cancelled = (await execution(f, 1)).run;
+    expect(cancelled).toMatchObject({ status: "cancelled" });
+    expect(await taskSession(f)).toBeNull();
+    await heldLease(f, cancelled.id, "ssh");
+    expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(true);
+    expect(await pauseConcludes(f, 1)).toBe("complete");
+    expect(await unprovenLinesOf(f)).toEqual([]);
+    const next = await nextExecution(f, () => resumeRetry(f, cancelled.id));
+    expect(next.run.contextSnapshot).toMatchObject({ previousRunId: cancelled.id });
+    expect(next.sessionId).toBeNull();
     expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.retry_workspace_reused", "pause_resume_task_workspace", null]]);
     expect(folderOf(next.run)).toBe(folderOf(cancelled));
   });
