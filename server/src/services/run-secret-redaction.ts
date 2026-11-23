@@ -35,37 +35,64 @@ function registryEntries(contextSnapshot: unknown): RegistryEntry[] {
   });
 }
 
-// STUDIO-0085: the local address of a KitWright broker carries the broker's access token in its path,
-// http://127.0.0.1:<port>/p/<8 characters>/t/<32 characters>/, and an engine prints it whole in its own errors.
-// It is masked by its form, when a run's output is written and again at every read of a run. Only the token is
-// replaced. Another host, other lengths, or a token already masked by the engine are left as they are.
-const BROKER_ADDRESS = /(http:\/\/127\.0\.0\.1:\d{1,5}\/p\/[\w-]{8}\/t\/)[\w-]{32}(?![\w-])/g;
-const BROKER_ADDRESS_OPEN = /http:\/\/127\.0\.0\.1:(?:\d{0,5}|\d{1,5}\/(?:p(?:\/(?:[\w-]{0,8}|[\w-]{8}\/(?:t(?:\/[\w-]{0,32})?)?))?)?)$/;
-const BROKER_ADDRESS_HEAD = "http://127.0.0.1:";
+// STUDIO-0085: the local address of a KitWright broker carries an access token in its path,
+// http://127.0.0.1:<port>/p/<pin>/t/<32 characters>/, and an engine prints it whole in its own errors. It is masked
+// by its form, when a run's output is written and again at every read of a run. Only the token is replaced.
+//
+// STUDIO-0098: the form is the PATH, not the address. Production, 23 Nov 2026 (TR-2598): the token is the Unity
+// project's own (read in KitWright 1.0.1: durable, kept in the EditorPrefs), and the first form (http, 127.0.0.1, a
+// pin of exactly 8 characters, plain slashes) let it through under another host name, another scheme, another pin
+// length, in a text whose slashes are escaped (a JSON text quoted in another), or percent-encoded.
+// What is recognised now: /p/<pin of 1 to 64 characters>/t/<32 characters>, where each slash may be written "/",
+// "\/" (with up to fifteen backslashes: a JSON text quoted in another, up to four times) or "%2F", whatever comes before. A token of another length, another path, and a
+// token an engine already masked are left as they are.
+const SLASH = String.raw`(?:\\{0,15}\/|%2[Ff])`;
+/** A slash that is begun and not finished: backslashes still waiting for it, or the beginning of %2F. */
+const SLASH_OPEN = String.raw`(?:\\{1,15}|%2?)`;
+const BROKER_TOKEN = new RegExp(`(${SLASH}p${SLASH}[\\w-]{1,64}${SLASH}t${SLASH})[\\w-]{32}(?![\\w-])`, "g");
+// Every beginning of that form that is not closed yet, from its first slash to 31 characters of the token.
+const BROKER_TOKEN_OPEN = new RegExp(`^(?:${SLASH_OPEN}|${SLASH}(?:p(?:${SLASH_OPEN}|${SLASH}(?:[\\w-]{0,64}`
+  + `|[\\w-]{1,64}(?:${SLASH_OPEN}|${SLASH}(?:t(?:${SLASH_OPEN}|${SLASH}[\\w-]{0,31})?)?)))?)?)$`);
+const BROKER_TOKEN_OPEN_END = new RegExp(`(${SLASH}t${SLASH})([\\w-]+)$`);
+/** The longest beginning: four slashes of up to sixteen characters, p, t, a pin of 64 and 31 characters of the token. */
+const BROKER_TOKEN_OPEN_MAX = 4 * 16 + 2 + 64 + 31;
 
 export function maskBrokerAddresses(text: string) {
-  return text.includes("/t/") ? text.replace(BROKER_ADDRESS, `$1${REDACTED_EVENT_VALUE}`) : text;
+  return text.length > 36 ? text.replace(BROKER_TOKEN, `$1${REDACTED_EVENT_VALUE}`) : text;
 }
 
-/** How many characters at the end of the text could be the beginning of a broker address that is not closed yet. */
+/** How many characters at the end of the text could be the beginning of a broker token's path that is not closed yet. */
 export function openBrokerAddressLength(text: string) {
-  const open = BROKER_ADDRESS_OPEN.exec(text.slice(-68));
-  if (open) return open[0].length;
-  for (let size = Math.min(BROKER_ADDRESS_HEAD.length - 1, text.length); size > 0; size--) {
-    if (text.endsWith(BROKER_ADDRESS_HEAD.slice(0, size))) return size;
+  const tail = text.slice(-BROKER_TOKEN_OPEN_MAX);
+  for (let start = 0; start < tail.length; start++) {
+    const first = tail.charCodeAt(start);
+    // A beginning starts on a slash, a backslash or a percent sign.
+    if (first !== 47 && first !== 92 && first !== 37) continue;
+    if (BROKER_TOKEN_OPEN.test(tail.slice(start))) return tail.length - start;
   }
   return 0;
 }
 
-// A page of a run log is read by byte offset and can end inside a broker address: it is ended just before, and the
-// next page starts there (an address is ASCII, so one character is one byte). In a page the mask keeps the length
-// of the token: a reader that has no next offset computes it from the size of what it received.
+/** A beginning that the end of the output interrupted: what follows /t/ is hidden, the rest is ordinary text. */
+export function maskOpenBrokerToken(held: string) {
+  return held.replace(BROKER_TOKEN_OPEN_END, `$1${REDACTED_EVENT_VALUE}`);
+}
+
+// A page of a run log is read by byte offset and can end inside a broker token's path: it is ended just before, and
+// the next page starts there (that path is ASCII, so one character is one byte). In a page the mask keeps the length
+// of the token: a reader that has no next offset computes it from the size of what it received. A page that is
+// nothing but such a beginning (a page shorter than the path itself) is not emptied, so that its reader advances:
+// the characters of the token it holds are hidden in place.
 function maskBrokerAddressesOfLogPage<T>(value: T): T {
   const page = asRecord(value);
   if (!page || typeof page.content !== "string" || !("logRef" in page)) return value;
   const held = openBrokerAddressLength(page.content);
+  if (held && held === page.content.length) {
+    return { ...page, content: page.content.replace(BROKER_TOKEN_OPEN_END,
+      (_whole: string, head: string, token: string) => head + "*".repeat(token.length)) } as T;
+  }
   return { ...page,
-    content: page.content.slice(0, page.content.length - held).replace(BROKER_ADDRESS, `$1${REDACTED_EVENT_VALUE.padEnd(32, "*")}`),
+    content: page.content.slice(0, page.content.length - held).replace(BROKER_TOKEN, `$1${REDACTED_EVENT_VALUE.padEnd(32, "*")}`),
     ...(held && typeof page.nextOffset === "number" ? { nextOffset: page.nextOffset - held } : {}) } as T;
 }
 
