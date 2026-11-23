@@ -143,8 +143,6 @@ export function executionBlockerPredicate() {
       or(inArray(issueRecoveryActions.status, ["active", "escalated"]),
         sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`),
     )),
-    // STUDIO-0100: a former assignee's hold does not hold the task's new assignee.
-    sql`not ${formerOwnerLegacyHoldReleasedPredicate()}`,
   );
 }
 
@@ -298,15 +296,21 @@ export function restoreHoldReleasedForCurrentOwnerPredicate() {
  * the assignee's (explicit-native-continuation.ts, `source_unavailable`), and the Board's reconciliation was refused
  * for the same reason (execution-recovery-resolution.ts). Every wake of the new assignee waited for ever.
  *
- * Released, for the task's CURRENT assignee only, when all of this holds:
- * - the hold is a legacy reconciliation hold with no folder to repair (no workspace restore failure or recovery, no
- *   system recovery, on the action or on the run);
- * - its run is a legacy run that ended (cancelled, failed, timed out, interrupted) and released every lease it took;
- * - the run's agent is no longer the task's assignee, nor the participant a pending review waits on.
+ * The rule, its name and the three places it is read at are those of the open upstream pull request
+ * paperclipai/paperclip#21818 ("release a finished run's legacy hold for a new task owner", head 84c1b7c7), adapted:
+ * the same rule as the one above for restore holds, for a plain legacy hold. Released, for the task's CURRENT owner
+ * only, when all of this holds:
+ * - the hold is a legacy reconciliation hold with no folder to repair (no workspace restore failure or recovery);
+ * - its run ended (cancelled, failed, timed out, interrupted);
+ * - the task has an owner, and the run's agent is neither the task's assignee nor the participant a pending review
+ *   waits on.
+ * Stricter than upstream, decided for the studio on 23 Nov 2026 ("passage terminé et relâché, sans dossier à
+ * réparer"): the run is a legacy run, it released every lease it took, and neither the action nor the run's result
+ * carries a system recovery or a restore to finish.
  * A run whose process is still alive holds the task through the ownership blocker, which this does not change. What
  * the former assignee's run did before it was cut stays unverified: the run is still there to inspect.
  *
- * The same condition serves a recovery action read under another name (the deferred-wake sweep).
+ * The same condition serves a recovery action read under another name (the deferred-wake sweep, the studio's own).
  */
 export function formerOwnerLegacyHoldReleasedCondition(action: { companyId: SQL; sourceIssueId: SQL; cause: SQL; evidence: SQL }) {
   // JSON reads are NULL for other holds. Callers negate this, so it must be strictly true or false.
@@ -321,8 +325,8 @@ export function formerOwnerLegacyHoldReleasedCondition(action: { companyId: SQL;
         and stopped.status in ('failed', 'timed_out', 'interrupted', 'cancelled')
         and stopped.finished_at is not null
         and not (coalesce(stopped.result_json, '{}'::jsonb) ?| array['workspaceRestoreFailure', 'workspaceRestoreRecovery'])
-        and task.assignee_agent_id is not null
-        and task.assignee_agent_id <> stopped.agent_id
+        and (task.assignee_agent_id is not null or task.assignee_user_id is not null)
+        and task.assignee_agent_id is distinct from stopped.agent_id
         and not coalesce(task.status = 'in_review'
           and task.execution_state->>'status' = 'pending'
           and task.execution_state->'currentParticipant'->>'type' = 'agent'
@@ -333,7 +337,7 @@ export function formerOwnerLegacyHoldReleasedCondition(action: { companyId: SQL;
   ), false)`;
 }
 
-export function formerOwnerLegacyHoldReleasedPredicate() {
+export function legacyHoldReleasedForNewOwnerPredicate() {
   return formerOwnerLegacyHoldReleasedCondition({ companyId: sql`${issueRecoveryActions.companyId}`,
     sourceIssueId: sql`${issueRecoveryActions.sourceIssueId}`, cause: sql`${issueRecoveryActions.cause}`,
     evidence: sql`${issueRecoveryActions.evidence}` });
@@ -353,6 +357,8 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
     not(restoreHoldReleasedForCurrentOwnerPredicate()),
+    // STUDIO-0100 (paperclipai/paperclip#21818): a former owner's legacy hold does not hold the task's new owner.
+    not(legacyHoldReleasedForNewOwnerPredicate()),
     or(
       unreconciledNativeExportPredicate(),
       sql`${issueRecoveryActions.evidence}->>'workspaceRestoreFailure' = 'restore_unsafe_archive'`,
@@ -381,6 +387,8 @@ export async function getExecutionBlocker(db: Db, companyId: string, issueId: st
     eq(issueRecoveryActions.sourceIssueId, issueId),
     executionBlockerPredicate(),
     not(restoreHoldReleasedForCurrentOwnerPredicate()),
+    // STUDIO-0100 (paperclipai/paperclip#21818): a former owner's legacy hold does not hold the task's new owner.
+    not(legacyHoldReleasedForNewOwnerPredicate()),
     boundary ? or(gt(issueRecoveryActions.createdAt, boundary.createdAt), nativeExecutionRecoveryActionPredicate()) : undefined,
   )).orderBy(desc(issueRecoveryActions.updatedAt), desc(issueRecoveryActions.id)).limit(1);
   if (!action) return null;

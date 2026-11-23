@@ -9,7 +9,7 @@ import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } fro
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
 import { runningProcesses, type AdapterExecutionContext, type AdapterExecutionResult } from "../adapters/index.ts";
 import { heartbeatService } from "../services/heartbeat.ts";
-import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { getExecutionBlocker, legacyHoldReleasedForNewOwnerPredicate } from "../services/execution-blocker.js";
 import { listExecutionHolds } from "../services/execution-hold.js";
 
 const mockAdapterExecute = vi.hoisted(() =>
@@ -193,6 +193,19 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(blocker).toMatchObject({ runId: f.ctoRunId });
   });
 
+  // A lease the run still holds also holds the task by itself (the ownership blocker), which hides this rule's own
+  // reading of the leases: it is read here on the rule itself, as the deferred-wake sweep reads it.
+  it("the rule itself reads the run's leases: not released while one is held or its cleanup failed", async () => {
+    const released = async (f: Fixture) => (await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions)
+      .where(and(eq(issueRecoveryActions.id, f.actionId), legacyHoldReleasedForNewOwnerPredicate()))).length === 1;
+    expect(await released(await seed())).toBe(true);
+    expect(await released(await seed({ lease: null }))).toBe(true);
+    expect(await released(await seed({ lease: { status: "active", releasedAt: null } }))).toBe(false);
+    expect(await released(await seed({ lease: { status: "pending_cleanup" } }))).toBe(false);
+    expect(await released(await seed({ lease: { cleanupStatus: "failed" } }))).toBe(false);
+    expect(await released(await seed({ assignee: "cto" }))).toBe(false);
+  });
+
   it("still holds the task when the cut run's agent is the participant a pending review waits on", async () => {
     const companyOf = await seed();
     await db.update(issues).set({ status: "in_review", executionState: { status: "pending",
@@ -201,6 +214,11 @@ const support = await getEmbeddedPostgresTestSupport();
     // The review over, the same hold is a former participant's: released.
     await db.update(issues).set({ status: "in_progress", executionState: null }).where(eq(issues.id, companyOf.issueId));
     expect(await getExecutionBlocker(db, companyOf.companyId, companyOf.issueId)).toBeNull();
+  });
+
+  it("is released as well when a person now owns the task", async () => {
+    const f = await seed({ task: { assigneeAgentId: null, assigneeUserId: "responsible-user" } });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
   });
 
   it("an ACTIVE hold of a former assignee's run is released the same way", async () => {
