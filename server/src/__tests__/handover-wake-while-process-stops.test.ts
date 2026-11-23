@@ -208,16 +208,25 @@ const support = await getEmbeddedPostgresTestSupport();
     // The stand-in adapter returns no stop receipt, so the stopped run leaves a reconciliation action that a real
     // provider's acknowledged stop does not leave. Production shows that action cancelled after a reassignment
     // (TR-702, the fixture of STUDIO-0041): put it in that state, by hand. The issue update route is not driven.
-    // STUDIO-0100: that action is the FORMER assignee's. Its run ended and released what it held, so it no longer
-    // holds the task for the new assignee: the kept wake starts as soon as the process is gone. (Before that patch
-    // the action held the kept wake until a person cancelled it, and the thread was told after ten minutes.) The
-    // action itself is still there, open, for who wants to inspect the stopped run.
-    const [reconciliation] = await db.select().from(issueRecoveryActions)
-      .where(and(eq(issueRecoveryActions.companyId, ids.companyId), eq(issueRecoveryActions.sourceIssueId, ids.issueId)));
-    expect(reconciliation).toMatchObject({ cause: "legacy_execution_requires_reconciliation", evidence: expect.objectContaining({ runId: devRun!.id }) });
-    expect(["active", "escalated"]).toContain(reconciliation!.status);
-    expect(await getExecutionBlocker(db, ids.companyId, ids.issueId)).toBeNull();
+    const reconciliation = await getExecutionBlocker(db, ids.companyId, ids.issueId);
+    expect(reconciliation).toMatchObject({ runId: devRun!.id, cause: "legacy_execution_requires_reconciliation" });
+    // While that action is open the kept wake waits. It must not wait in silence: past the limit the thread is told,
+    // once, what holds; the wake stays kept and nothing starts.
+    await heartbeat.resumeQueuedRuns();
+    expect(await notes(f)).toHaveLength(0);
+    await db.update(agentWakeupRequests).set({ requestedAt: new Date(Date.now() - 11 * 60_000) }).where(eq(agentWakeupRequests.id, kept.id));
+    await heartbeat.resumeQueuedRuns();
+    await heartbeat.resumeQueuedRuns();
+    const held = await notes(f);
+    expect(held).toHaveLength(1);
+    expect(held[0].body).toContain("CTO has not started on this task: its wake has waited 11 minutes behind the previous run of Dev Unity");
+    expect(held[0].body).toContain(reconciliation!.nextAction);
+    expect(held[0].body).toContain(`<!-- execution-owner-stall-notice-for:${devRun!.id}:${reconciliation!.recoveryActionId} -->`);
     expect(await wakeRow(kept.id)).toMatchObject({ status: "deferred_issue_execution", runId: null });
+    expect(await assignmentRuns(f, f.cto)).toHaveLength(0);
+    await db.update(issueRecoveryActions).set({ status: "cancelled", outcome: "cancelled", resolvedAt: new Date() })
+      .where(and(eq(issueRecoveryActions.companyId, ids.companyId), eq(issueRecoveryActions.sourceIssueId, ids.issueId)));
+    expect(await getExecutionBlocker(db, ids.companyId, ids.issueId)).toBeNull();
     await heartbeat.resumeQueuedRuns();
     const run = await startsOnce(f, f.cto);
     expect(run).toMatchObject({ agentId: f.cto, contextSnapshot: expect.objectContaining({ issueId: f.issueId, source: "issue.update" }) });
@@ -231,8 +240,7 @@ const support = await getEmbeddedPostgresTestSupport();
     await heartbeat.resumeQueuedRuns();
     expect(await assignmentRuns(f, f.cto)).toHaveLength(1);
     expect(await keptWakes(f, f.cto)).toHaveLength(0);
-    // Nothing waited: the thread was told nothing.
-    expect(await notes(f)).toHaveLength(0);
+    expect(await notes(f)).toHaveLength(1);
   }, 90_000);
 
   it.each(["process", "lease"] as const)("keeps and then starts the wake behind the stopped run's %s", async owner => {

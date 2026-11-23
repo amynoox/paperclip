@@ -306,16 +306,19 @@ export function restoreHoldReleasedForCurrentOwnerPredicate() {
  *   waits on.
  * Stricter than upstream, decided for the studio on 23 Nov 2026 ("passage terminé et relâché, sans dossier à
  * réparer"): the run is a legacy run, it released every lease it took, and neither the action nor the run's result
- * carries a system recovery or a restore to finish.
+ * carries a system recovery or a restore to finish. And the action must be SETTLED: an action still open (active or
+ * escalated) holds the task as before. That keeps the wait of a hand-over wake behind the open reconciliation action
+ * of a run that was stopping when the task was handed over (STUDIO-0066), and the note the thread gets for it.
  * A run whose process is still alive holds the task through the ownership blocker, which this does not change. What
  * the former assignee's run did before it was cut stays unverified: the run is still there to inspect.
  *
  * The same condition serves a recovery action read under another name (the deferred-wake sweep, the studio's own).
  */
-export function formerOwnerLegacyHoldReleasedCondition(action: { companyId: SQL; sourceIssueId: SQL; cause: SQL; evidence: SQL }) {
+export function formerOwnerLegacyHoldReleasedCondition(action: { companyId: SQL; sourceIssueId: SQL; cause: SQL; status: SQL; evidence: SQL }) {
   // JSON reads are NULL for other holds. Callers negate this, so it must be strictly true or false.
   return sql`coalesce((
     ${action.cause} = 'legacy_execution_requires_reconciliation'
+    and ${action.status} not in ('active', 'escalated')
     and not (${action.evidence} ?| array['workspaceRestoreFailure', 'workspaceRestoreRecovery', 'systemRecovery'])
     and exists (select 1 from ${heartbeatRuns} stopped
       join ${issues} task on task.company_id = stopped.company_id and task.id = ${action.sourceIssueId}
@@ -340,7 +343,7 @@ export function formerOwnerLegacyHoldReleasedCondition(action: { companyId: SQL;
 export function legacyHoldReleasedForNewOwnerPredicate() {
   return formerOwnerLegacyHoldReleasedCondition({ companyId: sql`${issueRecoveryActions.companyId}`,
     sourceIssueId: sql`${issueRecoveryActions.sourceIssueId}`, cause: sql`${issueRecoveryActions.cause}`,
-    evidence: sql`${issueRecoveryActions.evidence}` });
+    status: sql`${issueRecoveryActions.status}`, evidence: sql`${issueRecoveryActions.evidence}` });
 }
 
 export async function getExecutionBlocker(db: Db, companyId: string, issueId: string, options?: { conversationResetCommentId?: string | null }): Promise<ExecutionBlocker | null> {

@@ -241,8 +241,15 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
   });
 
-  it("an ACTIVE hold of a former assignee's run is released the same way", async () => {
-    const f = await seed({ action: { status: "active", outcome: null, resolvedAt: null }, evidence: { automaticRecovery: undefined } });
+  // Only a SETTLED action is released. An action still open holds the task as before: the wait of a hand-over wake
+  // behind the open reconciliation action of a run that was stopping (STUDIO-0066) is not changed.
+  it.each(["active", "escalated"])("an action still open (%s) holds the task as before, also for the new assignee", async status => {
+    const f = await seed({ action: { status, outcome: null, resolvedAt: null }, evidence: { automaticRecovery: undefined } });
+    expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toMatchObject({ recoveryActionId: f.actionId,
+      cause: "legacy_execution_requires_reconciliation", runId: f.ctoRunId });
+    // Once that same action is settled with nothing to replay, it is the hold of TR-165: released.
+    await db.update(issueRecoveryActions).set({ status: "resolved", outcome: "cancelled", resolvedAt: new Date(),
+      evidence: { runId: f.ctoRunId, automaticRecovery: { replay: "blocked" } } }).where(eq(issueRecoveryActions.id, f.actionId));
     expect(await getExecutionBlocker(db, f.companyId, f.issueId)).toBeNull();
   });
 });
