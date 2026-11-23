@@ -2359,7 +2359,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               and former_hold.id::text = ${agentWakeupRequests.payload}->'executionWait'->>'recoveryActionId'
               and ${formerOwnerLegacyHoldReleasedCondition({ companyId: sql.raw("former_hold.company_id"),
                 sourceIssueId: sql.raw("former_hold.source_issue_id"), cause: sql.raw("former_hold.cause"),
-                evidence: sql.raw("former_hold.evidence") })}))`,
+                status: sql.raw("former_hold.status"), evidence: sql.raw("former_hold.evidence") })}))`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'chat-inbound:%'`,
         sql`coalesce(${agentWakeupRequests.idempotencyKey}, '') not like 'stale-addressee-requeue:%'`,
         // Unique whatever the status: a second row with the same key can never be inserted.
@@ -3665,12 +3665,15 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           error: invokability.message,
         }, { status: agent.status, reason: invokability.reason });
         waitSaved = wait.waitSaved === true;
-      } else if (invokability.reason === "paused" && issueId && isUuidLike(issueId)) {
+      } else if (invokability.reason === "paused" && issueId && isUuidLike(issueId) && !receiptRequest) {
         // STUDIO-0099: a wake a PERSON asked for on a task, refused because the agent is paused, left no row at all
         // (production, 23 Nov 2026: three tasks the Board put to work during a pause; nothing was replayed at the
         // resume, because there was nothing to replay). It now leaves the same refused row as a wake of the system
         // or of an agent, which the resume replays once per task (pause-missed-wakes.ts). The caller is answered as
         // before: the refusal, not a saved wait.
+        // Never for a wake that carries a durable receipt (a message of a chat channel, above all): the row would
+        // carry the receipt's id and be read as that receipt's refusal, and its delivery would be settled as failed
+        // instead of being tried again until the resume, as its own path does on this refusal.
         await writeSkippedRequest("agent.not_invokable", {
           error: invokability.message,
         }, { status: agent.status, reason: invokability.reason });

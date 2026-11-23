@@ -13,11 +13,12 @@ import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import { agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issues } from "@paperclipai/db";
+import { agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueComments, issues } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { createDurableChatWakeupRequest } from "../services/durable-chat-wakeup.js";
 import { PAUSE_MISSED_WAKE_REASON, replayWakesMissedDuringPause } from "../services/pause-missed-wakes.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 
@@ -189,6 +190,27 @@ const ADAPTER = "codex_local";
     const replayed = await replayedWakesOf(f);
     expect(replayed).toHaveLength(1);
     expect(await firstRunOf(f)).toMatchObject({ status: "succeeded", wakeupRequestId: replayed[0]!.id });
+  });
+
+  // A person's message that comes through a chat channel carries a durable receipt. Refused by the pause, it must be
+  // answered as before and leave NO refused row: such a row would carry the receipt's id, be read as the receipt's
+  // refusal, and settle the delivery as failed, while the channel's own path tries the message again until the resume.
+  it("a chat channel's message to a paused agent leaves no refused row: its own path tries it again", async () => {
+    const f = await seed({ status: "in_progress" });
+    await pause(f);
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({ id: commentId, companyId: f.companyId, issueId: f.taskId, authorType: "user",
+      authorUserId: "board-user", body: "From the chat channel." });
+    const receipt = createDurableChatWakeupRequest({ id: randomUUID(), companyId: f.companyId, agentId: f.devId, issueId: f.taskId,
+      commentId, requestedByActorType: "user", requestedByActorId: "board-user", requestedAt: new Date(), authorize: async () => {} });
+    const refusal = await heartbeat.wakeup(f.devId, { source: "on_demand", triggerDetail: "manual", reason: "issue_commented",
+      payload: { issueId: f.taskId, commentId }, contextSnapshot: { issueId: f.taskId, source: "chat:slack", wakeCommentId: commentId },
+      requestedByActorType: "user", requestedByActorId: "board-user", durableChatRequest: receipt }).then(() => null, error => error);
+    // Refused, so that the channel keeps the message and tries again.
+    expect(refusal).toMatchObject({ status: 409 });
+    const rows = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.devId));
+    expect(rows.filter(row => row.status === "skipped")).toEqual([]);
+    expect(rows.filter(row => row.id === receipt.id)).toEqual([]);
   });
 
   it("the caller of a refused wake is answered as before, and a wake that names no task leaves no row", async () => {
