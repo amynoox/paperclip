@@ -12,8 +12,8 @@ import { randomUUID } from "node:crypto";
 import { and, asc, eq } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
-  agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueThreadInteractions,
-  issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
+  agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, heartbeatRuns, issueRelations,
+  issueThreadInteractions, issues, EMBEDDED_POSTGRES_TEST_TIMEOUT_MS,
 } from "@paperclipai/db";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
 import { drainHeartbeatRunsToQuiescence } from "./helpers/drain-heartbeat-runs.js";
@@ -34,6 +34,8 @@ vi.setConfig({ testTimeout: 120_000 });
   type Launch = { issueId: string; runId: string; context: Record<string, unknown> };
   const launches: Launch[] = [];
   const SUCCESS = { exitCode: 0, signal: null, timedOut: false, resultJson: {} };
+  // What the stand-in engine answers for a task, turn by turn; a plain success when nothing is said.
+  const answers = new Map<string, Array<Record<string, unknown>>>();
 
   beforeAll(async () => {
     database = await startEmbeddedPostgresTestDatabase("orphan-deferred-wake-");
@@ -44,7 +46,7 @@ vi.setConfig({ testTimeout: 120_000 });
       // The role ends each run well and sets no disposition on its task, as in production.
       execute: async (input) => {
         launches.push({ issueId: String(input.context.issueId), runId: input.runId, context: input.context as Record<string, unknown> });
-        return SUCCESS as never;
+        return (answers.get(String(input.context.issueId))?.shift() ?? SUCCESS) as never;
       },
       testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date().toISOString() }),
     });
@@ -55,6 +57,7 @@ vi.setConfig({ testTimeout: 120_000 });
     await db.update(heartbeatRuns).set({ status: "cancelled", finishedAt: new Date() }).where(eq(heartbeatRuns.status, "scheduled_retry"));
     await drainHeartbeatRunsToQuiescence(db, heartbeat);
     launches.length = 0;
+    answers.clear();
   });
   afterAll(async () => {
     unregisterServerAdapter(adapterType);
@@ -219,5 +222,89 @@ vi.setConfig({ testTimeout: 120_000 });
     await heartbeat.resumeQueuedRuns();
     expect(cardLaunches(f, card.id), await state(f)).toHaveLength(0);
     expect((await wakeNow(wake.id)).status).toBe("deferred_issue_execution");
+  });
+
+  // The two cases below play other refusals of the retry gate than the supersession: the same receipt and the same
+  // release follow them. What becomes of the wake that waited is the release's own rule, the one of any end of run.
+  const cancelledRetry = async (id: string) => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, id)))[0]!;
+
+  it("the role is paused when the retry comes due: the retry is refused for the role, the card's wake keeps waiting, and it starts when the role works again", async () => {
+    const f = await seed();
+    const retry = await repairScheduled(f);
+    const { card, wake } = await cardNamingOwnTask(f);
+    expect(wake, await state(f)).toMatchObject({ status: "deferred_issue_execution" });
+    await db.update(agents).set({ status: "paused", pauseReason: "manual", pausedAt: new Date() }).where(eq(agents.id, f.agentId));
+
+    await due(retry.id);
+    await heartbeat.promoteDueScheduledRetries();
+    expect(await cancelledRetry(retry.id), await state(f)).toMatchObject({ status: "cancelled", errorCode: "agent_not_invokable" });
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    // Nothing starts for a paused role, and the wake is neither cancelled nor failed: it waits.
+    expect(cardLaunches(f, card.id), await state(f)).toHaveLength(0);
+    expect(await wakeNow(wake.id), await state(f)).toMatchObject({ status: "deferred_issue_execution", error: null });
+
+    // The role works again: the periodic pass takes the waiting wake up.
+    await db.update(agents).set({ status: "idle", pauseReason: null, pausedAt: null }).where(eq(agents.id, f.agentId));
+    await vi.waitFor(async () => {
+      await heartbeat.resumeQueuedRuns();
+      expect(cardLaunches(f, card.id).length, await state(f)).toBe(1);
+    }, { timeout: 30_000, interval: 500 });
+    expect((await wakeNow(wake.id)).status).not.toBe("deferred_issue_execution");
+  });
+
+  /** A run of the role that fails on a lost link: the product schedules its retry (not a disposition repair). */
+  async function failureRetryScheduled(f: Fixture) {
+    answers.set(f.ownIssueId, [{ exitCode: 1, signal: null, timedOut: false, errorCode: "router_provider_stop_unverified",
+      errorMessage: "router provider stop unverified" }]);
+    await heartbeat.wakeup(f.agentId, { source: "assignment", triggerDetail: "system", reason: "issue_assigned",
+      payload: { issueId: f.ownIssueId, mutation: "update" }, requestedByActorType: "system", requestedByActorId: "test",
+      contextSnapshot: { issueId: f.ownIssueId, taskId: f.ownIssueId, source: "issue.update" } });
+    let scheduled: typeof heartbeatRuns.$inferSelect | undefined;
+    await vi.waitFor(async () => {
+      scheduled = (await runsOf(f)).find((run) => run.status === "scheduled_retry");
+      expect(scheduled, await state(f)).toBeDefined();
+    }, { timeout: 30_000, interval: 250 });
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    return scheduled!;
+  }
+  async function blockOwnTask(f: Fixture) {
+    const blockerId = randomUUID();
+    await db.insert(issues).values({ id: blockerId, companyId: f.companyId, title: "Something to finish first", status: "todo", priority: "medium",
+      assigneeAgentId: f.otherAgentId });
+    await db.insert(issueRelations).values({ companyId: f.companyId, issueId: blockerId, relatedIssueId: f.ownIssueId, type: "blocks" });
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, f.ownIssueId));
+  }
+
+  it.each([
+    ["off (the default)", false],
+    ["on", true],
+  ])("a blocker is set on the task when the retry comes due, the company's setting for a card's wake on a blocked task %s: the wake that waited meets the same rule as a card's wake that arrives then", async (_label, settingOn) => {
+    const f = await seed();
+    if (settingOn) await db.update(companies).set({ interactionResolverGovernance: { addresseeWakeOnBlockedIssue: { enabled: true } } as never })
+      .where(eq(companies.id, f.companyId));
+    const retry = await failureRetryScheduled(f);
+    const { card, wake } = await cardNamingOwnTask(f);
+    expect(wake, await state(f)).toMatchObject({ status: "deferred_issue_execution" });
+    await blockOwnTask(f);
+
+    await due(retry.id);
+    await heartbeat.promoteDueScheduledRetries();
+    expect(await cancelledRetry(retry.id), await state(f)).toMatchObject({ status: "cancelled", errorCode: "issue_dependencies_blocked" });
+    await heartbeat.resumeQueuedRuns();
+    await drainHeartbeatRunsToQuiescence(db, heartbeat);
+    const after = await wakeNow(wake.id);
+    // The wake no longer waits for ever behind a run that is gone.
+    expect(after.status, await state(f)).not.toBe("deferred_issue_execution");
+    if (settingOn) {
+      // The setting lets a card's wake start on the addressee's own blocked task, in the bounded mode.
+      expect(cardLaunches(f, card.id), await state(f)).toHaveLength(1);
+      expect(cardLaunches(f, card.id)[0]!.context).toMatchObject({ interactionId: card.id, dependencyBlockedInteraction: true });
+    } else {
+      // Without it the wake is held with the task, said as such: the product wakes the assignee when the blocker resolves.
+      expect(cardLaunches(f, card.id), await state(f)).toHaveLength(0);
+      expect(after, await state(f)).toMatchObject({ status: "skipped" });
+      expect(String(after.error)).toContain("dependencies are still blocked");
+    }
   });
 });

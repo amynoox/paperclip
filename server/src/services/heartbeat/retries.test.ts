@@ -37,7 +37,7 @@ function callbacks() {
     runDispatch: {
       nextScheduledRetryAt: vi.fn(async () => null),
       evaluateScheduledRetryGate: vi.fn<HeartbeatRetryDependencies["runDispatch"]["evaluateScheduledRetryGate"]>(async () => ({ allowed: true })),
-      promoteDueScheduledRetries: vi.fn<HeartbeatRetryDependencies["runDispatch"]["promoteDueScheduledRetries"]>(async () => ({ promoted: 0, runIds: [], postCommitEffects: [] })),
+      promoteDueScheduledRetries: vi.fn<HeartbeatRetryDependencies["runDispatch"]["promoteDueScheduledRetries"]>(async () => ({ promoted: 0, runIds: [], postCommitEffects: [], suppressedRuns: [] })),
       promoteScheduledRetry: vi.fn<HeartbeatRetryDependencies["runDispatch"]["promoteScheduledRetry"]>(async () => ({ outcome: "not_promoted" })),
     },
   } satisfies HeartbeatRetryDependencies;
@@ -166,11 +166,17 @@ describe("heartbeat retry module callbacks", () => {
       invocationSource: "automation", triggerDetail: "system", wakeupRequestId: "wake",
     };
     deps.getWorktreeExecutionCutoff.mockResolvedValue(cutoff);
-    deps.runDispatch.promoteDueScheduledRetries.mockResolvedValue({ promoted: 1, runIds: ["retry"], postCommitEffects: [effect] });
+    // STUDIO-0095: one retry was promoted, another was cancelled by its gate.
+    const suppressed = { id: "suppressed", companyId: "company" };
+    deps.runDispatch.promoteDueScheduledRetries.mockResolvedValue({ promoted: 1, runIds: ["retry"], postCommitEffects: [effect],
+      suppressedRuns: [suppressed] });
     expect(await extracted.createHeartbeatRetries(database.db, deps).promoteDueScheduledRetries(now)).toEqual({ promoted: 1, runIds: ["retry"] });
     expect(deps.runDispatch.promoteDueScheduledRetries).toHaveBeenCalledWith({ now, cutoff });
     expect(deps.applyRunDispatchPostCommitEffects).toHaveBeenCalledWith([effect]);
     expect(deps.applyRunDispatchPostCommitEffects).toHaveBeenCalledAfter(deps.runDispatch.promoteDueScheduledRetries);
+    // What waited behind the cancelled retry is released, and that release starts no recovery of its own.
+    expect(deps.releaseIssueExecutionAndPromote).toHaveBeenCalledExactlyOnceWith(suppressed, { suppressImmediateRecovery: true });
+    expect(deps.releaseIssueExecutionAndPromote).toHaveBeenCalledAfter(deps.applyRunDispatchPostCommitEffects);
     expect(database.access).not.toHaveBeenCalled();
   });
 
