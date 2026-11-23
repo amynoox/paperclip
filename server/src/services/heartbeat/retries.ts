@@ -1820,7 +1820,19 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       cutoff,
     });
     applyRunDispatchPostCommitEffects(result.postCommitEffects);
+    await promoteBehindSuppressedRetries(result.suppressedRuns ?? []);
     return { promoted: result.promoted, runIds: result.runIds };
+  }
+
+  // STUDIO-0095: a scheduled retry the gate cancels (a disposition repair superseded by a wake that waits behind it,
+  // for example) never ran, so no end of run promotes the wakes that waited behind it. Production, 22 Nov 2026,
+  // TR-2562: the retry was cancelled as superseded by a card's wake, and that wake stayed deferred with no run left
+  // on the issue. The same release as at the end of a run: holds, pauses and operator stops still apply.
+  async function promoteBehindSuppressedRetries(runs: Array<{ id: string; companyId: string }>) {
+    for (const run of runs) {
+      await releaseIssueExecutionAndPromote(run).catch(err =>
+        logger.warn({ err, runId: run.id }, "failed to promote the wakes that waited behind a suppressed scheduled retry"));
+    }
   }
 
   async function getIssueRetryRun(
@@ -2035,6 +2047,7 @@ export function createHeartbeatRetries(db: Db, dependencies: HeartbeatRetryDepen
       };
     }
     if (promotion.outcome === "gate_suppressed") {
+      await promoteBehindSuppressedRetries([{ id: updated.id, companyId: updated.companyId }]);
       return {
         outcome: "gate_suppressed" as const,
         message: promotion.reason,

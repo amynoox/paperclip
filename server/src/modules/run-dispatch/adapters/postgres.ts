@@ -12,6 +12,7 @@ import { notifyUnsafeWorkspaceExportRecovery } from "../../../services/unsafe-wo
 import { notifyCancelledWorkspacePreservation } from "../../../services/cancelled-workspace-preservation-notifications.js";
 import { notifyInstructionCollection } from "../../../services/instruction-collection-notifications.js";
 import { notifyScheduledRetryCancellation } from "../../../services/scheduled-retry-cancellation-notifications.js";
+import { scheduledRetrySuppressionReceipt } from "../../../services/suppressed-scheduled-retry.js";
 import { readClaimedNativeStopRecovery } from "../../../services/native-runtime/native-cancellation-request.js";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { recordedUserStop, userStopBoundaryAt } from "../../../services/run-cancellation.js";
@@ -986,13 +987,13 @@ export function createPostgresRunDispatchAdapter(
         finishedAt: input.now,
         error: input.reason,
         errorCode: input.errorCode,
-        ...(pauseSuppression ? {
-          resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify(pauseSuppression)}::jsonb`,
-        } : {}),
-        // STUDIO-0063: a retry the dependency gate refused is a marked hold (see HELD_DEPENDENCY_TRACE_KEY).
-        ...(input.errorCode === "issue_dependencies_blocked" ? {
-          resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({ [HELD_DEPENDENCY_TRACE_KEY]: true })}::jsonb`,
-        } : {}),
+        // One object for the three marks. STUDIO-0063: a retry the dependency gate refused is a marked hold (see
+        // HELD_DEPENDENCY_TRACE_KEY). STUDIO-0095: the gate's receipt (services/suppressed-scheduled-retry.ts).
+        resultJson: sql`coalesce(${heartbeatRuns.resultJson}, '{}'::jsonb) || ${JSON.stringify({
+          ...(pauseSuppression ?? {}),
+          ...(input.errorCode === "issue_dependencies_blocked" ? { [HELD_DEPENDENCY_TRACE_KEY]: true } : {}),
+          ...scheduledRetrySuppressionReceipt(input.errorCode),
+        })}::jsonb`,
         updatedAt: input.now,
       })
       .where(
