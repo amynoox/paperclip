@@ -179,8 +179,11 @@ const support = await getEmbeddedPostgresTestSupport();
   it("an agent that already exists is not touched: neither by a change of its configuration nor by another agent's creation", async () => {
     const lifecycle = createAgentLifecycle(db);
     // An agent as the ones created before this patch: no key in its stored configuration.
-    const old = await lifecycle.requestHire(companyId, { name: "Old agent", adapterType: "codex_local", adapterConfig: { model: "old" } });
+    // `runnerResolved`: the engine named is the one stored, as after the route's own choice of the local launcher.
+    const old = await lifecycle.requestHire(companyId, { name: "Old agent", adapterType: "codex_local", adapterConfig: { model: "old" } },
+      { runnerResolved: true });
     await db.update(agents).set({ adapterConfig: { model: "old" } }).where(eq(agents.id, old.id));
+    expect(await stored(old.id)).toMatchObject({ adapterType: "codex_local" });
     expect(await configOf(old.id)).not.toHaveProperty(LIVE_STEERING_KEY);
     // Its configuration is changed through the route, and through the service: no key appears.
     const patched = await request(app()).patch(`/api/agents/${old.id}`).send({ adapterConfig: { model: "newer" } });
@@ -190,7 +193,11 @@ const support = await getEmbeddedPostgresTestSupport();
     await lifecycle.updateConfiguration(old.id, { adapterConfig: { model: "newest" } });
     expect(await configOf(old.id)).not.toHaveProperty(LIVE_STEERING_KEY);
     // Another agent is created beside it.
-    await lifecycle.requestHire(companyId, { name: "New neighbour", adapterType: "codex_local", adapterConfig: {}, runner: "legacy" });
+    const neighbour = await lifecycle.requestHire(companyId, { name: "New neighbour", adapterType: "codex_local", adapterConfig: {} },
+      { runnerResolved: true });
+    expect(await stored(neighbour.id)).toMatchObject({ adapterType: "codex_local" });
+    expect(await configOf(neighbour.id)).toMatchObject({ experimentalLiveSteering: true });
+    expect(await stored(old.id)).toMatchObject({ adapterType: "codex_local" });
     expect(await configOf(old.id)).not.toHaveProperty(LIVE_STEERING_KEY);
     // And one that was switched off by hand stays off.
     await db.update(agents).set({ adapterConfig: { model: "old", experimentalLiveSteering: false } }).where(eq(agents.id, old.id));
@@ -201,8 +208,13 @@ const support = await getEmbeddedPostgresTestSupport();
   // The change of engine of an existing agent, through the real route: the way the studio's roles get their engine.
   // The route keeps only the engine-agnostic keys of the old configuration; live steering was dropped with the rest.
   async function existingAgent(adapterType: string, config: Record<string, unknown>) {
-    const created = await createAgentLifecycle(db).requestHire(companyId, { name: `Existing ${randomUUID().slice(0, 8)}`, adapterType, adapterConfig: {} });
+    // `runnerResolved`: the engine named is the one stored (called directly, the service would choose the native launcher).
+    const created = await createAgentLifecycle(db).requestHire(companyId, { name: `Existing ${randomUUID().slice(0, 8)}`, adapterType, adapterConfig: {} },
+      { runnerResolved: true });
     await db.update(agents).set({ adapterConfig: config }).where(eq(agents.id, created.id));
+    // The agent is on the engine the case names, with exactly the configuration it gives, before anything is changed.
+    expect(await stored(created.id)).toMatchObject({ adapterType });
+    expect(await configOf(created.id)).toEqual(config);
     return created.id;
   }
   const changeEngine = (id: string, adapterType: string, adapterConfig: Record<string, unknown>) =>
@@ -242,14 +254,21 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await configOf(id)).toMatchObject({ model: "new-model", experimentalLiveSteering: false });
   });
 
-  it("no change of engine: a configuration saved again, also replaced whole, gets nothing written and loses nothing", async () => {
+  it("no change of engine: nothing is written on an agent without the key, also when its configuration is replaced whole; a merged change keeps the key the agent had", async () => {
     const id = await existingAgent("codex_local", { model: "old-model" });
     const replaced = await request(app()).patch(`/api/agents/${id}`).send({ adapterConfig: { model: "new-model" }, replaceAdapterConfig: true });
     expect(replaced.status, JSON.stringify(replaced.body)).toBe(200);
+    expect(await stored(id)).toMatchObject({ adapterType: "codex_local" });
     expect(await configOf(id)).not.toHaveProperty(LIVE_STEERING_KEY);
     const steered = await existingAgent("codex_local", { model: "old-model", experimentalLiveSteering: true });
     const merged = await request(app()).patch(`/api/agents/${steered}`).send({ adapterConfig: { model: "new-model" } });
     expect(merged.status, JSON.stringify(merged.body)).toBe(200);
+    expect(await stored(steered)).toMatchObject({ adapterType: "codex_local" });
     expect(await configOf(steered)).toMatchObject({ model: "new-model", experimentalLiveSteering: true });
+    // Replaced whole by a configuration that does not carry the key, an agent that had it loses it: a replacement is
+    // the request's own word, and this patch does not change it.
+    const whole = await request(app()).patch(`/api/agents/${steered}`).send({ adapterConfig: { model: "newest-model" }, replaceAdapterConfig: true });
+    expect(whole.status, JSON.stringify(whole.body)).toBe(200);
+    expect(await configOf(steered)).not.toHaveProperty(LIVE_STEERING_KEY);
   });
 });
