@@ -16,7 +16,7 @@ import { errorHandler } from "../middleware/error-handler.js";
 import { agentRoutes } from "../routes/agents.js";
 import { createAgentLifecycle } from "../services/agent-lifecycle.js";
 import { selectsAdapterInteractiveControl } from "../services/adapter-interactive-control.js";
-import { LIVE_STEERING_ADAPTER_TYPES, LIVE_STEERING_KEY, withLiveSteeringDefault } from "../lib/agent-live-steering.js";
+import { LIVE_STEERING_ADAPTER_TYPES, LIVE_STEERING_KEY, withLiveSteeringCarriedOver, withLiveSteeringDefault } from "../lib/agent-live-steering.js";
 
 describe("live steering by default: the rule", () => {
   it("is written for the engines that read it, when the creation says nothing of it", () => {
@@ -40,6 +40,26 @@ describe("live steering by default: the rule", () => {
     for (const adapterType of ["process", "paperclip_runner", "cursor_cloud", "gemini_local", null, undefined]) {
       const config = { model: "m" };
       expect(withLiveSteeringDefault(adapterType, config)).toBe(config);
+    }
+  });
+
+  it("through a change of engine: what the request says, else what the old configuration said, else true; nothing for another engine", () => {
+    for (const next of LIVE_STEERING_ADAPTER_TYPES) {
+      expect(withLiveSteeringCarriedOver(next, { experimentalLiveSteering: true, model: "old" }, { model: "new" }))
+        .toEqual({ model: "new", experimentalLiveSteering: true });
+      expect(withLiveSteeringCarriedOver(next, { experimentalLiveSteering: false }, { model: "new" }))
+        .toEqual({ model: "new", experimentalLiveSteering: false });
+      expect(withLiveSteeringCarriedOver(next, { model: "old" }, { model: "new" })).toEqual({ model: "new", experimentalLiveSteering: true });
+      expect(withLiveSteeringCarriedOver(next, null, {})).toEqual({ experimentalLiveSteering: true });
+      // The request's own word wins over the old configuration, both ways.
+      const off = { experimentalLiveSteering: false };
+      expect(withLiveSteeringCarriedOver(next, { experimentalLiveSteering: true }, off)).toBe(off);
+      const on = { experimentalLiveSteering: true };
+      expect(withLiveSteeringCarriedOver(next, { experimentalLiveSteering: false }, on)).toBe(on);
+    }
+    for (const next of ["process", "paperclip_runner", "cursor_cloud", null, undefined]) {
+      const config = { model: "new" };
+      expect(withLiveSteeringCarriedOver(next, { experimentalLiveSteering: true }, config)).toBe(config);
     }
   });
 
@@ -176,5 +196,60 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.update(agents).set({ adapterConfig: { model: "old", experimentalLiveSteering: false } }).where(eq(agents.id, old.id));
     await lifecycle.updateConfiguration(old.id, { runtimeConfig: { heartbeat: { enabled: false } } });
     expect(await configOf(old.id)).toMatchObject({ experimentalLiveSteering: false });
+  });
+
+  // The change of engine of an existing agent, through the real route: the way the studio's roles get their engine.
+  // The route keeps only the engine-agnostic keys of the old configuration; live steering was dropped with the rest.
+  async function existingAgent(adapterType: string, config: Record<string, unknown>) {
+    const created = await createAgentLifecycle(db).requestHire(companyId, { name: `Existing ${randomUUID().slice(0, 8)}`, adapterType, adapterConfig: {} });
+    await db.update(agents).set({ adapterConfig: config }).where(eq(agents.id, created.id));
+    return created.id;
+  }
+  const changeEngine = (id: string, adapterType: string, adapterConfig: Record<string, unknown>) =>
+    request(app()).patch(`/api/agents/${id}`).send({ adapterType, adapterConfig });
+
+  it.each([
+    ["codex_local", "claude_local"],
+    ["claude_local", "codex_local"],
+  ])("a change of engine from %s to %s: a steerable agent stays steerable", async (from, to) => {
+    const id = await existingAgent(from, { model: "old-model", experimentalLiveSteering: true });
+    const changed = await changeEngine(id, to, { model: "new-model" });
+    expect(changed.status, JSON.stringify(changed.body)).toBe(200);
+    expect(await stored(id)).toMatchObject({ adapterType: to });
+    expect(await configOf(id)).toMatchObject({ model: "new-model", experimentalLiveSteering: true });
+    expect(await configOf(id)).not.toMatchObject({ model: "old-model" });
+  });
+
+  it("a change of engine: an agent switched off stays off", async () => {
+    const id = await existingAgent("codex_local", { model: "old-model", experimentalLiveSteering: false });
+    const changed = await changeEngine(id, "claude_local", { model: "new-model" });
+    expect(changed.status, JSON.stringify(changed.body)).toBe(200);
+    expect(await stored(id)).toMatchObject({ adapterType: "claude_local" });
+    expect(await configOf(id)).toMatchObject({ model: "new-model", experimentalLiveSteering: false });
+  });
+
+  it("a change of engine: an agent whose old configuration said nothing becomes steerable", async () => {
+    const id = await existingAgent("codex_local", { model: "old-model" });
+    const changed = await changeEngine(id, "claude_local", { model: "new-model" });
+    expect(changed.status, JSON.stringify(changed.body)).toBe(200);
+    expect(await configOf(id)).toMatchObject({ model: "new-model", experimentalLiveSteering: true });
+  });
+
+  it("a change of engine: what the request says wins over the old configuration", async () => {
+    const id = await existingAgent("codex_local", { model: "old-model", experimentalLiveSteering: true });
+    const changed = await changeEngine(id, "claude_local", { model: "new-model", experimentalLiveSteering: false });
+    expect(changed.status, JSON.stringify(changed.body)).toBe(200);
+    expect(await configOf(id)).toMatchObject({ model: "new-model", experimentalLiveSteering: false });
+  });
+
+  it("no change of engine: a configuration saved again, also replaced whole, gets nothing written and loses nothing", async () => {
+    const id = await existingAgent("codex_local", { model: "old-model" });
+    const replaced = await request(app()).patch(`/api/agents/${id}`).send({ adapterConfig: { model: "new-model" }, replaceAdapterConfig: true });
+    expect(replaced.status, JSON.stringify(replaced.body)).toBe(200);
+    expect(await configOf(id)).not.toHaveProperty(LIVE_STEERING_KEY);
+    const steered = await existingAgent("codex_local", { model: "old-model", experimentalLiveSteering: true });
+    const merged = await request(app()).patch(`/api/agents/${steered}`).send({ adapterConfig: { model: "new-model" } });
+    expect(merged.status, JSON.stringify(merged.body)).toBe(200);
+    expect(await configOf(steered)).toMatchObject({ model: "new-model", experimentalLiveSteering: true });
   });
 });
