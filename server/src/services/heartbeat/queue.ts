@@ -1,7 +1,7 @@
 import { connectionIntentService } from "../connection-intents.js";
 import { verifyBlockerStallWake } from "../recovery/blocker-stall-wakeups.js";
 import { verifyPluginBlockedWake } from "../plugin-blocked-wake.js";
-import { verifyOwnIssueInteractionWake } from "../addressee-wake-issue.js";
+import { readOwnIssueInteractionWake, verifyOwnIssueInteractionWake } from "../addressee-wake-issue.js";
 import { agentCommentHeldByDependencies, allUnresolvedBlockersCancelled, HELD_DEPENDENCY_COMMENT_IDS_KEY,
   HELD_DEPENDENCY_HANDOVER_AT_KEY, HELD_DEPENDENCY_OLDER_COUNT_KEY, HELD_DEPENDENCY_REASON_KEY, HELD_DEPENDENCY_TRACE_KEY,
   isDependencyHandoffWake, readCommentsToHandOver,
@@ -2508,9 +2508,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     const releasedNativeSources = new Set<string>();
     for (const { wake } of strandedQueues) {
       const dependencyWake = isDependencyResolvedWakePayload(wake.payload);
+      // STUDIO-0095: also a card's wake delivered on a task of the addressee itself (STUDIO-0087): its card is on
+      // another task, so the first reading does not know it.
       const pendingAddresseeWake = readNonEmptyString(parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]).wakeReason) === "interaction_pending" &&
-        await verifyAddresseeInteractionWake(db, { companyId: wake.companyId, issueId: String(wake.payload?.issueId),
-          agentId: wake.agentId, contextSnapshot: parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]) });
+        (await verifyAddresseeInteractionWake(db, { companyId: wake.companyId, issueId: String(wake.payload?.issueId),
+          agentId: wake.agentId, contextSnapshot: parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]) }) ||
+        await readOwnIssueInteractionWake(db, { companyId: wake.companyId, issueId: String(wake.payload?.issueId),
+          agentId: wake.agentId, contextSnapshot: parseObject(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]) }) !== null);
       if (!dependencyWake && !pendingAddresseeWake && !queuedCommentIdsFromWakePayload(wake.payload).length &&
           !carriesPluginBlockedWake(wake.payload?.[DEFERRED_WAKE_CONTEXT_KEY]) &&
           !await readQueuedInteractionResponse(db, wake.companyId, String(wake.payload?.issueId), wake.payload)) continue;
