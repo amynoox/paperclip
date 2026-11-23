@@ -36,15 +36,19 @@ export function createPromoteDueScheduledRetries(deps: {
     ).slice(0, MAX_DUE_RETRIES_PER_SWEEP);
     const runIds: string[] = [];
     const postCommitEffects: PostCommitEffect[] = [];
+    // STUDIO-0095: the retries the gate cancelled. Their cancellation ended no run: the caller releases the issue
+    // of each and promotes what waited behind it.
+    const suppressedRuns: Array<{ id: string; companyId: string }> = [];
 
     for (const dueRun of dueRuns) {
       const result = await deps.promoteScheduledRetry({ ...dueRun, now });
+      if (result.outcome === "gate_suppressed") suppressedRuns.push({ id: dueRun.runId, companyId: dueRun.companyId });
       if (result.outcome !== "promoted") continue;
       runIds.push(dueRun.runId);
       postCommitEffects.push(...result.postCommitEffects);
     }
 
-    return { promoted: runIds.length, runIds, postCommitEffects };
+    return { promoted: runIds.length, runIds, postCommitEffects, suppressedRuns };
   };
 }
 

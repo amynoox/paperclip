@@ -35,6 +35,7 @@ import {
 } from "@paperclipai/db";
 import { hasConversationContinuationPolicy } from "../../../services/conversation-continuation.js";
 import { legacyExecutionNeedsReconciliationWithEvidence } from "../../../services/legacy-execution-recovery.js";
+import { isSuppressedScheduledRetryVerified } from "../../../services/suppressed-scheduled-retry.js";
 import {
   authorizeFailedChatRunRetryWake,
   FailedChatRunRetryAuthorizationError,
@@ -1293,7 +1294,10 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           issueStatus: issueRow?.status ?? "",
           hasAssigneeUser: Boolean(issueRow?.assigneeUserId),
           assigneeAgentMatchesRunAgent: issueRow?.assigneeAgentId === run.agentId,
+          // STUDIO-0095: a scheduled retry its gate cancelled before any dispatch did nothing that needs
+          // reconciliation; what waited behind it is promoted like behind any run that ended.
           legacyExecutionNeedsReconciliation: evidence.kind === "complete" &&
+            !(await isSuppressedScheduledRetryVerified(tx as unknown as Db, evidence.run)) &&
             await legacyExecutionNeedsReconciliationWithEvidence(tx as unknown as Db, evidence.run),
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
