@@ -16888,6 +16888,15 @@ export function issueRoutes(
         existing.status === "in_review" &&
         issue.status === "todo" &&
         req.body.status !== undefined;
+      // STUDIO-0099: a person who puts an assigned task to work (todo → in_progress) asks its assignee to work on
+      // it; nothing woke the assignee (production, 23 Nov 2026: three tasks the Board put in progress stayed
+      // without a wake). Only a person's change: an agent that puts its own task in progress is already at work,
+      // and a change made by another agent wakes nobody, as before.
+      const personPutTodoTaskToWork =
+        actor.actorType === "user" &&
+        existing.status === "todo" &&
+        issue.status === "in_progress" &&
+        req.body.status !== undefined;
       const previousExecutionState = parseIssueExecutionState(
         existing.executionState,
       );
@@ -17052,7 +17061,8 @@ export function issueRoutes(
           (statusChangedFromBacklog ||
             statusChangedFromBlockedToTodo ||
             statusChangedFromClosedToTodo ||
-            userResumedFromReviewToTodo) &&
+            userResumedFromReviewToTodo ||
+            personPutTodoTaskToWork) &&
           issue.assigneeAgentId
         ) {
           addWakeup(issue.assigneeAgentId, {
