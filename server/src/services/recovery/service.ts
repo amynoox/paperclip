@@ -1233,6 +1233,15 @@ export function recoveryService(
    * is kept and replayed (STUDIO-0028). Called after that replay: no start when a wake or a run of the agent is
    * already live for the task. A run that waits again extends the same series, so the bound does not start over.
    */
+  /**
+   * STUDIO-0101: the same reading for another pass (the hand-over backstop of STUDIO-0063): the deadline of a wait the
+   * adapter declared on the agent's latest started run on the issue, while it is within its bound; null otherwise.
+   */
+  async function declaredWaitDeadlineForIssue(input: { companyId: string; issueId: string; agentId: string; now?: Date }) {
+    const run = await getLatestStartedIssueRunForAgent(input.companyId, input.issueId, input.agentId);
+    return liveAdapterDeclaredWaitDeadline({ companyId: input.companyId, id: input.issueId }, input.agentId, run, input.now ?? new Date());
+  }
+
   async function wakeDeclaredWaitsAfterPause(input: { companyId: string; agentId: string; now?: Date }) {
     const waiting = await db.select({ id: issues.id, companyId: issues.companyId }).from(issues).where(and(
       eq(issues.companyId, input.companyId),
@@ -7181,6 +7190,7 @@ export function recoveryService(
     registerActiveRunSilenceWork: watchdog.registerSilenceWork,
     reconcileStrandedAssignedIssues,
     wakeDeclaredWaitsAfterPause,
+    declaredWaitDeadlineForIssue,
     reconcileUnassignedBlockingIssues,
     reconcileActiveRecoveryActions,
     reconcileLegacyContinuation,

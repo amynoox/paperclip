@@ -15,7 +15,9 @@
 // apart from the wake request, written before the wake: the wait holds when the admission returns without a row or
 // throws). An issue whose runs never qualify (a router that refuses for hours, a run that succeeds without a
 // recorded process start) is retried at most hourly, forever: late, never silent.
-// Left alone: an issue with an active recovery action (its owner, the Board for a blocked execution path, decides the
+// Left alone (STUDIO-0101): an issue whose assignee's latest started run ended in a wait the adapter declared, still
+// within its bound (the adapter wakes the assignee itself; the pass looks again at the bound's end, and past it wakes
+// as before). Left alone: an issue with an active recovery action (its owner, the Board for a blocked execution path, decides the
 // continuation; resolving it runs this pass again), and an assignee that is not invocable or over budget (the pass
 // resumes when it is).
 // Cadence: the stranded-assignment and resolved-dependency recovery queues (recovery/work.ts) check each open assigned
@@ -61,14 +63,17 @@ export type HeldCommentHandoverWake = (agentId: string, request: {
 }) => Promise<unknown>;
 
 export type HeldCommentHandoverOutcome =
-  | "not_target" | "agent_not_invocable" | "no_trace" | "not_ready" | "live_path" | "recovery_action" | "waiting"
-  | "woken" | "handed_back";
+  | "not_target" | "agent_not_invocable" | "no_trace" | "not_ready" | "live_path" | "declared_wait" | "recovery_action"
+  | "waiting" | "woken" | "handed_back";
 
 export async function reconcileHeldCommentHandover(db: Db, input: {
   companyId: string;
   issueId: string;
   wake: HeldCommentHandoverWake;
   invocationBlocked?: (agentId: string, issueId: string) => Promise<boolean>;
+  /** STUDIO-0101: the end of a wait the adapter declared on the assignee's latest started run on the issue, while
+   * it is within its bound; null otherwise (recovery/service.ts: `declaredWaitDeadlineForIssue`). */
+  declaredWaitDeadline?: (agentId: string, issueId: string, now: Date) => Promise<number | null>;
   now?: Date;
   /** The next time this issue is worth another look (the end of a wait between two backstop wakes). */
   onDeferredDeadline?: (at: number) => void;
@@ -102,6 +107,17 @@ export async function reconcileHeldCommentHandover(db: Db, input: {
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
   )).limit(1);
   if (liveWake || liveRun) return "live_path";
+  // STUDIO-0101: the assignee's latest started run on the issue ended in a wait the adapter declared (no machine free,
+  // a stop being proven: recovery/adapter-declared-wait.ts), still within its bound. The adapter keeps the request
+  // and wakes the assignee itself; a wake from here would only be refused again (production, 23 Nov 2026: 32 runs
+  // refused `router_waiting_for_resources` in one hour on four tasks, each started by this pass). The bound and the
+  // run read are the stranded-work recovery's own (`declaredWaitDeadline`); past the bound, this pass wakes as before.
+  const now = input.now ?? new Date();
+  const waitDeadline = input.declaredWaitDeadline ? await input.declaredWaitDeadline(assigneeAgentId, issue.id, now) : null;
+  if (waitDeadline !== null) {
+    input.onDeferredDeadline?.(waitDeadline);
+    return "declared_wait";
+  }
   const [recoveryAction] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, input.companyId),
     eq(issueRecoveryActions.sourceIssueId, issue.id),
@@ -112,7 +128,6 @@ export async function reconcileHeldCommentHandover(db: Db, input: {
   if (!agent || !(await evaluateAgentInvokabilityFromDb(db, agent)).invokable) return "agent_not_invocable";
   if (input.invocationBlocked && await input.invocationBlocked(assigneeAgentId, issue.id)) return "agent_not_invocable";
   // The wait between two backstop wakes of this issue doubles; counted from the backstop's own attempts since the base.
-  const now = input.now ?? new Date();
   const windowStart = new Date(now.getTime() - HELD_HANDOVER_BACKSTOP_ATTEMPT_WINDOW_MS);
   const attemptsSince = base.traceSince && base.traceSince > windowStart ? base.traceSince : windowStart;
   const earlier = await db.select({ requestedAt: agentWakeupRequests.requestedAt }).from(agentWakeupRequests).where(and(
