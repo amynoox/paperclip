@@ -291,9 +291,14 @@ export interface AdapterExecutionContext {
   /** Host-owned collection after the final provider invocation is confirmed stopped,
    * before remote workspace restore or disposal. Never call on an unverified timeout. */
   onProviderStopped?: () => Promise<void>;
-  /** STUDIO-0097: host-owned record of the proof a prepared interactive process hands with its stop callback
-   * (the engine's verified stop). The host checks it; it never throws and grants nothing by itself. */
+  /** STUDIO-0097: host-owned record of what a prepared interactive process hands with its stop callback (the
+   * engine's stop as its adapter saw it). The host checks it and keeps it as a trace; it never throws and proves
+   * nothing by itself: the host's own observation does (`ServerAdapterModule.readProviderStop`). */
   onProviderStopProof?: (proof: unknown) => Promise<void>;
+  /** STUDIO-0097: host-owned record of the announcement a prepared interactive process hands when its engine
+   * started (`paperclip.provider-identity.v1`: the engine's process number and start time on its machine). The host
+   * checks it, keeps it, and hands it back to `readProviderStop`. Never throws. */
+  onProviderIdentity?: (identity: unknown) => Promise<void>;
   /** Server-owned, actor-attributed snapshot also rendered by legacy wake prompts. */
   executionContinuation?: ExecutionContinuationEnvelope | null;
   runId: string;
@@ -594,6 +599,22 @@ export interface ServerAdapterModule {
    * without knowing provider-specific credential paths or API shapes.
    */
   getQuotaWindows?: () => Promise<ProviderQuotaResult>;
+  /**
+   * STUDIO-0097. Optional: look, after a steered run ended, at what is left of its engine on its machine.
+   * Called by the host only, never by a run: with the announcement the host kept for the run
+   * (`paperclip.provider-identity.v1`) and the execution target of the environment the run used. Returns a
+   * `paperclip.provider-stop-observation.v1` (`absent`, `alive` or `unreadable`; the announced engine if it still
+   * exists; the other processes of the session's account born since it started; what was stopped): process numbers,
+   * start times and program names, never arguments. With `stop`, it may stop the announced engine, and only it with
+   * what is still attached to it, then looks again. It never throws for a machine that does not answer.
+   */
+  readProviderStop?: (input: {
+    runId: string;
+    announcement: Record<string, unknown>;
+    target: AdapterExecutionTarget;
+    stop: boolean;
+    signal: AbortSignal;
+  }) => Promise<unknown>;
   /**
    * Optional: detect the currently configured model from local config files.
    * Returns the detected model/provider and the config source, or null if

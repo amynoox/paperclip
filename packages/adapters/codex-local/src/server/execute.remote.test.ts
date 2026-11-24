@@ -751,9 +751,10 @@ describe("codex remote execution", () => {
     expect(restoreWorkspaceFromSshExecution).not.toHaveBeenCalled();
   });
 
-  // STUDIO-0097: a prepared run that is cancelled hands the proof of its engine's stop with the stop callback; the
-  // adapter passes it on to the host as it is, before the process returns.
-  it("passes the proof a cancelled prepared run hands with the stop callback on to the host", async () => {
+  // STUDIO-0097: a prepared run announces its engine when it started, and when it is cancelled hands what it saw of
+  // the engine's stop with the stop callback; the adapter passes both on to the host as they are, before the process
+  // returns.
+  it("passes the engine's announcement and what a cancelled prepared run hands with the stop callback on to the host", async () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const bridgeStop = vi.fn(async () => {});
     startAdapterExecutionTargetPaperclipBridge.mockResolvedValueOnce({
@@ -778,7 +779,15 @@ describe("codex remote execution", () => {
       await new Promise(resolve => setTimeout(resolve, 20));
       order.push(`host:${JSON.stringify(value)}`);
     });
-    const codexPreparedProcess = vi.fn(async (prepared: { options: { onProcessStopped?: (proof?: unknown) => void | Promise<void> } }) => {
+    const announcement = { schema: "paperclip.provider-identity.v1", runId: "run-ssh-prepared-proof", providerPid: 4321,
+      providerStartedAt: "2026-11-23T10:00:00Z" };
+    const onProviderIdentity = vi.fn(async (value: unknown) => {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      order.push(`announced:${JSON.stringify(value)}`);
+    });
+    const codexPreparedProcess = vi.fn(async (prepared: { options: { onProcessStopped?: (proof?: unknown) => void | Promise<void>;
+      onProviderStarted?: (identity: unknown) => void | Promise<void> } }) => {
+      await prepared.options.onProviderStarted?.(announcement);
       controller.abort(new Error("operator cancel"));
       await prepared.options.onProcessStopped?.(proof);
       order.push("process returns");
@@ -806,11 +815,12 @@ describe("codex remote execution", () => {
       registerInteractiveControl: () => () => {},
       codexPreparedProcess,
       onProviderStopProof,
+      onProviderIdentity,
       signal: controller.signal,
       onLog: async () => {},
     })).rejects.toThrow(/router_cancelled/);
 
-    expect(order).toEqual([`host:${JSON.stringify(proof)}`, "process returns"]);
+    expect(order).toEqual([`announced:${JSON.stringify(announcement)}`, `host:${JSON.stringify(proof)}`, "process returns"]);
   });
 
   // STUDIO-0075: the session the worker router returns for a cut run carries the folder of the task on the machine and

@@ -193,23 +193,30 @@ describe("claude prepared interactive process", () => {
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
   });
 
-  // STUDIO-0097: the proof a prepared interactive process hands with its stop goes on to the host as it is, before
-  // the process returns; a stop that carries none calls nothing.
-  it("passes the proof handed with the stop callback on to the host, and nothing when the stop carries none", async () => {
+  // STUDIO-0097: what a prepared interactive process says of its engine goes on to the host as it is, before the
+  // process returns: its announcement when the engine started, and what it hands with its stop; a stop that carries
+  // nothing calls nothing.
+  it("passes the engine's announcement and what is handed with the stop callback on to the host, and nothing when the stop carries none", async () => {
     const proof = { schema: "paperclip.provider-stop-proof.v1", runId: RUN, providerPid: 4321 };
+    const announcement = { schema: "paperclip.provider-identity.v1", runId: RUN, providerPid: 4321, providerStartedAt: "2026-11-23T10:00:00Z" };
     const order: string[] = [];
+    const onProviderIdentity = vi.fn(async (value: unknown) => {
+      await new Promise(resolve => setTimeout(resolve, 20));
+      order.push(`announced:${JSON.stringify(value)}`);
+    });
     const onProviderStopProof = vi.fn(async (value: unknown) => {
       await new Promise(resolve => setTimeout(resolve, 20));
       order.push(`host:${JSON.stringify(value)}`);
     });
     const withProof = vi.fn(async (prepared: ClaudePreparedProcessInput) => {
+      await prepared.options.onProviderStarted?.(announcement);
       await prepared.options.onProcessStopped?.(proof);
       order.push("process returns");
       return processResult();
     });
-    const result = await execute({ ...await context({ hook: withProof }), onProviderStopProof });
+    const result = await execute({ ...await context({ hook: withProof }), onProviderStopProof, onProviderIdentity });
     expect(result.exitCode).toBe(0);
-    expect(order).toEqual([`host:${JSON.stringify(proof)}`, "process returns"]);
+    expect(order).toEqual([`announced:${JSON.stringify(announcement)}`, `host:${JSON.stringify(proof)}`, "process returns"]);
     // The stop is proven as before: the bridge is stopped and the workspace restored.
     expect(bridgeStop).toHaveBeenCalledTimes(1);
     expect(restoreWorkspaceFromSshExecution).toHaveBeenCalledTimes(1);
@@ -222,6 +229,7 @@ describe("claude prepared interactive process", () => {
     // A host that has no such callback is left alone.
     await execute(await context({ hook: withProof }));
     expect(onProviderStopProof).toHaveBeenCalledTimes(1);
+    expect(onProviderIdentity).toHaveBeenCalledTimes(1);
   });
 
   it("keeps the bridge and the remote workspace when the hook fails with an unknown provider state", async () => {

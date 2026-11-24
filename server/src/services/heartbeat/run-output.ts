@@ -11,6 +11,7 @@ import { isRunLogStoreType, type RunLogHandle, type RunLogStore } from "../run-l
 import { appendExcerpt, canonicalNativeRunLogRedactionForms, compactRunLogChunk, redactCanonicalNativeRunLogChunk } from "./run-log.js";
 import { createNativeRunLogExporter, nativeRunLogPrefixCursor } from "../native-runtime/native-run-log-export.js";
 import { createRunSecretRedactionRegistry } from "../run-secret-redaction.js";
+import { isServerReservedProviderEvent } from "../provider-stop-proof.js";
 import {
   isHeartbeatRunRuntimeStatusActive,
   publishHeartbeatRunRuntimeProgress,
@@ -322,7 +323,10 @@ export function createHeartbeatRunOutput(db: Db, input: HeartbeatRunOutputInput)
       const eventType = event.eventType.trim();
       // This namespace attests host-owned handoff cleanup. Legacy adapters do
       // not carry nativeSource identities, so they must never author it.
-      if (!eventType || eventType.startsWith("legacy.case_handoff_") || eventType.startsWith("adapter.steering.")) return;
+      // STUDIO-0097: what is known of an engine's identity and stop is written by the host alone, from what it
+      // checked or observed itself (provider-stop-proof.ts); an adapter's own events never author it.
+      if (!eventType || eventType.startsWith("legacy.case_handoff_") || eventType.startsWith("adapter.steering.")
+          || isServerReservedProviderEvent(eventType)) return;
       await appendRunEvent(currentRun, {
         eventType: eventType.slice(0, 120),
         stream: event.stream,

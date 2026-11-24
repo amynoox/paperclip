@@ -18,7 +18,6 @@ import { deferredWorkIntentWait } from "../work-intent-outbox.js";
 import { cancelledRunKeepsSession, conversationCancelledRunKeepsSession } from "../cut-run-session.js";
 import { PAUSE_RESUME_RETRY_KEY_PREFIX } from "../pause-resume-continuation.js";
 import { isGovernancePauseStop } from "../governance-pause-stop.js";
-import { pauseCutEngineStopUnproven } from "../provider-stop-proof.js";
 import { notifyIssueRecovery } from "../issue-recovery-notifications.js";
 import { createHeartbeatTimerPolicy } from "./timer-policy.js";
 import { notifyExecutionRunWork } from "../execution-control-notifications.js";
@@ -3092,13 +3091,6 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               eq(agentTaskSessions.taskKey, issueId))).limit(1)
         : [];
       if (keptByCutRun?.lastRunId !== retry.sourceRunId || !isGovernancePauseStop(keptByCutRun)) enrichedContextSnapshot.forceFreshSession = true;
-      // STUDIO-0097: the engine of a steered run a pause cut may still be writing in that conversation when its stop
-      // is not proven (provider-stop-proof.ts): the run that continues the work opens a new one.
-      else if (await pauseCutEngineStopUnproven(db, { companyId: receipt.companyId, runId: retry.sourceRunId })) {
-        enrichedContextSnapshot.forceFreshSession = true;
-        logger.info({ companyId: receipt.companyId, issueId, sourceRunId: retry.sourceRunId, retryRequestId: receipt.id },
-          "The run that continues a pause-cut run opens a new conversation: no proof of the engine's stop was handed for the cut run");
-      }
       enrichedContextSnapshot.previousRunId = retry.sourceRunId;
       enrichedContextSnapshot.taskRetryRequestId = receipt.id;
       if (retry.boardMessageOrigin) enrichedContextSnapshot.boardMessageRetry = true;

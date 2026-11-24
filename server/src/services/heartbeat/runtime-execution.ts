@@ -53,7 +53,7 @@ import { hasWorkspaceRestoreFailure } from "@paperclipai/shared";
 import { isConversation } from "../agent-conversations.js";
 import { withAdapterExecutionPhase } from "@paperclipai/adapter-utils/execution-phase";
 import { remoteExecutionHasStopped } from "../remote-execution-termination.js";
-import { recordLiveProviderStopProof } from "../provider-stop-proof.js";
+import { recordLiveProviderStopProof, recordProviderIdentityAnnouncement } from "../provider-stop-proof.js";
 import { registerAdapterExecutionControl } from "../adapter-execution-control.js";
 import { withAdapterInteractiveControl, selectsAdapterInteractiveControl, ADAPTER_STEERING_EVENT } from "../adapter-interactive-control.js";
 import { appendHeartbeatRunEvent } from "../heartbeat-run-events.js";
@@ -913,9 +913,13 @@ export async function executeHeartbeatRuntime(db: Db, input: HeartbeatRuntimeExe
                 );
               },
               onProviderStopped: collectStoppedInstructions,
-              // STUDIO-0097: the engine's verified stop, handed by a prepared interactive process, is kept on this run.
+              // STUDIO-0097: what a prepared interactive process says of its engine is kept on this run: its
+              // announcement when it started, and its stop as the adapter saw it (a trace, never the proof).
               onProviderStopProof: async proof => {
                 await recordLiveProviderStopProof(db, { companyId: agent.companyId, runId: run.id, agentId: agent.id }, proof);
+              },
+              onProviderIdentity: async identity => {
+                await recordProviderIdentityAnnouncement(db, { companyId: agent.companyId, runId: run.id, agentId: agent.id }, identity);
               },
               onDispatch: markDispatchStarted,
               signal: executionControl.controller.signal,

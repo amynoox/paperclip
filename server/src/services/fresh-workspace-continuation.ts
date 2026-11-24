@@ -9,7 +9,6 @@ import { readSystemRecovery } from "./system-recovery-state.js";
 import { readTaskRetryIntent } from "./task-retry.js";
 import { isGovernancePauseStop } from "./governance-pause-stop.js";
 import { PAUSE_RESUME_RETRY_KEY_PREFIX } from "./pause-resume-continuation.js";
-import { ENGINE_STOP_UNPROVEN_REASON, pauseCutEngineStopUnproven } from "./provider-stop-proof.js";
 import { z } from "zod";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { hasPendingRunCleanup } from "./execution-blocker.js";
@@ -22,6 +21,7 @@ import { readFailedPreparationSettlement } from "./failed-preparation-settlement
 import { taskRetryRunAncestry } from "./recovery-run-ancestry.js";
 import { parseNativeExecutionInput } from "../vendor/paperclip-runner/index.js";
 import { nativeExecutionUsesTaskWorkspace } from "./heartbeat/external-provider.js";
+import { ENGINE_STOP_UNPROVEN_REASON, readUnprovenContinuation } from "./provider-stop-proof.js";
 
 export type ContinuationReadiness =
   | { mode: "resume_preserved_workspace"; preservationReceiptId: string }
@@ -342,8 +342,37 @@ async function stoppedNativeContinuationWorkspace(db: Db, source: typeof heartbe
 }
 
 /** Preparation trusts the committed admission receipt, not a raw wake payload. */
-export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heartbeatRuns.$inferSelect,
-  "id" | "companyId" | "agentId" | "issueId" | "nativeIssueId" | "contextSnapshot" | "runtimeMode" | "runnerProfileJson">): Promise<ContinuationReadiness | null> {
+type ReadinessRun = Pick<typeof heartbeatRuns.$inferSelect,
+  "id" | "companyId" | "agentId" | "issueId" | "nativeIssueId" | "contextSnapshot" | "runtimeMode" | "runnerProfileJson">;
+
+/**
+ * STUDIO-0097: a run that starts after a steered run a pause cut, whose engine stop is not proven, never continues
+ * in that run's folder, whatever started it (provider-stop-proof.ts decides it once when the run starts, and keeps
+ * the decision on the run: this is read several times while a run is prepared and must not change in between).
+ * Such a run gets a fresh isolated workspace, by the product's own way of making one; a choice that already is a
+ * fresh workspace stands as it is.
+ */
+export async function readFreshWorkspaceReadiness(db: Db, run: ReadinessRun): Promise<ContinuationReadiness | null> {
+  const unproven = run.runtimeMode === "legacy" ? await readUnprovenContinuation(db, run) : null;
+  const readiness = await readContinuationReadiness(db, run, unproven !== null);
+  if (!unproven || readiness?.mode === "fresh_isolated_workspace") return readiness;
+  const fresh: ContinuationReadiness = { mode: "fresh_isolated_workspace", retryIntentId: run.id, sourceRunId: unproven.cutRunId,
+    retainedSourceIds: unproven.leaseIds };
+  // Said once per run on the task, as a Retry's own fresh workspace is: under the lock of the run's own row.
+  const issueId = run.nativeIssueId ?? run.issueId ?? run.contextSnapshot?.issueId;
+  if (typeof issueId === "string") await db.transaction(async tx => {
+    await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(eq(heartbeatRuns.id, run.id)).for("update");
+    const [said] = await tx.select({ id: activityLog.id }).from(activityLog).where(and(
+      eq(activityLog.companyId, run.companyId), eq(activityLog.runId, run.id),
+      eq(activityLog.action, "issue.fresh_workspace_selected"))).limit(1);
+    if (!said) await persistActivity(tx as unknown as Db, { companyId: run.companyId,
+      actorType: "system", actorId: "task-recovery", action: "issue.fresh_workspace_selected",
+      entityType: "issue", entityId: issueId, runId: run.id, details: { ...fresh, reason: ENGINE_STOP_UNPROVEN_REASON } });
+  });
+  return fresh;
+}
+
+async function readContinuationReadiness(db: Db, run: ReadinessRun, engineStopUnproven: boolean): Promise<ContinuationReadiness | null> {
   const issueId = run.nativeIssueId ?? run.issueId ?? run.contextSnapshot?.issueId;
   if (typeof issueId !== "string") return null;
   const admittedInput = run.runnerProfileJson?.nativeExecutionInput;
@@ -407,14 +436,10 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
     // ("effective run configuration changed: adapter config, workspace config"; production, 22 Nov 2026).
     // Only when the cut run is seen to have left its workspace (pauseCutSourceLeftItsWorkspace); otherwise the choice
     // below stands, as for any Retry.
-    // STUDIO-0097: a steered run a pause cut, whose ENGINE stop is not proven (provider-stop-proof.ts), may still
-    // write in its folder: the run that continues its work gets a new isolated workspace, whatever else could be
-    // reused, and the task's activity says why.
-    let engineStopUnproven = false;
     if (intent.strategy !== "fresh_isolated_workspace" && wake.idempotencyKey?.startsWith(PAUSE_RESUME_RETRY_KEY_PREFIX)
         && isGovernancePauseStop(source)) {
-      engineStopUnproven = await pauseCutEngineStopUnproven(db, { companyId: run.companyId, runId: source.id });
-      const refusal = engineStopUnproven ? ENGINE_STOP_UNPROVEN_REASON
+      // STUDIO-0097: not when the stop of the cut run's engine is not proven: the folder is not reused, nothing says it is.
+      const refusal = engineStopUnproven ? "engine_stop_unproven"
         : await pauseCutSourceLeftItsWorkspace(db, { companyId: run.companyId, issueId, successorRunId: run.id, source });
       if (!refusal) {
         // Said once per run on the task: this is read several times while a run is prepared, so the line is looked
@@ -432,10 +457,9 @@ export async function readFreshWorkspaceReadiness(db: Db, run: Pick<typeof heart
         return null;
       }
       logger.info({ companyId: run.companyId, issueId, sourceRunId: source.id, successorRunId: run.id, reason: refusal },
-        engineStopUnproven
-          ? "The run that continues a pause-cut run gets a new isolated workspace: no proof of the engine's stop was handed for the cut run"
-          : "The run that continues a pause-cut run does not keep the task workspace; the Retry's own choice stands");
+        "The run that continues a pause-cut run does not keep the task workspace; the Retry's own choice stands");
     }
+    // STUDIO-0097: nor is any other folder of the source reused when its engine's stop is not proven.
     if (intent.strategy !== "fresh_isolated_workspace" && !engineStopUnproven) {
       const stoppedWorkspace = await stoppedNativeContinuationWorkspace(db, source, { runId: run.id, issueId, retryIntentId: wake.id });
       if (stoppedWorkspace) return stoppedWorkspace;
