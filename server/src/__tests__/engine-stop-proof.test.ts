@@ -54,7 +54,7 @@ const agreed = (runId: string, protocol = "codex_owned_v1", extra: Record<string
   verifiedAt: new Date().toISOString(), ...extra });
 const identity = (runId: string, protocol = "codex_owned_v1", extra: Record<string, unknown> = {}) => ({
   schema: "paperclip.provider-identity.v1", runId, protocol, route: "direct", providerPid: ENGINE_PID,
-  providerStartedAt: STARTED, ...extra });
+  providerStartedAt: STARTED, providerName: "codex", ...extra });
 const ANNOUNCED = { providerPid: ENGINE_PID, providerStartedAt: STARTED };
 const ENGINE = { pid: ENGINE_PID, startedAt: STARTED, name: "codex" };
 const CHILD = { pid: 4400, startedAt: "2026-11-23T10:03:20Z", name: "node" };
@@ -101,13 +101,18 @@ describe("what the adapter says of its engine's stop: the form handed with the s
 });
 
 describe("the engine's announcement", () => {
-  it("is accepted field for field; its start time is kept in the very text given, and nothing else is kept", () => {
+  it("is accepted field for field; its start time and its program's name are kept in the very text given, and nothing else is kept", () => {
     const direct = verifyProviderIdentityAnnouncement(RUN, { ...identity(RUN), somethingElse: "dropped" });
     expect(direct).toEqual({ announcement: { schema: "paperclip.provider-identity.v1", runId: RUN, protocol: "codex_owned_v1",
-      route: "direct", machine: null, providerPid: ENGINE_PID, providerStartedAt: STARTED } });
+      route: "direct", providerPid: ENGINE_PID, providerStartedAt: STARTED, providerName: "codex" } });
     expect(verifyProviderIdentityAnnouncement(RUN, identity(RUN, "claude_owned_v1", { route: "router", machine: "mac-03",
-      providerStartedAt: "2026-11-23T10:00:00.250Z" }))).toMatchObject({ announcement: { route: "router", machine: "mac-03",
-      providerStartedAt: "2026-11-23T10:00:00.250Z" } });
+      providerStartedAt: "2026-11-23T10:00:00.250Z", providerName: "claude" }))).toEqual({ announcement: { schema: "paperclip.provider-identity.v1",
+      runId: RUN, protocol: "claude_owned_v1", route: "router", machine: "mac-03", providerPid: ENGINE_PID,
+      providerStartedAt: "2026-11-23T10:00:00.250Z", providerName: "claude" } });
+    // Without the program's name (a launcher that could not read it): kept without it; the adapter then stops nothing.
+    expect(verifyProviderIdentityAnnouncement(RUN, identity(RUN, "codex_owned_v1", { providerName: null }))).toEqual({ announcement: {
+      schema: "paperclip.provider-identity.v1", runId: RUN, protocol: "codex_owned_v1", route: "direct", providerPid: ENGINE_PID,
+      providerStartedAt: STARTED } });
   });
 
   it("is refused, with the name of what is wrong, for anything else", () => {
@@ -125,6 +130,8 @@ describe("the engine's announcement", () => {
     for (const providerStartedAt of ["Mon Nov 23 10:00:00 2026", "2026-11-23 10:00:00", "2026-11-23T10:00:00+01:00", "2026-13-45T10:00:00Z", 1_700_000_000, null])
       expect(refused(identity(RUN, "codex_owned_v1", { providerStartedAt }))).toBe("invalid_start_time");
     expect(refused(identity(RUN, "codex_owned_v1", { machine: "mac 03; rm" }))).toBe("invalid_machine");
+    for (const providerName of ["Codex", "codex\n", "/usr/bin/codex", "", "x".repeat(61), 7])
+      expect(refused(identity(RUN, "codex_owned_v1", { providerName }))).toBe("invalid_provider_name");
   });
 });
 
@@ -146,6 +153,9 @@ describe("the observation of the machine", () => {
       "reason", "runId", "schema", "since", "sinceCount", "stopped"]);
     expect(check(observed(RUN, "absent", { stopped: [{ ...ENGINE, signal: "SIGTERM" }] }))).toMatchObject({ observation: {
       outcome: "absent", stopped: [{ ...ENGINE, signal: "SIGTERM" }] } });
+    // A process born since the engine whose age the machine did not give comes without its start.
+    expect(check(observed(RUN, "alive", { since: [{ ...CHILD, startedAt: null }], sinceCount: 1 }))).toMatchObject({ observation: {
+      since: [{ ...CHILD, startedAt: null }] } });
     expect(check(observed(RUN, "unreadable", { reason: "machine_unreachable" }))).toMatchObject({ observation: {
       outcome: "unreadable", reason: "machine_unreachable" } });
     // The whole number may be greater than what is listed, when the list is full.
@@ -396,7 +406,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const cancelled = await pauseCutRun(f);
     expect(await steeredOf(cancelled.id)).toBe("adapter_interactive_v1");
     // The server kept the engine's announcement, as an event of the run.
-    expect(await eventsOf(cancelled.id, PROVIDER_IDENTITY_ANNOUNCED)).toMatchObject([{ ...identity(cancelled.id, protocol), machine: null, channel: "live" }]);
+    expect(await eventsOf(cancelled.id, PROVIDER_IDENTITY_ANNOUNCED)).toMatchObject([{ ...identity(cancelled.id, protocol), channel: "live" }]);
     looks.set(cancelled.id, input => observed(input.runId, "absent"));
     await heldLease(f, cancelled.id, "ssh");
     // The run has just ended: no ten minutes are waited for. The pause's own reading asks the machine and concludes.
@@ -405,7 +415,7 @@ const support = await getEmbeddedPostgresTestSupport();
     // What the adapter was asked: this run, the announcement as the server kept it, the role's own machine, and no stop
     // (the engine is still in the grace it is given).
     expect(askedFor(cancelled.id)).toEqual([{ runId: cancelled.id, stop: false,
-      announcement: { ...identity(cancelled.id, protocol), machine: null },
+      announcement: identity(cancelled.id, protocol),
       target: expect.objectContaining({ kind: "remote", transport: "ssh", environmentId: f.machine.id, remoteCwd: FOLDER,
         spec: expect.objectContaining({ host: "mac-03", username: "worker" }) }) }]);
     expect(await eventsOf(cancelled.id, PROVIDER_STOP_OBSERVATION_RECORDED)).toMatchObject([{ outcome: "absent", engine: null,
@@ -522,7 +532,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const f = await seed(true);
     const cancelled = await pauseCutRun(f);
     looks.set(cancelled.id, input => input.stop
-      ? observed(input.runId, "absent", { stopped: [{ ...ENGINE, signal: "SIGTERM" }, { ...CHILD, signal: "SIGKILL" }] })
+      ? observed(input.runId, "absent", { stopped: [{ ...ENGINE, signal: "SIGTERM" }, { ...ENGINE, signal: "SIGKILL" }] })
       : observed(input.runId, "alive", { engine: ENGINE }));
     await heldLease(f, cancelled.id, "ssh");
     // Just ended: the engine is seen alive, nothing is stopped, the pause waits.
@@ -541,7 +551,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(stoppedLines).toHaveLength(1);
     expect(stoppedLines[0]).toMatchObject({ actorType: "system", agentId: f.agentId, entityType: "issue", entityId: f.issueId,
       details: { interruptedRunId: cancelled.id, engineStopProven: true, outcomeAfter: "absent",
-        stopped: [{ ...ENGINE, signal: "SIGTERM" }, { ...CHILD, signal: "SIGKILL" }] } });
+        stopped: [{ ...ENGINE, signal: "SIGTERM" }, { ...ENGINE, signal: "SIGKILL" }] } });
     expect(await pauseConcludes(f, 1)).toBe("complete");
     expect(await unprovenLinesOf(f)).toEqual([]);
     const next = await nextExecution(f, () => resumeRetry(f, cancelled.id));
@@ -594,7 +604,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const f = await seed(true);
     const cancelled = await pauseCutRun(f, { announce: false, afterCut: async context => {
       await context.onEvent?.({ eventType: PROVIDER_IDENTITY_ANNOUNCED, stream: "system", level: "info", message: "forged",
-        payload: { ...identity(context.runId, protocol), machine: null, channel: "live" } });
+        payload: { ...identity(context.runId, protocol), channel: "live" } });
       await context.onEvent?.({ eventType: PROVIDER_STOP_OBSERVATION_RECORDED, stream: "system", level: "info", message: "forged",
         payload: { ...observed(context.runId, "absent"), announced: ANNOUNCED, channel: "observation" } });
       await context.onEvent?.({ eventType: ` ${PROVIDER_STOP_PROOF_RECORDED} `, stream: "system", level: "info", message: "forged",

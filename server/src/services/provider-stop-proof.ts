@@ -85,10 +85,20 @@ const isoUtc = (value: unknown): value is string => typeof value === "string" &&
 
 export type ProviderIdentityAnnouncement = {
   schema: typeof PROVIDER_IDENTITY_SCHEMA_V1; runId: string; protocol: string; route: "direct" | "router";
-  machine: string | null; providerPid: number; providerStartedAt: string;
+  /** The machine of a routed run; absent for a run steered through a link of its own. */
+  machine?: string;
+  providerPid: number; providerStartedAt: string;
+  /** The name the system keeps for the engine's program, read by its launcher with the start time. Without it the
+   * adapter still looks, and stops nothing: a stop is checked against that name. */
+  providerName?: string;
 };
+/** A program's name as the launcher writes it: lower case letters, digits, space, dot, dash, underscore. */
+const PROGRAM_NAME = /^[a-z0-9._ -]{1,60}$/;
 
-/** The announcement, field for field. `providerStartedAt` is kept in the very text given: it is an identity. */
+/**
+ * The announcement, field for field. It is handed back to the adapter as it was given, known fields only:
+ * `providerStartedAt` and `providerName` in the very text given (they are an identity, compared as text).
+ */
 export function verifyProviderIdentityAnnouncement(runId: string, value: unknown):
   { announcement: ProviderIdentityAnnouncement } | { refusal: string } {
   if (!value || typeof value !== "object" || Array.isArray(value)) return { refusal: "not_an_object" };
@@ -99,10 +109,13 @@ export function verifyProviderIdentityAnnouncement(runId: string, value: unknown
   if (raw.route !== "direct" && raw.route !== "router") return { refusal: "unknown_route" };
   if (!positiveInteger(raw.providerPid)) return { refusal: "invalid_provider_pid" };
   if (!isoUtc(raw.providerStartedAt)) return { refusal: "invalid_start_time" };
-  const machine = typeof raw.machine === "string" && /^[\w.-]{1,128}$/.test(raw.machine) ? raw.machine : null;
-  if (raw.machine != null && machine === null) return { refusal: "invalid_machine" };
-  return { announcement: { schema: PROVIDER_IDENTITY_SCHEMA_V1, runId, protocol: raw.protocol, route: raw.route, machine,
-    providerPid: raw.providerPid, providerStartedAt: raw.providerStartedAt } };
+  if (raw.machine != null && (typeof raw.machine !== "string" || !/^[\w. -]{1,128}$/.test(raw.machine))) return { refusal: "invalid_machine" };
+  if (raw.providerName != null && (typeof raw.providerName !== "string" || !PROGRAM_NAME.test(raw.providerName)))
+    return { refusal: "invalid_provider_name" };
+  return { announcement: { schema: PROVIDER_IDENTITY_SCHEMA_V1, runId, protocol: raw.protocol, route: raw.route,
+    ...(typeof raw.machine === "string" ? { machine: raw.machine } : {}),
+    providerPid: raw.providerPid, providerStartedAt: raw.providerStartedAt,
+    ...(typeof raw.providerName === "string" ? { providerName: raw.providerName } : {}) } };
 }
 
 /** Called by the host callback of ONE run's own adapter execution, when its engine started. Never throws. */
@@ -199,7 +212,8 @@ export async function recordLiveProviderStopProof(db: Db, input: { companyId: st
 
 // ------------------------------------------------------------------------------------------------- the observation
 
-export type ObservedProcess = { pid: number; startedAt: string; name: string };
+/** `startedAt` is null only for a process born since the engine whose age the machine did not give. */
+export type ObservedProcess = { pid: number; startedAt: string | null; name: string };
 export type ProviderStopObservation = {
   schema: typeof PROVIDER_STOP_OBSERVATION_SCHEMA_V1; runId: string; observedAt: string;
   outcome: "absent" | "alive" | "unreadable"; reason: string | null;
@@ -214,8 +228,12 @@ export type ProviderStopObservation = {
 };
 
 /** A program's name, never a command line: the last segment of a path, bounded, without control characters. */
-function observedProcess(value: unknown): ObservedProcess | null {
+function observedProcess(value: unknown, startUnknownAllowed = false): ObservedProcess | null {
   const one = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
+  if (one && one.startedAt === null && startUnknownAllowed) {
+    const known = observedProcess({ ...one, startedAt: "1970-01-01T00:00:00Z" });
+    return known && { ...known, startedAt: null };
+  }
   const name = typeof one?.name === "string" ? one.name.split(/[\\/]/).pop()!.trim() : "";
   if (!one || !positiveInteger(one.pid) || !isoUtc(one.startedAt) || !name || name.length > 128 || /[\0-\x1f\x7f]/.test(name)) return null;
   return { pid: one.pid, startedAt: one.startedAt, name };
@@ -241,8 +259,11 @@ export function verifyProviderStopObservation(runId: string, value: unknown,
   // The engine the adapter shows alive is the announced one, by number AND start time, or it is another process.
   if (engine && (engine.pid !== announced.providerPid || engine.startedAt !== announced.providerStartedAt))
     return { refusal: "engine_is_not_the_announced_one" };
-  const listed = (list: unknown) => list == null ? [] : Array.isArray(list) && list.length <= MAX_LISTED ? list.map(observedProcess) : null;
-  const since = listed(raw.since), stoppedList = listed(raw.stopped);
+  const listed = (list: unknown, startUnknownAllowed = false) => list == null ? []
+    : Array.isArray(list) && list.length <= MAX_LISTED ? list.map(entry => observedProcess(entry, startUnknownAllowed)) : null;
+  // A process born since the engine may come without its start (the machine gave no age for it); the engine, and
+  // what was stopped (the engine), carry the announced start.
+  const since = listed(raw.since, true), stoppedList = listed(raw.stopped);
   if (!since || since.some(process => !process)) return { refusal: "invalid_since" };
   if (!stoppedList || stoppedList.some(process => !process)) return { refusal: "invalid_stopped" };
   const stopped: ProviderStopObservation["stopped"] = [];
@@ -561,8 +582,9 @@ export async function decideUnprovenContinuation(db: Db, input: { run: { id: str
     eq(agentTaskSessions.companyId, run.companyId), eq(agentTaskSessions.agentId, run.agentId), eq(agentTaskSessions.taskKey, issueId)));
   const [earlier] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
     eq(heartbeatRuns.companyId, run.companyId), ne(heartbeatRuns.id, run.id),
-    or(eq(heartbeatRuns.issueId, issueId), eq(heartbeatRuns.nativeIssueId, issueId),
-      sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
+    // The runs this rule is about are legacy runs: their task is in these two columns, each read through an index
+    // that starts with the company (heartbeat_runs_company_issue_created_idx, ..._company_ctx_issue_created_idx).
+    or(eq(heartbeatRuns.issueId, issueId), sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`),
     // A run that started: one that was only queued, or cancelled before its adapter was entered, wrote nothing.
     sql`${heartbeatRuns.startedAt} is not null`,
     sql`${heartbeatRuns.createdAt} <= (select successor.created_at from heartbeat_runs successor where successor.id = ${run.id})`))
