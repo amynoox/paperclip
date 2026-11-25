@@ -500,7 +500,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(folderOf(next.run)).toContain("isolated-workspace-attempts");
   });
 
-  it("no proof: a person's message after the pause does not go on in the cut run's conversation nor in its folder, and the run after that one stays in the new folder", async () => {
+  it("no proof: a person's message after the pause does not go on in the cut run's conversation nor in its folder, and the run after that one never goes back to its folder", async () => {
     const f = await seed(true);
     const cancelled = await pauseCutRun(f);
     await heldLease(f, cancelled.id, "ssh", ELEVEN_MINUTES);
@@ -509,7 +509,8 @@ const support = await getEmbeddedPostgresTestSupport();
     turns.get(f.companyId)!.push(async () => ({ ...SUCCESS, sessionId: after, sessionDisplayId: after, sessionParams: paramsOf(after) }));
     const next = await nextExecution(f, () => personMessage(f));
     expect(next.sessionId).toBeNull();
-    expect(next.run.contextSnapshot).toMatchObject({ engineStopUnprovenRunId: cancelled.id });
+    expect(next.run.contextSnapshot).toMatchObject({ engineStopUnprovenRunId: cancelled.id, forceFreshSession: true });
+    expect(next.run.contextSnapshot).not.toHaveProperty("resumeSessionParams");
     expect(await eventsOf(next.run.id, PROVIDER_STOP_UNPROVEN_CONTINUATION)).toMatchObject([{ cutRunId: cancelled.id, channel: "decision" }]);
     expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.fresh_workspace_selected", "fresh_isolated_workspace", "no_engine_stop_proof"]]);
     expect(folderOf(next.run)).not.toBe(folderOf(cancelled));
@@ -518,13 +519,15 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await unprovenLinesOf(f)).toHaveLength(1);
     // The new run's own conversation is the task's from now on.
     expect(await taskSession(f)).toMatchObject({ sessionDisplayId: after, lastRunId: next.run.id });
-    // The run after that one is not judged again, nor sent to yet another folder: it works where the new run worked.
-    // (Which conversation it opens is the product's own rule after a change of workspace mode, unchanged here.)
+    // The run after that one is not judged again (its predecessor is the new run), and it never goes back to the cut
+    // run's folder. Which isolated folder and which conversation it takes is the product's own rule after a fresh
+    // isolated attempt, unchanged here: played again and again, it is the new run's folder or another fresh attempt.
     const third = await nextExecution(f, () => personMessage(f));
     expect(await eventsOf(third.run.id, PROVIDER_STOP_UNPROVEN_CONTINUATION)).toEqual([]);
     expect(third.run.contextSnapshot).not.toHaveProperty("engineStopUnprovenRunId");
     expect(await workspaceChoiceOf(f, third.run.id)).toEqual([]);
-    expect(folderOf(third.run)).toBe(folderOf(next.run));
+    expect(folderOf(third.run)).not.toBe(folderOf(cancelled));
+    expect(folderOf(third.run)).toContain("isolated-workspace-attempts");
     expect(await unprovenLinesOf(f)).toHaveLength(1);
   });
 
