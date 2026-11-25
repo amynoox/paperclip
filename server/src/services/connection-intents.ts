@@ -13,7 +13,7 @@ import { isDeepStrictEqual } from "node:util";
 import { logActivity } from "./activity-log.js";
 import { aiConnectionService } from "./ai-connections.js";
 import { aiConnectionBindingSchema, aiConnectionRouterBindingSchema } from "@paperclipai/shared";
-import { aiBindingForAuthRecovery, isAiAuthenticationFailure, isAiAuthenticationRepairable } from "./ai-auth-failure.js";
+import { aiBindingForAuthRecovery, isAiAuthenticationFailure, isAiAuthenticationRepairable, runResultReportsProviderLimit } from "./ai-auth-failure.js";
 import { and, eq, desc, inArray, isNull, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
@@ -1505,6 +1505,8 @@ export function connectionIntentService(db: Db) {
     requestForRunAuthFailure: async (runId: string) => {
       const [run] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId));
       if (!run || run.status !== "failed" || !isAiAuthenticationRepairable(run) || !run.responsibleUserId) return null;
+      // STUDIO-0064: a run whose own result reports a provider limit is no proof of a refused sign-in.
+      if (runResultReportsProviderLimit(run.resultJson)) return null;
       const context = await loadRunContext({ sub: run.agentId, company_id: run.companyId, run_id: run.id, responsible_user_id: run.responsibleUserId }, "failed_auth");
       const [latest] = await db.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
         eq(heartbeatRuns.companyId, run.companyId),
