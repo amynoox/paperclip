@@ -1,6 +1,6 @@
-import { and, count, eq } from "drizzle-orm";
+import { and, count, eq, gt, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { activityLog, heartbeatRuns } from "@paperclipai/db";
+import { activityLog, agentApiKeys, heartbeatRuns } from "@paperclipai/db";
 import { isUuidLike, issueWriteDenialResponse } from "@paperclipai/shared";
 import { forbidden } from "../errors.js";
 import { logger } from "../middleware/logger.js";
@@ -179,6 +179,63 @@ export async function observeCrossIssueInfluence(
       logger.warn(logContext, "cross-issue influence cap exceeded");
     }
 
+    return decision;
+  });
+}
+
+/**
+ * STUDIO-0102: the cap of a project commenter key. Such a key belongs to an agent that never runs: it has no run to
+ * count its writes on. Its comments are counted on the key itself instead: 20 in any hour, each one written to the
+ * activity log as a run's are (the same action, with the key's id where a run's id would be); past the cap, a clear
+ * refusal, at once (no observation-only period).
+ */
+export const PROJECT_COMMENTER_HOURLY_CAP = 20;
+const HOUR_MS = 60 * 60_000;
+
+export async function observeProjectCommenterInfluence(
+  db: Db,
+  input: {
+    companyId: string;
+    keyId: string;
+    agentId: string;
+    responsibleUserId?: string | null;
+    targetIssueId: string;
+    targetIssueIdentifier?: string | null;
+    kind: CrossIssueInfluenceKind;
+    now?: Date;
+  },
+): Promise<CrossIssueInfluenceDecision> {
+  const now = input.now ?? new Date();
+  return db.transaction(async (tx) => {
+    // The key row is the attribution anchor: locked, so that two comments of the key are counted one after the other.
+    const [key] = await tx.select({ id: agentApiKeys.id }).from(agentApiKeys).where(and(
+      eq(agentApiKeys.id, input.keyId), eq(agentApiKeys.companyId, input.companyId), eq(agentApiKeys.agentId, input.agentId),
+      isNull(agentApiKeys.revokedAt))).for("update");
+    if (!key) throw crossIssueInfluenceRunContextError();
+    const priorCount = await tx.select({ count: count() }).from(activityLog).where(and(
+      eq(activityLog.companyId, input.companyId),
+      eq(activityLog.action, CROSS_ISSUE_INFLUENCE_ACTIVITY),
+      sql`${activityLog.details}->>'keyId' = ${input.keyId}`,
+      gt(activityLog.createdAt, new Date(now.getTime() - HOUR_MS)),
+    )).then((rows) => Number(rows[0]?.count ?? 0));
+    const nextCount = priorCount + 1;
+    const decision: CrossIssueInfluenceDecision = {
+      allowed: nextCount <= PROJECT_COMMENTER_HOURLY_CAP, mode: "enforce", count: nextCount,
+      cap: PROJECT_COMMENTER_HOURLY_CAP, enforceAt: now.toISOString(),
+    };
+    await tx.insert(activityLog).values({
+      companyId: input.companyId, actorType: "agent", actorId: input.agentId, agentId: input.agentId,
+      responsibleUserId: input.responsibleUserId ?? null,
+      action: decision.allowed ? CROSS_ISSUE_INFLUENCE_ACTIVITY : CROSS_ISSUE_INFLUENCE_REJECTED_ACTIVITY,
+      entityType: "issue", entityId: input.targetIssueId, createdAt: now,
+      details: { kind: input.kind, keyId: input.keyId, window: "1h", targetIssueId: input.targetIssueId,
+        targetIssueIdentifier: input.targetIssueIdentifier ?? null, count: decision.count, cap: decision.cap,
+        mode: decision.mode, allowed: decision.allowed },
+    });
+    const logContext = { event: "project_commenter_key_cap", companyId: input.companyId, keyId: input.keyId,
+      agentId: input.agentId, targetIssueId: input.targetIssueId, count: decision.count, cap: decision.cap, allowed: decision.allowed };
+    if (decision.allowed) logger.info(logContext, "project commenter key write observed");
+    else logger.warn(logContext, "project commenter key cap exceeded");
     return decision;
   });
 }

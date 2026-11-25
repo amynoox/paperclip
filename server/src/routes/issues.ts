@@ -419,6 +419,7 @@ import {
   crossIssueInfluenceLimitError,
   crossIssueInfluenceRunContextError,
   observeCrossIssueInfluence,
+  observeProjectCommenterInfluence,
   type CrossIssueInfluenceKind,
 } from "../services/cross-issue-influence-limit.js";
 import {
@@ -3803,20 +3804,36 @@ export function issueRoutes(
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
-    if (!req.actor.agentId || !req.actor.runId)
-      throw crossIssueInfluenceRunContextError();
+    let decision: Awaited<ReturnType<typeof observeCrossIssueInfluence>>;
+    if (projectCommenterScopeOf(req)) {
+      // STUDIO-0102: a project commenter key has no run; its writes are counted on the key, 20 in any hour.
+      if (!req.actor.agentId || !req.actor.keyId)
+        throw crossIssueInfluenceRunContextError();
+      decision = await observeProjectCommenterInfluence(db, {
+        companyId: issue.companyId,
+        keyId: req.actor.keyId,
+        agentId: req.actor.agentId,
+        responsibleUserId: req.actor.onBehalfOfUserId ?? null,
+        targetIssueId: issue.id,
+        targetIssueIdentifier: issue.identifier ?? null,
+        kind,
+      });
+    } else {
+      if (!req.actor.agentId || !req.actor.runId)
+        throw crossIssueInfluenceRunContextError();
 
-    // The counter transaction locks and validates the persisted run before it
-    // derives the source issue. Never trust the API-key run header by itself.
-    const decision = await observeCrossIssueInfluence(db, {
-      companyId: issue.companyId,
-      runId: req.actor.runId,
-      agentId: req.actor.agentId,
-      responsibleUserId: req.actor.onBehalfOfUserId ?? null,
-      targetIssueId: issue.id,
-      targetIssueIdentifier: issue.identifier ?? null,
-      kind,
-    });
+      // The counter transaction locks and validates the persisted run before it
+      // derives the source issue. Never trust the API-key run header by itself.
+      decision = await observeCrossIssueInfluence(db, {
+        companyId: issue.companyId,
+        runId: req.actor.runId,
+        agentId: req.actor.agentId,
+        responsibleUserId: req.actor.onBehalfOfUserId ?? null,
+        targetIssueId: issue.id,
+        targetIssueIdentifier: issue.identifier ?? null,
+        kind,
+      });
+    }
     if (!decision || decision.allowed) return true;
 
     const labels = await issueWriteDenialLabels(req, {
@@ -9257,6 +9274,8 @@ export function issueRoutes(
       includeLiveDescendantSummary: includeLiveDescendantSummary === true,
       hasPlanDocument,
       q: req.query.q as string | undefined,
+      // STUDIO-0102: a project commenter key does not read documents, so it does not search in them either.
+      ...(projectCommenterScopeOf(req) ? { excludeDocumentSearch: true } : {}),
       limit,
       offset,
       sortField: sortField === "updated" || sortField === "created" || sortField === "id" ? sortField : undefined,
@@ -9353,6 +9372,13 @@ export function issueRoutes(
       etagOutcome: "none",
       identicalInFlightCount: coordinated.identicalInFlightCount,
     });
+    // STUDIO-0102: a project commenter key gets, of each ticket, what it needs to find the one that follows an event.
+    if (projectCommenterScopeOf(req)) {
+      const rows = Array.isArray(coordinated.response.body) ? coordinated.response.body as Array<Record<string, unknown>> : [];
+      res.json(rows.map(row => ({ id: row.id, companyId: row.companyId, projectId: row.projectId,
+        assigneeAgentId: row.assigneeAgentId, status: row.status })));
+      return;
+    }
     res.json(coordinated.response.body);
   });
 
@@ -10017,12 +10043,12 @@ export function issueRoutes(
     if (!issue) return;
     if (!(await timing.time("authorization", () => assertIssueReadAllowed(req, res, issue, { allowBreakGlass: true, finalForAgents: true })))) return;
     // STUDIO-0102: a project commenter key reads what it needs to find the ticket that follows an event, and no
-    // more: no documents, no description, no workspace, no related tickets.
+    // more: no documents, no description, no workspace, no related tickets; of a work product, what names it.
     if (projectCommenterScopeOf(req)) {
       const workProducts = await workProductsSvc.listForIssue(issue.id);
-      res.json({ id: issue.id, companyId: issue.companyId, projectId: issue.projectId, identifier: issue.identifier,
-        title: issue.title, status: issue.status, assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId,
-        updatedAt: issue.updatedAt, workProducts });
+      res.json({ id: issue.id, companyId: issue.companyId, projectId: issue.projectId, assigneeAgentId: issue.assigneeAgentId,
+        status: issue.status, workProducts: workProducts.map(product => ({ type: product.type, provider: product.provider,
+          externalId: product.externalId, url: product.url })) });
       return;
     }
     // Saved cards are structural conversation data. Include their local
@@ -17876,9 +17902,14 @@ export function issueRoutes(
       order,
       limit,
     });
-    res.json(
-      await runRedactions.redactForIssue(issue.companyId, issue.id, comments),
-    );
+    const redacted = await runRedactions.redactForIssue(issue.companyId, issue.id, comments);
+    // STUDIO-0102: a project commenter key reads each comment's id, author agent and body, whole, and nothing else.
+    if (projectCommenterScopeOf(req)) {
+      res.json((redacted as Array<{ id: string; authorAgentId: string | null; body: string }>)
+        .map(comment => ({ id: comment.id, authorAgentId: comment.authorAgentId, body: comment.body })));
+      return;
+    }
+    res.json(redacted);
   });
 
   /** Maps a wake-queue queued-comment mutation error onto the same HTTP error the route threw before this mutation moved into the module. */

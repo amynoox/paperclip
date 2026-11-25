@@ -16,6 +16,8 @@ import {
   agentRecordQueries,
   hashToken,
   createToken,
+  createProjectCommenterToken,
+  hashProjectCommenterToken,
   containsRedactedMarker,
   configPatchFromSnapshot,
 } from "../lib/agent-records.js";
@@ -142,8 +144,9 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
         if (found.length !== named.length) throw unprocessable("A project commenter key names projects of its agent's company only");
       }
 
-      const token = createToken();
-      const keyHash = hashToken(token);
+      // STUDIO-0102: its own token and hash, so that a server without the scope refuses it.
+      const token = scope.kind === "project_commenter" ? createProjectCommenterToken() : createToken();
+      const keyHash = scope.kind === "project_commenter" ? hashProjectCommenterToken(token) : hashToken(token);
       const created = await db
         .insert(agentApiKeys)
         .values({

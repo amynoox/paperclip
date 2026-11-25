@@ -11,16 +11,18 @@ import type { ProjectCommenterAgentKeyScope } from "@paperclipai/shared";
  * - GET  /api/companies/:companyId/issues        the key's company; `projectId` one of the key's projects; only `q`,
  *                                                 `projectId`, `limit`
  * - GET  /api/issues/:id                          `id` a UUID; no query (the route answers a reduced view)
- * - GET  /api/issues/:id/comments                 only `order`, `limit`, `afterCommentId`, `after`
- * - POST /api/issues/:id/comments                 a body of `body`, `reopen: false` (or absent), `clientRequestId` only
+ * - GET  /api/issues/:id/comments                 only `order`, `limit`, `afterCommentId`
+ * - POST /api/issues/:id/comments                 a body of `body` and `reopen: false` (or absent) only
+ * The answers of the three reads are reduced to what finding the ticket needs (routes/issues.ts), and its search
+ * leaves documents out.
  */
 const UUID = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 const LIST = new RegExp(`^/api/companies/(${UUID})/issues/?$`);
 const DETAIL = new RegExp(`^/api/issues/${UUID}/?$`);
 const COMMENTS = new RegExp(`^/api/issues/${UUID}/comments/?$`);
 const LIST_QUERY = new Set(["q", "projectId", "limit"]);
-const COMMENTS_QUERY = new Set(["order", "limit", "afterCommentId", "after"]);
-const COMMENT_BODY = new Set(["body", "reopen", "clientRequestId"]);
+const COMMENTS_QUERY = new Set(["order", "limit", "afterCommentId"]);
+const COMMENT_BODY = new Set(["body", "reopen"]);
 export const PROJECT_COMMENTER_ROUTE_DENIED = "project_commenter_route_denied";
 
 export function projectCommenterScopeOf(req: Request): ProjectCommenterAgentKeyScope | null {
