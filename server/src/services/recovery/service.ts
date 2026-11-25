@@ -1226,6 +1226,19 @@ export function recoveryService(
   }
 
   /**
+   * STUDIO-0101: the same reading for another pass (the hand-over backstop of STUDIO-0063): a wait the adapter
+   * declared on the agent's latest started run on the issue, while it is within its bound (its deadline and the code
+   * of that run); null otherwise.
+   */
+  async function declaredWaitDeadlineForIssue(input: { companyId: string; issueId: string; agentId: string; now?: Date }):
+    Promise<{ deadline: number; errorCode: string } | null> {
+    const run = await getLatestStartedIssueRunForAgent(input.companyId, input.issueId, input.agentId);
+    const deadline = await liveAdapterDeclaredWaitDeadline({ companyId: input.companyId, id: input.issueId }, input.agentId, run,
+      input.now ?? new Date());
+    return deadline !== null && run?.errorCode ? { deadline, errorCode: run.errorCode } : null;
+  }
+
+  /**
    * STUDIO-0076: when a pause lifts, start once each task of the agent that waits on a declared wait still within
    * its bound. The owner of the wait wakes the assignee itself, but that wake can be lost to the pause: a plugin's
    * wake is refused before the queue, and written nowhere, while the agent's budget is reached or its company or
@@ -7181,6 +7194,7 @@ export function recoveryService(
     registerActiveRunSilenceWork: watchdog.registerSilenceWork,
     reconcileStrandedAssignedIssues,
     wakeDeclaredWaitsAfterPause,
+    declaredWaitDeadlineForIssue,
     reconcileUnassignedBlockingIssues,
     reconcileActiveRecoveryActions,
     reconcileLegacyContinuation,

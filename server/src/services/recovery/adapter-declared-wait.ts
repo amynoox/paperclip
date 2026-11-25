@@ -231,6 +231,18 @@ export const ADAPTER_DECLARED_WAIT_ERROR_CODES: readonly string[] = Object.freez
   "router_ticket_blocked",
 ]);
 
+// STUDIO-0101: waits of the list above for which the worker router keeps no request and wakes nobody (read in the
+// router's code, 25 Nov 2026). A pass that wakes the assignee itself (the hand-over backstop of STUDIO-0063) is
+// then the way back, and leaves such a task alone only as said here:
+// - router_ticket_blocked: the router refuses a new reservation for a ticket whose status is `blocked`; the server's
+//   dependency wakes start it again once it is unblocked. Left alone only while the status is still `blocked`.
+// - router_readmission_not_drained: raised before anything is kept; the next run passes once the receipts are
+//   settled, and nothing wakes the assignee for it. Never left alone: the backstop's own doubling wait applies.
+export const ADAPTER_DECLARED_WAITS_WITHOUT_ADAPTER_WAKE: Readonly<Record<string, "while_blocked" | "never">> = Object.freeze({
+  router_ticket_blocked: "while_blocked",
+  router_readmission_not_drained: "never",
+});
+
 // Bound on such a wait, counted from the END of the oldest run of the latest
 // consecutive series of the assignee's runs on the issue that all failed under
 // a code above (or from the Board's latest return of the issue, if later), and chosen

@@ -15,6 +15,14 @@
 // apart from the wake request, written before the wake: the wait holds when the admission returns without a row or
 // throws). An issue whose runs never qualify (a router that refuses for hours, a run that succeeds without a
 // recorded process start) is retried at most hourly, forever: late, never silent.
+// Left alone (STUDIO-0101): a READY issue whose assignee's latest started run ended in a wait the adapter declared,
+// still within its bound (the adapter wakes the assignee itself; the pass looks again at the bound's end, and past it
+// wakes as before). Not an issue left with cancelled blockers only, not a `router_ticket_blocked` wait once the issue
+// is no longer `blocked`, never a `router_readmission_not_drained` wait (the adapter wakes nobody for those). The
+// price: within that bound, a wake of the adapter that is lost (refused at the plugins' gate, by a budget, a paused
+// company or project, a stopped router) is caught up at the bound's end, up to 12 h later, instead of within the
+// hour; and for the unproven stop (router_provider_stop_unverified, router_previous_dispatch_unsettled) a dispatch the
+// router never proves has no wake of the router at all: the pass wakes only past the bound. "Late" means up to it.
 // Left alone: an issue with an active recovery action (its owner, the Board for a blocked execution path, decides the
 // continuation; resolving it runs this pass again), and an assignee that is not invocable or over budget (the pass
 // resumes when it is).
@@ -26,6 +34,8 @@ import { agentWakeupRequests, agents, heartbeatRuns, issueRecoveryActions, issue
 import { issueService } from "../issues.js";
 import { evaluateAgentInvokabilityFromDb } from "../agent-invokability.js";
 import { ISSUE_BLOCKERS_RESOLVED_WAKE_REASON } from "../issue-dependency-wakeups.js";
+import { logger } from "../../middleware/logger.js";
+import { ADAPTER_DECLARED_WAITS_WITHOUT_ADAPTER_WAKE } from "./adapter-declared-wait.js";
 import {
   allUnresolvedBlockersCancelled,
   handBackDependentsLeftWithCancelledBlockers,
@@ -61,14 +71,17 @@ export type HeldCommentHandoverWake = (agentId: string, request: {
 }) => Promise<unknown>;
 
 export type HeldCommentHandoverOutcome =
-  | "not_target" | "agent_not_invocable" | "no_trace" | "not_ready" | "live_path" | "recovery_action" | "waiting"
-  | "woken" | "handed_back";
+  | "not_target" | "agent_not_invocable" | "no_trace" | "not_ready" | "live_path" | "declared_wait" | "recovery_action"
+  | "waiting" | "woken" | "handed_back";
 
 export async function reconcileHeldCommentHandover(db: Db, input: {
   companyId: string;
   issueId: string;
   wake: HeldCommentHandoverWake;
   invocationBlocked?: (agentId: string, issueId: string) => Promise<boolean>;
+  /** STUDIO-0101: a wait the adapter declared on the assignee's latest started run on the issue, while it is within
+   * its bound: its end and the run's code; null otherwise (recovery/service.ts: `declaredWaitDeadlineForIssue`). */
+  declaredWaitDeadline?: (agentId: string, issueId: string, now: Date) => Promise<{ deadline: number; errorCode: string } | null>;
   now?: Date;
   /** The next time this issue is worth another look (the end of a wait between two backstop wakes). */
   onDeferredDeadline?: (at: number) => void;
@@ -102,6 +115,31 @@ export async function reconcileHeldCommentHandover(db: Db, input: {
     sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issue.id}`,
   )).limit(1);
   if (liveWake || liveRun) return "live_path";
+  // STUDIO-0101: the assignee's latest started run on the issue ended in a wait the adapter declared (no machine free,
+  // a stop being proven: recovery/adapter-declared-wait.ts), still within its bound. The adapter keeps the request
+  // and wakes the assignee itself; a wake from here would only be refused again (production, 23 Nov 2026: 32 runs
+  // refused `router_waiting_for_resources` in one hour on four tasks, each started by this pass). The bound and the
+  // run read are the stranded-work recovery's own (`declaredWaitDeadline`); past the bound, this pass wakes as before.
+  // Only on the READY path: when only cancelled blockers are left, the adapter's wake is refused at the plugins' gate
+  // (a cancelled blocker is not done) and the hand-back below is the only way back. Not for a wait the adapter wakes
+  // nobody for (ADAPTER_DECLARED_WAITS_WITHOUT_ADAPTER_WAKE): router_ticket_blocked once the task is no longer
+  // `blocked`, router_readmission_not_drained never; this pass is the way back. A reading that throws is logged and the
+  // pass goes on as before.
+  const now = input.now ?? new Date();
+  if (ready && input.declaredWaitDeadline) {
+    let wait: { deadline: number; errorCode: string } | null = null;
+    try {
+      wait = await input.declaredWaitDeadline(assigneeAgentId, issue.id, now);
+    } catch (error) {
+      logger.warn({ err: error, companyId: input.companyId, issueId: issue.id, agentId: assigneeAgentId },
+        "the declared wait of the assignee's latest run could not be read; the hand-over backstop goes on as before");
+    }
+    const withoutAdapterWake = wait ? ADAPTER_DECLARED_WAITS_WITHOUT_ADAPTER_WAKE[wait.errorCode] : undefined;
+    if (wait && (withoutAdapterWake === undefined || (withoutAdapterWake === "while_blocked" && issue.status === "blocked"))) {
+      input.onDeferredDeadline?.(wait.deadline);
+      return "declared_wait";
+    }
+  }
   const [recoveryAction] = await db.select({ id: issueRecoveryActions.id }).from(issueRecoveryActions).where(and(
     eq(issueRecoveryActions.companyId, input.companyId),
     eq(issueRecoveryActions.sourceIssueId, issue.id),
@@ -112,7 +150,6 @@ export async function reconcileHeldCommentHandover(db: Db, input: {
   if (!agent || !(await evaluateAgentInvokabilityFromDb(db, agent)).invokable) return "agent_not_invocable";
   if (input.invocationBlocked && await input.invocationBlocked(assigneeAgentId, issue.id)) return "agent_not_invocable";
   // The wait between two backstop wakes of this issue doubles; counted from the backstop's own attempts since the base.
-  const now = input.now ?? new Date();
   const windowStart = new Date(now.getTime() - HELD_HANDOVER_BACKSTOP_ATTEMPT_WINDOW_MS);
   const attemptsSince = base.traceSince && base.traceSince > windowStart ? base.traceSince : windowStart;
   const earlier = await db.select({ requestedAt: agentWakeupRequests.requestedAt }).from(agentWakeupRequests).where(and(
