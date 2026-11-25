@@ -14,7 +14,7 @@ import type { ProjectCommenterAgentKeyScope } from "@paperclipai/shared";
  * - GET  /api/issues/:id/comments                 only `order`, `limit`, `afterCommentId`
  * - POST /api/issues/:id/comments                 a body of `body` and `reopen: false` (or absent) only
  * The answers of the three reads are reduced to what finding the ticket needs (routes/issues.ts), and its search
- * leaves documents out.
+ * leaves documents out. No request of such a key may carry `X-Paperclip-Run-Id`: it has no run.
  */
 const UUID = "[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}";
 const LIST = new RegExp(`^/api/companies/(${UUID})/issues/?$`);
@@ -24,6 +24,7 @@ const LIST_QUERY = new Set(["q", "projectId", "limit"]);
 const COMMENTS_QUERY = new Set(["order", "limit", "afterCommentId"]);
 const COMMENT_BODY = new Set(["body", "reopen"]);
 export const PROJECT_COMMENTER_ROUTE_DENIED = "project_commenter_route_denied";
+const RUN_ID_HEADER = "x-paperclip-run-id";
 
 export function projectCommenterScopeOf(req: Request): ProjectCommenterAgentKeyScope | null {
   const scope = req.actor?.type === "agent" ? req.actor.keyScope : undefined;
@@ -31,11 +32,14 @@ export function projectCommenterScopeOf(req: Request): ProjectCommenterAgentKeyS
 }
 
 /** Null when the request is one of the four; otherwise why it is refused. */
-export function projectCommenterRouteRefusal(req: Pick<Request, "method" | "path" | "query" | "body">,
+export function projectCommenterRouteRefusal(req: Pick<Request, "method" | "path" | "query" | "body" | "headers">,
   scope: ProjectCommenterAgentKeyScope, companyId: string | null | undefined): string | null {
   const keys = (value: unknown) => value && typeof value === "object" && !Array.isArray(value) ? Object.keys(value) : [];
   const only = (value: unknown, allowed: Set<string>) => keys(value).every(key => allowed.has(key));
   const single = (value: unknown) => typeof value === "string" ? value : null;
+  // Such a key has no run: a run id it would send could tie its comment to another agent's run (and lose that
+  // run's wake). Refused on every route; the authentication does not take it either.
+  if (req.headers?.[RUN_ID_HEADER] !== undefined) return "run_header_not_allowed";
   if (req.method === "GET") {
     const list = LIST.exec(req.path);
     if (list) {

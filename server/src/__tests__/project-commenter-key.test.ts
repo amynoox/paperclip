@@ -6,14 +6,20 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { readFileSync } from "node:fs";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import express from "express";
 import request from "supertest";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
-  activityLog, agentApiKeys, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, documents, issueComments,
-  issueDocuments, issueWorkProducts, issues, projects,
+  activityLog, agentApiKeys, agentWakeupRequests, agents, authUsers, companies, companyMemberships, createDb, documents, heartbeatRuns,
+  issueComments, issueDocuments, issueWorkProducts, issues, projects,
 } from "@paperclipai/db";
+import { createApp } from "../app.js";
+import { createStorageService } from "../storage/service.js";
+import { createLocalDiskStorageProvider } from "../storage/local-disk-provider.js";
 import { actorMiddleware } from "../middleware/auth.js";
 import { errorHandler } from "../middleware/error-handler.js";
 import { projectCommenterRouteGuard } from "../middleware/project-commenter-scope.js";
@@ -210,6 +216,34 @@ const support = await getEmbeddedPostgresTestSupport();
     denied(await get(`/api/issues/${tracking}/comments?after=${randomUUID()}`));
   });
 
+  it("refuses the list's neighbours: the count, the summaries and the chat bootstrap of the company's tickets", async () => {
+    for (const path of [`/api/companies/${companyId}/issues/count?attention=blocked&projectId=${devQa}`,
+      `/api/companies/${companyId}/issues/summaries?projectId=${devQa}`, `/api/companies/${companyId}/issues/chat-bootstrap?projectId=${devQa}`,
+      `/api/companies/${companyId}/issues/count`, `/api/companies/${companyId}/issues/summaries`, `/api/companies/${companyId}/issues/chat-bootstrap`,
+    ]) denied(await get(path));
+  });
+
+  it("refuses a run id on every route, writes nothing, and the authentication never takes it", async () => {
+    // A run of the holder of the tracking ticket: the id a stolen key would send to tie its comment to that run.
+    const [holderRun] = await db.insert(heartbeatRuns).values({ companyId, agentId: qaId, invocationSource: "assignment",
+      status: "succeeded", startedAt: new Date(), finishedAt: new Date(), contextSnapshot: { issueId: tracking } }).returning();
+    const withRun = (res: request.Response) => { denied(res); expect(res.body.reason).toBe("run_header_not_allowed"); };
+    withRun(await request(app).post(`/api/issues/${tracking}/comments`).set(as()).set("X-Paperclip-Run-Id", holderRun!.id)
+      .send({ body: "With the holder's run.", reopen: false }));
+    withRun(await request(app).get(`/api/issues/${tracking}`).set(as()).set("X-Paperclip-Run-Id", holderRun!.id));
+    withRun(await request(app).get(`/api/companies/${companyId}/issues?projectId=${devQa}`).set(as()).set("X-Paperclip-Run-Id", randomUUID()));
+    expect((await commentsOf(tracking)).filter(row => row.body === "With the holder's run.")).toEqual([]);
+    // The authentication alone, with no guard: the key's actor carries no run; a standard key's does (the control).
+    const bare = express();
+    bare.use(actorMiddleware(db, { deploymentMode: "authenticated" }));
+    bare.get("/actor", (req, res) => { res.json(req.actor); });
+    const commenter = await request(bare).get("/actor").set(as()).set("X-Paperclip-Run-Id", holderRun!.id);
+    expect(commenter.body).toMatchObject({ type: "agent", agentId: commenterId, keyScope: { kind: "project_commenter" } });
+    expect(commenter.body.runId).toBeUndefined();
+    const standard = await request(bare).get("/actor").set(as(standardToken)).set("X-Paperclip-Run-Id", holderRun!.id);
+    expect(standard.body.runId).toBe(holderRun!.id);
+  });
+
   it("refuses to read a secret, a document, an attachment, the activity, the company, the agents, its own agent and keys", async () => {
     for (const path of [
       `/api/companies/${companyId}/secrets`, `/api/issues/${byDocument}/documents`, `/api/issues/${byDocument}/documents/plan`,
@@ -285,6 +319,34 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(between.match(/app\.use\(/g)?.length ?? 0).toBe(1);
     expect(between).toContain("app.use(cloudControlMiddleware());");
   });
+
+  it("in the server as it is assembled (createApp), the guard stands before every route the key could reach", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "project-commenter-app-"));
+    let real: Awaited<ReturnType<typeof createApp>> | undefined;
+    try {
+      real = await createApp(db, {
+        uiMode: "none", serverPort: 0, bindHost: "127.0.0.1", allowedHostnames: ["127.0.0.1"],
+        deploymentMode: "authenticated", deploymentExposure: "private", authReady: true, companyDeletionEnabled: false,
+        managedPluginAutoInstall: [], storageService: createStorageService(createLocalDiskStorageProvider(directory)),
+        decisionServiceOptions: { wakeOriginAgent: async () => null },
+      });
+      const realGet = (path: string) => request(real!).get(path).set(as());
+      // Routers mounted at different points of the app: each refused by the guard itself (its code), not by a route.
+      for (const path of [`/api/companies/${companyId}`, `/api/companies/${companyId}/agents`, "/api/agents/me",
+        `/api/companies/${companyId}/secrets`, `/api/companies/${companyId}/tools`, `/api/companies/${companyId}/issues/count`,
+        `/api/issues/${byDocument}/documents`, "/api/plugins", `/api/companies/${companyId}/projects`]) denied(await realGet(path));
+      // The four requests still reach their routes, reduced.
+      const detail = await realGet(`/api/issues/${tracking}`);
+      expect(detail.status, JSON.stringify(detail.body)).toBe(200);
+      expect(Object.keys(detail.body).sort()).toEqual(["assigneeAgentId", "companyId", "id", "projectId", "status", "workProducts"]);
+      const list = await realGet(`/api/companies/${companyId}/issues?projectId=${devQa}&q=${marker}`);
+      expect(list.status, JSON.stringify(list.body)).toBe(200);
+      expect(Object.keys(list.body[0] ?? {}).sort()).toEqual(["assigneeAgentId", "companyId", "id", "projectId", "status"]);
+    } finally {
+      await real?.locals.paperclipShutdown?.();
+      await rm(directory, { recursive: true, force: true });
+    }
+  }, 180_000);
 
   it("a key of this scope names projects of its agent's company only", async () => {
     await expect(agentService(db).createApiKey(commenterId, "foreign", { kind: "project_commenter", projectIds: [foreignProject] },

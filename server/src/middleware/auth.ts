@@ -518,18 +518,21 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
+    const keyScope = normalizeAgentApiKeyScope(key.scopeConfig);
     req.actor = {
       type: "agent",
       agentId: key.agentId,
       companyId: key.companyId,
       keyId: key.id,
-      keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
+      keyScope,
       onBehalfOfUserId: responsibleUserId,
       onBehalfOfMemberships: await loadResponsibleUserMemberships(db, {
         companyId: key.companyId,
         userId: responsibleUserId,
       }),
-      runId: runIdHeader || undefined,
+      // STUDIO-0102: a project commenter key has no run: a run id it sends is never taken (the route guard refuses
+      // the header too), so that its comment is never tied to another agent's run.
+      runId: keyScope.kind === "project_commenter" ? undefined : runIdHeader || undefined,
       source: "agent_key",
     };
     if (isCloudManagedInstance() && req.actor.onBehalfOfMemberships?.length) {
