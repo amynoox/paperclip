@@ -292,6 +292,7 @@ import {
   unprocessable,
 } from "../errors.js";
 import { privateJsonEtag } from "../middleware/private-json-etag.js";
+import { projectCommenterScopeOf } from "../middleware/project-commenter-scope.js";
 import { createRequestPromiseMemo } from "../lib/request-promise-memo.js";
 import {
   assertBoard,
@@ -10015,6 +10016,15 @@ export function issueRoutes(
     );
     if (!issue) return;
     if (!(await timing.time("authorization", () => assertIssueReadAllowed(req, res, issue, { allowBreakGlass: true, finalForAgents: true })))) return;
+    // STUDIO-0102: a project commenter key reads what it needs to find the ticket that follows an event, and no
+    // more: no documents, no description, no workspace, no related tickets.
+    if (projectCommenterScopeOf(req)) {
+      const workProducts = await workProductsSvc.listForIssue(issue.id);
+      res.json({ id: issue.id, companyId: issue.companyId, projectId: issue.projectId, identifier: issue.identifier,
+        title: issue.title, status: issue.status, assigneeAgentId: issue.assigneeAgentId, assigneeUserId: issue.assigneeUserId,
+        updatedAt: issue.updatedAt, workProducts });
+      return;
+    }
     // Saved cards are structural conversation data. Include their local
     // projection before first paint, independently of slow recovery, workspace
     // and related-task enrichment. This never refreshes external providers.

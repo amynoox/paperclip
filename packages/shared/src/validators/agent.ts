@@ -223,13 +223,25 @@ export const skillTestAgentKeyScopeSchema = z.object({
   issueId: z.string().guid(),
 }).strict();
 
+/**
+ * STUDIO-0102: a key that may only find, read and comment on the tickets of the projects named, and nothing else
+ * (an agent that relays outside events onto the tickets that follow them). Every other route is refused before it
+ * runs (server/src/middleware/project-commenter-scope.ts), and every other action by the authorization service.
+ */
+export const projectCommenterAgentKeyScopeSchema = z.object({
+  kind: z.literal("project_commenter"),
+  projectIds: z.array(z.string().guid()).min(1).max(10),
+}).strict();
+
 export const agentApiKeyScopeSchema = z.union([
   standardAgentKeyScopeSchema,
   taskBridgeAgentKeyScopeSchema,
   skillTestAgentKeyScopeSchema,
+  projectCommenterAgentKeyScopeSchema,
 ]);
 
 export type AgentApiKeyScope = z.infer<typeof agentApiKeyScopeSchema>;
+export type ProjectCommenterAgentKeyScope = z.infer<typeof projectCommenterAgentKeyScopeSchema>;
 export type TaskBridgeAgentKeyScope = z.infer<typeof taskBridgeAgentKeyScopeSchema>;
 export type SkillTestAgentKeyScope = z.infer<typeof skillTestAgentKeyScopeSchema>;
 
