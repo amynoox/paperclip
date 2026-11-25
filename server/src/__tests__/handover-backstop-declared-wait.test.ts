@@ -9,8 +9,8 @@
  * codes, the series, its bound), the backstop wakes nobody on the READY path and looks again at the bound's end; past
  * the bound, or when the latest run is not such a wait, it wakes as before. Not when only cancelled blockers are left
  * (the adapter's wake is refused at the plugins' gate: the hand-back is the only way back), not for a
- * `router_ticket_blocked` wait once the issue is no longer `blocked` (the adapter wakes nobody for it), and a reading
- * that throws leaves the pass as before.
+ * `router_ticket_blocked` wait once the issue is no longer `blocked`, never for a `router_readmission_not_drained` wait
+ * (the adapter wakes nobody for those), and a reading that throws leaves the pass as before.
  */
 import { randomUUID } from "node:crypto";
 import express from "express";
@@ -206,6 +206,16 @@ const ADAPTER = "codex_local";
       const { outcome } = await pass(t, new Date(ended.getTime() + 30_000));
       // The router refuses a blocked ticket and wakes nobody: the server's dependency wake is the way back.
       expect({ status, outcome }).toEqual({ status, outcome: status === "blocked" ? "declared_wait" : "woken" });
+    }
+  }, 180_000);
+
+  it("a router_readmission_not_drained wait: never left alone, the router wakes nobody for it", async () => {
+    for (const status of ["todo", "in_progress"] as const) {
+      const t = await heldTask();
+      await db.update(issues).set({ status }).where(eq(issues.id, t.taskId));
+      const ended = new Date(Date.now() - 60_000);
+      await endedRun(t, "router_readmission_not_drained", ended);
+      expect({ status, outcome: (await pass(t, new Date(ended.getTime() + 30_000))).outcome }).toEqual({ status, outcome: "woken" });
     }
   }, 180_000);
 
