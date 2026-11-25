@@ -19,6 +19,20 @@ export function createToken() {
   return `pcp_${randomBytes(24).toString("hex")}`;
 }
 
+/**
+ * STUDIO-0102: a project commenter key has a token of its own prefix, kept under a hash separated by a domain. A
+ * server without that scope hashes the token as above, finds no key and refuses it (401): it never reads the key as
+ * an unscoped one. This server looks such a token up under its own hash only (middleware/auth.ts).
+ */
+export const PROJECT_COMMENTER_TOKEN_PREFIX = "pcc_";
+export function createProjectCommenterToken() {
+  return `${PROJECT_COMMENTER_TOKEN_PREFIX}${randomBytes(24).toString("hex")}`;
+}
+export function hashProjectCommenterToken(token: string) {
+  return createHash("sha256").update(`paperclip.project_commenter.v1
+${token}`).digest("hex");
+}
+
 const CONFIG_REVISION_FIELDS = [
   "name",
   "role",

@@ -23,6 +23,7 @@ import {
   rekeyCompanyIssueIdentifiers,
 } from "../services/issue-prefix.js";
 import { verifyLocalAgentJwt } from "../agent-auth-jwt.js";
+import { PROJECT_COMMENTER_TOKEN_PREFIX, hashProjectCommenterToken } from "../lib/agent-records.js";
 import { agentRunWritesRevoked } from "../agent-run-cancellation.js";
 import { loadAgentRunAuthentication } from "./agent-run-authentication.js";
 import { isUuidLike, normalizeAgentApiKeyScope, type DeploymentMode } from "@paperclipai/shared";
@@ -339,12 +340,17 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       }
     }
 
-    const tokenHash = hashToken(token);
-    const key = await db
+    // STUDIO-0102: a project commenter token is looked up under its own hash, and only a key of that scope answers
+    // to it; a key of that scope never answers to the ordinary hash (a server without the scope would read it so).
+    const commenterToken = token.startsWith(PROJECT_COMMENTER_TOKEN_PREFIX);
+    const tokenHash = commenterToken ? hashProjectCommenterToken(token) : hashToken(token);
+    const found = await db
       .select()
       .from(agentApiKeys)
       .where(and(eq(agentApiKeys.keyHash, tokenHash), isNull(agentApiKeys.revokedAt)))
       .then((rows) => rows[0] ?? null);
+    const key = found && (normalizeAgentApiKeyScope(found.scopeConfig).kind === "project_commenter") === commenterToken
+      ? found : null;
 
     if (!key) {
       const claims = verifyLocalAgentJwt(token);
@@ -512,18 +518,21 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
       return;
     }
 
+    const keyScope = normalizeAgentApiKeyScope(key.scopeConfig);
     req.actor = {
       type: "agent",
       agentId: key.agentId,
       companyId: key.companyId,
       keyId: key.id,
-      keyScope: normalizeAgentApiKeyScope(key.scopeConfig),
+      keyScope,
       onBehalfOfUserId: responsibleUserId,
       onBehalfOfMemberships: await loadResponsibleUserMemberships(db, {
         companyId: key.companyId,
         userId: responsibleUserId,
       }),
-      runId: runIdHeader || undefined,
+      // STUDIO-0102: a project commenter key has no run: a run id it sends is never taken (the route guard refuses
+      // the header too), so that its comment is never tied to another agent's run.
+      runId: keyScope.kind === "project_commenter" ? undefined : runIdHeader || undefined,
       source: "agent_key",
     };
     if (isCloudManagedInstance() && req.actor.onBehalfOfMemberships?.length) {

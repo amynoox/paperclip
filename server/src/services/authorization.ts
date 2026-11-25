@@ -2282,7 +2282,8 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
     }
 
     if (isConnectionManagementAction(input.action) &&
-        (input.actor.keyScope?.kind === "skill_test" || input.actor.keyScope?.kind === "task_bridge")) {
+        (input.actor.keyScope?.kind === "skill_test" || input.actor.keyScope?.kind === "task_bridge"
+          || input.actor.keyScope?.kind === "project_commenter")) {
       return deny({ action: input.action, reason: "deny_scope", explanation: "Scoped test and task bridge credentials cannot administer connections." });
     }
 
@@ -2312,6 +2313,24 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
         keyId,
       });
       if (taskBridgeDecision) return taskBridgeDecision;
+    }
+
+    // STUDIO-0102: a `project_commenter` key reads and comments on the tickets of its projects, and does nothing
+    // else. Any other action is refused here, whatever route asks (the route guard refuses the other routes first).
+    // Within its projects, the agent's own rules then apply as for any agent.
+    if (input.actor.keyScope?.kind === "project_commenter") {
+      const scope = input.actor.keyScope;
+      const denyCommenter = (explanation: string) => deny({ action: input.action, reason: "deny_scope", explanation });
+      if (input.action !== "issue:read" && input.action !== "issue:comment") {
+        return denyCommenter("A project commenter key may only read and comment on the tickets of its projects.");
+      }
+      if (input.resource.type !== "issue" || !input.resource.issueId) {
+        return denyCommenter("A project commenter key acts on one ticket at a time.");
+      }
+      const issue = await loadIssue(input.resource.issueId);
+      if (!issue || issue.companyId !== companyId || !issue.projectId || !scope.projectIds.includes(issue.projectId)) {
+        return denyCommenter("This ticket is not in a project of this key.");
+      }
     }
 
     const trustResolution = await resolveActorTrust({
