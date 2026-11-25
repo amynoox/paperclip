@@ -871,6 +871,10 @@ export function shouldResetTaskSessionForWake(
 export function describeSessionResetReason(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ) {
+  // STUDIO-0097: a run that starts after a steered run a pause cut, whose engine stop is not proven.
+  const unprovenRunId = readNonEmptyString(contextSnapshot?.engineStopUnprovenRunId);
+  if (contextSnapshot?.forceFreshSession === true && unprovenRunId)
+    return `a new conversation starts in a new folder: the stop of the engine of the cut run ${unprovenRunId} is not proven`;
   // STUDIO-0075: a continuation that would have gone on in the session of the run it continues.
   const cutRunId = readNonEmptyString(contextSnapshot?.cutRunSessionNotKept);
   if (contextSnapshot?.forceFreshSession === true && cutRunId)

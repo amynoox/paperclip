@@ -1,11 +1,12 @@
 import { readProcessStartedAt } from "./hot-restart.js";
 import { runUsedConversationAdapter } from "./conversation-continuation.js";
 import { and, eq, inArray, isNull, or, sql } from "drizzle-orm";
-import { environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
+import { agents, environmentLeases, heartbeatRuns, nativeRunFinalizations, type Db } from "@paperclipai/db";
 import { hasNativeLocalProcessStop } from "./native-local-process-stop.js";
 import { hasRemoteTerminationReceipt } from "./remote-execution-termination.js";
 import { isCancelledNativeStartup } from "./cancelled-native-startup.js";
 import { isPreDispatchCancellation, markSettledStopsBeforeProcessLaunch, PRE_DISPATCH_CANCELLATION_KEY } from "./pre-dispatch-cancellation.js";
+import { engineStopProvenNowOrSoon } from "./provider-stop-proof.js";
 
 // STUDIO-0068: the stop proof reads every run the agents ever had. Production, 18 Nov 2026: with whole rows
 // (result_json, usage_json, context_snapshot...) the runs of one long-lived role were 864 MB compressed in the
@@ -17,6 +18,8 @@ import { isPreDispatchCancellation, markSettledStopsBeforeProcessLaunch, PRE_DIS
 const stopProofRunColumns = {
   id: heartbeatRuns.id,
   companyId: heartbeatRuns.companyId,
+  agentId: heartbeatRuns.agentId,
+  updatedAt: heartbeatRuns.updatedAt,
   status: heartbeatRuns.status,
   runtimeMode: heartbeatRuns.runtimeMode,
   executionStage: heartbeatRuns.executionStage,
@@ -108,6 +111,16 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], opt
   const coordinators = await db.select().from(nativeRunFinalizations)
     .where(inArray(nativeRunFinalizations.runId, runIds));
   const now = options.now ?? new Date();
+  // STUDIO-0097: when each agent's current pause began (the bound markEngineStopsUnprovenAtPause reads too).
+  const pausedAtOf = new Map(options.pauseStop
+    ? (await db.select({ id: agents.id, pausedAt: agents.pausedAt }).from(agents).where(inArray(agents.id, agentIds)))
+      .map(row => [row.id, row.pausedAt] as const)
+    : []);
+  const cutByThisPause = (run: StopProofRun) => {
+    const pausedAt = pausedAtOf.get(run.agentId);
+    const ended = run.finishedAt ?? run.updatedAt;
+    return Boolean(pausedAt && ended && ended.getTime() >= pausedAt.getTime());
+  };
   const abandoned = coordinators.filter(row => row.leaseOwner);
   if (abandoned.some(row => !row.leaseExpiresAt || row.leaseExpiresAt > now || row.resultId ||
       runs.find(run => run.id === row.runId)?.status !== "cancelled")) return false;
@@ -125,8 +138,19 @@ export async function agentExecutionsHaveStopped(db: Db, agentIds: string[], opt
     // no process ran and no remote command was sent on its lease.
     const cancelledBeforeDispatch = isPreDispatchCancellation(run);
     if (runLeases.some(lease => lease.provider && lease.provider !== "local")) {
+      // STUDIO-0097: a pause also concludes on the proof of the engine's stop: the server's own observation of the
+      // machine (provider-stop-proof.ts), asked here for a steered run the pause cut, without the delay of the ssh
+      // client rule: every lease is released (above). The observation goes on in the background when it does not
+      // answer at once; the next reading of this state finds what it proved.
+      // Without that proof the ssh client rule still concludes the pause, as before: the link's absence then proves
+      // nothing of the engine, and the run is marked when the pause concludes (agent-lifecycle-driver.ts).
+      // The ssh client rule is read first: it asks the machine nothing. And the machine is asked only of a run THIS
+      // pause cut: a run an earlier pause cut is never observed again here (each observation is an ssh connection to
+      // the role's account; the account's service manager it starts would be seen, born since the engine, by the
+      // observation of this pause's run that follows it).
       if (run.status === "cancelled" && !cancelledBeforeDispatch && !runLeases.every(hasRemoteTerminationReceipt) &&
-          !(options.pauseStop && await sshClientStopProvesPause(run, runLeases, now))) return false;
+          !(options.pauseStop && (await sshClientStopProvesPause(run, runLeases, now)
+            || (cutByThisPause(run) && await engineStopProvenNowOrSoon(db, { companyId: run.companyId, runId: run.id }))))) return false;
       continue;
     }
     let processAlive = Boolean(run.processPid && !absent(run.processPid));
