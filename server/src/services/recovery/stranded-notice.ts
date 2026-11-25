@@ -7,6 +7,7 @@ import {
   type NoticeMetadataRow,
   type NoticeMetadataSection,
 } from "./notice-format.js";
+import { routerRefusalBlockBody, routerRefusalText } from "./adapter-declared-wait.js";
 
 /** The saved version is unchanged by a failed restore; the run names the failed step. */
 export const REMOTE_WORKSPACE_RESTORE_NEXT_ACTION =
@@ -87,6 +88,19 @@ export function buildImmediateExecutionPathRecoveryNoticeSeed(input: {
       "Moving it to `blocked` so it is visible for intervention.",
     title: "No live execution path",
     tone: "danger",
+  };
+}
+
+// STUDIO-0059: a run the worker router refused before any reservation, for a
+// code only a person's gesture lifts. Names the code, its meaning and the
+// gesture.
+export function buildRouterRefusalRecoveryNoticeSeed(code: string): StrandedRecoveryNoticeSeed {
+  const text = routerRefusalText(code);
+  return {
+    body: routerRefusalBlockBody(code),
+    title: text.title,
+    tone: "warning",
+    ...(text.gesture ? { nextAction: text.gesture } : {}),
   };
 }
 

@@ -206,6 +206,8 @@ export type ReleaseRecoverySharedFacts = {
   isStrandedRecoveryOrigin: boolean;
   recoveryAgentPresent: boolean;
   recoveryAgentInvokable: boolean;
+  /** STUDIO-0059: the run was refused by the worker router before any reservation: "block" (only a person's gesture lifts it) or "note" (this participant's part is finished; nothing to do). */
+  routerRefusal?: "block" | "note" | null;
 };
 
 export type ReleaseRecoveryReviewParticipantFacts = {
@@ -243,7 +245,8 @@ export type ReleaseRecoveryBlockedNoticeKind =
   | "workspace_validation"
   | "configuration_incomplete"
   | "execution_review_participant"
-  | "immediate_execution_path";
+  | "immediate_execution_path"
+  | "router_refusal";
 
 export type ReleaseRecoveryDecision =
   | { kind: "released" }
@@ -390,6 +393,14 @@ export function decideReleaseRecovery(facts: ReleaseRecoveryFacts): ReleaseRecov
     ) {
       return { kind: "released" };
     }
+    // STUDIO-0059: the review participant's run gets the same gate as the
+    // assignee's (immediate branch below). A declared wait is neither
+    // requeued nor blocked here (the stranded-work sweep owns its bound); a
+    // reviewer refused by the worker router is not requeued (asking again
+    // cannot pass).
+    if (immediate.isAdapterDeclaredWaitRun) return { kind: "released" };
+    if (shared.routerRefusal === "note") return { kind: "released" };
+    if (shared.routerRefusal === "block") return { kind: "blocked", notice: "router_refusal" };
     if (shared.isStrandedRecoveryOrigin) {
       return { kind: "blocked_recovery_in_place" };
     }
@@ -413,6 +424,12 @@ export function decideReleaseRecovery(facts: ReleaseRecoveryFacts): ReleaseRecov
   // Neither requeue nor block a declared wait at release; the stranded-work
   // sweep owns its bound.
   if (immediate.isAdapterDeclaredWaitRun) return { kind: "released" };
+  // STUDIO-0059: a run the worker router refused before any reservation is
+  // never requeued. A code only a person's gesture lifts blocks at once with
+  // its own notice; a finished participant's refusal is left as it is (the
+  // stranded-work sweep posts its note).
+  if (shared.routerRefusal === "note") return { kind: "released" };
+  if (shared.routerRefusal === "block") return { kind: "blocked", notice: "router_refusal" };
   if (shared.isStrandedRecoveryOrigin) return { kind: "blocked_recovery_in_place" };
 
   const shouldBlockImmediately =

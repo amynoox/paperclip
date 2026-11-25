@@ -27,7 +27,9 @@ import {
   ADAPTER_DECLARED_WAIT_ERROR_CODES,
   ADAPTER_DECLARED_WAIT_MAX_MS,
   ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES,
+  ROUTER_REFUSAL_ERROR_CODES,
   adapterDeclaredWaitMaxMs,
+  routerRefusalOutcome,
 } from "../services/recovery/adapter-declared-wait.js";
 import { recoveryPostgresSupport, startRecoveryPostgres } from "./helpers/recovery-postgres.js";
 
@@ -50,9 +52,17 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   const dispatched = new Set<string>();
   // Per-issue adapter outcome; default finishes the task.
   const modes = new Map<string, "wait" | "wait-transient" | "other-transient" | "stop-transient" | "unsettled-transient" | "stop-plain">();
+  // STUDIO-0059: per-issue router refusal code (worst case: declared with a transient error family).
+  const refusals = new Map<string, string>();
   const oldHome = process.env.PAPERCLIP_HOME;
   let home: string;
   const WAIT = "router_waiting_for_resources";
+  const ENDED = "router_group_participant_ended";
+  const CLOSED = "router_group_participant_closed";
+  const MISMATCH = "router_group_participant_mismatch";
+  const RESERVED = "router_group_participant_reserved";
+  const TICKET_BLOCKED = "router_ticket_blocked";
+  const READMISSION = "router_readmission_not_drained";
   // A cut link to the worker machine (router 0.30.10): the cut run, then the next run.
   const STOP = "router_provider_stop_unverified";
   const UNSETTLED = "router_previous_dispatch_unsettled";
@@ -67,6 +77,10 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       type: adapterType, supportsLocalAgentJwt: false,
       execute: async input => {
         dispatched.add(input.runId);
+        const refusal = refusals.get(String(input.context.issueId));
+        if (refusal) {
+          return { exitCode: 1, signal: null, timedOut: false, errorCode: refusal, errorMessage: "Refused by the worker router", errorFamily: "transient_upstream" as const };
+        }
         const mode = modes.get(String(input.context.issueId));
         if (mode) {
           return {
@@ -94,13 +108,15 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
 
   type PriorRun = { minutesAgo: number; errorCode: string | null; status?: string; retry?: boolean; durationMinutes?: number };
 
-  async function seed(status: "todo" | "in_progress", prior: PriorRun[]) {
-    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID();
+  async function seed(status: "todo" | "in_progress" | "in_review" | "backlog" | "blocked", prior: PriorRun[],
+    opts?: { review?: boolean; reviewer?: boolean }) {
+    const companyId = randomUUID(), agentId = randomUUID(), issueId = randomUUID(), reviewerId = randomUUID();
     const userId = `wait-user-${companyId}`;
     await db.insert(authUsers).values({ id: userId, name: "Board user", email: `${userId}@example.test`, createdAt: new Date(), updatedAt: new Date() });
     await db.insert(companies).values({ id: companyId, name: "Adapter wait fixture", issuePrefix: `W${companyId.slice(0, 6)}` });
     await db.insert(companyMemberships).values({ companyId, principalId: userId, principalType: "user", status: "active", membershipRole: "member" });
     await db.insert(agents).values({ id: agentId, companyId, name: "Executor", adapterType, status: "idle", adapterConfig: {} });
+    if (opts?.reviewer) await db.insert(agents).values({ id: reviewerId, companyId, name: "Reviewer", adapterType, status: "idle", adapterConfig: {} });
     const runIds: string[] = [];
     for (const run of prior) {
       const createdAt = new Date(Date.now() - run.minutesAgo * 60_000);
@@ -124,8 +140,17 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       id: issueId, companyId, title: "Routed task", status, assigneeAgentId: agentId, responsibleUserId: userId, issueNumber: 1,
       checkoutRunId: status === "in_progress" ? runIds[runIds.length - 1] ?? null : null,
       startedAt: status === "in_progress" ? new Date() : null,
+      // STUDIO-0059: an execution-review stage whose current participant is the assignee (TR-1318).
+      ...(opts?.review || opts?.reviewer ? {
+        executionState: {
+          status: "pending", currentStageId: randomUUID(), currentStageIndex: 0, currentStageType: "review",
+          currentParticipant: { type: "agent", agentId: opts?.reviewer ? reviewerId : agentId, userId: null },
+          returnAssignee: { type: "agent", agentId, userId: null },
+          reviewRequest: null, completedStageIds: [], lastDecisionId: null, lastDecisionOutcome: null,
+        },
+      } : {}),
     });
-    return { companyId, agentId, issueId, runIds };
+    return { companyId, agentId, issueId, runIds, reviewerId };
   }
 
   const issueOf = async (issueId: string) => (await db.select().from(issues).where(eq(issues.id, issueId)))[0];
@@ -134,15 +159,29 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
   const commentsOf = (issueId: string) => db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
   const actionsOf = (issueId: string) => db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.sourceIssueId, issueId));
 
-  it("declares only the router's three codes: 12 h for a machine wait, 1 h for an unproven stop", () => {
-    expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT, STOP, UNSETTLED]);
+  it("declares the router's waits (machine, stop, blocked ticket) and its four group refusals, none retried", () => {
+    expect(ROUTER_REFUSAL_ERROR_CODES).toEqual([ENDED, CLOSED, MISMATCH, RESERVED]);
+    // Only the dependency wait joins the bounded waits; the group refusals are never a wait.
+    expect(ADAPTER_DECLARED_WAIT_ERROR_CODES).toEqual([WAIT, STOP, UNSETTLED, READMISSION, TICKET_BLOCKED]);
+    expect(adapterDeclaredWaitMaxMs(TICKET_BLOCKED)).toBe(12 * 60 * 60_000);
+    // Unsettled receipts: the stop kind and its bound.
+    expect(adapterDeclaredWaitMaxMs(READMISSION)).toBe(60 * 60_000);
+    expect(routerRefusalOutcome(RESERVED, "in_review")).toBe("block");
+    expect(routerRefusalOutcome(MISMATCH, "todo")).toBe("block");
+    expect(routerRefusalOutcome(CLOSED, "in_progress")).toBe("block");
+    expect(routerRefusalOutcome(CLOSED, "in_review")).toBe("note");
+    expect(routerRefusalOutcome(ENDED, "todo")).toBe("block");
+    expect(routerRefusalOutcome(ENDED, "in_progress")).toBe("block");
+    expect(routerRefusalOutcome(ENDED, "in_review")).toBe("note");
+    expect(routerRefusalOutcome(TICKET_BLOCKED, "todo")).toBeNull();
+    expect(routerRefusalOutcome("process_lost", "todo")).toBeNull();
     expect(ADAPTER_DECLARED_WAIT_MAX_MS).toBe(12 * 60 * 60_000);
     expect(ADAPTER_DECLARED_STOP_WAIT_MAX_MS).toBe(60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(WAIT)).toBe(12 * 60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(STOP)).toBe(60 * 60_000);
     expect(adapterDeclaredWaitMaxMs(UNSETTLED)).toBe(60 * 60_000);
     // The cut run keeps its transient retry (the retried run waits for the link itself).
-    expect(ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES).toEqual([WAIT, UNSETTLED]);
+    expect(ADAPTER_DECLARED_WAIT_NO_TRANSIENT_RETRY_CODES).toEqual([WAIT, UNSETTLED, READMISSION, TICKET_BLOCKED, ...ROUTER_REFUSAL_ERROR_CODES]);
   });
 
   // Production, 14 Nov 2026: the responsible coordinates on its executor's
@@ -164,7 +203,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       expect((await issueOf(f.issueId)).status).toBe(status);
       expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
       expect(await actionsOf(f.issueId)).toHaveLength(0);
-      expect(await commentsOf(f.issueId)).toHaveLength(0);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
     }
   }, 180_000);
 
@@ -186,7 +225,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     for (const [f, status] of [[cut, "todo"], [fresh, "in_progress"]] as const) {
       expect((await issueOf(f.issueId)).status).toBe(status);
       expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
-      expect(await commentsOf(f.issueId)).toHaveLength(0);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
       expect(await actionsOf(f.issueId)).toHaveLength(0);
     }
     // STUDIO-0045: the bound runs from the END of the first waiting run.
@@ -246,7 +285,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     for (const [f, status] of [[todo, "todo"], [fresh, "todo"], [working, "in_progress"], [series, "todo"]] as const) {
       expect((await issueOf(f.issueId)).status).toBe(status);
       expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
-      expect(await commentsOf(f.issueId)).toHaveLength(0);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
       expect(await actionsOf(f.issueId)).toHaveLength(0);
     }
     // The sweep re-checks at the bound, counted from the first waiting run of the series.
@@ -362,6 +401,265 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     ]);
   }, 180_000);
 
+  // STUDIO-0059: production 15-16 Nov 2026. TR-1261: three runs refused (`router_control_failed`, today
+  // `router_group_participant_reserved`), retried, then blocked by recovery. TR-1318: `in_review`, woken by comments,
+  // refused `_ended` twice, `_closed` after a retry, then blocked by recovery at 02:26:35. A refusal before any
+  // reservation is never retried. A code only a gesture lifts blocks AT ONCE, naming the code and the gesture; a
+  // finished participant's refusal leaves the issue as it is, with one note per series.
+  // A comment wake, as TR-1318 was woken (a real comment row; the run claims it).
+  async function commentWake(f: { companyId: string; agentId: string; issueId: string }) {
+    const [comment] = await db.insert(issueComments).values({
+      companyId: f.companyId, issueId: f.issueId, authorType: "user", authorUserId: `wait-user-${f.companyId}`,
+      body: "Can you confirm the result?",
+    }).returning();
+    const run = await heartbeat.wakeup(f.agentId, {
+      source: "automation", triggerDetail: "system", reason: "issue_commented",
+      payload: { issueId: f.issueId, commentId: comment!.id },
+      contextSnapshot: { issueId: f.issueId, taskId: f.issueId, wakeReason: "issue_commented", commentId: comment!.id, wakeCommentId: comment!.id },
+    });
+    expect(run).not.toBeNull();
+    await heartbeat.drainActiveRunExecutions();
+    await expect.poll(async () => {
+      const row = (await runsOf(f)).find(r => r.id === run!.id);
+      return `${row?.status}:${row?.errorCode}`;
+    }, { timeout: 30_000 }).toMatch(/^failed:/);
+    return run!;
+  }
+  // STUDIO-0059: a declared wait posts one note per series; other comments are counted apart.
+  const nonWaitComments = async (issueId: string) => (await commentsOf(issueId)).filter(row => !row.body.includes("The worker router held this run"));
+  const waitNotes = async (issueId: string) => (await commentsOf(issueId)).filter(row => row.body.includes("The worker router held this run"));
+  const routerNotices = async (issueId: string) => (await commentsOf(issueId)).filter(row => row.body.includes("The worker router refused this run"));
+
+  it("blocks at once, with the code and the gesture, a run the router refused for a code only a gesture lifts", async () => {
+    const fixtures: Array<{ code: string; gesture: string; f: Awaited<ReturnType<typeof seed>>; runId: string }> = [];
+    for (const [code, status, gesture] of [
+      [RESERVED, "todo", "Replace the already-reserved participant"],
+      // The gesture puts the issue back where the assignee is queued again (`todo`; `in_progress` wakes nobody).
+      [MISMATCH, "todo", "Correct the `worker-router` block"],
+      [CLOSED, "in_progress", "Remove the finished or cancelled participant"],
+      [CLOSED, "todo", "Remove the finished or cancelled participant"],
+      // Nothing changes without a retry: a finished participant whose issue still has work to do is blocked now too.
+      [ENDED, "todo", "move the issue to review or done"],
+      [ENDED, "in_progress", "move the issue to review or done"],
+    ] as const) {
+      const f = await seed(status, []);
+      refusals.set(f.issueId, code);
+      fixtures.push({ code, gesture, f, runId: (await boardWake(f)).id });
+    }
+    await heartbeat.drainActiveRunExecutions();
+    for (const { code, gesture, f, runId } of fixtures) {
+      await expect.poll(async () => (await runsOf(f)).find(run => run.id === runId)?.status, { timeout: 30_000 }).toBe("failed");
+      expect((await runsOf(f)).find(run => run.id === runId)).toMatchObject({ errorCode: code });
+      // Released by the run's own end: no retry, no recovery run, blocked now (no sweep yet).
+      expect((await runsOf(f)).map(run => run.id)).toEqual([runId]);
+      await expect.poll(async () => (await issueOf(f.issueId)).status, { timeout: 30_000 }).toBe("blocked");
+      const [notice] = await routerNotices(f.issueId);
+      expect(notice?.body).toContain(`\`${code}\``);
+      expect(JSON.stringify(notice?.metadata)).toContain(gesture);
+      if (code !== ENDED) expect(JSON.stringify(notice?.metadata)).toContain("then move this issue back to `todo`.");
+      expect(await actionsOf(f.issueId)).toEqual([expect.objectContaining({ kind: "stranded_assigned_issue", status: "active" })]);
+    }
+    // Further sweeps add nothing.
+    for (let sweep = 0; sweep < 2; sweep += 1) {
+      for (const { f } of fixtures) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    }
+    await heartbeat.drainActiveRunExecutions();
+    for (const { f, runId } of fixtures) {
+      expect((await runsOf(f)).map(run => run.id)).toEqual([runId]);
+      expect(await routerNotices(f.issueId)).toHaveLength(1);
+      expect(await actionsOf(f.issueId)).toHaveLength(1);
+    }
+  }, 180_000);
+
+  it("the stranded-work sweep blocks with the same notice a refused run whose release did not", async () => {
+    const reserved = await seed("todo", [{ minutesAgo: 5, errorCode: RESERVED }]);
+    const closed = await seed("in_progress", [{ minutesAgo: 5, errorCode: CLOSED }]);
+    const ended = await seed("todo", [{ minutesAgo: 5, errorCode: ENDED }]);
+    const codeOf = new Map([[reserved, RESERVED], [closed, CLOSED], [ended, ENDED]]);
+    // Even a refusal minutes old: no bound, no requeue.
+    for (const f of [reserved, closed, ended]) {
+      const result = await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      expect(result.dispatchRequeued + result.continuationRequeued).toBe(0);
+      expect((await issueOf(f.issueId)).status).toBe("blocked");
+      expect((await routerNotices(f.issueId))[0]?.body).toContain(codeOf.get(f)!);
+      expect(await actionsOf(f.issueId)).toHaveLength(1);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+    }
+    await heartbeat.drainActiveRunExecutions();
+  }, 180_000);
+
+  // TR-1318 replayed: an `in_review` issue whose review participant is its assignee, woken by a comment.
+  it("keeps an in-review issue in review when the router refuses its participant as ended, then closed (TR-1318)", async () => {
+    for (const review of [true, false]) {
+      const f = await seed("in_review", [], { review });
+      refusals.set(f.issueId, ENDED);
+      const commented = () => commentWake(f);
+      const ended = await commented();
+      for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      expect((await issueOf(f.issueId)).status).toBe("in_review");
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect((await runsOf(f)).map(run => run.id)).toEqual([ended.id]);
+      const [note] = await routerNotices(f.issueId);
+      expect(note).toMatchObject({ authorType: "system" });
+      expect(note!.body).toContain(ENDED);
+      // Refused again in the same series (production: twice): still one note, nothing requeued.
+      const endedAgain = await commented();
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      expect((await routerNotices(f.issueId)).map(row => row.body.includes(ENDED))).toEqual([true]);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([ended.id, endedAgain.id].sort());
+
+      refusals.set(f.issueId, CLOSED);
+      const closed = await commented();
+      for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      expect((await issueOf(f.issueId)).status).toBe("in_review");
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([ended.id, endedAgain.id, closed.id].sort());
+      const notes = await routerNotices(f.issueId);
+      expect(notes).toHaveLength(2);
+      expect(notes.some(row => row.body.includes(CLOSED))).toBe(true);
+    }
+  }, 240_000);
+
+  it("blocks at once a review participant refused for a code only a gesture lifts", async () => {
+    for (const code of [RESERVED, MISMATCH]) {
+      const f = await seed("in_review", [], { review: true });
+      refusals.set(f.issueId, code);
+      const run = await commentWake(f);
+      // A comment wake is not the review path's run, so its release leaves it; the sweep blocks it at once (no
+      // bound), and no review recovery is requeued.
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      expect((await issueOf(f.issueId)).status).toBe("blocked");
+      expect((await runsOf(f)).map(row => row.id)).toEqual([run.id]);
+      expect((await routerNotices(f.issueId))[0]?.body).toContain(code);
+      expect(await actionsOf(f.issueId)).toHaveLength(1);
+    }
+  }, 180_000);
+
+  it("reads the review participant's own run when the reviewer is another agent than the assignee", async () => {
+    // The refusal and the wait are on the REVIEWER's run (the gate serves the pending participant).
+    const blocked = await seed("in_review", [], { reviewer: true });
+    const refused = { ...blocked, agentId: blocked.reviewerId };
+    refusals.set(blocked.issueId, RESERVED);
+    const refusedRun = await commentWake(refused);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: blocked.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await issueOf(blocked.issueId)).status).toBe("blocked");
+    expect((await routerNotices(blocked.issueId))[0]?.body).toContain(RESERVED);
+    expect((await runsOf(refused)).map(run => run.id)).toEqual([refusedRun.id]);
+    expect(await runsOf(blocked)).toEqual([]);
+
+    const held = await seed("in_review", [], { reviewer: true });
+    const waiting = { ...held, agentId: held.reviewerId };
+    refusals.set(held.issueId, TICKET_BLOCKED);
+    const waitRun = await commentWake(waiting);
+    for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: held.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await issueOf(held.issueId)).status).toBe("in_review");
+    expect((await runsOf(waiting)).map(run => run.id)).toEqual([waitRun.id]);
+    expect(await runsOf(held)).toEqual([]);
+    expect(await actionsOf(held.issueId)).toHaveLength(0);
+    expect((await waitNotes(held.issueId)).map(row => row.body.includes(TICKET_BLOCKED))).toEqual([true]);
+  }, 180_000);
+
+  it("leaves a refusal on a backlog or blocked issue alone (a status that calls for no run, or is already visible)", async () => {
+    for (const status of ["backlog", "blocked"] as const) {
+      const f = await seed(status, [{ minutesAgo: 5, errorCode: CLOSED }]);
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      expect((await issueOf(f.issueId)).status).toBe(status);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect((await runsOf(f)).map(run => run.id)).toEqual(f.runIds);
+    }
+  }, 180_000);
+
+  // The second review's verified defect (TR-1318): on an `in_review` issue with a pending reviewer, a declared wait
+  // fell into the review path, which requeued a review recovery run, refused again, then blocked at its release.
+  it("holds a declared wait of the review participant like the assignee's, with one note, then the normal path", async () => {
+    for (const code of [TICKET_BLOCKED, READMISSION]) {
+      const f = await seed("in_review", [], { review: true });
+      refusals.set(f.issueId, code);
+      const run = await commentWake(f);
+      for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      await heartbeat.drainActiveRunExecutions();
+      expect((await issueOf(f.issueId)).status).toBe("in_review");
+      expect((await runsOf(f)).map(row => row.id)).toEqual([run.id]);
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      const notes = await waitNotes(f.issueId);
+      expect(notes).toHaveLength(1);
+      expect(notes[0]!.body).toContain(code);
+      refusals.delete(f.issueId);
+    }
+    // Past its bound, the review path takes over again.
+    const old = await seed("in_review", [
+      { minutesAgo: ADAPTER_DECLARED_STOP_WAIT_MAX_MS / 60_000 + 30, errorCode: READMISSION },
+      { minutesAgo: 10, errorCode: READMISSION, retry: true },
+    ], { review: true });
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: old.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    const moved = (await issueOf(old.issueId)).status === "blocked" || (await runsOf(old)).length > old.runIds.length;
+    expect(moved).toBe(true);
+  }, 240_000);
+
+  it("posts one note per series for a blocked-ticket wait on an issue at work", async () => {
+    const f = await seed("todo", [{ minutesAgo: 20, durationMinutes: 1, errorCode: TICKET_BLOCKED }, { minutesAgo: 5, durationMinutes: 1, errorCode: TICKET_BLOCKED, retry: true }]);
+    for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    expect((await issueOf(f.issueId)).status).toBe("todo");
+    expect((await waitNotes(f.issueId)).map(row => row.body.includes(TICKET_BLOCKED))).toEqual([true]);
+    await heartbeat.drainActiveRunExecutions();
+  }, 180_000);
+
+  it("does not block again on a refusal older than the Board's return of the issue", async () => {
+    const f = await seed("todo", [{ minutesAgo: 10, errorCode: RESERVED }]);
+    // The Board fixed the group and returned the issue to todo, without a wake.
+    await boardReturnedToTodo(f, 5);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await issueOf(f.issueId)).status).not.toBe("blocked");
+    expect(await routerNotices(f.issueId)).toHaveLength(0);
+    expect(await actionsOf(f.issueId)).toHaveLength(0);
+    // The normal path follows: the assignee is served again.
+    expect((await runsOf(f)).length).toBeGreaterThan(f.runIds.length);
+  }, 180_000);
+
+  it("counts each kind of wait in its own series: a wait after another kind gets its own bound", async () => {
+    const bound = ADAPTER_DECLARED_WAIT_MAX_MS / 60_000;
+    // A machine wait older than 12 h, then an unproven stop 5 min ago: the 1 h stop bound counts from the stop.
+    const stop = await seed("todo", [{ minutesAgo: bound + 30, errorCode: WAIT }, { minutesAgo: 5, durationMinutes: 1, errorCode: STOP, retry: true }]);
+    // A machine wait older than 12 h, then a blocked ticket 5 min ago: the dependency wait counts from itself.
+    const ticket = await seed("todo", [{ minutesAgo: bound + 30, errorCode: WAIT }, { minutesAgo: 5, durationMinutes: 1, errorCode: TICKET_BLOCKED, retry: true }]);
+    for (const f of [stop, ticket]) {
+      await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+      expect((await issueOf(f.issueId)).status).toBe("todo");
+      expect(await actionsOf(f.issueId)).toHaveLength(0);
+      expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
+    }
+    // The blocked ticket's own series past its bound: normal recovery, as for any wait.
+    const old = await seed("todo", [{ minutesAgo: bound + 12, errorCode: TICKET_BLOCKED }, { minutesAgo: 10, errorCode: TICKET_BLOCKED, retry: true }]);
+    await heartbeat.reconcileStrandedAssignedIssues({ companyId: old.companyId });
+    expect((await issueOf(old.issueId)).status).toBe("blocked");
+    await heartbeat.drainActiveRunExecutions();
+  }, 180_000);
+
+  it("schedules no transient retry for a blocked-ticket refusal and keeps it held within its bound", async () => {
+    const f = await seed("todo", []);
+    refusals.set(f.issueId, TICKET_BLOCKED);
+    const run = await boardWake(f);
+    await heartbeat.drainActiveRunExecutions();
+    await expect.poll(async () => (await runsOf(f)).find(row => row.id === run.id)?.status, { timeout: 30_000 }).toBe("failed");
+    const leftStatus = (await issueOf(f.issueId)).status;
+    expect(leftStatus).not.toBe("blocked");
+    for (let sweep = 0; sweep < 2; sweep += 1) await heartbeat.reconcileStrandedAssignedIssues({ companyId: f.companyId });
+    await heartbeat.drainActiveRunExecutions();
+    expect((await runsOf(f)).map(row => row.id)).toEqual([run.id]);
+    expect((await issueOf(f.issueId)).status).toBe(leftStatus);
+    expect(await actionsOf(f.issueId)).toHaveLength(0);
+    expect((await waitNotes(f.issueId)).map(row => row.body.includes(TICKET_BLOCKED))).toEqual([true]);
+  }, 180_000);
+
   it("does not re-block an issue the Board returned to todo whose new run ends waiting (production race)", async () => {
     const f = await seed("todo", [{ minutesAgo: 40, errorCode: WAIT }, { minutesAgo: 20, errorCode: WAIT, retry: true }]);
     modes.set(f.issueId, "wait");
@@ -381,7 +679,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
     await heartbeat.drainActiveRunExecutions();
     expect((await issueOf(f.issueId)).status).toBe(afterRun);
     expect((await runsOf(f)).map(row => row.id).sort()).toEqual([...f.runIds, run.id].sort());
-    expect(await commentsOf(f.issueId)).toHaveLength(0);
+    expect(await nonWaitComments(f.issueId)).toHaveLength(0);
     expect(await actionsOf(f.issueId)).toHaveLength(0);
   }, 180_000);
 
@@ -405,7 +703,7 @@ describePostgres("stranded-work recovery and adapter-declared waits", () => {
       await heartbeat.drainActiveRunExecutions();
       expect((await issueOf(f.issueId)).status).toBe("todo");
       expect((await runsOf(f)).map(run => run.id).sort()).toEqual([...f.runIds].sort());
-      expect(await commentsOf(f.issueId)).toHaveLength(0);
+      expect(await nonWaitComments(f.issueId)).toHaveLength(0);
     }
     expect(await actionsOf(statusChanged.issueId)).toHaveLength(0);
 
