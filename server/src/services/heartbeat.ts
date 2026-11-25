@@ -1822,6 +1822,9 @@ export function heartbeatService(
         wake: (agentId, request) => enqueueWakeup(agentId, request as Parameters<typeof enqueueWakeup>[1]),
         invocationBlocked: async (agentId, issueId) =>
           Boolean(await budgets.getInvocationBlock(scope.companyId, agentId, { issueId, projectId: null })),
+        // STUDIO-0101: a wait the adapter declared, within its bound, is read as the stranded-work recovery reads it.
+        declaredWaitDeadline: (agentId, issueId, now) =>
+          recovery.declaredWaitDeadlineForIssue({ companyId: scope.companyId, issueId, agentId, now }),
       });
     } catch (err) {
       logger.warn({ err, issueId: scope.issueId }, "held comment hand-over backstop failed; the next pass retries");
