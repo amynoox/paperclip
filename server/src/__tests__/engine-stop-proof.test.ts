@@ -788,6 +788,9 @@ const support = await getEmbeddedPostgresTestSupport();
     // Were the earlier run within the ssh client rule's ten minutes (it ended five minutes ago), it would not be asked
     // of either: the pause waits for it, as before this patch.
     await heldLease(f, earlier.id, "ssh", 5 * 60);
+    // The earlier run was last asked of at the resume's start; its spacing is forgotten, as when that was long ago
+    // (otherwise the spacing alone would keep it from being asked during this pause).
+    forgetProviderStopObservationAttempts();
     pauseStarted = Date.now();
     expect(await pauseConcludes(f, 1)).toBe("pending");
     expect(askedDuringThePause()).toEqual([]);
