@@ -209,8 +209,8 @@ const ADAPTER = "codex_local";
     }
   }, 180_000);
 
-  it("a router_readmission_not_drained wait: never left alone, the router wakes nobody for it", async () => {
-    for (const status of ["todo", "in_progress"] as const) {
+  it("a router_readmission_not_drained wait: never left alone, whatever the status, the router wakes nobody for it", async () => {
+    for (const status of ["todo", "in_progress", "blocked"] as const) {
       const t = await heldTask();
       await db.update(issues).set({ status }).where(eq(issues.id, t.taskId));
       const ended = new Date(Date.now() - 60_000);
