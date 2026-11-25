@@ -600,6 +600,29 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(await pauseCutEngineStopUnproven(db, scopeOf(f, cancelled.id))).toBe(true);
   });
 
+  // A steered run cut early has often recorded no session (production, 23 Nov 2026: a role paused in the middle of its
+  // first turn): the task keeps no conversation written by it, and the cut run is found as the latest run of the task.
+  it("a cut run that recorded no session, no proof: a person's message after the pause does not go on in its folder", async () => {
+    const f = await seed(true);
+    turns.get(f.companyId)!.push(async context => {
+      await context.onSpawn?.({ pid: LINK_PID, processGroupId: null, startedAt: new Date().toISOString() });
+      await context.onProviderIdentity?.(identity(context.runId, protocol));
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return { exitCode: 1, signal: null, timedOut: false, errorCode: "router_cancelled", errorMessage: "router cancelled" };
+    });
+    await assignmentWake(f);
+    const cancelled = (await execution(f, 1)).run;
+    expect(cancelled).toMatchObject({ status: "cancelled" });
+    expect(await taskSession(f)).toBeNull();
+    await heldLease(f, cancelled.id, "ssh", ELEVEN_MINUTES);
+    const next = await nextExecution(f, () => personMessage(f));
+    expect(next.sessionId).toBeNull();
+    expect(await eventsOf(next.run.id, PROVIDER_STOP_UNPROVEN_CONTINUATION)).toMatchObject([{ cutRunId: cancelled.id, channel: "decision" }]);
+    expect(await workspaceChoiceOf(f, next.run.id)).toEqual([["issue.fresh_workspace_selected", "fresh_isolated_workspace", "no_engine_stop_proof"]]);
+    expect(folderOf(next.run)).not.toBe(folderOf(cancelled));
+    expect(await unprovenLinesOf(f)).toHaveLength(1);
+  });
+
   it("an adapter cannot write the announcement, the observation or the decision through its own events", async () => {
     const f = await seed(true);
     const cancelled = await pauseCutRun(f, { announce: false, afterCut: async context => {
