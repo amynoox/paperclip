@@ -231,6 +231,14 @@ export const ADAPTER_DECLARED_WAIT_ERROR_CODES: readonly string[] = Object.freez
   "router_ticket_blocked",
 ]);
 
+// STUDIO-0101: waits of the list above whose end the worker router does NOT wake the assignee for. The server's own
+// dependency wakes start the task again once it is unblocked (router_ticket_blocked: the router refuses a new
+// reservation for a ticket whose status is `blocked`, and promises no wake). A pass that IS such a wake (the hand-over
+// backstop of STUDIO-0063) leaves the task alone for this code only while its status is still `blocked`.
+export const ADAPTER_DECLARED_WAITS_ENDED_BY_THE_SERVER: readonly string[] = Object.freeze([
+  "router_ticket_blocked",
+]);
+
 // Bound on such a wait, counted from the END of the oldest run of the latest
 // consecutive series of the assignee's runs on the issue that all failed under
 // a code above (or from the Board's latest return of the issue, if later), and chosen

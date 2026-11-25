@@ -6,8 +6,11 @@
  * same role. Each was started by this backstop, under its own doubling wait (30 s, 1 min, 2 min...): it does not read
  * the declared waits. The worker router kept every request and woke each task itself once a machine was free.
  * The rule now: within the bound of the declared wait (the stranded-work recovery's own reading: the closed list of
- * codes, the series, its bound), the backstop wakes nobody and looks again at the bound's end; past the bound, or
- * when the latest run is not such a wait, it wakes as before.
+ * codes, the series, its bound), the backstop wakes nobody on the READY path and looks again at the bound's end; past
+ * the bound, or when the latest run is not such a wait, it wakes as before. Not when only cancelled blockers are left
+ * (the adapter's wake is refused at the plugins' gate: the hand-back is the only way back), not for a
+ * `router_ticket_blocked` wait once the issue is no longer `blocked` (the adapter wakes nobody for it), and a reading
+ * that throws leaves the pass as before.
  */
 import { randomUUID } from "node:crypto";
 import express from "express";
@@ -21,6 +24,7 @@ import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
 import { registerServerAdapter, unregisterServerAdapter } from "../adapters/index.js";
 import { heartbeatService } from "../services/heartbeat.js";
+import { reconcileHeldCommentHandover, HELD_HANDOVER_BACKSTOP_ATTEMPT_REASON } from "../services/recovery/held-comment-handover-backstop.js";
 import { issueService } from "../services/issues.js";
 import { ADAPTER_DECLARED_WAIT_MAX_MS } from "../services/recovery/adapter-declared-wait.js";
 import { getEmbeddedPostgresTestSupport, startEmbeddedPostgresTestDatabase } from "./helpers/embedded-postgres.js";
@@ -75,9 +79,10 @@ const ADAPTER = "codex_local";
   /**
    * A Dev's task held behind a blocker, with a comment of the CTO held at admission (the hold trace the backstop
    * reads), then its blocker removed by a direct service write that wakes nobody (a plugin's setBlockedBy): the
-   * backstop is the one that would wake the Dev.
+   * backstop is the one that would wake the Dev. `release: "cancel"`: the blocker is cancelled instead, by a direct
+   * write that wakes nobody either, so only a cancelled blocker is left.
    */
-  async function heldTask() {
+  async function heldTask(release: "remove" | "cancel" = "remove") {
     const companyId = randomUUID(), devId = randomUUID(), ctoId = randomUUID();
     const taskId = randomUUID(), blockerId = randomUUID(), ctoTaskId = randomUUID(), ctoRunId = randomUUID();
     const prefix = `W${companyId.replaceAll("-", "").slice(0, 5).toUpperCase()}`;
@@ -104,7 +109,8 @@ const ADAPTER = "codex_local";
     await expect.poll(async () => (await db.select({ status: agentWakeupRequests.status, reason: agentWakeupRequests.reason })
       .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, devId), sql`${agentWakeupRequests.payload}->>'commentId' = ${comment!.id}`))),
     { timeout: 20_000 }).toEqual([{ status: "skipped", reason: "issue_dependencies_blocked" }]);
-    await issueService(db).update(taskId, { blockedByIssueIds: [], actorAgentId: null, actorUserId: null } as never);
+    if (release === "remove") await issueService(db).update(taskId, { blockedByIssueIds: [], actorAgentId: null, actorUserId: null } as never);
+    else await db.update(issues).set({ status: "cancelled", cancelledAt: new Date() }).where(eq(issues.id, blockerId));
     await heartbeat.drainActiveRunExecutions();
     return { companyId, devId, taskId, commentId: comment!.id };
   }
@@ -119,6 +125,9 @@ const ADAPTER = "codex_local";
   };
   const backstopWakes = (t: Task) => db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, t.devId),
     sql`${agentWakeupRequests.idempotencyKey} like 'held-handover-backstop:%'`));
+  /** The backstop's own attempt rows (no key: they are told apart by their reason). */
+  const backstopAttempts = (t: Task) => db.select().from(agentWakeupRequests).where(and(eq(agentWakeupRequests.agentId, t.devId),
+    eq(agentWakeupRequests.reason, HELD_HANDOVER_BACKSTOP_ATTEMPT_REASON)));
   const pass = async (t: Task, now: Date) => {
     const deadlines: number[] = [];
     const outcome = await heartbeat.reconcileHeldCommentHandover({ companyId: t.companyId, issueId: t.taskId, now,
@@ -136,12 +145,16 @@ const ADAPTER = "codex_local";
       expect(await pass(t, new Date(ended.getTime() + after))).toEqual({ outcome: "declared_wait", deadlines: [bound] });
     }
     expect(await backstopWakes(t)).toEqual([]);
+    // Nothing is written either: no attempt row, so the doubling wait does not run on while the backstop waits.
+    expect(await backstopAttempts(t)).toEqual([]);
   }, 120_000);
 
   it("past the bound (the negative control), the backstop wakes the assignee as before, with the held comment", async () => {
     const t = await heldTask();
     const ended = new Date(Date.now() - 60_000);
     await endedRun(t, "router_waiting_for_resources", ended);
+    // Asked again and again within the bound, then once past it: woken at that first pass past the bound.
+    for (const after of [60_000, 6 * HOUR]) expect((await pass(t, new Date(ended.getTime() + after))).outcome).toBe("declared_wait");
     const past = new Date(ended.getTime() + ADAPTER_DECLARED_WAIT_MAX_MS + 1000);
     expect((await pass(t, past)).outcome).toBe("woken");
     expect(await backstopWakes(t)).toHaveLength(1);
@@ -173,5 +186,36 @@ const ADAPTER = "codex_local";
     await endedRun(t, "router_group_participant_reserved", ended);
     expect((await pass(t, new Date(ended.getTime() + 30_000))).outcome).toBe("woken");
     expect(await backstopWakes(t)).toHaveLength(1);
+  }, 120_000);
+
+  it("only cancelled blockers left: the backstop hands the dependency back as before, even within the bound of a declared wait", async () => {
+    const t = await heldTask("cancel");
+    const ended = new Date(Date.now() - 60_000);
+    await endedRun(t, "router_waiting_for_resources", ended);
+    // The router's own wake cannot pass while the task waits on a blocker that is not done: the hand-back is the way.
+    expect((await pass(t, new Date(ended.getTime() + 30_000))).outcome).toBe("handed_back");
+    expect(await backstopAttempts(t)).toHaveLength(1);
+  }, 120_000);
+
+  it("a router_ticket_blocked wait: left alone while the task is still blocked, woken once it is not", async () => {
+    for (const status of ["blocked", "todo"] as const) {
+      const t = await heldTask();
+      await db.update(issues).set({ status }).where(eq(issues.id, t.taskId));
+      const ended = new Date(Date.now() - 60_000);
+      await endedRun(t, "router_ticket_blocked", ended);
+      const { outcome } = await pass(t, new Date(ended.getTime() + 30_000));
+      // The router refuses a blocked ticket and wakes nobody: the server's dependency wake is the way back.
+      expect({ status, outcome }).toEqual({ status, outcome: status === "blocked" ? "declared_wait" : "woken" });
+    }
+  }, 180_000);
+
+  it("a reading of the declared wait that throws: the backstop goes on as before", async () => {
+    const t = await heldTask();
+    await endedRun(t, "router_waiting_for_resources", new Date(Date.now() - 60_000));
+    const woken: string[] = [];
+    const outcome = await reconcileHeldCommentHandover(db, { companyId: t.companyId, issueId: t.taskId,
+      wake: async agentId => { woken.push(agentId); },
+      declaredWaitDeadline: async () => { throw new Error("the reading failed"); } });
+    expect({ outcome, woken }).toEqual({ outcome: "woken", woken: [t.devId] });
   }, 120_000);
 });

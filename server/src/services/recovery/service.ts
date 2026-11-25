@@ -1226,6 +1226,19 @@ export function recoveryService(
   }
 
   /**
+   * STUDIO-0101: the same reading for another pass (the hand-over backstop of STUDIO-0063): a wait the adapter
+   * declared on the agent's latest started run on the issue, while it is within its bound (its deadline and the code
+   * of that run); null otherwise.
+   */
+  async function declaredWaitDeadlineForIssue(input: { companyId: string; issueId: string; agentId: string; now?: Date }):
+    Promise<{ deadline: number; errorCode: string } | null> {
+    const run = await getLatestStartedIssueRunForAgent(input.companyId, input.issueId, input.agentId);
+    const deadline = await liveAdapterDeclaredWaitDeadline({ companyId: input.companyId, id: input.issueId }, input.agentId, run,
+      input.now ?? new Date());
+    return deadline !== null && run?.errorCode ? { deadline, errorCode: run.errorCode } : null;
+  }
+
+  /**
    * STUDIO-0076: when a pause lifts, start once each task of the agent that waits on a declared wait still within
    * its bound. The owner of the wait wakes the assignee itself, but that wake can be lost to the pause: a plugin's
    * wake is refused before the queue, and written nowhere, while the agent's budget is reached or its company or
@@ -1233,15 +1246,6 @@ export function recoveryService(
    * is kept and replayed (STUDIO-0028). Called after that replay: no start when a wake or a run of the agent is
    * already live for the task. A run that waits again extends the same series, so the bound does not start over.
    */
-  /**
-   * STUDIO-0101: the same reading for another pass (the hand-over backstop of STUDIO-0063): the deadline of a wait the
-   * adapter declared on the agent's latest started run on the issue, while it is within its bound; null otherwise.
-   */
-  async function declaredWaitDeadlineForIssue(input: { companyId: string; issueId: string; agentId: string; now?: Date }) {
-    const run = await getLatestStartedIssueRunForAgent(input.companyId, input.issueId, input.agentId);
-    return liveAdapterDeclaredWaitDeadline({ companyId: input.companyId, id: input.issueId }, input.agentId, run, input.now ?? new Date());
-  }
-
   async function wakeDeclaredWaitsAfterPause(input: { companyId: string; agentId: string; now?: Date }) {
     const waiting = await db.select({ id: issues.id, companyId: issues.companyId }).from(issues).where(and(
       eq(issues.companyId, input.companyId),
