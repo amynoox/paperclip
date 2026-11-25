@@ -29,6 +29,7 @@ import { readUpgradeReadiness } from "./heartbeat/upgrade-readiness.js";
 import { DELIVERY_QUEUES } from "./delivery-work-notifications.js";
 import { writeExecutionControl } from "./execution-control-notifications.js";
 import { readFreshWorkspaceReadiness } from "./fresh-workspace-continuation.js";
+import { decideUnprovenContinuation } from "./provider-stop-proof.js";
 import { settleFailedNativeRecoveryPreparation } from "./native-runtime/native-recovery-preparation-failure.js";
 import { promptInjectionPreventionService } from "./prompt-injection-prevention.js";
 import { createHeartbeatAgentStatus } from "./heartbeat/agent-status.js";
@@ -2319,6 +2320,19 @@ export function heartbeatService(
       const sessionCodec = getAdapterSessionCodec(agent.adapterType);
       const issueId = readNonEmptyString(context.issueId);
       const freshWorkspace = await timePreparation("workspace_selection", async () => {
+        // STUDIO-0097: whatever started this run, it does not continue in the conversation nor in the folder of a
+        // steered run a pause cut before it on this task while the stop of that run's engine is not proven. The
+        // machine is observed once more here; without the proof the decision is kept on this run, and the reading
+        // just below then chooses a fresh isolated workspace.
+        const unproven = issueId && run.runtimeMode === "legacy"
+          ? await decideUnprovenContinuation(db, { run, issueId }) : null;
+        if (unproven) {
+          context.forceFreshSession = true;
+          context.engineStopUnprovenRunId = unproven.cutRunId;
+          delete context.resumeSessionParams;
+          delete context.resumeSessionDisplayId;
+          context.workspaceSelectionChanged = true;
+        }
         const readiness = await readFreshWorkspaceReadiness(db, run);
         if (issueId && canApplyTaskWorkspaceSelectionAtAdmission({ admittedInput: parseObject(run.runnerProfileJson).nativeExecutionInput, restarting: Boolean(runOptions.nativeRestartRecovery), hasLeaseOwner: Boolean(runOptions.nativeLeaseOwner) })) {
           const changed = await executionWorkspacesSvc.applyPendingTaskWorkspaceSelection({ companyId: agent.companyId,

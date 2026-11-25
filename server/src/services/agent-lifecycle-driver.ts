@@ -3,6 +3,7 @@ import { CANCELLABLE_HEARTBEAT_RUN_STATUSES } from "./heartbeat/recovery.js";
 import { promoteDeferredWorkIntents } from "./work-intent-outbox.js";
 import { replayWakesMissedDuringPause } from "./pause-missed-wakes.js";
 import { continueRunsCutByPause, pauseLiftedOf } from "./pause-resume-continuation.js";
+import { markEngineStopsUnprovenAtPause } from "./provider-stop-proof.js";
 import { logger } from "../middleware/logger.js";
 import { agents, companies, environments, heartbeatRuns, plugins, pluginCompanySettings, type Db } from "@paperclipai/db";
 import { instanceSettingsService } from "./instance-settings.js";
@@ -110,6 +111,9 @@ export function createLifecycleDriver(db: Db, manager: PluginWorkerManager): Lif
         }
         if (!await heartbeat.stopInvocationsForAgents(ids, reason,
           { preservePauseDeferred: agent.lifecycleState === "pausing", pauseStop: agent.lifecycleState === "pausing" })) return "pending";
+        // STUDIO-0097: the pause concludes; a steered run it cut without a proof of its engine's stop is marked,
+        // and said once on its task.
+        if (agent.lifecycleState === "pausing") await markEngineStopsUnprovenAtPause(db, agent);
       }
       return "complete";
     },
