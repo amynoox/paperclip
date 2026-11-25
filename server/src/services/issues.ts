@@ -1982,6 +1982,8 @@ export interface IssueFilters {
   hasPlanDocument?: boolean;
   lowTrustBoundary?: LowTrustBoundary & { companyId: string };
   readCondition?: SQL<boolean>;
+  /** STUDIO-0102: search titles, identifiers, descriptions and comments, not documents (a project commenter key). */
+  excludeDocumentSearch?: boolean;
   q?: string;
   limit?: number;
   offset?: number;
@@ -8686,7 +8688,7 @@ export function issueService(db: Db) {
         : db.select(selectedFields)).from(issues);
       const searchedSource = hasSearch
         ? issueSource.innerJoin(sql`(
-            ${taskSearchCtes(companyId, taskSearch, true, and(...conditions), filters?.readCondition)}
+            ${taskSearchCtes(companyId, taskSearch, true, and(...conditions), filters?.readCondition, !filters?.excludeDocumentSearch)}
             SELECT m.id, ${taskSearchScore(taskSearch)} AS score FROM matched m
           ) task_search`, sql`task_search.id = ${issues.id}`)
         : issueSource;

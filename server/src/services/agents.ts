@@ -4,7 +4,7 @@ import { type BudgetServiceHooks } from "./budgets.js";
 
 import { and, desc, eq, inArray } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { agents, agentConfigRevisions, agentApiKeys, heartbeatRuns } from "@paperclipai/db";
+import { agents, agentConfigRevisions, agentApiKeys, heartbeatRuns, projects } from "@paperclipai/db";
 import { isUuidLike, normalizeAgentApiKeyScope, normalizeAgentUrlKey, type AgentApiKeyScope } from "@paperclipai/shared";
 
 import { conflict, notFound, unprocessable } from "../errors.js";
@@ -16,6 +16,8 @@ import {
   agentRecordQueries,
   hashToken,
   createToken,
+  createProjectCommenterToken,
+  hashProjectCommenterToken,
   containsRedactedMarker,
   configPatchFromSnapshot,
 } from "../lib/agent-records.js";
@@ -134,9 +136,17 @@ export function agentService(db: Db, budgetHooks: BudgetServiceHooks = {}) {
       if (existing.status === "terminated") {
         throw conflict("Cannot create keys for terminated agents");
       }
+      // STUDIO-0102: a project commenter key names projects of its agent's company, every one of them.
+      if (scope.kind === "project_commenter") {
+        const named = [...new Set(scope.projectIds)];
+        const found = await db.select({ id: projects.id }).from(projects)
+          .where(and(eq(projects.companyId, existing.companyId), inArray(projects.id, named)));
+        if (found.length !== named.length) throw unprocessable("A project commenter key names projects of its agent's company only");
+      }
 
-      const token = createToken();
-      const keyHash = hashToken(token);
+      // STUDIO-0102: its own token and hash, so that a server without the scope refuses it.
+      const token = scope.kind === "project_commenter" ? createProjectCommenterToken() : createToken();
+      const keyHash = scope.kind === "project_commenter" ? hashProjectCommenterToken(token) : hashToken(token);
       const created = await db
         .insert(agentApiKeys)
         .values({

@@ -82,7 +82,8 @@ export function taskSearchScore(search: TaskSearch): SQL<number> {
  * Uses existing pg_trgm indexes and current rows: no derived corpus or worker.
  * The tagged comment/document sets are evaluated once, not once per task.
  */
-export function taskSearchCtes(companyId: string, search: TaskSearch, includeContext = true, fallbackFilters?: SQL, readCondition?: SQL<boolean>): SQL {
+export function taskSearchCtes(companyId: string, search: TaskSearch, includeContext = true, fallbackFilters?: SQL, readCondition?: SQL<boolean>,
+  includeDocuments = true): SQL {
   const n = search.tokens.length;
   const comments = n === 0 || !includeContext ? sql`SELECT NULL::uuid AS issue_id, 0 AS ord WHERE false`
     : sql.join(search.patterns.map((_, index) => sql`
@@ -90,7 +91,8 @@ export function taskSearchCtes(companyId: string, search: TaskSearch, includeCon
       WHERE c.company_id = ${companyId} AND c.deleted_at IS NULL AND ${taskSearchTermMatch(sql`c.body`, search, index)}
       GROUP BY c.issue_id
     `), sql` UNION ALL `);
-  const documents = n === 0 || !includeContext ? sql`SELECT NULL::uuid AS issue_id, 0 AS ord WHERE false`
+  // STUDIO-0102: a reader that may not read documents does not search in them either (includeDocuments false).
+  const documents = n === 0 || !includeContext || !includeDocuments ? sql`SELECT NULL::uuid AS issue_id, 0 AS ord WHERE false`
     : sql.join(search.patterns.map((_, index) => sql`
       SELECT d.issue_id, ${index}::int AS ord FROM issue_documents d
       JOIN documents body ON body.id = d.document_id AND body.company_id = d.company_id
