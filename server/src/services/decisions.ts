@@ -519,6 +519,10 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
             postCommitIssueActions,
           );
           if (effect.comment) await svc.addComment(target.id, interpolate(effect.comment, values), { userId: decidedByUserId, runId: decision.originRunId }, { clientRequestId: lockKey }, tx);
+          // STUDIO-0063: a blocker made done or cancelled: the dependents' wakes, after commit.
+          if (updated && (updated.status === "done" || updated.status === "cancelled")) {
+            postCommitIssueActions.push(dependenciesChanged(updated, updated.status === "done" ? "blocker_done" : "blocker_cancelled"));
+          }
           result = { issueId: updated?.id, status: updated?.status };
         } else if (effect.type === "assign_issue") {
           const updated = await svc.update(
@@ -536,7 +540,7 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
           result = { issueId: updated?.id };
         } else if (effect.type === "resolve_blocker") {
           const current = await tx.select({ id: issueRelations.issueId }).from(issueRelations).where(and(eq(issueRelations.companyId, decision.companyId), eq(issueRelations.relatedIssueId, target.id), eq(issueRelations.type, "blocks")));
-          await svc.update(
+          const resolved = await svc.update(
             target.id,
             {
               blockedByIssueIds: current.map((row) => row.id).filter((id) => !effect.removeBlockedByIssueIds.includes(id)),
@@ -546,6 +550,8 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
             postCommitActivityPublications,
             postCommitIssueActions,
           );
+          // STUDIO-0063: blockers removed can make the target ready: its wake, after commit.
+          if (resolved) postCommitIssueActions.push(dependenciesChanged(resolved, "blockers_edited"));
           result = { removedBlockedByIssueIds: effect.removeBlockedByIssueIds };
         } else if (effect.type === "create_issue") {
           const draft = effect.draft;
@@ -557,13 +563,15 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
         } else {
           const cancelled = [target.id, ...cancellationDescendantIds!].reverse();
           for (const id of cancelled) {
-            await svc.update(
+            const cancelledIssue = await svc.update(
               id,
               { status: "cancelled", actorUserId: decidedByUserId },
               tx,
               postCommitActivityPublications,
               postCommitIssueActions,
             );
+            // STUDIO-0063: a cancelled blocker can leave its dependents waiting only on cancelled blockers.
+            if (cancelledIssue) postCommitIssueActions.push(dependenciesChanged(cancelledIssue, "blocker_cancelled"));
           }
           await svc.addComment(target.id, interpolate(effect.reasonComment, values), { userId: decidedByUserId, runId: decision.originRunId }, { clientRequestId: lockKey }, tx);
           result = { cancelledIssueIds: cancelled };
@@ -789,4 +797,16 @@ export function decisionService(db: Db, options: DecisionServiceOptions) {
     sweepTtlExpiry: expiry.sweep, nextExpiryAt: expiry.next,
     recoverEffects: effectRecovery.sweep, nextEffectRecoveryAt: effectRecovery.next,
     sweepInvalidTargets: targets.sweep, decisionTargetsChanged: targets.changed, hasDecisionTargetWork: targets.hasPending };
+}
+
+// STUDIO-0063: the post-commit action that hands a decision's dependency change to wakeDependentsAfterDependencyChange.
+function dependenciesChanged(
+  issue: { id: string; companyId: string; identifier?: string | null; completedAt?: Date | string | null; updatedAt: Date | string },
+  kind: "blocker_done" | "blocker_cancelled" | "blockers_edited",
+): IssuePostCommitAction {
+  return {
+    type: "dependencies_changed", companyId: issue.companyId, kind, issueId: issue.id,
+    identifier: issue.identifier ?? null, completedAt: issue.completedAt ?? null, at: issue.updatedAt,
+    actor: { type: "system", id: "decision_effect" },
+  };
 }

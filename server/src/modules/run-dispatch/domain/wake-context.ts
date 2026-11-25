@@ -110,6 +110,13 @@ export function isNonAssigneeWorkspaceBusyRetry(
   );
 }
 
+/**
+ * STUDIO-0063: marks a dependency hold written since that change (`true` in the payload of the admission's skipped
+ * `issue_dependencies_blocked` request, and in the resultJson of a run cancelled with that code). Holds of before carry
+ * no mark: studio.21 held assignments and automatic wakes, never an agent's comment, so they hide nothing to hand over.
+ */
+export const HELD_DEPENDENCY_TRACE_KEY = "heldDependencyTrace";
+
 export function extractWakeCommentIds(
   contextSnapshot: Record<string, unknown> | null | undefined,
 ): string[] {
