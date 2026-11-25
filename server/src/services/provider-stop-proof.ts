@@ -69,8 +69,13 @@ const CLOCK_TOLERANCE_MS = 2 * 60_000;
 const ISO_UTC = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,6})?Z$/;
 /** The server's own bound around one observation; the adapter bounds its reading itself. */
 export const OBSERVATION_TIMEOUT_MS = 40_000;
-/** An observation that proved nothing is not asked again before this delay. */
-export const OBSERVATION_RETRY_AFTER_MS = 10_000;
+/**
+ * Two observations of a run are never closer than this, forced or not. Each observation is an ssh connection to the
+ * role's account, and each connection starts that account's service manager (`systemd --user`) again: asked more
+ * often than its stop delay plus the call itself, it is still alive at the next look, born since the engine started,
+ * and no observation could ever prove the stop (read by the worker router's reviewer, 25 Nov 2026). More than 15 s.
+ */
+export const OBSERVATION_RETRY_AFTER_MS = 20_000;
 const DEFAULT_GRACE_SEC = 20;
 const MAX_LISTED = 32;
 
@@ -356,7 +361,8 @@ export function forgetProviderStopObservationAttempts() { attempts.clear(); }
  *
  * Only for a run this rule is about, once it ended and its adapter execution returned: nothing the server started
  * for that run is left on the machine then. One observation at a time for a run; one that proved nothing is not
- * asked again before OBSERVATION_RETRY_AFTER_MS (unless `force`). The adapter is asked to stop the announced engine
+ * asked again before OBSERVATION_RETRY_AFTER_MS; a forced one (a run of the task starts) waits for the end of that
+ * spacing rather than skipping it. The adapter is asked to stop the announced engine
  * only when the run ended longer ago than the grace the agent is given.
  */
 export async function observeProviderStop(db: Db, input: { companyId: string; runId: string },
@@ -372,7 +378,11 @@ export async function observeProviderStop(db: Db, input: { companyId: string; ru
   state.inFlight = (async () => {
     try {
       if (await hasEngineStopProof(db, input.companyId, input.runId)) { attempts.delete(input.runId); return true; }
-      if (!options.force && state.lastAt && clock().getTime() - state.lastAt < OBSERVATION_RETRY_AFTER_MS) return false;
+      const sinceLast = state.lastAt ? clock().getTime() - state.lastAt : Number.POSITIVE_INFINITY;
+      if (sinceLast < OBSERVATION_RETRY_AFTER_MS) {
+        if (!options.force) return false;
+        await new Promise(resolve => setTimeout(resolve, OBSERVATION_RETRY_AFTER_MS - sinceLast));
+      }
       const run = await steeredRunCutByPause(db, input);
       if (!run || !run.finishedAt || adapterExecutionControls.has(run.id)
           || !["cancelled", "failed", "timed_out", "interrupted", "succeeded"].includes(run.status)) return false;

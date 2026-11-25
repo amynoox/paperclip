@@ -19,7 +19,7 @@ import {
   ENGINE_STOP_UNPROVEN_KEY, PAUSE_CUT_ENGINE_STOPPED, PAUSE_CUT_ENGINE_STOP_UNPROVEN, PROVIDER_IDENTITY_ANNOUNCED,
   PROVIDER_STOP_OBSERVATION_RECORDED, PROVIDER_STOP_PROOF_RECORDED, PROVIDER_STOP_UNPROVEN_CONTINUATION,
   forgetProviderStopObservationAttempts, hasEngineStopProof, isServerReservedProviderEvent, markEngineStopsUnprovenAtPause,
-  observeProviderStop, pauseCutEngineStopUnproven, readEngineStopProof, readProviderIdentityAnnouncement,
+  observeProviderStop, OBSERVATION_RETRY_AFTER_MS, pauseCutEngineStopUnproven, readEngineStopProof, readProviderIdentityAnnouncement,
   recordLiveProviderStopProof, recordProviderIdentityAnnouncement, verifyLiveProviderStopProof,
   verifyProviderIdentityAnnouncement, verifyProviderStopObservation,
 } from "../services/provider-stop-proof.js";
@@ -217,7 +217,7 @@ const support = await getEmbeddedPostgresTestSupport();
   const executions = new Map<string, Array<{ runId: string; runtime: AdapterExecutionContext["runtime"] }>>();
   /** What the machine answers for a run, and what the server asked. No entry: the machine does not answer. */
   const looks = new Map<string, Look>();
-  const asked: Array<{ runId: string; stop: boolean; announcement: Record<string, unknown>; target: Record<string, unknown> }> = [];
+  const asked: Array<{ runId: string; stop: boolean; announcement: Record<string, unknown>; target: Record<string, unknown>; at?: number }> = [];
   const askedFor = (runId: string) => asked.filter(call => call.runId === runId);
   const play: Turn = async context => {
     const key = context.agent.companyId;
@@ -233,7 +233,7 @@ const support = await getEmbeddedPostgresTestSupport();
     setObserver(true);
     observer.read.mockImplementation(async input => {
       const call = input as Parameters<Look>[0];
-      asked.push({ runId: call.runId, stop: call.stop, announcement: call.announcement, target: call.target });
+      asked.push({ runId: call.runId, stop: call.stop, announcement: call.announcement, target: call.target, at: Date.now() });
       const look = looks.get(call.runId);
       return look ? look(call) : observed(call.runId, "unreadable", { reason: "machine_unreachable" });
     });
@@ -414,7 +414,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(Date.now() - (await reread(cancelled.id)).finishedAt!.getTime()).toBeLessThan(10_000);
     // What the adapter was asked: this run, the announcement as the server kept it, the role's own machine, and no stop
     // (the engine is still in the grace it is given).
-    expect(askedFor(cancelled.id)).toEqual([{ runId: cancelled.id, stop: false,
+    expect(askedFor(cancelled.id)).toMatchObject([{ runId: cancelled.id, stop: false,
       announcement: identity(cancelled.id, protocol),
       target: expect.objectContaining({ kind: "remote", transport: "ssh", environmentId: f.machine.id, remoteCwd: FOLDER,
         spec: expect.objectContaining({ host: "mac-03", username: "worker" }) }) }]);
@@ -676,7 +676,8 @@ const support = await getEmbeddedPostgresTestSupport();
     const cancelled = await pauseCutRun(f);
     await heldLease(f, cancelled.id, "ssh", 30);
     const scope = scopeOf(f, cancelled.id);
-    const ask = () => observeProviderStop(db, scope, { force: true });
+    // Each forced question here comes after the spacing between two observations (a forced one waits for it).
+    const ask = () => { forgetProviderStopObservationAttempts(); return observeProviderStop(db, scope, { force: true }); };
     // An answer for another run, an engine that is not the announced one, an answer that throws or never comes.
     looks.set(cancelled.id, () => observed(randomUUID(), "absent"));
     expect(await ask()).toBe(false);
@@ -685,6 +686,7 @@ const support = await getEmbeddedPostgresTestSupport();
     looks.set(cancelled.id, () => { throw new Error("the adapter failed"); });
     expect(await ask()).toBe(false);
     looks.set(cancelled.id, () => new Promise(() => undefined));
+    forgetProviderStopObservationAttempts();
     expect(await observeProviderStop(db, scope, { force: true, timeoutMs: 200 })).toBe(false);
     // An observation dated before the run ended is not of this stop.
     looks.set(cancelled.id, input => observed(input.runId, "absent", { observedAt: new Date(Date.now() - 10 * 60_000).toISOString() }));
@@ -712,6 +714,24 @@ const support = await getEmbeddedPostgresTestSupport();
       eventType: PROCESS_IDENTITY_RECORDED, stream: "system", level: "info", message: "a new launch", payload: {} });
     expect(await hasEngineStopProof(db, f.companyId, cancelled.id)).toBe(false);
   });
+
+  it("two observations of a run are never closer than the spacing: a forced one waits for its end", async () => {
+    const f = await seed(true);
+    const cancelled = await pauseCutRun(f);
+    looks.set(cancelled.id, input => observed(input.runId, "alive", { since: [CHILD], sinceCount: 1 }));
+    await heldLease(f, cancelled.id, "ssh");
+    expect(OBSERVATION_RETRY_AFTER_MS).toBeGreaterThan(15_000);
+    expect(await observeProviderStop(db, scopeOf(f, cancelled.id))).toBe(false);
+    // Asked again at once: not asked.
+    expect(await observeProviderStop(db, scopeOf(f, cancelled.id))).toBe(false);
+    expect(askedFor(cancelled.id)).toHaveLength(1);
+    // Forced (a run of the task starts): asked, but only once the spacing is over.
+    expect(await observeProviderStop(db, scopeOf(f, cancelled.id), { force: true })).toBe(false);
+    const [first, second] = askedFor(cancelled.id) as Array<{ at: number }>;
+    expect(second!.at - first!.at).toBeGreaterThanOrEqual(OBSERVATION_RETRY_AFTER_MS - 50);
+    // The second observation says nothing new: it is not written a second time.
+    expect(await eventsOf(cancelled.id, PROVIDER_STOP_OBSERVATION_RECORDED)).toHaveLength(1);
+  }, 120_000);
 
   it("a run the worker router dispatched (steered, a local lease): nothing changes, and the machine is never asked", async () => {
     const f = await seed(true);
