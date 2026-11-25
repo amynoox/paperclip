@@ -493,6 +493,8 @@ const support = await getEmbeddedPostgresTestSupport();
     await heldLease(f, cancelled.id, "ssh", ELEVEN_MINUTES);
     expect(await pauseCutEngineStopUnproven(db, scopeOf(f, cancelled.id))).toBe(true);
     expect(await pauseConcludes(f, 12)).toBe("complete");
+    // Past the ten minutes the ssh client rule is read first and concludes: the machine is not asked again.
+    expect(askedFor(cancelled.id)).toHaveLength(1);
     expect((await reread(cancelled.id)).resultJson?.[ENGINE_STOP_UNPROVEN_KEY]).toMatchObject({ version: 1, reason: "no_engine_stop_proof" });
     const lines = await unprovenLinesOf(f);
     expect(lines).toHaveLength(1);
