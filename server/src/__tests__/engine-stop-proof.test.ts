@@ -12,6 +12,7 @@ import { heartbeatService } from "../services/heartbeat.ts";
 import { environmentService } from "../services/environments.js";
 import { requestTaskRetry } from "../services/task-retry.js";
 import { agentExecutionsHaveStopped } from "../services/agent-execution-stop.js";
+import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
 import { createLifecycleDriver } from "../services/agent-lifecycle-driver.js";
 import { appendHeartbeatRunEvent } from "../services/heartbeat-run-events.js";
 import { PROCESS_IDENTITY_RECORDED } from "../services/native-local-process-stop.js";
@@ -105,9 +106,9 @@ describe("the engine's announcement", () => {
     const direct = verifyProviderIdentityAnnouncement(RUN, { ...identity(RUN), somethingElse: "dropped" });
     expect(direct).toEqual({ announcement: { schema: "paperclip.provider-identity.v1", runId: RUN, protocol: "codex_owned_v1",
       route: "direct", providerPid: ENGINE_PID, providerStartedAt: STARTED, providerName: "codex" } });
-    expect(verifyProviderIdentityAnnouncement(RUN, identity(RUN, "claude_owned_v1", { route: "router", machine: "mac-03",
+    expect(verifyProviderIdentityAnnouncement(RUN, identity(RUN, "claude_owned_v1", { route: "router", machine: "role-host-7",
       providerStartedAt: "2026-11-23T10:00:00.250Z", providerName: "claude" }))).toEqual({ announcement: { schema: "paperclip.provider-identity.v1",
-      runId: RUN, protocol: "claude_owned_v1", route: "router", machine: "mac-03", providerPid: ENGINE_PID,
+      runId: RUN, protocol: "claude_owned_v1", route: "router", machine: "role-host-7", providerPid: ENGINE_PID,
       providerStartedAt: "2026-11-23T10:00:00.250Z", providerName: "claude" } });
     // Without the program's name (a launcher that could not read it): kept without it; the adapter then stops nothing.
     expect(verifyProviderIdentityAnnouncement(RUN, identity(RUN, "codex_owned_v1", { providerName: null }))).toEqual({ announcement: {
@@ -177,6 +178,15 @@ describe("the observation of the machine", () => {
     expect(refused(observed(RUN, "alive", { engine: { ...ENGINE, startedAt: "2026-11-23T11:00:00Z" } }))).toBe("engine_is_not_the_announced_one");
     expect(refused(observed(RUN, "alive", { engine: { pid: ENGINE_PID, startedAt: STARTED } }))).toBe("invalid_engine");
     expect(refused(observed(RUN, "alive", { engine: { ...ENGINE, name: "codex\nexec --token" } }))).toBe("invalid_engine");
+    // A program's name, never a command line: an option or an assignment is refused, and so is a long name.
+    expect(refused(observed(RUN, "alive", { engine: { ...ENGINE, name: "node /opt/tool/cli.js --token=abc123 --project x" } })))
+      .toBe("invalid_engine");
+    expect(refused(observed(RUN, "alive", { since: [{ ...CHILD, name: "tool token=abc123" }], sinceCount: 1 }))).toBe("invalid_since");
+    expect(refused(observed(RUN, "alive", { since: [{ ...CHILD, name: "x".repeat(33) }], sinceCount: 1 }))).toBe("invalid_since");
+    expect(refused(observed(RUN, "alive", { since: [{ ...CHILD, name: "Google Chrome He" }], sinceCount: 1 }))).toBe("accepted");
+    // "absent" must say it with its list and its number.
+    expect(refused({ ...observed(RUN, "absent"), since: undefined })).toBe("absent_without_lists");
+    expect(refused({ ...observed(RUN, "absent"), sinceCount: undefined })).toBe("absent_without_lists");
     expect(refused(observed(RUN, "alive", { since: [{ ...CHILD, startedAt: "10:03" }], sinceCount: 1 }))).toBe("invalid_since");
     expect(refused(observed(RUN, "alive", { since: "many", sinceCount: 3 }))).toBe("invalid_since");
     expect(refused(observed(RUN, "alive", { since: Array.from({ length: 33 }, () => CHILD), sinceCount: 33 }))).toBe("invalid_since");
@@ -258,7 +268,7 @@ const support = await getEmbeddedPostgresTestSupport();
   }
 
   const FOLDER = "/srv/work/6d499883/63d1cf8b/work";
-  const MACHINE = { transport: "ssh", host: "mac-03", port: 22, username: "worker", remoteCwd: FOLDER };
+  const MACHINE = { transport: "ssh", host: "role-host-7", port: 22, username: "worker", remoteCwd: FOLDER };
   const paramsOf = (sessionId: string) => ({ sessionId, cwd: FOLDER, remoteExecution: MACHINE });
   /** What the driving adapter returns for a run a pause cut: its failure, with the session its engine had opened. */
   const cancelledResult = (): AdapterExecutionResult => ({ exitCode: 1, signal: null, timedOut: false, errorCode: "router_cancelled",
@@ -281,7 +291,7 @@ const support = await getEmbeddedPostgresTestSupport();
       assigneeAgentId: agentId });
     // The role's own environment: the machine the server reaches by ssh, where its engine runs.
     const [machine] = await db.insert(environments).values({ name: `Role machine ${companyId.slice(0, 8)}`, driver: "ssh",
-      config: { host: "mac-03", port: 22, username: "worker", remoteWorkspacePath: FOLDER } }).returning();
+      config: { host: "role-host-7", port: 22, username: "worker", remoteWorkspacePath: FOLDER } }).returning();
     turns.set(companyId, []);
     executions.set(companyId, []);
     return { companyId, agentId, issueId, machine: machine! };
@@ -381,7 +391,7 @@ const support = await getEmbeddedPostgresTestSupport();
     if (provider === "ssh") await db.delete(environmentLeases).where(eq(environmentLeases.heartbeatRunId, runId));
     await db.insert(environmentLeases).values({ companyId: f.companyId, environmentId, heartbeatRunId: runId,
       issueId: f.issueId, provider, status: "expired", leasePolicy: "ephemeral", releasedAt: ended,
-      ...(provider === "ssh" ? { providerLeaseId: `ssh://worker@mac-03:22${FOLDER}/${runId}`, cleanupStatus: "success" } : {}),
+      ...(provider === "ssh" ? { providerLeaseId: `ssh://worker@role-host-7:22${FOLDER}/${runId}`, cleanupStatus: "success" } : {}),
       metadata: { agentId: f.agentId, driver: provider, ...(provider === "ssh" ? { remoteCwd: FOLDER } : {}) } });
   }
   const ELEVEN_MINUTES = 11 * 60;
@@ -399,6 +409,18 @@ const support = await getEmbeddedPostgresTestSupport();
     await db.update(agents).set({ status: "active", lifecycleState: "ready", pausedAt: null }).where(eq(agents.id, f.agentId));
     return outcome;
   }
+  /**
+   * One reading of the pause's state, as the lifecycle worker takes it while the agent is `pausing`: the agent's row
+   * then carries the time this pause began (`pausedMinutesAgo`; the pause sets it when it starts).
+   */
+  async function pauseRead(f: Fixture, pausedMinutesAgo = 1) {
+    await db.update(agents).set({ pausedAt: new Date(Date.now() - pausedMinutesAgo * 60_000) }).where(eq(agents.id, f.agentId));
+    try {
+      return await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true });
+    } finally {
+      await db.update(agents).set({ pausedAt: null }).where(eq(agents.id, f.agentId));
+    }
+  }
   const scopeOf = (f: Fixture, runId: string) => ({ companyId: f.companyId, runId });
 
   it("the machine observed, nothing left: the pause concludes within seconds, nothing is marked, and the work goes on in the same conversation and the same folder", async () => {
@@ -410,19 +432,19 @@ const support = await getEmbeddedPostgresTestSupport();
     looks.set(cancelled.id, input => observed(input.runId, "absent"));
     await heldLease(f, cancelled.id, "ssh");
     // The run has just ended: no ten minutes are waited for. The pause's own reading asks the machine and concludes.
-    expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(true);
+    expect(await pauseRead(f)).toBe(true);
     expect(Date.now() - (await reread(cancelled.id)).finishedAt!.getTime()).toBeLessThan(10_000);
     // What the adapter was asked: this run, the announcement as the server kept it, the role's own machine, and no stop
     // (the engine is still in the grace it is given).
     expect(askedFor(cancelled.id)).toMatchObject([{ runId: cancelled.id, stop: false,
       announcement: identity(cancelled.id, protocol),
       target: expect.objectContaining({ kind: "remote", transport: "ssh", environmentId: f.machine.id, remoteCwd: FOLDER,
-        spec: expect.objectContaining({ host: "mac-03", username: "worker" }) }) }]);
+        spec: expect.objectContaining({ host: "role-host-7", username: "worker" }) }) }]);
     expect(await eventsOf(cancelled.id, PROVIDER_STOP_OBSERVATION_RECORDED)).toMatchObject([{ outcome: "absent", engine: null,
       since: [], sinceCount: 0, stopped: [], announced: ANNOUNCED, channel: "observation" }]);
     expect(await readEngineStopProof(db, f.companyId, cancelled.id)).toMatchObject({ runId: cancelled.id, outcome: "absent" });
     // Proven once: the machine is not asked again.
-    expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(true);
+    expect(await pauseRead(f)).toBe(true);
     expect(askedFor(cancelled.id)).toHaveLength(1);
     // Only a pause concludes on it: a termination keeps the receipt of the lease's own driver.
     expect(await agentExecutionsHaveStopped(db, [f.agentId])).toBe(false);
@@ -459,7 +481,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const cancelled = await pauseCutRun(f);
     await heldLease(f, cancelled.id, "ssh");
     // The run has just ended: the link's absence is not accepted yet, and the machine proves nothing.
-    expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(false);
+    expect(await pauseRead(f)).toBe(false);
     expect(await pauseConcludes(f, 1)).toBe("pending");
     expect(await unprovenLinesOf(f)).toEqual([]);
     // A state read again and again asks the machine once, then leaves it the delay before the next question.
@@ -481,7 +503,7 @@ const support = await getEmbeddedPostgresTestSupport();
     expect(lines[0]!.details).toMatchObject({ environmentIds: [f.machine.id],
       environments: [{ id: f.machine.id, name: f.machine.name, driver: "ssh" }], leaseIds: [lease!.id] });
     // Nothing of the machine's own address is written.
-    expect(JSON.stringify(lines[0]!.details)).not.toContain("mac-03");
+    expect(JSON.stringify(lines[0]!.details)).not.toContain("role-host-7");
     // Concluded again (the worker's next tick, another pause later): nothing is said twice.
     expect(await pauseConcludes(f, 12)).toBe("complete");
     expect(await markEngineStopsUnprovenAtPause(db, { id: f.agentId, companyId: f.companyId }, new Date(0))).toBe(0);
@@ -539,16 +561,16 @@ const support = await getEmbeddedPostgresTestSupport();
       : observed(input.runId, "alive", { engine: ENGINE }));
     await heldLease(f, cancelled.id, "ssh");
     // Just ended: the engine is seen alive, nothing is stopped, the pause waits.
-    expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(false);
+    expect(await pauseRead(f)).toBe(false);
     expect(askedFor(cancelled.id).map(call => call.stop)).toEqual([false]);
     expect(await linesOf(f, PAUSE_CUT_ENGINE_STOPPED)).toEqual([]);
     // Read again at once: the machine is not asked before the delay between two questions.
-    expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(false);
+    expect(await pauseRead(f)).toBe(false);
     expect(askedFor(cancelled.id)).toHaveLength(1);
     // Half a minute after the run ended (the grace is twenty seconds): the adapter is asked to stop the announced engine.
     forgetProviderStopObservationAttempts();
     await heldLease(f, cancelled.id, "ssh", 30);
-    expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(true);
+    expect(await pauseRead(f)).toBe(true);
     expect(askedFor(cancelled.id).map(call => call.stop)).toEqual([false, true]);
     const stoppedLines = await linesOf(f, PAUSE_CUT_ENGINE_STOPPED);
     expect(stoppedLines).toHaveLength(1);
@@ -568,7 +590,7 @@ const support = await getEmbeddedPostgresTestSupport();
     looks.set(cancelled.id, input => observed(input.runId, "alive", { since: [CHILD], sinceCount: 1,
       ...(input.stop ? { stopped: [{ ...ENGINE, signal: "SIGTERM" }] } : {}) }));
     await heldLease(f, cancelled.id, "ssh", 30);
-    expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(false);
+    expect(await pauseRead(f)).toBe(false);
     expect(askedFor(cancelled.id).map(call => call.stop)).toEqual([true]);
     expect(await hasEngineStopProof(db, f.companyId, cancelled.id)).toBe(false);
     expect(await eventsOf(cancelled.id, PROVIDER_STOP_OBSERVATION_RECORDED)).toMatchObject([{ outcome: "alive", engine: null,
@@ -599,7 +621,7 @@ const support = await getEmbeddedPostgresTestSupport();
       agreed(cancelled.id, protocol, { launcherVerified: false }))).toEqual({ recorded: false, refusal: "stop_not_verified" });
     await heldLease(f, cancelled.id, "ssh");
     expect(await hasEngineStopProof(db, f.companyId, cancelled.id)).toBe(false);
-    expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(false);
+    expect(await pauseRead(f)).toBe(false);
     expect(await pauseCutEngineStopUnproven(db, scopeOf(f, cancelled.id))).toBe(true);
   });
 
@@ -650,7 +672,7 @@ const support = await getEmbeddedPostgresTestSupport();
     const cancelled = await pauseCutRun(f, { announce: false });
     looks.set(cancelled.id, input => observed(input.runId, "absent"));
     await heldLease(f, cancelled.id, "ssh", 30);
-    expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(false);
+    expect(await pauseRead(f)).toBe(false);
     expect(askedFor(cancelled.id)).toEqual([]);
     expect(await eventsOf(cancelled.id, PROVIDER_STOP_OBSERVATION_RECORDED)).toEqual([]);
     // An announcement that is not the agreed form is refused, and changes nothing.
@@ -718,20 +740,80 @@ const support = await getEmbeddedPostgresTestSupport();
   it("two observations of a run are never closer than the spacing: a forced one waits for its end", async () => {
     const f = await seed(true);
     const cancelled = await pauseCutRun(f);
-    looks.set(cancelled.id, input => observed(input.runId, "alive", { since: [CHILD], sinceCount: 1 }));
+    // Each call takes two seconds (a call that stops something takes longer): the spacing counts from its end.
+    const CALL_MS = 2_000;
+    looks.set(cancelled.id, async input => {
+      await new Promise(resolve => setTimeout(resolve, CALL_MS));
+      return observed(input.runId, "alive", { since: [CHILD], sinceCount: 1 });
+    });
     await heldLease(f, cancelled.id, "ssh");
     expect(OBSERVATION_RETRY_AFTER_MS).toBeGreaterThan(15_000);
     expect(await observeProviderStop(db, scopeOf(f, cancelled.id))).toBe(false);
     // Asked again at once: not asked.
     expect(await observeProviderStop(db, scopeOf(f, cancelled.id))).toBe(false);
     expect(askedFor(cancelled.id)).toHaveLength(1);
-    // Forced (a run of the task starts): asked, but only once the spacing is over.
+    // Forced (a run of the task starts): asked, but only once the spacing after the end of the last call is over.
     expect(await observeProviderStop(db, scopeOf(f, cancelled.id), { force: true })).toBe(false);
     const [first, second] = askedFor(cancelled.id) as Array<{ at: number }>;
-    expect(second!.at - first!.at).toBeGreaterThanOrEqual(OBSERVATION_RETRY_AFTER_MS - 50);
+    expect(second!.at - first!.at).toBeGreaterThanOrEqual(CALL_MS + OBSERVATION_RETRY_AFTER_MS - 50);
     // The second observation says nothing new: it is not written a second time.
     expect(await eventsOf(cancelled.id, PROVIDER_STOP_OBSERVATION_RECORDED)).toHaveLength(1);
   }, 120_000);
+
+  it("a run an earlier pause cut is never asked of again: the pause concludes on the run it cut, at its first reading", async () => {
+    const f = await seed(true);
+    // A run an earlier pause cut, without a proof: something born since its engine still lives on the account. That
+    // pause concluded on the ssh client rule, ten minutes after the run ended.
+    const earlier = await pauseCutRun(f);
+    looks.set(earlier.id, input => observed(input.runId, "alive", { since: [CHILD], sinceCount: 1 }));
+    await heldLease(f, earlier.id, "ssh", ELEVEN_MINUTES);
+    expect(await pauseConcludes(f, 12)).toBe("complete");
+    // The resume, then the run the next pause cuts. (Its start asks once of the earlier run, forced: no proof, so a
+    // new conversation.)
+    turns.get(f.companyId)!.push(async context => {
+      await context.onSpawn?.({ pid: LINK_PID, processGroupId: null, startedAt: new Date().toISOString() });
+      await context.onProviderIdentity?.(identity(context.runId, protocol));
+      await heartbeat.cancelActiveForAgent(f.agentId);
+      return cancelledResult();
+    });
+    const current = (await nextExecution(f, () => resumeRetry(f, earlier.id))).run;
+    expect(current.status, await state(f)).toBe("cancelled");
+    await heldLease(f, current.id, "ssh");
+    // Each connection to the account starts its service manager again: an observation of this pause's run that
+    // follows a question about the earlier one, within the spacing, would see it born since its engine.
+    let pauseStarted = Number.POSITIVE_INFINITY;
+    const askedDuringThePause = () => askedFor(earlier.id).filter(call => (call.at ?? 0) >= pauseStarted);
+    looks.set(current.id, input => askedDuringThePause().some(call => Date.now() - (call.at ?? 0) < OBSERVATION_RETRY_AFTER_MS)
+      ? observed(input.runId, "alive", { since: [CHILD], sinceCount: 1 }) : observed(input.runId, "absent"));
+    // Were the earlier run within the ssh client rule's ten minutes (it ended five minutes ago), it would not be asked
+    // of either: the pause waits for it, as before this patch.
+    await heldLease(f, earlier.id, "ssh", 5 * 60);
+    pauseStarted = Date.now();
+    expect(await pauseConcludes(f, 1)).toBe("pending");
+    expect(askedDuringThePause()).toEqual([]);
+    // Eleven minutes: the ssh client rule stops it without a question, and this pause's run is proven at once.
+    await heldLease(f, earlier.id, "ssh", ELEVEN_MINUTES);
+    expect(await pauseConcludes(f, 1)).toBe("complete");
+    expect(askedDuringThePause()).toEqual([]);
+    expect(await hasEngineStopProof(db, f.companyId, current.id)).toBe(true);
+    expect(await hasEngineStopProof(db, f.companyId, earlier.id)).toBe(false);
+  }, 180_000);
+
+  it("while the adapter's execution of a cut run has not returned, the machine is not asked of it", async () => {
+    const f = await seed(true);
+    const cancelled = await pauseCutRun(f);
+    looks.set(cancelled.id, input => observed(input.runId, "absent"));
+    await heldLease(f, cancelled.id, "ssh");
+    adapterExecutionControls.set(cancelled.id, createAdapterExecutionControl());
+    try {
+      expect(await observeProviderStop(db, scopeOf(f, cancelled.id), { force: true })).toBe(false);
+      expect(askedFor(cancelled.id)).toEqual([]);
+    } finally {
+      adapterExecutionControls.delete(cancelled.id);
+    }
+    expect(await observeProviderStop(db, scopeOf(f, cancelled.id), { force: true })).toBe(true);
+    expect(askedFor(cancelled.id)).toHaveLength(1);
+  });
 
   it("a run the worker router dispatched (steered, a local lease): nothing changes, and the machine is never asked", async () => {
     const f = await seed(true);
@@ -740,7 +822,7 @@ const support = await getEmbeddedPostgresTestSupport();
     looks.set(cancelled.id, input => observed(input.runId, "alive", { engine: ENGINE }));
     await heldLease(f, cancelled.id, "local", 30);
     expect(await pauseCutEngineStopUnproven(db, scopeOf(f, cancelled.id))).toBe(false);
-    expect(await agentExecutionsHaveStopped(db, [f.agentId], { pauseStop: true })).toBe(true);
+    expect(await pauseRead(f)).toBe(true);
     expect(await observeProviderStop(db, scopeOf(f, cancelled.id), { force: true })).toBe(false);
     expect(await pauseConcludes(f, 1)).toBe("complete");
     expect((await reread(cancelled.id)).resultJson).not.toHaveProperty(ENGINE_STOP_UNPROVEN_KEY);

@@ -73,7 +73,8 @@ export const OBSERVATION_TIMEOUT_MS = 40_000;
  * Two observations of a run are never closer than this, forced or not. Each observation is an ssh connection to the
  * role's account, and each connection starts that account's service manager (`systemd --user`) again: asked more
  * often than its stop delay plus the call itself, it is still alive at the next look, born since the engine started,
- * and no observation could ever prove the stop (read by the worker router's reviewer, 25 Nov 2026). More than 15 s.
+ * and no observation could ever prove the stop (found on the worker router side, 25 Nov 2026). More than 15 s, counted
+ * from the end of one call to the start of the next.
  */
 export const OBSERVATION_RETRY_AFTER_MS = 20_000;
 const DEFAULT_GRACE_SEC = 20;
@@ -232,7 +233,11 @@ export type ProviderStopObservation = {
   announced: { providerPid: number; providerStartedAt: string };
 };
 
-/** A program's name, never a command line: the last segment of a path, bounded, without control characters. */
+/**
+ * A program's name, never a command line: the last segment of a path, 32 characters at most (a machine gives 15 or 16),
+ * without control characters, and refused when it carries an option or an assignment (" -", "="): that is a command
+ * line, whose arguments the server never keeps.
+ */
 function observedProcess(value: unknown, startUnknownAllowed = false): ObservedProcess | null {
   const one = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
   if (one && one.startedAt === null && startUnknownAllowed) {
@@ -240,7 +245,8 @@ function observedProcess(value: unknown, startUnknownAllowed = false): ObservedP
     return known && { ...known, startedAt: null };
   }
   const name = typeof one?.name === "string" ? one.name.split(/[\\/]/).pop()!.trim() : "";
-  if (!one || !positiveInteger(one.pid) || !isoUtc(one.startedAt) || !name || name.length > 128 || /[\0-\x1f\x7f]/.test(name)) return null;
+  if (!one || !positiveInteger(one.pid) || !isoUtc(one.startedAt) || !name || name.length > 32 || /[\0-\x1f\x7f]/.test(name)
+      || /=|\s-/.test(name)) return null;
   return { pid: one.pid, startedAt: one.startedAt, name };
 }
 
@@ -256,6 +262,8 @@ export function verifyProviderStopObservation(runId: string, value: unknown,
   if (raw.schema !== PROVIDER_STOP_OBSERVATION_SCHEMA_V1) return { refusal: "unknown_schema" };
   if (raw.runId !== runId) return { refusal: "another_run" };
   if (raw.outcome !== "absent" && raw.outcome !== "alive" && raw.outcome !== "unreadable") return { refusal: "unknown_outcome" };
+  // "absent" says that nothing was born since the engine: it must say it, with its list and its number.
+  if (raw.outcome === "absent" && (!Array.isArray(raw.since) || typeof raw.sinceCount !== "number")) return { refusal: "absent_without_lists" };
   const observedAt = typeof raw.observedAt === "string" ? new Date(raw.observedAt) : null;
   if (!observedAt || !Number.isFinite(observedAt.getTime())) return { refusal: "invalid_time" };
   if (now && observedAt.getTime() > now.getTime() + CLOCK_TOLERANCE_MS) return { refusal: "time_in_the_future" };
@@ -361,8 +369,8 @@ export function forgetProviderStopObservationAttempts() { attempts.clear(); }
  *
  * Only for a run this rule is about, once it ended and its adapter execution returned: nothing the server started
  * for that run is left on the machine then. One observation at a time for a run; one that proved nothing is not
- * asked again before OBSERVATION_RETRY_AFTER_MS; a forced one (a run of the task starts) waits for the end of that
- * spacing rather than skipping it. The adapter is asked to stop the announced engine
+ * asked again before OBSERVATION_RETRY_AFTER_MS after the end of the last call; a forced one (a run of the task starts)
+ * waits for the end of that spacing rather than skipping it. The adapter is asked to stop the announced engine
  * only when the run ended longer ago than the grace the agent is given.
  */
 export async function observeProviderStop(db: Db, input: { companyId: string; runId: string },
@@ -391,6 +399,8 @@ export async function observeProviderStop(db: Db, input: { companyId: string; ru
       const announcement = await readProviderIdentityAnnouncement(db, run.companyId, run.id);
       const answer = announcement ? await askAdapter(db, run, announcement, clock(), options.timeoutMs ?? OBSERVATION_TIMEOUT_MS)
         : { refusal: "no_announcement" };
+      // The spacing counts from the end of this call: the silence between two calls is never shorter than it.
+      state.lastAt = clock().getTime();
       let checked = "refusal" in answer ? answer : verifyProviderStopObservation(run.id, answer.value, announcement!, clock());
       // Requested after the run ended: an observation dated before that end is not of this stop.
       if ("observation" in checked && new Date(checked.observation.observedAt).getTime() < run.finishedAt.getTime())
