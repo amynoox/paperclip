@@ -126,7 +126,7 @@ const support = await getEmbeddedPostgresTestSupport();
   });
 
   it("comments: the body is kept whole, with its HTML comment, read back whole, and wakes the holder; the cursor and the bounds", async () => {
-    const body = `Pull request 389 was merged.\n\n<!-- facteur-v1 key=${randomUUID()} -->`;
+    const body = `Pull request 389 was merged.\n\n<!-- relay-v1 key=${randomUUID()} -->`;
     const res = await post(`/api/issues/${tracking}/comments`, { body, reopen: false });
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     const [comment] = (await commentsOf(tracking)).filter(row => row.body === body);
