@@ -137,6 +137,11 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/agents\/[^/]+\/skills$/ },
   { method: "POST", path: /^\/api\/agents\/[^/]+\/skills\/sync$/ },
   { method: "PATCH", path: /^\/api\/agents\/[^/]+\/instructions-path$/ },
+  // An agent's instructions bundle: read it, read one file, write one file. The server decides who may
+  // (agent_config:read for a peer's read, agent_instructions:update plus its change grant and consent for a write).
+  { method: "GET", path: /^\/api\/agents\/[^/]+\/instructions-bundle$/ },
+  { method: "GET", path: /^\/api\/agents\/[^/]+\/instructions-bundle\/file$/ },
+  { method: "PUT", path: /^\/api\/agents\/[^/]+\/instructions-bundle\/file$/ },
 
   // Read-only schema discovery for validated control-plane requests.
   { method: "GET", path: /^\/api\/openapi\.json$/ },
