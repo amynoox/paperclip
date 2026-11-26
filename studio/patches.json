@@ -2842,6 +2842,32 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: in packages/shared/src/validators/agent.ts, `projectCommenterAgentKeyScopeSchema` in the scope union, and its type exported (validators/index.ts, index.ts). In server/src/middleware/project-commenter-scope.ts, `projectCommenterScopeOf`, `projectCommenterRouteRefusal` (the four requests and their parameters; no run id header) and `projectCommenterRouteGuard`, mounted in app.ts after `cloudControlMiddleware()`. In lib/agent-records.ts, `PROJECT_COMMENTER_TOKEN_PREFIX`, `createProjectCommenterToken`, `hashProjectCommenterToken`; in services/agents.ts the key's creation checks its projects and uses that token and hash; in middleware/auth.ts the lookup by that hash, the match between the token's prefix and the key's scope, and no run id in such a key's actor. In services/authorization.ts, the project_commenter block before the trust resolution, and connection management refused. In routes/issues.ts, the three reduced answers, `excludeDocumentSearch` on the list, and the run-less branch of `assertCrossIssueInfluenceWithinRunCap`; in services/issues.ts and task-search.ts the `excludeDocumentSearch` filter and `includeDocuments` parameter; in services/cross-issue-influence-limit.ts `observeProjectCommenterInfluence` and `PROJECT_COMMENTER_HOURLY_CAP`. Why: see `problem` and `reason`. To re-apply after an upstream update: re-add each of these (search STUDIO-0102); if upstream changed `normalizeAgentApiKeyScope`, the token's own prefix and hash stay, so that a server without the scope never reads the key as standard."
+    },
+    {
+      "id": "STUDIO-0103",
+      "title": "The callback bridge lets a role read its company's labels (GET /api/companies/:companyId/labels)",
+      "status": "implemented-not-deployed",
+      "problem": "Roles running on work machines call the API through the sandbox callback bridge, which forwards only the routes of DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST. Reading the company's label list answered 403 \"Route not allowed\", so a role could not find the id of a label it had never used and could not put it on a ticket (25 Nov 2026: the Feedback Manager on TR-3371 and TR-3372, unblocked by hand).",
+      "reason": "The route is read-only, and its server handler already enforces company access (server/src/routes/issues.ts, assertCompanyAccess(req, companyId)): the bridge only stops forwarding a request the server would answer for this company. Carried as-is from upstream, so it goes when upstream has it.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "the sandbox callback bridge allow-list (packages/adapter-utils/src/sandbox-callback-bridge.ts) and the route table of skills/paperclip/SKILL.md",
+      "paths": [
+        "packages/adapter-utils/src/sandbox-callback-bridge.ts",
+        "packages/adapter-utils/src/sandbox-callback-bridge.test.ts",
+        "skills/paperclip/SKILL.md"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-26",
+        "repository": "paperclipai/paperclip",
+        "details": "Upstream pull request #16534 (head 6f5194a64530ce96d8d456c5477818c914f8114e) adds the same allow-list rule, test case and SKILL.md row; carried from it without change."
+      },
+      "validation": "The allow-list test of sandbox-callback-bridge.test.ts gains the case GET /api/companies/co-1/labels; at the bench a run reads its company's labels through the bridge.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder: the route is refused by the bridge again (403 Route not allowed), nothing else changes.",
+      "retireWhen": "Upstream ships #16534 (or the same rule) in a release the studio is on.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: one rule GET ^/api/companies/[^/]+/labels$ in DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST, one case in the allow-list test, one row 'List labels' in the route table of skills/paperclip/SKILL.md. Why: roles on work machines could not read their company's labels through the bridge. Origin: upstream paperclipai/paperclip#16534, first carried on studio/2026.1110.0 as amynoox/paperclip#108 (bd95ff3307b0), carried here onto the line in service (studio/lot-26-candidate-6, 835844e5)."
     }
   ]
 }
