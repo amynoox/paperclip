@@ -1741,6 +1741,9 @@ describe("sandbox callback bridge", () => {
       { method: "GET", path: "/api/agents/agent-1/skills" },
       { method: "POST", path: "/api/agents/agent-1/skills/sync" },
       { method: "PATCH", path: "/api/agents/agent-1/instructions-path" },
+      { method: "GET", path: "/api/agents/agent-1/instructions-bundle" },
+      { method: "GET", path: "/api/agents/agent-1/instructions-bundle/file" },
+      { method: "PUT", path: "/api/agents/agent-1/instructions-bundle/file" },
       { method: "GET", path: "/api/companies/co-1" },
       { method: "GET", path: "/api/companies/co-1/dashboard" },
       { method: "GET", path: "/api/companies/co-1/agents" },
@@ -1852,6 +1855,13 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/companies/co-1/logo" },
       { method: "GET", path: "/api/companies/co-1/secrets" },
       { method: "PATCH", path: "/api/secrets/secret-1" },
+      // The instructions bundle opens its read and its one-file write only: the rest stays denied.
+      { method: "PATCH", path: "/api/agents/agent-1/instructions-bundle" },
+      { method: "DELETE", path: "/api/agents/agent-1/instructions-bundle/file" },
+      { method: "POST", path: "/api/agents/agent-1/instructions-bundle/restore" },
+      { method: "GET", path: "/api/agents/agent-1/instructions-bundle/history" },
+      { method: "POST", path: "/api/agents/agent-1/instructions-bundle/candidates/run-1/resolve" },
+      { method: "PUT", path: "/api/agents/agent-1/instructions-bundle/file/extra" },
     ];
     for (const request of denied) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request)).toBe(
