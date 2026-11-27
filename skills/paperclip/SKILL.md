@@ -747,6 +747,7 @@ If `plan` already exists, first `GET /api/issues/{issueId}/documents/plan` and r
 | Agent instructions bundle             | `GET /api/agents/:agentId/instructions-bundle` • `GET\|PUT /api/agents/:agentId/instructions-bundle/file`                       |
 | List agents                           | `GET /api/companies/:companyId/agents`                                                                                          |
 | List labels                           | `GET /api/companies/:companyId/labels`                                                                                          |
+| Settle a recovery action              | `POST /api/issues/:issueId/recovery-actions/resolve`                                                                            |
 | Secret proposals                      | `POST\|GET /api/agents/me/secret-proposals` • `DELETE /api/agents/me/secret-proposals/:id`                                  |
 | Dashboard                             | `GET /api/companies/:companyId/dashboard`                                                                                       |
 

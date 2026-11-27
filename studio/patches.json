@@ -2894,6 +2894,32 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: three rules in DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST (GET ^/api/agents/[^/]+/instructions-bundle$, GET and PUT ^/api/agents/[^/]+/instructions-bundle/file$), their cases and six denied neighbours in the allow-list test, one row in the route table of skills/paperclip/SKILL.md. Why: the role that keeps other roles' instructions could not read or publish them from a work machine. Origin: the studio (no upstream change), written on the line in service (studio/lot-26-candidate-6, 835844e5)."
+    },
+    {
+      "id": "STUDIO-0108",
+      "title": "The callback bridge lets a role settle a recovery action (POST /api/issues/:id/recovery-actions/resolve); the server decides who may",
+      "status": "implemented-not-deployed",
+      "problem": "Roles on work machines call the API through the sandbox callback bridge. POST /api/issues/:id/recovery-actions/resolve is not in DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST (the allow-list test even listed it among the denied execution controls), so the bridge answers 403 \"Route not allowed\" before the server is asked. On 27 Nov 2026 the CEO could not settle the stranded_assigned_issue recovery action of TR-3514, a task of a role that reports to it, as its instruction sheet asks (TR-3519, 03:58:24 UTC); the Board had to do it.",
+      "reason": "The bridge only forwards; the server already decides: an agent may resolve only a recovery action of a task it holds or manages, or one it owns (requireRecoveryActionAuthority in server/src/routes/issues.ts), and the false positive, the cancel, the execution reconciliation of a replay-blocked hold and the workspace repair stay Board-only (assertBoard). Only this route is opened: the other recovery actions (confirm-run-stopped, retry-workspace-export, ...) and any longer path stay denied by the bridge. GET /api/issues/:id/recovery-actions was already allowed.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "the sandbox callback bridge allow-list (packages/adapter-utils/src/sandbox-callback-bridge.ts) and the route table of skills/paperclip/SKILL.md",
+      "paths": [
+        "packages/adapter-utils/src/sandbox-callback-bridge.ts",
+        "packages/adapter-utils/src/sandbox-callback-bridge.test.ts",
+        "skills/paperclip/SKILL.md"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-27",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found that opens recovery-actions/resolve to the callback bridge; upstream keeps it in the denied execution controls of the allow-list test."
+      },
+      "validation": "The allow-list test admits POST recovery-actions/resolve on both transports and keeps denied: retry-workspace-export, confirm-run-stopped, PUT resolve, resolve/extra, the run cancel/retry/watchdog routes. At the bench: a manager role settles a stranded_assigned_issue of its report through the bridge (200), a role outside the chain is refused by the server (403 from the route, not \"Route not allowed\").",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder: the route is refused by the bridge again.",
+      "retireWhen": "Upstream opens the same route to the callback bridge, or no role settles recovery actions from a work machine.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: one rule POST ^/api/issues/[^/]+/recovery-actions/resolve$ in DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST, the route moved from the denied to the allowed cases of the allow-list test with four neighbours kept denied, one row in the route table of skills/paperclip/SKILL.md. Why: the CEO and CTO instruction sheets ask them to settle a stranded assigned task of a role that reports to them, and the bridge refused it (TR-3519). Origin: the studio (no upstream change), written on the line in service (studio/lot-26-candidate-7b, 9f94fedc)."
     }
   ]
 }

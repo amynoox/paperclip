@@ -1720,14 +1720,23 @@ describe("sandbox callback bridge", () => {
     { method: "POST", path: "/api/heartbeat-runs/run-1/cancel" },
     { method: "POST", path: "/api/heartbeat-runs/run-1/retry" },
     { method: "POST", path: "/api/heartbeat-runs/run-1/watchdog-decisions" },
-    { method: "POST", path: "/api/issues/issue-1/recovery-actions/resolve" },
     { method: "POST", path: "/api/issues/issue-1/recovery-actions/retry-workspace-export" },
+    { method: "POST", path: "/api/issues/issue-1/recovery-actions/confirm-run-stopped" },
+    { method: "POST", path: "/api/issues/issue-1/recovery-actions/resolve/extra" },
+    { method: "PUT", path: "/api/issues/issue-1/recovery-actions/resolve" },
     { method: "GET", path: "/api/heartbeat-runs/run-1/provider-trace" },
     { method: "GET", path: "/api/companies/co-1/provider-traces" },
     { method: "GET", path: "/api/companies/co-1/execution-workspaces" },
   ])("keeps execution control and unrelated reads denied: $method $path", (request) => {
     expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request))
       .toBe(`Route not allowed: ${request.method} ${request.path}`);
+  });
+
+  it("admits settling a recovery action on both transports; the server decides who may", () => {
+    const request = { method: "POST", path: "/api/issues/issue-1/recovery-actions/resolve" };
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request, routes)).toBeNull();
+    }
   });
 
   it("permits the documented heartbeat surface and denies unrelated routes", () => {
