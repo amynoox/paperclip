@@ -11,13 +11,15 @@ import {
 } from "../lib/agent-permissions.js";
 
 describe("agent permissions service", () => {
-  it("grants agent-creation authority to new agents by default", () => {
-    expect(defaultAgentPermissions({ context: "create" }).canCreateAgents).toBe(true);
-    expect(normalizeAgentPermissions(undefined, { context: "create" }).canCreateAgents).toBe(true);
-    expect(normalizeAgentPermissions({}, { context: "create" }).canCreateAgents).toBe(true);
+  // STUDIO-0106: a new agent is born without hiring authority unless the request asks for it.
+  it("does not grant agent-creation authority to new agents by default", () => {
+    expect(defaultAgentPermissions({ context: "create" }).canCreateAgents).toBe(false);
+    expect(normalizeAgentPermissions(undefined, { context: "create" }).canCreateAgents).toBe(false);
+    expect(normalizeAgentPermissions({}, { context: "create" }).canCreateAgents).toBe(false);
     expect(
       normalizeAgentPermissions({ trustPreset: "standard" }, { context: "create" }).canCreateAgents,
-    ).toBe(true);
+    ).toBe(false);
+    expect(normalizeAgentPermissions({ canCreateAgents: true }, { context: "create" }).canCreateAgents).toBe(true);
   });
 
   it("keeps stored rows without an explicit value fail-closed", () => {

@@ -2896,6 +2896,33 @@
       "origin": "What: three rules in DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST (GET ^/api/agents/[^/]+/instructions-bundle$, GET and PUT ^/api/agents/[^/]+/instructions-bundle/file$), their cases and six denied neighbours in the allow-list test, one row in the route table of skills/paperclip/SKILL.md. Why: the role that keeps other roles' instructions could not read or publish them from a work machine. Origin: the studio (no upstream change), written on the line in service (studio/lot-26-candidate-6, 835844e5)."
     },
     {
+      "id": "STUDIO-0106",
+      "title": "A new agent is born without the right to create agents unless its creation request asks for it",
+      "status": "implemented-not-deployed",
+      "problem": "defaultAgentPermissions (server/src/lib/agent-permissions.ts) gave canCreateAgents: true to every new agent outside the low-trust preset: prepareAgentHire (server/src/services/agent-hiring.ts) normalizes the requested permissions in the \"create\" context and persists the result, so a hire or a creation whose request said nothing about canCreateAgents stored true. The legacy creator allow of the authorization service (canCreateAgentsLegacy, server/src/services/authorization.ts) then let that agent hire and create agents. Seen in production: the Quest Writer, hired by the Super RH role, was born with canCreateAgents: true (removed by hand after approval). STUDIO-0084 had removed the other default rights of a new agent, but only from the grant list (NEW_STANDARD_AGENT_DEFAULT_GRANT_KEYS); canCreateAgents is a flag of the agent's permissions record, not a grant key, so it stayed.",
+      "reason": "The owner's decision: creating roles is reserved to the Super RH. A new agent therefore does not receive the right by default; it receives it only when the creation request carries canCreateAgents: true, which only an actor that already passes agents:create can send (the hire and create routes ask agents:create before anything else).",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "new-agent default permissions (server/src/lib/agent-permissions.ts, defaultAgentPermissions)",
+      "paths": [
+        "server/src/lib/agent-permissions.ts",
+        "server/src/__tests__/agent-permissions-service.test.ts",
+        "server/src/__tests__/new-agent-no-create-agents-default-routes.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-27",
+        "repository": "paperclipai/paperclip",
+        "details": "Queries (gh search prs and issues): 'canCreateAgents default', 'canCreateAgents', 'hire default permissions create agents', 'agent creation authority default'. The default is upstream's choice: #12814 (merged 2026-09-04, 'grant new agents hire permission by default') made canCreateAgents default to true for new standard-trust agents so that agent teams grow without per-agent toggling. Related, unchanged by this patch: #20041 (merged, honour an explicit hiring denial on CEO agents, the ceoHiringDeniedBy record kept here), #15904 (open, canCreateAgents gates several capabilities), #14830 (open, an import parsing defect that resets agent permissions to true). No upstream change returns to a disabled default: this is a studio policy, not an upstream defect.",
+        "selected": null
+      },
+      "validation": "Linux (WSL), Node 24.22.2, a tree of 9f94fedc with this patch; the real agent routes, the real authorization service and approval service, an embedded PostgreSQL. New test file server/src/__tests__/new-agent-no-create-agents-default-routes.test.ts: a role hired by the Board without asking is stored with canCreateAgents: false and its own hire request is refused (403); a role hired with canCreateAgents: true holds it, hires, and its own hires are false unless it asks; a role that cannot hire cannot pass the right through a hire request (403, nothing written); a hire waiting for Board approval is activated by the approval with canCreateAgents: false; existing agents' stored permissions are byte-identical after a hire, a holder and a CEO without a recorded refusal still hire, a CEO with a recorded refusal and a legacy row without the flag do not; a CEO hired without asking keeps the CEO's hiring authority. The unit test of agent-permissions-service.test.ts states the new default. With the patch, the new file and seven existing files (agent-permissions-service, new-agent-default-grants-routes of STUDIO-0084, agents-pending-approval-config, agent-permissions-routes, agent-hire-idempotency-routes, teams-catalog-install-no-overrides, authorization-service): 245/245. Witness: the agent-permissions.ts of 9f94fedc under the two changed test files: 6 of 16 fail (five of the six route cases and the default unit case); the case of the existing agents passes on both, as it should.",
+      "migration": "None. Stored rows are not rewritten: an agent that holds canCreateAgents: true today keeps it, and the Board removes it case by case on the agent's permissions page.",
+      "rollback": "Switch cli/current back to the previous install folder: the next agents created receive canCreateAgents: true again; agents created in between keep false.",
+      "retireWhen": "Upstream returns to a disabled default for canCreateAgents, or the owner decides that new roles hire by default again.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: defaultAgentPermissions no longer gives canCreateAgents: true in the create context (only a CEO row without a recorded refusal keeps the legacy hiring authority, as before); the unit test stating the default and a new route test file. Why: the Quest Writer, hired by the Super RH, was born able to hire; the owner reserves the creation of roles to the Super RH. Origin: the studio, reversing upstream #12814 for this fork; written on the line in service (9f94fedc), building on STUDIO-0084 (amynoox/paperclip #87), which removed the other default rights of a new agent from the grant list only."
+    },
+    {
       "id": "STUDIO-0105",
       "title": "At the resume of a role, a pending card addressed to it whose run the pause cut wakes it once again",
       "status": "implemented-not-deployed",
