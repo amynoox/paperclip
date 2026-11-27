@@ -2997,6 +2997,32 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: in replayWakesMissedDuringPause, the lost-wake read also takes a card wake cancelled by a pause stop with its run set; such a wake counts as the task's lost card wake, is skipped on the agent's own task, and a later run dispatch cancelled as issue_assignee_changed does not count as the agent having run; a new test file. Why: a role paused during its run for a card addressed to it on another role's task was never woken again at the resume, and the card waited (TR-3106). Origin: the studio (no upstream change), written on the line in service (studio/question-addressee-resume-33, based on 9f94fedc)."
+    },
+    {
+      "id": "STUDIO-0109",
+      "title": "The interruption list projection does not read the run result of a done or cancelled task",
+      "status": "implemented-not-deployed",
+      "problem": "GET /api/companies/:id/issues outside the index view calls taskInterruptionPresentations, whose run query builds resultJson and providerFailureRunId with about twenty heartbeat_runs.result_json->'...' accesses per task. result_json carries the run's whole stdout (539 kB on average, up to 12 MB, for the latest runs of the 100 latest done tasks on 27 Nov 2026), and every access decompresses the whole value: twenty accesses on 100 runs took 6.76 s (EXPLAIN ANALYZE), so a list of 100 done tasks took 7.2 s against 0.83 s for the index view, and a work-machine tool reading 100 recent tasks was cut by the callback bridge's 10 s limit (TR-3732, TR-3758).",
+      "reason": "A done or cancelled task presents only its latest run's id: projectTaskInterruption returns its base presentation before any read of resultJson. The run query now receives the page's finished task ids and wraps the two result_json expressions in a case that returns null (resultJson) or the run's own id (providerFailureRunId) for them; Postgres does not evaluate the discarded branch, so nothing is decompressed for those tasks. Open tasks are unchanged. The resultJson column gets a stable alias (interruption_result_json) since its default name changed with the case.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "server/src/services/task-interruption-presentation.ts (taskInterruptionPresentations)",
+      "paths": [
+        "server/src/services/task-interruption-presentation.ts",
+        "server/src/__tests__/task-interruption-terminal-result.test.ts",
+        "server/src/__tests__/task-interruption-query.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-27",
+        "repository": "paperclipai/paperclip",
+        "details": "No upstream change found that skips the run result of finished tasks in the interruption list projection."
+      },
+      "validation": "New test: the captured run query projects no run result for a done and a cancelled task whose result_json carries a 600 kB stdout, and keeps it for an open task; the presentations of the finished tasks stay resolved with their run id, the open task keeps its provider failure. task-interruption-query.test.ts reads the aliased column. At the bench: the same tasks in the list before and after, an open task's interruption presentation unchanged, and the list duration of 100 done tasks with large results before and after.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder: the projection reads the run result again for every task.",
+      "retireWhen": "Upstream stops reading result_json for finished tasks in this projection, or stdout leaves result_json.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: the run query of taskInterruptionPresentations skips its two result_json expressions for done and cancelled tasks, one test file, and the existing query test reads the aliased column. Why: a list of 100 done tasks took 7.2 s on 27 Nov 2026, twenty decompressions of a stdout-heavy result_json per task, for values those tasks never present. Origin: the studio (no upstream change), written on the line in service (studio/lot-26-candidate-8, 94045d42)."
     }
   ]
 }
