@@ -168,6 +168,10 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "GET", path: /^\/api\/heartbeat-runs\/[^/]+$/ },
   { method: "GET", path: /^\/api\/heartbeat-runs\/[^/]+\/(?:events|log|workspace-operations|issues)$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/(?:runs|recovery-actions)$/ },
+  // Settle a recovery action (e.g. a stranded assigned task) of a task the role holds or manages. The server decides who
+  // may (requireRecoveryActionAuthority) and keeps the Board-only outcomes there: false positive, cancel, execution
+  // reconciliation of a replay-blocked hold, workspace repair. The other recovery actions stay denied.
+  { method: "POST", path: /^\/api\/issues\/[^/]+\/recovery-actions\/resolve$/ },
 
   // Task-bound email actions. Company, inbox ownership, task/run authority,
   // and action policies are enforced by the controller; mailbox setup stays denied.
