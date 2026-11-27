@@ -62,10 +62,10 @@ export function permissionsImplyLowTrust(permissions: unknown): boolean {
 
 /**
  * "create" is the context for permissions arriving on a new-agent write: the
- * hire/create default applies and the resolved value is persisted. "stored"
- * is the context for rows read back from the database: a row without an
- * explicit value stays fail-closed, so the default is never granted
- * retroactively to legacy or malformed records at read or enforcement time.
+ * resolved value is persisted. "stored" is the context for rows read back from
+ * the database: a row without an explicit value stays fail-closed, so nothing
+ * is granted retroactively to legacy or malformed records at read or
+ * enforcement time.
  */
 export type AgentPermissionsContext = "create" | "stored";
 
@@ -73,9 +73,11 @@ export function defaultAgentPermissions(
   options?: { lowTrust?: boolean; context?: AgentPermissionsContext; role?: string | null },
 ): NormalizedAgentPermissions {
   return {
-    // A CEO row without a recorded hiring restriction keeps its legacy hiring
-    // authority, so reads report what enforcement allows.
-    canCreateAgents: (options?.context === "create" || options?.role === "ceo") && options?.lowTrust !== true,
+    // STUDIO-0106: a new agent is born without hiring authority, in every
+    // context; only an explicit canCreateAgents: true in the creation request
+    // gives it. A CEO row without a recorded hiring restriction keeps its
+    // legacy hiring authority, so reads report what enforcement allows.
+    canCreateAgents: options?.role === "ceo" && options?.lowTrust !== true,
     canCreateSkills: true,
   };
 }
