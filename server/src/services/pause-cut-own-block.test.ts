@@ -10,8 +10,11 @@ import { configureAgentLifecycle, createAgentLifecycle } from "./agent-lifecycle
 import { createLifecycleDriver } from "./agent-lifecycle-driver.js";
 import { getExecutionBlocker } from "./execution-blocker.js";
 import { environmentService } from "./environments.js";
-import { PAUSE_CUT_WORK_CONTINUED, PAUSE_CUT_WORK_KEPT, PAUSE_CUT_WORK_NOT_CONTINUED, PAUSE_CUT_WORK_REQUEST_FILED,
-  PAUSE_CUT_WORK_UNBLOCKED } from "./pause-resume-continuation.js";
+import { PAUSE_CUT_WORK_CONTINUED, PAUSE_CUT_WORK_KEPT, PAUSE_CUT_WORK_NOT_CONTINUED, PAUSE_CUT_WORK_REQUEST_FILED }
+  from "./pause-resume-continuation.js";
+
+/** Written as text, so that these cases also run, and fail on their behaviour, against a server without the entry. */
+const PAUSE_CUT_WORK_UNBLOCKED = "agent.pause_cut_work_unblocked";
 
 // STUDIO-0107: production, 26 Nov 2026. The Board paused every role for a pose window; the cut runs' holds then
 // blocked their tasks (receipt legacyCancellationBlock), and at the resume the continuation of STUDIO-0074 refused
