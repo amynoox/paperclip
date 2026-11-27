@@ -308,6 +308,11 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
   const requestedIssueId = sql<string>`"requested_interruption_issues"."requested_issue_id"`;
   const requestedUuid = sql<string>`case when ${requestedIssueId} ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
     then ${requestedIssueId}::uuid else null end`;
+  // A done or cancelled task presents only its latest run's id (projectTaskInterruption returns `base` for it), so
+  // its run's result_json is not read: every `->` on that column decompresses the whole value, stdout included, and
+  // a page of finished tasks paid about twenty such reads per row.
+  const terminalIds = [...new Set(selected.filter(issue => issue.status === "done" || issue.status === "cancelled").map(issue => issue.id))];
+  const openTask = sql`not (${requestedIssueId} = any(${sql.param(terminalIds)}::text[]))`;
   const legacyIssue = sql<string>`${heartbeatRuns.contextSnapshot}->>'issueId'`;
   const candidate = (condition: ReturnType<typeof and>) => db.select({ id: heartbeatRuns.id, createdAt: heartbeatRuns.createdAt })
     .from(heartbeatRuns).where(and(eq(heartbeatRuns.companyId, companyId), condition))
@@ -349,10 +354,11 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
           and ${nativeRunFinalizations.phase} = 'terminal_failure')`.mapWith(value => value == null ? null : new Date(value)),
       // The run whose resultJson supplied providerFailure. A scheduled retry
       // shows its predecessor's reason, so redaction must use that run's registry.
-      providerFailureRunId: sql<string>`case when ${heartbeatRuns.resultJson}->'providerFailure' is null
+      providerFailureRunId: sql<string>`case when not ${openTask} then ${heartbeatRuns.id}
+        when ${heartbeatRuns.resultJson}->'providerFailure' is null
         and ${heartbeatRuns.status} = 'scheduled_retry' and ${heartbeatRuns.retryOfRunId} is not null
         then ${heartbeatRuns.retryOfRunId} else ${heartbeatRuns.id} end`,
-      resultJson: sql<Record<string, unknown>>`jsonb_build_object('configurationIncomplete', ${heartbeatRuns.resultJson}->'configurationIncomplete',
+      resultJson: sql<Record<string, unknown> | null>`case when not ${openTask} then null else jsonb_build_object('configurationIncomplete', ${heartbeatRuns.resultJson}->'configurationIncomplete',
         'stopReason', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'stopReason'`, 80)},
         'timeoutSource', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'timeoutSource'`, 80)},
         'timeoutFired', coalesce(${heartbeatRuns.resultJson}->'timeoutFired' = 'true'::jsonb, false),
@@ -373,7 +379,8 @@ export async function taskInterruptionPresentations(db: Db, companyId: string, i
           'acknowledgementAuditId', ${boundedJsonString(sql`${heartbeatRuns.resultJson}->'nativeCancellation'->'acknowledgementAuditId'`, 160)}),
         'providerFailure', coalesce(${heartbeatRuns.resultJson}->'providerFailure', case when ${heartbeatRuns.status} = 'scheduled_retry'
           then (select predecessor.result_json->'providerFailure' from ${heartbeatRuns} predecessor
-            where predecessor.company_id = ${heartbeatRuns.companyId} and predecessor.id = ${heartbeatRuns.retryOfRunId}) end))`,
+            where predecessor.company_id = ${heartbeatRuns.companyId} and predecessor.id = ${heartbeatRuns.retryOfRunId}) end)) end`
+        .as("interruption_result_json"),
     }).from(requested).innerJoinLateral(latestRuns, sql`true`).innerJoin(heartbeatRuns, and(eq(heartbeatRuns.companyId, companyId), eq(heartbeatRuns.id, latestRuns.id)))
       .leftJoin(agents, and(eq(agents.companyId, heartbeatRuns.companyId), eq(agents.id, heartbeatRuns.agentId)))
       .orderBy(requestedIssueId),
