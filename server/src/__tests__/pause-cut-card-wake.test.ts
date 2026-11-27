@@ -32,9 +32,9 @@ describe("a card wake whose run the pause cut", () => {
     await db.insert(issueThreadInteractions).values({ id: interactionId, companyId, issueId, kind: "ask_user_questions",
       status: "pending", continuationPolicy: "wake_assignee", addresseeAgentId: addressee, createdByAgentId: owner,
       payload: { version: 1, questions: [] } as never });
-    // The card's wake, promoted to a run, as the wake queue leaves it.
+    // The card's wake, promoted to a run, as the wake queue leaves it (finalizePromotedWake: queued, runId set).
     const [wake] = await db.insert(agentWakeupRequests).values({ companyId, agentId: addressee, source: "automation",
-      triggerDetail: "system", reason: "issue_execution_promoted", status: "claimed", claimedAt: new Date(),
+      triggerDetail: "system", reason: "issue_execution_promoted", status: "queued",
       payload: { issueId, mutation: "interaction", interactionId, interactionKind: "ask_user_questions" } }).returning();
     const [run] = await db.insert(heartbeatRuns).values({ companyId, agentId: addressee, invocationSource: "automation",
       triggerDetail: "system", status: "queued", wakeupRequestId: wake.id,
