@@ -2894,6 +2894,31 @@
       "upgradeDecisions": [],
       "commits": [],
       "origin": "What: three rules in DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST (GET ^/api/agents/[^/]+/instructions-bundle$, GET and PUT ^/api/agents/[^/]+/instructions-bundle/file$), their cases and six denied neighbours in the allow-list test, one row in the route table of skills/paperclip/SKILL.md. Why: the role that keeps other roles' instructions could not read or publish them from a work machine. Origin: the studio (no upstream change), written on the line in service (studio/lot-26-candidate-6, 835844e5)."
+    },
+    {
+      "id": "STUDIO-0105",
+      "title": "At the resume of a role, a pending card addressed to it whose run the pause cut wakes it once again",
+      "status": "implemented-not-deployed",
+      "problem": "Production, 26 Nov 2026, TR-3106: the task's assignee (CTO) created an ask_user_questions card (continuation_policy wake_assignee) addressed to the Feedback Manager. The card's wake was promoted to a run (issue_execution_promoted, payload issueId, mutation interaction, interactionId, interactionKind, sourceRunId). A Board pause of the Feedback Manager (POST /api/agents/:id/pause) cancelled that run (error_code agent_paused); the wake request was left cancelled, error \"Cancelled due to agent pause\", with its runId set. At the resume nothing woke the addressee and the card stayed pending. A manual wake (POST /api/agents/:id/wakeup with payload.issueId) was cancelled within the second as issue_assignee_changed, because the addressee does not own the task.",
+      "reason": "replayWakesMissedDuringPause (STUDIO-0028, server/src/services/pause-missed-wakes.ts) replays a wake the pause refused or cancelled before it had a run (runId null), and STUDIO-0038 a pending card with no wake recorded; a card wake whose run had already been created fell between the two. continueRunsCutByPause (STUDIO-0074) continues cut runs only on tasks the agent owns. Now a card wake cancelled by a pause stop with its run counts as a lost card wake for an addressee that does not own the task, and is replayed with the shape of the card's own wake (mutation interaction, wakeReason interaction_pending), which dispatch verifies (verifyAddresseeInteractionWake) instead of cancelling it as issue_assignee_changed. Same guards as the other lost wakes: the card is still pending and addressed to the agent, no wake of the agent for the task is live, no run of the agent on the task since the loss (a run dispatch cancelled as issue_assignee_changed did nothing and does not count), one wake per loss by its idempotency key. On the agent's own task the cut run stays with STUDIO-0074.",
+      "observedOnUpstream": "2026.1110.0",
+      "owner": "the replay of wakes lost to a pause (server/src/services/pause-missed-wakes.ts), called by the lifecycle driver when the agent is ready again",
+      "paths": [
+        "server/src/services/pause-missed-wakes.ts",
+        "server/src/__tests__/pause-cut-card-wake.test.ts"
+      ],
+      "upstreamSearch": {
+        "date": "2026-11-27",
+        "repository": "paperclipai/paperclip",
+        "details": "gh search prs (pause resume interaction wake; addressee wake pause; resume replay wake; interaction addressee cancelled pause): no upstream change replays, at an agent's resume, a card wake whose run the pause cut. Neighbours, open, other causes: #14378 (verify the addressee before the staleness gate cancels an interaction wake), #20806 (a pending card's addressee through the dependency gates), #20750 (resume parked execution-stage wakes), #22320 (a live wake target for wake_assignee cards on ownerless tasks)."
+      },
+      "validation": "pause-cut-card-wake.test.ts reproduces the production sequence on an embedded database (the card's promoted wake and its run, the pause route's cancelActiveForAgent, the resume) and checks: the addressee is woken once with the card's wake; through the real queue the replayed wake is not refused nor cancelled as issue_assignee_changed and a second resume adds nothing; a manual wake cancelled as issue_assignee_changed does not stop the replay; no wake when one for the task is queued, when the card is answered or addressed to another agent, or on the agent's own task. The test fails on the base and passes with the change; pause-missed-wakes.test.ts and paused-addressee-card.test.ts still pass. At the bench: pause the addressee during its card run, resume, the card's addressee runs once.",
+      "migration": "None.",
+      "rollback": "Switch cli/current back to the previous install folder: a card wake whose run the pause cut is no longer replayed at the resume.",
+      "retireWhen": "Upstream replays at an agent's resume the card wakes its pause cut, or a pause no longer cancels a card's run.",
+      "upgradeDecisions": [],
+      "commits": [],
+      "origin": "What: in replayWakesMissedDuringPause, the lost-wake read also takes a card wake cancelled by a pause stop with its run set; such a wake counts as the task's lost card wake, is skipped on the agent's own task, and a later run dispatch cancelled as issue_assignee_changed does not count as the agent having run; a new test file. Why: a role paused during its run for a card addressed to it on another role's task was never woken again at the resume, and the card waited (TR-3106). Origin: the studio (no upstream change), written on the line in service (studio/question-addressee-resume-33, based on 9f94fedc)."
     }
   ]
 }

@@ -33,6 +33,14 @@ import { issueThreadInteractionAttentionAgentAllowed } from "./issue-thread-inte
  * still pending and addressed to the agent, with no wake recorded for it,
  * counts as a lost card wake from the moment it was created.
  *
+ * STUDIO-0105: a card wake whose run had already been created when the pause
+ * cut it (26 Nov 2026, TR-3106: the card's wake was promoted to a run, the
+ * pause route cancelled that run with `agent_paused`, the request was left
+ * `cancelled` with its runId set, and nothing replayed it) is lost too, for an
+ * addressee that does not own the task. On the agent's own task a cut run is
+ * continued by STUDIO-0074, so it is not replayed here. A run cancelled as
+ * `issue_assignee_changed` did no work and does not count as a later run.
+ *
  * Not covered: a wake that was never requested (no row), for example a task
  * whose recovery settled as blocked; there is nothing to replay.
  */
@@ -55,7 +63,8 @@ type Wakeup = (agentId: string, opts: {
 }) => Promise<unknown>;
 
 // `id` is the lost wake request; null for a card whose wake was never recorded.
-type Missed = { id: string | null; finishedAt: Date; interactionId: string | null };
+// `cut`: the lost wake had a run, cut by the pause (STUDIO-0105).
+type Missed = { id: string | null; finishedAt: Date; interactionId: string | null; cut?: boolean };
 
 export async function replayWakesMissedDuringPause(db: Db, input: {
   companyId: string;
@@ -69,6 +78,7 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
     issueId: sql<string | null>`${agentWakeupRequests.payload}->>'issueId'`,
     interactionId: sql<string | null>`${agentWakeupRequests.payload}->>'interactionId'`,
     finishedAt: agentWakeupRequests.finishedAt,
+    runId: agentWakeupRequests.runId,
   }).from(agentWakeupRequests).where(and(
     eq(agentWakeupRequests.companyId, input.companyId),
     eq(agentWakeupRequests.agentId, input.agentId),
@@ -77,6 +87,9 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
       // Cancelled by a pause stop before it ever started a run.
       and(eq(agentWakeupRequests.status, "cancelled"), inArray(agentWakeupRequests.error, PAUSE_STOP_ERRORS),
         isNull(agentWakeupRequests.runId)),
+      // STUDIO-0105: a card wake whose run the pause stop cancelled.
+      and(eq(agentWakeupRequests.status, "cancelled"), inArray(agentWakeupRequests.error, PAUSE_STOP_ERRORS),
+        isNotNull(agentWakeupRequests.runId), sql`${agentWakeupRequests.payload}->>'interactionId' is not null`),
     ),
     isNotNull(agentWakeupRequests.finishedAt),
     gt(agentWakeupRequests.finishedAt, since),
@@ -85,9 +98,15 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
   // Per task: the latest lost wake, and the latest one that was for a card.
   const latest = new Map<string, Missed>();
   const latestCard = new Map<string, Missed>();
+  // STUDIO-0105: per task, the latest card wake whose run the pause cut.
+  const latestCut = new Map<string, Missed>();
   for (const row of lost) {
     if (!row.issueId || !UUID.test(row.issueId)) continue;
     const missed = { id: row.id, finishedAt: row.finishedAt!, interactionId: row.interactionId && UUID.test(row.interactionId) ? row.interactionId : null };
+    if (row.runId) {
+      if (missed.interactionId && !latestCut.has(row.issueId)) latestCut.set(row.issueId, { ...missed, cut: true });
+      continue;
+    }
     if (!latest.has(row.issueId)) latest.set(row.issueId, missed);
     if (missed.interactionId && !latestCard.has(row.issueId)) latestCard.set(row.issueId, missed);
   }
@@ -130,11 +149,20 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
     }
   }
 
+  // STUDIO-0105: a cut card wake counts as a lost card wake. It never stands for a lost wake of the agent's own
+  // task: on that task the cut run is continued by STUDIO-0074.
+  for (const [issueId, cut] of latestCut) {
+    const knownCard = latestCard.get(issueId);
+    if (!knownCard || knownCard.finishedAt < cut.finishedAt) latestCard.set(issueId, cut);
+    if (!latest.has(issueId)) latest.set(issueId, cut);
+  }
+
   let woken = 0;
   for (const [issueId, last] of latest) {
     const [issue] = await db.select({ id: issues.id, status: issues.status, assigneeAgentId: issues.assigneeAgentId })
       .from(issues).where(and(eq(issues.companyId, input.companyId), eq(issues.id, issueId))).limit(1);
     if (!issue || ["done", "cancelled", "backlog"].includes(issue.status)) continue;
+    if (last.cut && issue.assigneeAgentId === input.agentId) continue;
     let missed: Missed | null = issue.assigneeAgentId === input.agentId ? last : null;
     let interactionId: string | null = null;
     let interactionKind: string | null = null;
@@ -172,6 +200,8 @@ export async function replayWakesMissedDuringPause(db: Db, input: {
       eq(heartbeatRuns.agentId, input.agentId),
       sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${issueId}`,
       gt(heartbeatRuns.createdAt, missed.finishedAt),
+      // STUDIO-0105: a run dispatch cancelled because the agent does not own the task did nothing.
+      sql`not (${heartbeatRuns.status} = 'cancelled' and coalesce(${heartbeatRuns.errorCode}, '') = 'issue_assignee_changed')`,
     )).limit(1);
     if (later) continue;
     const [live] = await db.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
