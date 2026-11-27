@@ -1,5 +1,5 @@
 import { and, desc, eq, inArray, or, sql } from "drizzle-orm";
-import { activityLog, agentWakeupRequests, budgetResumeClaims, heartbeatRuns, issues, type Db } from "@paperclipai/db";
+import { activityLog, agentWakeupRequests, budgetResumeClaims, heartbeatRuns, issueRecoveryActions, issues, type Db } from "@paperclipai/db";
 import { HttpError } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { logActivity, publishActivity, type ActivityPublication, type LogActivityInput } from "./activity-log.js";
@@ -27,6 +27,9 @@ import type { PauseResumeOperation, ResumeRequester } from "../modules/agent-lif
  *   soon as a newer run exists.
  * Checked here, before filing: a person asked, signed in by a source the Retry accepts; the cut run's hold still
  * holds the task; the task is not blocked and has no unresolved blocker; no request of a person already waits.
+ * STUDIO-0107: a task blocked by that hold itself (its receipt names the cut run and the status has not moved since)
+ * gets its previous status back in the transaction that files the Retry, once the server proves the stop on the
+ * facts of the Board's reconciliation (`agent.pause_cut_work_unblocked`); without that proof it keeps its hold.
  *
  * The task's activity says what happened, with who asked and how that person was signed in:
  * - `agent.pause_cut_work_not_continued`: nothing was filed, with the reason;
@@ -46,6 +49,8 @@ export const PAUSE_CUT_WORK_CONTINUED = "agent.pause_cut_work_continued";
 export const PAUSE_CUT_WORK_NOT_CONTINUED = "agent.pause_cut_work_not_continued";
 export const PAUSE_CUT_WORK_REQUEST_FILED = "agent.pause_cut_work_request_filed";
 export const PAUSE_CUT_WORK_KEPT = "agent.pause_cut_work_kept";
+/** STUDIO-0107: the cut run's own hold had blocked the task; the resume gave it back its status, on the server's stop proof. */
+export const PAUSE_CUT_WORK_UNBLOCKED = "agent.pause_cut_work_unblocked";
 export const PAUSE_RESUME_ACTOR_ID = "pause-resume";
 const RETRY_KEY = "pause-resume:";
 /** The idempotency key of the filed Retry, as task-retry.ts stores it: this prefix, the cut run, the ready operation. */
@@ -160,7 +165,8 @@ export async function continueRunsCutByPause(db: Db, input: PauseResumeContinuat
 async function continueOne(db: Db, input: PauseResumeContinuation, issueId: string): Promise<"continued" | "kept" | "notContinued" | null> {
   const { companyId, agentId, readyOperationId } = input;
   const write = input.record ?? logActivity;
-  const [task] = await db.select({ id: issues.id, status: issues.status }).from(issues).where(and(
+  const [task] = await db.select({ id: issues.id, status: issues.status, statusVersion: issues.statusVersion,
+    executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId }).from(issues).where(and(
     eq(issues.companyId, companyId), eq(issues.id, issueId), eq(issues.assigneeAgentId, agentId),
     inArray(issues.status, OPEN_TASK_STATUSES)));
   // Closed, or no longer this agent's task: not its work any more.
@@ -214,7 +220,12 @@ async function continueOne(db: Db, input: PauseResumeContinuation, issueId: stri
   if (!blocker?.recoveryActionId) return refuse("not_held");
   if (blocker.runId !== cut.id) return refuse("held_for_another_reason",
     { recoveryActionId: blocker.recoveryActionId, cause: blocker.cause });
-  if (task.status === "blocked") return refuse("task_blocked");
+  // STUDIO-0107: a task blocked by the cut run's own hold (its settlement, or stranded-work recovery, under this
+  // hold) is not the role's block. Any other block is the role's or a person's: left alone.
+  const ownBlock = task.status === "blocked"
+    ? await ownCancellationBlock(db, { companyId, agentId, cutRunId: cut.id, recoveryActionId: blocker.recoveryActionId, task })
+    : null;
+  if (task.status === "blocked" && !ownBlock) return refuse("task_blocked");
   const dependencyReady = input.dependencyReady ?? (async (id: string) =>
     (await (await import("./issues.js")).issueService(db).getDependencyReadiness(id)).isDependencyReady);
   if (!await dependencyReady(issueId)) return refuse("blocked_by_dependency");
@@ -224,22 +235,39 @@ async function continueOne(db: Db, input: PauseResumeContinuation, issueId: stri
     sql`${agentWakeupRequests.payload}->>'issueId' = ${issueId}`)).limit(1);
   // A message kept during the pause, or a Retry: that request continues the cut run by the same path.
   if (waiting) return refuse("already_requested_by_person", { wakeRequestId: waiting.id });
+  if (ownBlock) {
+    // The block is undone only on the facts the Board's reconciliation checks, read by the server itself.
+    const notProven = await stopNotProvenByServer(db, { companyId, issueId, agentId, cutRunId: cut.id });
+    if (notProven) return refuse("task_blocked_stop_not_proven", { recoveryActionId: blocker.recoveryActionId, stopProof: notProven });
+  }
 
-  // The Retry and its record commit together: no request is ever filed without its entry on the task.
+  // The Retry and its record commit together: no request is ever filed without its entry on the task. The task's
+  // status, given back when the hold had blocked it, commits with them, or not at all.
   const requestRetry = input.requestRetry ?? (await import("./task-retry.js")).requestTaskRetry;
   const publications: ActivityPublication[] = [];
   let requestId: string | null = null;
   try {
     requestId = await db.transaction(async tx => {
+      if (ownBlock) {
+        const restored = await restoreOwnBlockedStatus(tx as unknown as Db, { companyId, agentId, issueId, ownBlock });
+        if (!restored) throw new NotFiled("task_blocked");
+        await write(tx as unknown as Db, entry(PAUSE_CUT_WORK_UNBLOCKED, { recoveryActionId: ownBlock.recoveryActionId,
+          restoredStatus: ownBlock.previousStatus, blockedStatusVersion: ownBlock.statusVersion }), publications);
+      }
       const receipt = await requestRetry({ db: tx as unknown as Db, companyId, issueId, observedRunId: cut.id,
         actorId: person.userId, actorSource: person.source,
         idempotencyKey: `${RETRY_KEY}${cut.id}:${readyOperationId}` });
       // The cut run is no longer the agent's latest run on the task, or the task was closed or handed over.
-      if (!receipt.accepted || !receipt.requestId) return null;
+      if (!receipt.accepted || !receipt.requestId) {
+        if (ownBlock) throw new NotFiled("already_continued");
+        return null;
+      }
       await write(tx as unknown as Db, entry(PAUSE_CUT_WORK_REQUEST_FILED, { retryRequestId: receipt.requestId }), publications);
       return receipt.requestId;
     });
   } catch (error) {
+    // Nothing was committed: the task keeps its block and its hold.
+    if (error instanceof NotFiled) return refuse(error.reason);
     // A refusal the Retry path names is this resume's answer; anything else is a failure.
     if (!(error instanceof HttpError) || error.status < 400 || error.status >= 500) throw error;
     const code = (error.details as { code?: unknown } | undefined)?.code;
@@ -280,6 +308,72 @@ async function recordOnce(db: Db, write: Record_, input: LogActivityInput) {
     sql`${activityLog.details}->>'reason' = ${String(details.reason)}`)).limit(1);
   if (same) return false;
   await write(db, input);
+  return true;
+}
+
+/** A refusal decided inside the filing transaction: it rolls back whatever that transaction wrote. */
+class NotFiled extends Error {
+  constructor(readonly reason: string) { super(reason); }
+}
+
+type OwnBlock = { recoveryActionId: string; statusVersion: number; previousStatus: string };
+const RESTORABLE_STATUSES = ["todo", "in_progress", "in_review"];
+const LEGACY_HOLD_CAUSE = "legacy_execution_requires_reconciliation";
+
+/**
+ * STUDIO-0107. Production, 26 Nov 2026: after the pause of a pose window, the cut runs' holds had blocked their tasks
+ * (the hold's settlement, or stranded-work recovery, wrote the receipt legacyCancellationBlock), the resume refused
+ * them as blocked, and eleven tasks waited for the Board's reconciliation while their roles could not lift them.
+ * The block is this hold's own when the hold is the legacy hold of this cut run, not reconciled nor kept for a
+ * workspace, and its receipt names this run with the task's current status version (the status has not moved since);
+ * as legacy-execution-recovery.ts requires before it restores a block of its own. Null otherwise: the role's or a
+ * person's block is never undone here.
+ */
+async function ownCancellationBlock(db: Db, input: { companyId: string; agentId: string; cutRunId: string;
+  recoveryActionId: string; task: { status: string; statusVersion: number; executionRunId: string | null; checkoutRunId: string | null } }): Promise<OwnBlock | null> {
+  const { task } = input;
+  if (task.status !== "blocked" || task.executionRunId || task.checkoutRunId) return null;
+  const [hold] = await db.select({ id: issueRecoveryActions.id, cause: issueRecoveryActions.cause,
+    fingerprint: issueRecoveryActions.fingerprint, evidence: issueRecoveryActions.evidence })
+    .from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, input.companyId),
+      eq(issueRecoveryActions.id, input.recoveryActionId))).limit(1);
+  if (!hold || hold.cause !== LEGACY_HOLD_CAUSE || hold.fingerprint !== `legacy-execution:${input.cutRunId}`) return null;
+  const evidence = record(hold.evidence);
+  if (evidence.runId !== input.cutRunId || ["executionReconciliation", "workspaceRestoreFailure", "workspaceRestoreRecovery",
+    "systemRecovery"].some(key => key in evidence)) return null;
+  const receipt = record(evidence.legacyCancellationBlock);
+  if (receipt.runId !== input.cutRunId || Number(receipt.statusVersion) !== task.statusVersion
+    || !RESTORABLE_STATUSES.includes(String(receipt.previousStatus))) return null;
+  return { recoveryActionId: hold.id, statusVersion: task.statusVersion, previousStatus: String(receipt.previousStatus) };
+}
+
+/**
+ * The server's own proof that the cut run's execution stopped: the checks of the Board's reconciliation
+ * (validateExecutionReconciliation: run cancelled and owned by the assignee, no live process of it on this server,
+ * no coordinator lease nor linked continuation, no unreleased environment lease). Null when proven; otherwise what
+ * is missing. It writes nothing and records no reconciliation: the Retry below keeps its own gate.
+ */
+async function stopNotProvenByServer(db: Db, input: { companyId: string; issueId: string; agentId: string; cutRunId: string }) {
+  const { validateExecutionReconciliation } = await import("./execution-recovery-resolution.js");
+  try {
+    await validateExecutionReconciliation({ db, companyId: input.companyId, issueId: input.issueId, agentId: input.agentId,
+      sourceRunId: input.cutRunId, decision: { runId: input.cutRunId, providerStopped: true, actionOutcome: "mixed",
+        outcomeEvidence: "Cut by a pause of the role; the server checks the stop before the resume continues the work." } });
+    return null;
+  } catch (error) {
+    if (error instanceof HttpError && error.status >= 400 && error.status < 500) return error.message;
+    throw error;
+  }
+}
+
+/** Gives the task back the status the hold took, under the task's lock, only if nothing moved since the check. */
+async function restoreOwnBlockedStatus(tx: Db, input: { companyId: string; agentId: string; issueId: string; ownBlock: OwnBlock }) {
+  const [locked] = await tx.select({ status: issues.status, statusVersion: issues.statusVersion, assigneeAgentId: issues.assigneeAgentId,
+    executionRunId: issues.executionRunId, checkoutRunId: issues.checkoutRunId }).from(issues)
+    .where(and(eq(issues.companyId, input.companyId), eq(issues.id, input.issueId))).for("update");
+  if (!locked || locked.status !== "blocked" || locked.statusVersion !== input.ownBlock.statusVersion
+    || locked.assigneeAgentId !== input.agentId || locked.executionRunId || locked.checkoutRunId) return false;
+  await (await import("./issues.js")).issueService(tx).update(input.issueId, { status: input.ownBlock.previousStatus }, tx);
   return true;
 }
 
